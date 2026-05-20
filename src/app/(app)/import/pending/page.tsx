@@ -293,7 +293,7 @@ function PendingImportsPageInner() {
   }, [openId, closeDetail, loadList]);
 
   return (
-    <div className="max-w-5xl space-y-6">
+    <div className="space-y-6">
       <div className="flex items-center gap-3">
         <Link href="/import" className="text-sm text-muted-foreground hover:text-foreground inline-flex items-center gap-1">
           <ArrowLeft className="h-4 w-4" />
