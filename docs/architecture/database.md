@@ -133,3 +133,29 @@ The unified-ingest staging tables (`staged_imports` + `staged_transactions`, see
 | `default_currency` | `TEXT` | `NULL` | ISO 4217 fallback applied to rows missing a `currency` / `entered_currency`. Validated against `supportedCurrencyEnum` at the API layer. |
 
 `bound_account_id` (added in `20260506_staging_unified_columns.sql`) is the fifth knob (default account) and was already present — FINLYNQ-54 only unified the UX into the same panel; the column was unchanged. Defaults preserve pre-FINLYNQ-54 behavior, so existing uploads that don't open the options panel are unaffected. `import_hash` is **not** recomputed when these knobs are toggled (load-bearing — dedup must stay stable across re-runs).
+
+## `staged_transactions` reconciliation columns + `transaction_reconciliation_flags` (FINLYNQ-55)
+
+Schema scaffolding for the two-pane reconciliation UI (F-53C) ahead of the UI itself. Two additive columns on `staged_transactions` + one new table, all delivered 2026-05-20 by [`scripts/migrations/20260520_finlynq-55-reconcile-state.sql`](../../scripts/migrations/20260520_finlynq-55-reconcile-state.sql):
+
+| Column on `staged_transactions` | Type | Default | Meaning |
+|---|---|---|---|
+| `reconcile_state` | `TEXT NOT NULL` | `'unmatched'` | One of `'unmatched'` / `'auto_suggested'` / `'linked'` / `'skipped_duplicate'`. The file-side row's reconciliation decision. `CHECK` over the four values. `'flagged_missing'` is **not** a value here — DB-side flags live on `transaction_reconciliation_flags` (different lifecycle: staging rows are ephemeral, flags persist past approval). |
+| `linked_transaction_id` | `INTEGER NULL` | `NULL` | FK into `transactions(id)` (which is `serial(integer)`, hence integer here). Set when the user manually links a file row to an existing DB row. `ON DELETE SET NULL` — a transaction wipe doesn't cascade into staging rows the user may want to re-link. |
+
+The new `transaction_reconciliation_flags` table carries the DB-side annotations:
+
+| Column | Type | Notes |
+|---|---|---|
+| `id` | `UUID PRIMARY KEY` | |
+| `transaction_id` | `INTEGER NOT NULL` | `REFERENCES transactions(id) ON DELETE CASCADE`. |
+| `user_id` | `TEXT NOT NULL` | `REFERENCES users(id) ON DELETE CASCADE` — wipe-account cleans up flags via the cascade without the wipe endpoint needing to know about the table. |
+| `flag_kind` | `TEXT NOT NULL` | `CHECK (flag_kind IN ('missing_from_statement'))` for now. Future kinds widen the CHECK in a follow-up migration. |
+| `note` | `TEXT NULL` | Optional user-supplied annotation. |
+| `created_at` | `TIMESTAMPTZ NOT NULL DEFAULT NOW()` | |
+
+Index on `(user_id, transaction_id)` — covers the per-user-per-tx prefix probe the reconciliation pane runs as it iterates rows.
+
+Why the separate table: a flag's lifecycle is distinct from any column on `transactions` (added, removed, can carry a note, independent of any column on the parent row), and keeping it out of the hot `transactions` table avoids touching every aggregator with a fresh `is_flagged` predicate. Per the FINLYNQ-55 issue body, the alternative of adding `reconcile_state='flagged_missing'` to staging rows was rejected — staging rows are ephemeral (deleted on approve/reject/expire) and flags need to outlive the staging row.
+
+Backup-restore (`/api/data/import` `strip()`) gained a `transactionIdMap` remap arg in the same change. Pre-migration backups (column absent) fall back to the column default `'unmatched'` / `NULL`. The `transaction_reconciliation_flags` rows aren't in the backup format today — that's a separate decision (the table's contents are user-curated annotations on DB-side rows; if/when included they'd remap via the same `transactionIdMap`).

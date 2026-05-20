@@ -701,7 +701,67 @@ export const stagedTransactions = pgTable("staged_transactions", {
   // materialize-into-`transactions` step (today's behavior); the column lets
   // the MCP "approve a subset" path mark intent before the actual delete.
   rowStatus: text("row_status").notNull().default("pending"), // 'pending' | 'approved' | 'rejected'
+  // FINLYNQ-55 (2026-05-20) — reconciliation-decision columns for the
+  // two-pane reconciliation UI (F-53C). CHECK enforced in SQL:
+  //   'unmatched'          — default; no decision yet (the file row hasn't
+  //                          been auto-matched and the user hasn't acted).
+  //   'auto_suggested'     — system found a probable DB-side match; user
+  //                          hasn't confirmed.
+  //   'linked'             — user confirmed a link to linked_transaction_id.
+  //   'skipped_duplicate'  — F-53E "already imported" marker.
+  // 'flagged_missing' is intentionally NOT a value here — DB-side flags
+  // belong to transactionReconciliationFlags (different lifecycle: staging
+  // rows are ephemeral, flags persist past approval).
+  reconcileState: text("reconcile_state").notNull().default("unmatched"),
+  // FK into the live `transactions` table when the user manually links a
+  // file row to an existing DB row. transactions.id is serial(integer) so
+  // this column is integer, not uuid. ON DELETE SET NULL so a transaction
+  // wipe doesn't cascade into staging rows that the user may still want
+  // to re-link.
+  linkedTransactionId: integer("linked_transaction_id").references(
+    () => transactions.id,
+    { onDelete: "set null" },
+  ),
 });
+
+// ─── transaction_reconciliation_flags — DB-side reconciliation annotations
+//
+// FINLYNQ-55 (2026-05-20). Separate table (not a column on `transactions`)
+// because the per-transaction-and-user flag lifecycle is distinct from the
+// transaction row itself: a flag can be added, removed, or carry a note,
+// independently of any column on `transactions`. Keeping it out of the hot
+// `transactions` table also avoids touching every aggregator with a fresh
+// "is_flagged" predicate.
+//
+// Today's only `flag_kind` is `missing_from_statement` (the DB has a row
+// the statement file doesn't, and the user explicitly chose to keep it
+// rather than delete it). Future kinds — `requires_review`,
+// `manual_adjustment`, etc. — would slot in via a follow-up migration that
+// widens the CHECK list.
+//
+// CASCADE on `transaction_id` and `user_id` so a transaction delete or a
+// wipe-account run (CLAUDE.md "Wipe-account is single-transaction +
+// user_id-only filters") cleans up the flag automatically without the wipe
+// endpoint needing to know about this table.
+export const transactionReconciliationFlags = pgTable(
+  "transaction_reconciliation_flags",
+  {
+    id: uuid("id").primaryKey(),
+    transactionId: integer("transaction_id")
+      .notNull()
+      .references(() => transactions.id, { onDelete: "cascade" }),
+    // text("user_id") — users.id is text (UUID stored as text), matches
+    // every other userId column in this schema.
+    userId: text("user_id")
+      .notNull()
+      .references(() => users.id, { onDelete: "cascade" }),
+    flagKind: text("flag_kind").notNull(), // 'missing_from_statement' (CHECK in SQL)
+    note: text("note"),
+    createdAt: timestamp("created_at", { withTimezone: true })
+      .notNull()
+      .defaultNow(),
+  },
+);
 
 // ─── Email Import — Admin Inbox + Trash (Phase A) ──────────────────────────
 //

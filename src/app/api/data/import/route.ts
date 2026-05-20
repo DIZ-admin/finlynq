@@ -78,6 +78,13 @@ function strip(
     accountIdMap?: Map<number, number>;
     categoryIdMap?: Map<number, number>;
     goalIdMap?: Map<number, number>;
+    // FINLYNQ-55 — remaps `staged_transactions.linkedTransactionId` (and any
+    // future restore-target that carries a `linkedTransactionId` FK into
+    // `transactions`) through the old→new id map built when transactions
+    // are re-inserted earlier in the restore flow. Pre-migration backups
+    // (column absent) fall through the `hasOwnProperty` guard and land
+    // with the column's DB default ('unmatched' / NULL).
+    transactionIdMap?: Map<number, number>;
   } = {},
 ): Row[] {
   return (rows ?? []).map((row) => {
@@ -144,6 +151,27 @@ function strip(
           );
         }
         out.assignCategoryId = newId;
+      }
+    }
+
+    // FINLYNQ-55 — staged_transactions.linkedTransactionId FK into the
+    // restored `transactions` table. Same cross-tenant risk pattern as
+    // accountId/categoryId — silently writing the source-DB integer id
+    // would land the FK on whichever tenant's transactions.id happens to
+    // match. Unmapped FK is a soft drop (null out) rather than a hard
+    // throw because the user may have selected the link before the
+    // referenced transaction was filtered out of the backup; the staging
+    // row stays useful with reconcile_state preserved.
+    if (
+      remap.transactionIdMap &&
+      Object.prototype.hasOwnProperty.call(rest, "linkedTransactionId")
+    ) {
+      const oldId = (rest as { linkedTransactionId: unknown }).linkedTransactionId;
+      if (oldId === null || oldId === undefined) {
+        out.linkedTransactionId = null;
+      } else {
+        const newId = remap.transactionIdMap.get(oldId as number);
+        out.linkedTransactionId = newId ?? null;
       }
     }
 
