@@ -1,64 +1,66 @@
 "use client";
 
 /**
- * /import/pending — review queue for email-delivered transactions.
+ * /import/pending — review queue for staged imports.
  *
- * Shows staged imports that came in via Resend Inbound and are waiting for
- * the user's approval. Click a row to see the parsed transactions with
- * per-row checkboxes, then Approve (materializes into the encrypted
- * transactions table with the user's DEK) or Reject (deletes).
+ * Two modes:
+ *   - List view (openId == null): shows pending batches; click to open.
+ *   - Two-pane reconciliation view (openId != null): full-page surface
+ *     with AccountSelector + DbPane (left) + FilePane (right) plus the
+ *     existing ReconciliationCallout + UnresolvedCategoriesBanner +
+ *     Approve/Discard footer.
  *
- * Rows auto-expire after 14 days regardless of action.
+ * URL state: `?id=<batchId>&account=<accountId>`. Both update via
+ * history.replaceState so tab close + reopen restores state.
+ *
+ * Rebuilt in Phase 2 of FINLYNQ-56. Phase 3 will wire the four match
+ * actions (auto-match accept, manual link/unlink, skip, flag-missing)
+ * on top of this scaffold.
  */
 
-import { Fragment, Suspense, useCallback, useEffect, useState } from "react";
-
-// Aliased Fragment so we can pass `key` without TypeScript complaining about
-// React's reserved key on the shorthand `<>` syntax — we render two
-// <TableRow>s per source staged row, and React needs a key per item.
-const RowFragment = Fragment;
+import {
+  Suspense,
+  useCallback,
+  useEffect,
+  useMemo,
+  useState,
+} from "react";
 import Link from "next/link";
 import { useSearchParams } from "next/navigation";
-import { Card, CardContent, CardHeader, CardTitle } from "@/components/ui/card";
+import { Card, CardContent } from "@/components/ui/card";
 import { Button } from "@/components/ui/button";
 import { Badge } from "@/components/ui/badge";
 import {
-  Dialog,
-  DialogContent,
-  DialogHeader,
-  DialogTitle,
-  DialogDescription,
-  DialogFooter,
-} from "@/components/ui/dialog";
-import {
-  Table,
-  TableBody,
-  TableCell,
-  TableHead,
-  TableHeader,
-  TableRow,
-} from "@/components/ui/table";
-import { ArrowLeft, Inbox, Mail, Upload, Clock, Check, X, RefreshCw, ChevronDown, ChevronRight } from "lucide-react";
-import { formatCurrency } from "@/lib/currency";
+  ArrowLeft,
+  Inbox,
+  Mail,
+  Upload,
+  Clock,
+  Check,
+  X,
+  RefreshCw,
+} from "lucide-react";
 import { ReconciliationCallout } from "@/components/staging/reconciliation-callout";
 import {
-  StagedRowEditor,
   type StagedEditableRow,
-  type AccountOption,
+  type AccountOption as EditorAccountOption,
   type HoldingOption,
 } from "@/components/staging/staged-row-editor";
 import { UnresolvedCategoriesBanner } from "@/components/staging/unresolved-categories-banner";
+import { AccountSelector, type AccountOption } from "@/components/import/reconcile/account-selector";
+import { TwoPaneLayout } from "@/components/import/reconcile/two-pane-layout";
+import { FilePane } from "@/components/import/reconcile/file-pane";
+import { DbPane, type DbTransactionRow } from "@/components/import/reconcile/db-pane";
 
 interface StagedRow {
   id: string;
-  source: string; // 'email' | 'upload'
+  source: string;
   fromAddress: string | null;
   subject: string | null;
   receivedAt: string;
   totalRowCount: number;
   duplicateCount: number;
   expiresAt: string;
-  // Issue #153 — populated for upload-source rows.
   originalFilename?: string | null;
   fileFormat?: string | null;
 }
@@ -68,15 +70,13 @@ interface StagedDetail {
     status: string;
     originalFilename?: string | null;
     fileFormat?: string | null;
-    // Issue #154 — reconciliation inputs from staged_imports.
     statementBalance?: number | null;
     statementBalanceDate?: string | null;
     statementCurrency?: string | null;
     boundAccountId?: number | null;
+    dateRangeStart?: string | null;
+    dateRangeEnd?: string | null;
   };
-  // Issue #155 — rows now carry every editable field. The full shape lives
-  // in StagedEditableRow (components/staging/staged-row-editor.tsx); this
-  // page treats its rows as that type.
   rows: StagedEditableRow[];
   reconciliation?: {
     currentBalance: number | null;
@@ -84,6 +84,11 @@ interface StagedDetail {
     pendingDelta: number | null;
     boundAccountCurrency: string | null;
   };
+  suggestedMatches?: Array<{
+    stagedRowId: string;
+    transactionId: number;
+    confidence: "exact" | "fuzzy";
+  }>;
 }
 
 function daysUntil(iso: string): number {
@@ -91,9 +96,13 @@ function daysUntil(iso: string): number {
   return Math.max(0, Math.ceil(ms / (24 * 60 * 60 * 1000)));
 }
 
-// useSearchParams requires Suspense (issue #153 — auto-open ?id=…). The
-// inner component owns the page state + side effects; the default export
-// just wraps it.
+/** Shift a YYYY-MM-DD by N days (positive or negative). */
+function shiftDays(date: string, days: number): string {
+  const d = new Date(date + "T00:00:00Z");
+  d.setUTCDate(d.getUTCDate() + days);
+  return d.toISOString().split("T")[0];
+}
+
 export default function PendingImportsPage() {
   return (
     <Suspense fallback={null}>
@@ -112,26 +121,14 @@ function PendingImportsPageInner() {
   const [selected, setSelected] = useState<Set<string>>(new Set());
   const [acting, setActing] = useState(false);
   const [toast, setToast] = useState<{ type: "success" | "error"; msg: string } | null>(null);
-  // Issue #155: account + holding catalogs for the row editor's dropdowns.
-  // Loaded once when the user opens the dialog; cached for the session.
-  const [accounts, setAccounts] = useState<AccountOption[]>([]);
+  const [accounts, setAccounts] = useState<EditorAccountOption[]>([]);
   const [holdings, setHoldings] = useState<HoldingOption[]>([]);
-  // Per-row expansion: only the row(s) the user explicitly clicks render
-  // the editor. Keeps the dialog responsive on large statements.
   const [expandedRows, setExpandedRows] = useState<Set<string>>(new Set());
-  // FINLYNQ-57 — when approval is refused with code='unresolved_categories'
-  // we surface a banner listing the affected rows. The banner owns the
-  // inline rule-creation modal; the page just passes through callbacks.
   const [unresolved, setUnresolved] = useState<{ rowIds: string[]; payees: string[] } | null>(null);
-
-  const toggleExpanded = useCallback((rowId: string) => {
-    setExpandedRows((s) => {
-      const next = new Set(s);
-      if (next.has(rowId)) next.delete(rowId);
-      else next.add(rowId);
-      return next;
-    });
-  }, []);
+  // FINLYNQ-56 — two-pane state.
+  const [accountId, setAccountId] = useState<number | null>(null);
+  const [dbRows, setDbRows] = useState<DbTransactionRow[]>([]);
+  const [dbRowsLoading, setDbRowsLoading] = useState(false);
 
   const loadList = useCallback(async () => {
     setLoading(true);
@@ -148,7 +145,9 @@ function PendingImportsPageInner() {
     }
   }, []);
 
-  useEffect(() => { loadList(); }, [loadList]);
+  useEffect(() => {
+    loadList();
+  }, [loadList]);
 
   const openDetail = useCallback(async (id: string) => {
     setOpenId(id);
@@ -156,9 +155,6 @@ function PendingImportsPageInner() {
     setDetailLoading(true);
     setExpandedRows(new Set());
     try {
-      // Fetch detail + account + holding catalogs in parallel. The catalogs
-      // populate the staged-row-editor's dropdowns; staleness is acceptable
-      // (changes during the dialog's lifetime are rare). Issue #155.
       const [detailRes, acctRes, holdRes] = await Promise.all([
         fetch(`/api/import/staged/${id}`),
         fetch("/api/accounts"),
@@ -169,10 +165,6 @@ function PendingImportsPageInner() {
         throw new Error((data as unknown as { error?: string }).error || "Failed to load");
       }
       setDetail(data);
-      // Default selection = all non-duplicate rows that aren't marked
-      // 'skipped_duplicate' (FINLYNQ-58 already-imported marker). User can
-      // manually re-check to override; the approve endpoint honors the
-      // explicit rowIds verbatim when provided.
       setSelected(
         new Set(
           data.rows
@@ -232,38 +224,195 @@ function PendingImportsPageInner() {
     setSelected(new Set());
     setExpandedRows(new Set());
     setUnresolved(null);
+    setAccountId(null);
+    setDbRows([]);
+    // Clear ?id= and ?account= from URL when returning to the list.
+    if (typeof window !== "undefined") {
+      const url = new URL(window.location.href);
+      url.searchParams.delete("id");
+      url.searchParams.delete("account");
+      window.history.replaceState({}, "", url.toString());
+    }
   }, []);
 
-  // Auto-open the detail dialog when navigated with ?id=… (e.g. after the
-  // /import/reconcile upload route stages a batch and redirects here).
-  // Issue #153 — uploads land in staging now and want a deep link to their
-  // own review queue entry without an extra click.
   const searchParams = useSearchParams();
   useEffect(() => {
     const idFromUrl = searchParams?.get("id");
-    if (idFromUrl) {
+    if (idFromUrl && idFromUrl !== openId) {
       void openDetail(idFromUrl);
     }
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [searchParams]);
 
-  const toggleRow = (id: string) => {
+  // Derive the per-account option list from already-loaded staged rows.
+  // Groups by decoded accountName; resolves each to an accounts.id via
+  // the loaded catalog. Falls back to staged.boundAccountId when per-row
+  // accountName resolution returns nothing (the common single-account
+  // OFX/QFX case where rows don't carry an explicit account name).
+  const accountOptions: AccountOption[] = useMemo(() => {
+    if (!detail) return [];
+    const byName = new Map<string, number>();
+    for (const r of detail.rows) {
+      const name = r.accountName?.trim();
+      if (!name) continue;
+      byName.set(name, (byName.get(name) ?? 0) + 1);
+    }
+    const opts: AccountOption[] = [];
+    for (const [name, count] of byName) {
+      const match = accounts.find((a) => a.name === name);
+      if (match) {
+        opts.push({
+          id: match.id,
+          name: match.name,
+          currency: match.currency,
+          rowCount: count,
+        });
+      }
+    }
+    if (opts.length === 0 && detail.staged.boundAccountId != null) {
+      const bound = accounts.find((a) => a.id === detail.staged.boundAccountId);
+      if (bound) {
+        opts.push({
+          id: bound.id,
+          name: bound.name,
+          currency: bound.currency,
+          rowCount: detail.rows.length,
+        });
+      }
+    }
+    return opts;
+  }, [detail, accounts]);
+
+  // Pick a default account: URL ?account= → first option's id → null.
+  useEffect(() => {
+    if (!detail || accountOptions.length === 0) return;
+    const fromUrl = searchParams?.get("account");
+    const parsed = fromUrl ? parseInt(fromUrl, 10) : NaN;
+    const fromUrlIsValid =
+      Number.isFinite(parsed) && accountOptions.some((o) => o.id === parsed);
+    const next = fromUrlIsValid ? parsed : accountOptions[0].id;
+    if (next !== accountId) {
+      setAccountId(next);
+    }
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [detail, accountOptions]);
+
+  // Persist accountId into the URL on every change (history.replaceState
+  // so back/forward isn't polluted with intra-page transitions).
+  useEffect(() => {
+    if (typeof window === "undefined") return;
+    if (!openId) return;
+    const url = new URL(window.location.href);
+    url.searchParams.set("id", openId);
+    if (accountId != null) {
+      url.searchParams.set("account", String(accountId));
+    } else {
+      url.searchParams.delete("account");
+    }
+    window.history.replaceState({}, "", url.toString());
+  }, [openId, accountId]);
+
+  // Compute the ±7d window from the batch's date range, falling back to
+  // min/max of staged-row dates for pre-FINLYNQ-58 rows with NULL ranges.
+  const dbWindow = useMemo(() => {
+    if (!detail) return null;
+    const stagedDates = detail.rows
+      .map((r) => r.date)
+      .filter((d): d is string => !!d)
+      .sort();
+    const minDate = detail.staged.dateRangeStart ?? stagedDates[0] ?? null;
+    const maxDate =
+      detail.staged.dateRangeEnd ??
+      stagedDates[stagedDates.length - 1] ??
+      null;
+    if (!minDate || !maxDate) return null;
+    return { from: shiftDays(minDate, -7), to: shiftDays(maxDate, 7) };
+  }, [detail]);
+
+  // Fetch DB rows when accountId or window changes.
+  useEffect(() => {
+    if (!accountId || !dbWindow) {
+      setDbRows([]);
+      return;
+    }
+    let cancelled = false;
+    setDbRowsLoading(true);
+    const params = new URLSearchParams({
+      accountId: String(accountId),
+      from: dbWindow.from,
+      to: dbWindow.to,
+    });
+    fetch(`/api/transactions/reconciliation?${params.toString()}`)
+      .then((res) => res.json().then((data) => ({ ok: res.ok, data })))
+      .then(({ ok, data }) => {
+        if (cancelled) return;
+        if (!ok) {
+          setToast({
+            type: "error",
+            msg: data?.error || "Failed to load existing transactions",
+          });
+          setDbRows([]);
+          return;
+        }
+        setDbRows(Array.isArray(data?.data?.transactions) ? data.data.transactions : []);
+      })
+      .catch((e) => {
+        if (cancelled) return;
+        setToast({
+          type: "error",
+          msg: e instanceof Error ? e.message : "Failed to load",
+        });
+        setDbRows([]);
+      })
+      .finally(() => {
+        if (cancelled) return;
+        setDbRowsLoading(false);
+      });
+    return () => {
+      cancelled = true;
+    };
+  }, [accountId, dbWindow?.from, dbWindow?.to]);
+
+  // Filter staged rows to the currently-selected account. Empty
+  // accountName matches every account (legacy rows pre-FINLYNQ-58 where
+  // boundAccountId was set but the row didn't carry an accountName).
+  const filteredStagedRows = useMemo(() => {
+    if (!detail || !accountId) return [];
+    const account = accounts.find((a) => a.id === accountId);
+    if (!account) return detail.rows;
+    return detail.rows.filter((r) => {
+      const rn = r.accountName?.trim();
+      return !rn || rn === account.name;
+    });
+  }, [detail, accountId, accounts]);
+
+  const toggleSelect = useCallback((id: string) => {
     setSelected((s) => {
       const next = new Set(s);
       if (next.has(id)) next.delete(id);
       else next.add(id);
       return next;
     });
-  };
+  }, []);
 
-  const toggleAll = () => {
-    if (!detail) return;
-    setSelected((s) =>
-      s.size === detail.rows.length
-        ? new Set()
-        : new Set(detail.rows.map((r) => r.id)),
-    );
-  };
+  const toggleExpanded = useCallback((rowId: string) => {
+    setExpandedRows((s) => {
+      const next = new Set(s);
+      if (next.has(rowId)) next.delete(rowId);
+      else next.add(rowId);
+      return next;
+    });
+  }, []);
+
+  const onRowUpdated = useCallback((updated: StagedEditableRow) => {
+    setDetail((d) => {
+      if (!d) return d;
+      return {
+        ...d,
+        rows: d.rows.map((x) => (x.id === updated.id ? updated : x)),
+      };
+    });
+  }, []);
 
   const approve = useCallback(async () => {
     if (!openId || selected.size === 0) return;
@@ -275,8 +424,6 @@ function PendingImportsPageInner() {
         body: JSON.stringify({ rowIds: Array.from(selected) }),
       });
       const data = await res.json();
-      // FINLYNQ-57 — 400 with code='unresolved_categories' surfaces the
-      // inline rule-creation flow rather than a generic error toast.
       if (!res.ok && data?.code === "unresolved_categories") {
         setUnresolved({
           rowIds: Array.isArray(data?.data?.rowIds) ? data.data.rowIds : [],
@@ -284,14 +431,18 @@ function PendingImportsPageInner() {
         });
         setToast({
           type: "error",
-          msg: `${data?.data?.rowIds?.length ?? 0} row${(data?.data?.rowIds?.length ?? 0) === 1 ? "" : "s"} need a category before import`,
+          msg: `${data?.data?.rowIds?.length ?? 0} row${
+            (data?.data?.rowIds?.length ?? 0) === 1 ? "" : "s"
+          } need a category before import`,
         });
         return;
       }
       if (!res.ok) throw new Error(data.error || "Approve failed");
       setToast({
         type: "success",
-        msg: `Imported ${data.imported ?? 0} transactions (${data.skippedDuplicates ?? 0} dupes skipped)`,
+        msg: `Imported ${data.imported ?? 0} transactions (${
+          data.skippedDuplicates ?? 0
+        } dupes skipped)`,
       });
       closeDetail();
       loadList();
@@ -302,10 +453,6 @@ function PendingImportsPageInner() {
     }
   }, [openId, selected, closeDetail, loadList]);
 
-  // FINLYNQ-57 — after the banner applies a rule, re-fetch the staged detail
-  // so the dialog reflects newly-assigned categories. The unresolved set is
-  // re-evaluated client-side against the refreshed rows; banner clears when
-  // every previously-unresolved row now carries a category.
   const refreshDetail = useCallback(async () => {
     if (!openId) return;
     try {
@@ -313,9 +460,6 @@ function PendingImportsPageInner() {
       const data: StagedDetail = await res.json();
       if (!res.ok) return;
       setDetail(data);
-      // Drop banner entries whose row now has a category. Don't auto-clear
-      // the banner here — leave the surface visible so the user can see
-      // progress; the parent component recomputes the count next render.
       setUnresolved((prev) => {
         if (!prev) return prev;
         const stillUnresolved = prev.rowIds.filter((rid) => {
@@ -325,12 +469,14 @@ function PendingImportsPageInner() {
         });
         if (stillUnresolved.length === 0) return null;
         const filteredPayees = prev.rowIds
-          .map((rid, idx) => (stillUnresolved.includes(rid) ? prev.payees[idx] : null))
+          .map((rid, idx) =>
+            stillUnresolved.includes(rid) ? prev.payees[idx] : null,
+          )
           .filter((p): p is string => p !== null);
         return { rowIds: stillUnresolved, payees: filteredPayees };
       });
     } catch {
-      // Best-effort refresh; banner stays as-is.
+      /* best-effort */
     }
   }, [openId]);
 
@@ -352,308 +498,286 @@ function PendingImportsPageInner() {
     }
   }, [openId, closeDetail, loadList]);
 
-  return (
-    <div className="space-y-6">
-      <div className="flex items-center gap-3">
-        <Link href="/import" className="text-sm text-muted-foreground hover:text-foreground inline-flex items-center gap-1">
-          <ArrowLeft className="h-4 w-4" />
-          Back to Import
-        </Link>
-      </div>
+  // ─── Render ────────────────────────────────────────────────────────────
 
+  // List view — no open batch.
+  if (!openId) {
+    return (
+      <div className="space-y-6">
+        <div className="flex items-center gap-3">
+          <Link
+            href="/import"
+            className="text-sm text-muted-foreground hover:text-foreground inline-flex items-center gap-1"
+          >
+            <ArrowLeft className="h-4 w-4" />
+            Back to Import
+          </Link>
+        </div>
+
+        <div className="flex items-start justify-between gap-4">
+          <div>
+            <h1 className="text-2xl font-bold tracking-tight">Pending Imports</h1>
+            <p className="text-sm text-muted-foreground mt-0.5">
+              Transactions from email forwards or file uploads (CSV / OFX /
+              QFX), waiting for your review. Rows auto-expire after 60 days.
+            </p>
+          </div>
+          <Button variant="outline" size="sm" onClick={loadList} disabled={loading}>
+            <RefreshCw className={`h-4 w-4 mr-1.5 ${loading ? "animate-spin" : ""}`} />
+            Refresh
+          </Button>
+        </div>
+
+        {toast && (
+          <Card
+            className={
+              toast.type === "success"
+                ? "border-emerald-200 bg-emerald-50/30"
+                : "border-rose-200 bg-rose-50/30"
+            }
+          >
+            <CardContent className="py-3 text-sm">{toast.msg}</CardContent>
+          </Card>
+        )}
+
+        {error && (
+          <Card className="border-rose-200 bg-rose-50/30">
+            <CardContent className="py-3 text-sm text-rose-700">{error}</CardContent>
+          </Card>
+        )}
+
+        {loading && !list && (
+          <Card>
+            <CardContent className="py-8 text-sm text-muted-foreground text-center">
+              Loading…
+            </CardContent>
+          </Card>
+        )}
+
+        {list && list.length === 0 && (
+          <Card>
+            <CardContent className="py-12 text-center space-y-3">
+              <Inbox className="h-10 w-10 text-muted-foreground mx-auto" />
+              <div>
+                <p className="text-sm font-medium">Nothing pending</p>
+                <p className="text-xs text-muted-foreground mt-1">
+                  Upload a CSV/OFX/QFX statement at{" "}
+                  <Link href="/import/reconcile" className="underline">
+                    Import → Reconciliation
+                  </Link>
+                  , or forward a bank statement to your import address — both
+                  land here for review.
+                </p>
+              </div>
+              <Link href="/import" className="inline-block">
+                <Button variant="outline" size="sm">
+                  View import options
+                </Button>
+              </Link>
+            </CardContent>
+          </Card>
+        )}
+
+        {list && list.length > 0 && (
+          <div className="space-y-3">
+            {list.map((row) => {
+              const isUpload = row.source === "upload";
+              const Icon = isUpload ? Upload : Mail;
+              const headline = isUpload
+                ? row.originalFilename || "Uploaded file"
+                : row.subject || "(no subject)";
+              const subline = isUpload
+                ? `${(row.fileFormat ?? "file").toUpperCase()} upload · ${new Date(
+                    row.receivedAt,
+                  ).toLocaleString()}`
+                : `from ${row.fromAddress || "(unknown)"} · received ${new Date(
+                    row.receivedAt,
+                  ).toLocaleString()}`;
+              return (
+                <Card
+                  key={row.id}
+                  className="cursor-pointer hover:border-primary/50 transition-colors"
+                  onClick={() => openDetail(row.id)}
+                >
+                  <CardContent className="py-4">
+                    <div className="flex items-start justify-between gap-4">
+                      <div className="flex-1 min-w-0">
+                        <div className="flex items-center gap-2 mb-1">
+                          <Icon className="h-4 w-4 text-muted-foreground shrink-0" />
+                          <p className="text-sm font-medium truncate">{headline}</p>
+                        </div>
+                        <p className="text-xs text-muted-foreground truncate">{subline}</p>
+                      </div>
+                      <div className="flex items-center gap-2 shrink-0">
+                        <Badge variant="outline" className="font-mono">
+                          {row.totalRowCount} {row.totalRowCount === 1 ? "row" : "rows"}
+                        </Badge>
+                        {row.duplicateCount > 0 && (
+                          <Badge
+                            variant="outline"
+                            className="bg-amber-50 text-amber-700 border-amber-200"
+                          >
+                            {row.duplicateCount} dupe{row.duplicateCount === 1 ? "" : "s"}
+                          </Badge>
+                        )}
+                        <Badge variant="outline" className="bg-muted/60 text-xs">
+                          <Clock className="h-3 w-3 mr-1" />
+                          {daysUntil(row.expiresAt)}d left
+                        </Badge>
+                      </div>
+                    </div>
+                  </CardContent>
+                </Card>
+              );
+            })}
+          </div>
+        )}
+      </div>
+    );
+  }
+
+  // Two-pane reconciliation view — batch open.
+  return (
+    <div className="space-y-4 flex flex-col h-[calc(100vh-8rem)]">
       <div className="flex items-start justify-between gap-4">
         <div>
-          <h1 className="text-2xl font-bold tracking-tight">Pending Imports</h1>
-          <p className="text-sm text-muted-foreground mt-0.5">
-            Transactions from email forwards or file uploads (CSV / OFX / QFX),
-            waiting for your review. Rows auto-expire after 60 days.
-          </p>
+          <button
+            type="button"
+            onClick={closeDetail}
+            className="text-sm text-muted-foreground hover:text-foreground inline-flex items-center gap-1 mb-2"
+          >
+            <ArrowLeft className="h-4 w-4" />
+            Back to Pending Imports
+          </button>
+          <h1 className="text-xl font-semibold tracking-tight">
+            {detail
+              ? detail.staged.source === "upload"
+                ? detail.staged.originalFilename || "Uploaded file"
+                : detail.staged.subject || "(no subject)"
+              : "Loading…"}
+          </h1>
+          {detail && (
+            <p className="text-xs text-muted-foreground mt-0.5">
+              {detail.staged.source === "upload" && detail.staged.fileFormat
+                ? `${detail.staged.fileFormat.toUpperCase()} upload`
+                : `From ${detail.staged.fromAddress || "(unknown)"}`}
+              {" · "}
+              {detail.rows.length} {detail.rows.length === 1 ? "row" : "rows"}
+              {detail.staged.dateRangeStart && detail.staged.dateRangeEnd && (
+                <>
+                  {" · "}
+                  {detail.staged.dateRangeStart} → {detail.staged.dateRangeEnd}
+                </>
+              )}
+            </p>
+          )}
         </div>
-        <Button variant="outline" size="sm" onClick={loadList} disabled={loading}>
-          <RefreshCw className={`h-4 w-4 mr-1.5 ${loading ? "animate-spin" : ""}`} />
-          Refresh
-        </Button>
+        <div className="flex gap-2">
+          <Button
+            variant="ghost"
+            onClick={reject}
+            disabled={acting}
+            className="text-rose-700 hover:text-rose-800 hover:bg-rose-50"
+          >
+            <X className="h-4 w-4 mr-1.5" />
+            Discard all
+          </Button>
+          <Button onClick={approve} disabled={acting || selected.size === 0}>
+            <Check className="h-4 w-4 mr-1.5" />
+            Import {selected.size > 0 && `(${selected.size})`}
+          </Button>
+        </div>
       </div>
 
       {toast && (
-        <Card className={toast.type === "success" ? "border-emerald-200 bg-emerald-50/30" : "border-rose-200 bg-rose-50/30"}>
+        <Card
+          className={
+            toast.type === "success"
+              ? "border-emerald-200 bg-emerald-50/30"
+              : "border-rose-200 bg-rose-50/30"
+          }
+        >
           <CardContent className="py-3 text-sm">{toast.msg}</CardContent>
         </Card>
       )}
 
-      {error && (
-        <Card className="border-rose-200 bg-rose-50/30">
-          <CardContent className="py-3 text-sm text-rose-700">{error}</CardContent>
-        </Card>
+      {detail && detail.staged.statementBalance != null && (() => {
+        const recon = detail.reconciliation;
+        const current = recon?.currentBalance ?? null;
+        let projected: number | null = null;
+        if (current != null) {
+          const liveDelta = detail.rows
+            .filter(
+              (r) =>
+                selected.has(r.id) &&
+                r.dedupStatus !== "existing" &&
+                r.reconcileState !== "skipped_duplicate" &&
+                r.reconcileState !== "linked",
+            )
+            .reduce((acc, r) => acc + Number(r.amount ?? 0), 0);
+          projected = current + liveDelta;
+        }
+        return (
+          <ReconciliationCallout
+            statementBalance={detail.staged.statementBalance ?? null}
+            statementBalanceDate={detail.staged.statementBalanceDate ?? null}
+            statementCurrency={detail.staged.statementCurrency ?? null}
+            boundAccountId={detail.staged.boundAccountId ?? null}
+            currentBalance={current}
+            projectedBalance={projected}
+            boundAccountCurrency={recon?.boundAccountCurrency ?? null}
+          />
+        );
+      })()}
+
+      {detail && unresolved && unresolved.rowIds.length > 0 && (
+        <UnresolvedCategoriesBanner
+          stagedImportId={detail.staged.id}
+          rowIds={unresolved.rowIds}
+          payees={unresolved.payees}
+          onRuleApplied={refreshDetail}
+          onDismiss={() => setUnresolved(null)}
+        />
       )}
 
-      {loading && !list && (
-        <Card><CardContent className="py-8 text-sm text-muted-foreground text-center">Loading…</CardContent></Card>
+      {detail && accountOptions.length > 0 && (
+        <AccountSelector
+          options={accountOptions}
+          value={accountId}
+          onChange={setAccountId}
+        />
       )}
 
-      {list && list.length === 0 && (
-        <Card>
-          <CardContent className="py-12 text-center space-y-3">
-            <Inbox className="h-10 w-10 text-muted-foreground mx-auto" />
-            <div>
-              <p className="text-sm font-medium">Nothing pending</p>
-              <p className="text-xs text-muted-foreground mt-1">
-                Upload a CSV/OFX/QFX statement at <Link href="/import/reconcile" className="underline">Import → Reconciliation</Link>, or forward a bank statement to your import address — both land here for review.
-              </p>
-            </div>
-            <Link href="/import" className="inline-block">
-              <Button variant="outline" size="sm">View import options</Button>
-            </Link>
-          </CardContent>
-        </Card>
-      )}
-
-      {list && list.length > 0 && (
-        <div className="space-y-3">
-          {list.map((row) => {
-            const isUpload = row.source === "upload";
-            const Icon = isUpload ? Upload : Mail;
-            const headline = isUpload
-              ? row.originalFilename || "Uploaded file"
-              : row.subject || "(no subject)";
-            const subline = isUpload
-              ? `${(row.fileFormat ?? "file").toUpperCase()} upload · ${new Date(row.receivedAt).toLocaleString()}`
-              : `from ${row.fromAddress || "(unknown)"} · received ${new Date(row.receivedAt).toLocaleString()}`;
-            return (
-            <Card key={row.id} className="cursor-pointer hover:border-primary/50 transition-colors" onClick={() => openDetail(row.id)}>
-              <CardContent className="py-4">
-                <div className="flex items-start justify-between gap-4">
-                  <div className="flex-1 min-w-0">
-                    <div className="flex items-center gap-2 mb-1">
-                      <Icon className="h-4 w-4 text-muted-foreground shrink-0" />
-                      <p className="text-sm font-medium truncate">{headline}</p>
-                    </div>
-                    <p className="text-xs text-muted-foreground truncate">
-                      {subline}
-                    </p>
-                  </div>
-                  <div className="flex items-center gap-2 shrink-0">
-                    <Badge variant="outline" className="font-mono">
-                      {row.totalRowCount} {row.totalRowCount === 1 ? "row" : "rows"}
-                    </Badge>
-                    {row.duplicateCount > 0 && (
-                      <Badge variant="outline" className="bg-amber-50 text-amber-700 border-amber-200">
-                        {row.duplicateCount} dupe{row.duplicateCount === 1 ? "" : "s"}
-                      </Badge>
-                    )}
-                    <Badge variant="outline" className="bg-muted/60 text-xs">
-                      <Clock className="h-3 w-3 mr-1" />
-                      {daysUntil(row.expiresAt)}d left
-                    </Badge>
-                  </div>
-                </div>
-              </CardContent>
-            </Card>
-            );
-          })}
-        </div>
-      )}
-
-      <Dialog open={!!openId} onOpenChange={(v) => { if (!v) closeDetail(); }}>
-        <DialogContent className="max-w-4xl max-h-[85vh] flex flex-col">
-          <DialogHeader>
-            <DialogTitle>Review transactions</DialogTitle>
-            <DialogDescription>
-              {detail ? (
-                detail.staged.source === "upload" ? (
-                  <>
-                    <span className="font-medium">{detail.staged.originalFilename || "Uploaded file"}</span>
-                    {detail.staged.fileFormat && <> · {detail.staged.fileFormat.toUpperCase()} upload</>}
-                  </>
-                ) : (
-                  <>
-                    From <span className="font-medium">{detail.staged.fromAddress || "(unknown)"}</span>
-                    {detail.staged.subject && <> · {detail.staged.subject}</>}
-                  </>
-                )
-              ) : "Loading…"}
-            </DialogDescription>
-          </DialogHeader>
-
-          {/* Issue #154 — statement-balance reconciliation. Renders nothing
-              when statementBalance is null, and a one-line hint when no
-              account is bound. Live-recompute "After approval" from the
-              currently-selected rows (excluding dedup_status='existing'). */}
-          {detail && detail.staged.statementBalance != null && (() => {
-            const recon = detail.reconciliation;
-            const current = recon?.currentBalance ?? null;
-            // Live-projected: currentBalance + Σ(selected rows
-            // where dedup_status != 'existing'). Recomputes on every
-            // checkbox toggle. The server's projectedBalance is the
-            // "approve everything eligible" baseline; the client owns
-            // the live "what the user actually picked" view.
-            let projected: number | null = null;
-            if (current != null) {
-              const liveDelta = detail.rows
-                .filter((r) => selected.has(r.id) && r.dedupStatus !== "existing")
-                .reduce((acc, r) => acc + Number(r.amount ?? 0), 0);
-              projected = current + liveDelta;
+      <div className="flex-1 min-h-0">
+        {detailLoading ? (
+          <Card>
+            <CardContent className="py-8 text-sm text-muted-foreground text-center">
+              Loading rows…
+            </CardContent>
+          </Card>
+        ) : detail ? (
+          <TwoPaneLayout
+            leftLabel="What's in Finlynq (existing)"
+            left={
+              <DbPane rows={dbRows} loading={dbRowsLoading} />
             }
-            return (
-              <ReconciliationCallout
-                statementBalance={detail.staged.statementBalance ?? null}
-                statementBalanceDate={detail.staged.statementBalanceDate ?? null}
-                statementCurrency={detail.staged.statementCurrency ?? null}
-                boundAccountId={detail.staged.boundAccountId ?? null}
-                currentBalance={current}
-                projectedBalance={projected}
-                boundAccountCurrency={recon?.boundAccountCurrency ?? null}
+            rightLabel="From the file (staged)"
+            right={
+              <FilePane
+                stagedImportId={detail.staged.id}
+                rows={filteredStagedRows}
+                selected={selected}
+                expanded={expandedRows}
+                accounts={accounts}
+                holdings={holdings}
+                onToggleSelect={toggleSelect}
+                onToggleExpand={toggleExpanded}
+                onRowUpdated={onRowUpdated}
               />
-            );
-          })()}
-
-          {/* FINLYNQ-57 — unresolved-category banner. Rendered when the
-              approval endpoint returned `code: 'unresolved_categories'`.
-              The banner owns its own inline rule-creation modal and calls
-              `refreshDetail` after a rule applies so the dialog state +
-              banner count update in lockstep. */}
-          {detail && unresolved && unresolved.rowIds.length > 0 && (
-            <UnresolvedCategoriesBanner
-              stagedImportId={detail.staged.id}
-              rowIds={unresolved.rowIds}
-              payees={unresolved.payees}
-              onRuleApplied={refreshDetail}
-              onDismiss={() => setUnresolved(null)}
-            />
-          )}
-
-          <div className="flex-1 overflow-auto border rounded-lg">
-            {detailLoading && <p className="p-6 text-sm text-muted-foreground text-center">Loading rows…</p>}
-            {detail && (
-              <Table>
-                <TableHeader>
-                  <TableRow>
-                    <TableHead className="w-10">
-                      <input
-                        type="checkbox"
-                        checked={detail.rows.length > 0 && selected.size === detail.rows.length}
-                        onChange={toggleAll}
-                        aria-label="Select all"
-                      />
-                    </TableHead>
-                    <TableHead className="w-8" />
-                    <TableHead>Date</TableHead>
-                    <TableHead>Account</TableHead>
-                    <TableHead>Payee</TableHead>
-                    <TableHead>Type</TableHead>
-                    <TableHead className="text-right">Amount</TableHead>
-                  </TableRow>
-                </TableHeader>
-                <TableBody>
-                  {detail.rows.map((r) => {
-                    const isExpanded = expandedRows.has(r.id);
-                    return (
-                      <RowFragment key={r.id}>
-                        <TableRow
-                          className={
-                            r.reconcileState === "skipped_duplicate"
-                              ? "opacity-60 line-through"
-                              : r.isDuplicate
-                                ? "opacity-60"
-                                : ""
-                          }
-                        >
-                          <TableCell>
-                            <input
-                              type="checkbox"
-                              checked={selected.has(r.id)}
-                              onChange={() => toggleRow(r.id)}
-                              aria-label={`Select row ${r.rowIndex}`}
-                            />
-                          </TableCell>
-                          <TableCell>
-                            <button
-                              type="button"
-                              onClick={() => toggleExpanded(r.id)}
-                              aria-label={isExpanded ? "Collapse row editor" : "Edit row"}
-                              className="text-muted-foreground hover:text-foreground p-1 -m-1"
-                            >
-                              {isExpanded ? <ChevronDown className="h-3.5 w-3.5" /> : <ChevronRight className="h-3.5 w-3.5" />}
-                            </button>
-                          </TableCell>
-                          <TableCell className="font-mono text-xs">{r.date}</TableCell>
-                          <TableCell className="text-xs">{r.accountName || <span className="text-muted-foreground">—</span>}</TableCell>
-                          <TableCell className="text-xs truncate max-w-[200px]">
-                            {r.payee || <span className="text-muted-foreground">—</span>}
-                            {r.category && <span className="text-muted-foreground"> · {r.category}</span>}
-                          </TableCell>
-                          <TableCell className="text-xs">
-                            {r.txType === "R" ? (
-                              <Badge variant="outline" className="text-[10px]">Transfer</Badge>
-                            ) : r.txType === "I" ? (
-                              <Badge variant="outline" className="text-[10px] bg-emerald-50 text-emerald-700 border-emerald-200">Income</Badge>
-                            ) : (
-                              <Badge variant="outline" className="text-[10px]">Expense</Badge>
-                            )}
-                            {r.isDuplicate && <Badge variant="outline" className="ml-1 text-[10px]">dupe</Badge>}
-                            {/* FINLYNQ-58 — already-imported marker. The
-                                row's import_hash collided with an existing
-                                transactions row for this user; default-
-                                excluded from approve, user can re-check to
-                                override. */}
-                            {r.reconcileState === "skipped_duplicate" && (
-                              <Badge
-                                variant="outline"
-                                className="ml-1 text-[10px] bg-amber-50 text-amber-700 border-amber-200"
-                              >
-                                already imported
-                              </Badge>
-                            )}
-                          </TableCell>
-                          <TableCell className="text-right font-mono text-xs">
-                            {formatCurrency(r.amount, r.currency || "CAD")}
-                          </TableCell>
-                        </TableRow>
-                        {isExpanded && (
-                          <TableRow>
-                            <TableCell colSpan={7} className="p-0">
-                              <StagedRowEditor
-                                stagedImportId={detail.staged.id}
-                                row={r}
-                                siblingRows={detail.rows}
-                                accounts={accounts}
-                                holdings={holdings}
-                                onUpdated={(updated) => {
-                                  setDetail((d) => {
-                                    if (!d) return d;
-                                    return {
-                                      ...d,
-                                      rows: d.rows.map((x) => (x.id === updated.id ? updated : x)),
-                                    };
-                                  });
-                                }}
-                              />
-                            </TableCell>
-                          </TableRow>
-                        )}
-                      </RowFragment>
-                    );
-                  })}
-                </TableBody>
-              </Table>
-            )}
-          </div>
-
-          <DialogFooter className="gap-2 sm:justify-between">
-            <Button variant="ghost" onClick={reject} disabled={acting} className="text-rose-700 hover:text-rose-800 hover:bg-rose-50">
-              <X className="h-4 w-4 mr-1.5" />
-              Discard all
-            </Button>
-            <div className="flex gap-2">
-              <Button variant="outline" onClick={closeDetail} disabled={acting}>Cancel</Button>
-              <Button onClick={approve} disabled={acting || selected.size === 0}>
-                <Check className="h-4 w-4 mr-1.5" />
-                Import {selected.size > 0 && `(${selected.size})`}
-              </Button>
-            </div>
-          </DialogFooter>
-        </DialogContent>
-      </Dialog>
+            }
+          />
+        ) : null}
+      </div>
     </div>
   );
 }
