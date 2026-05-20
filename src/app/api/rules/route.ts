@@ -6,15 +6,22 @@ import { z } from "zod";
 import { validateBody, safeErrorMessage } from "@/lib/validate";
 import { verifyOwnership, OwnershipError } from "@/lib/verify-ownership";
 
+// FINLYNQ-66 — the Settings → Categorization form at
+// src/app/(app)/settings/categorization/page.tsx serializes empty optional
+// fields as `null` (e.g. `assignTags: ruleForm.assignTags || null`). Plain
+// `z.string().optional()` accepts `string | undefined` but rejects `null`
+// with "Invalid input: expected string, received null". Use `.nullish()` so
+// the schema tolerates `null` / `undefined` / missing; the handlers below
+// already normalize the three to NULL on insert.
 const postSchema = z.object({
   name: z.string(),
   matchField: z.string(),
   matchType: z.string(),
   matchValue: z.string(),
-  assignCategoryId: z.number().optional(),
-  assignTags: z.string().optional(),
-  renameTo: z.string().optional(),
-  priority: z.number().optional(),
+  assignCategoryId: z.number().nullish(),
+  assignTags: z.string().nullish(),
+  renameTo: z.string().nullish(),
+  priority: z.number().nullish(),
 });
 
 const putSchema = z.object({
@@ -23,9 +30,9 @@ const putSchema = z.object({
   matchField: z.string().optional(),
   matchType: z.string().optional(),
   matchValue: z.string().optional(),
-  assignCategoryId: z.number().optional(),
-  assignTags: z.string().optional(),
-  renameTo: z.string().optional(),
+  assignCategoryId: z.number().nullish(),
+  assignTags: z.string().nullish(),
+  renameTo: z.string().nullish(),
   isActive: z.boolean().optional(),
   priority: z.number().optional(),
 });

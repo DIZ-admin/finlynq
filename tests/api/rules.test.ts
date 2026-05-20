@@ -81,6 +81,29 @@ describe("API /api/rules", () => {
       const res = await POST(req);
       expect(res.status).toBe(400);
     });
+
+    // FINLYNQ-66 — the Settings → Categorization form sends `null` for
+    // empty optional fields (`assignTags: ruleForm.assignTags || null`,
+    // same for `renameTo` and `assignCategoryId`). Before the fix, the
+    // POST schema declared these as `z.string().optional()` (= `string |
+    // undefined`) and Zod rejected `null` with "Invalid input: expected
+    // string, received null". Each of these payloads MUST succeed.
+    const finlynq66Payloads: Array<{ label: string; body: Record<string, unknown> }> = [
+      { label: "assignTags=null + renameTo=null", body: { name: "test", matchField: "payee", matchType: "contains", matchValue: "a", assignCategoryId: null, assignTags: null, renameTo: null, priority: 0 } },
+      { label: "assignTags=''", body: { name: "test", matchField: "payee", matchType: "contains", matchValue: "a", assignTags: "" } },
+      { label: "assignTags omitted", body: { name: "test", matchField: "payee", matchType: "contains", matchValue: "a" } },
+      { label: "renameTo='sas' + assignTags=null (exact repro)", body: { name: "test", matchField: "payee", matchType: "contains", matchValue: "a", assignCategoryId: null, assignTags: null, renameTo: "sas", priority: 1 } },
+    ];
+
+    for (const { label, body } of finlynq66Payloads) {
+      it(`FINLYNQ-66: accepts ${label}`, async () => {
+        const rule = { id: 1, name: "test", matchField: "payee", matchType: "contains", matchValue: "a" };
+        mockDbChain.get!.mockReturnValueOnce(rule);
+        const req = createMockRequest("http://localhost:3000/api/rules", { method: "POST", body });
+        const res = await POST(req);
+        expect(res.status).toBe(201);
+      });
+    }
   });
 
   describe("PUT", () => {
