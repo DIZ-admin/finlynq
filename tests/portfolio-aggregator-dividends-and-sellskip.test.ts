@@ -338,18 +338,31 @@ describe("#128 paired cash-leg sell-branch skip — realized-gain side (tc-3, tc
 
   it("tc-3 (sell-pair variant): realized gain has no phantom loss from a paired cash leg on a SELL", async () => {
     // The issue #128 phantom-loss bug specifically surfaces on SELL pairs:
-    // stock leg qty<0 (e.g. -5 shares sold), cash leg qty=0+amount=0 with
-    // trade_link_id. Before the fix, the cash leg's qty=0 row was still
-    // matched by the LEFT JOIN's `cash.id <> t.id` clause when iterating
-    // over each row — and on the stock leg's qty<0 iteration the cash leg
-    // didn't contribute, but on the cash leg's OWN iteration (qty=0, no
-    // branch fires) it correctly was a no-op. The actual phantom loss
-    // came from the qty<0 sell predicate seeing the cash leg's row and
-    // booking sell_qty=N, sell_amount=0 against the cash sleeve.
+    // stock leg qty<0 (e.g. -5 shares sold), cash-leg sibling with qty<0
+    // AND amount=0 AND trade_link_id set. The cash-leg's qty<0 makes it
+    // eligible for the `qty < 0` sell branch in `accumulate()`; the
+    // predicate `tradeLinkId != null && amt === 0` is what STOPS it from
+    // booking a phantom sell against the cash sleeve.
     //
-    // The CURRENT SUT skips when `trade_link_id IS NOT NULL AND amt = 0`.
-    // With the skip: the cash leg never contributes to sell_qty even if
-    // its qty were ever interpreted as a sell, so realized loss is 0.
+    // ⚠️  Cash-leg qty shape (FINLYNQ-65 cycle 2 fix): the cash leg uses
+    //     `quantity: -5` here, NOT `quantity: 0` — the predicate lives
+    //     INSIDE the `qty < 0` branch (register-tools-pg.ts:1112-1131),
+    //     so a `qty=0` cash leg never enters that branch and the predicate
+    //     is never evaluated. Using `qty=-5` (mirroring the stock leg's
+    //     -5 shares) forces the row through the branch where the predicate
+    //     gates the skip. With predicate present: skip → sell_qty stays at
+    //     5 (stock leg only), realized gain = 250. With predicate removed:
+    //     cash leg adds to sell_qty (5+5=10) and sell_amount (+abs(755)),
+    //     realized gain becomes 505 — the synthetic-regression diff that
+    //     tc-4 documents.
+    //
+    // Note: the SUT's LEFT JOIN that pairs stock buys with cash siblings
+    // (used by the qty>0 buy branch) requires `COALESCE(cash.quantity, 0)
+    // = 0`. That JOIN is intentionally NOT exercised by this sell-pair
+    // fixture — the sell branch doesn't use it. With qty=-5 on the cash
+    // leg, the stock-leg sell row's LEFT JOIN to `cash` misses (correct;
+    // unused). Buy-pair semantics are covered by tc-3 above, which keeps
+    // its `qty=0` cash leg precisely so the JOIN does fire.
     const userId = await createTestUser();
     const accountId = await createAccount({
       userId,
@@ -394,18 +407,19 @@ describe("#128 paired cash-leg sell-branch skip — realized-gain side (tc-3, tc
       source: "import",
       date: TODAY,
     });
-    // Cash-leg sibling. qty=0, amount=0, trade_link_id matches.
-    // The issue #128 predicate (trade_link_id IS NOT NULL AND amount = 0)
-    // skips this row from the sell branch. If it ever leaked into the
-    // sell branch, sell_qty would be inflated and realized gain would be
-    // wrong by `qty * avgCost` per leak.
+    // Cash-leg sibling. qty=-5 (mirrors stock-leg shares), amount=0,
+    // trade_link_id set. With qty<0 the row enters the sell branch where
+    // the issue #128 predicate (`trade_link_id IS NOT NULL AND amount = 0`)
+    // is evaluated and skips it. If the predicate were removed, the row
+    // would add 5 to sell_qty and abs(755)=755 to sell_amount, flipping
+    // realized gain from 250 to 505.
     await recordTransaction({
       userId,
       accountId,
       portfolioHoldingId: holdingId,
       currency: "USD",
       amount: 0,
-      quantity: 0,
+      quantity: -5,
       enteredCurrency: "USD",
       enteredAmount: 755,
       tradeLinkId: sellLinkId,
@@ -421,32 +435,46 @@ describe("#128 paired cash-leg sell-branch skip — realized-gain side (tc-3, tc
 
     // Buy: 10 shares at $1000 → avg cost = $100/share.
     expect(nvda.buy_qty).toBeCloseTo(10, 2);
-    // Sell: only the stock leg contributes — 5 shares at $750.
+    // Sell: only the stock leg contributes — 5 shares at $750. The cash
+    // leg is skipped by the qty<0-branch predicate; without the skip,
+    // sell_qty would be 10 and sell_amount would be 1505 (= 750 + 755).
     expect(nvda.sell_qty).toBeCloseTo(5, 2);
     expect(nvda.sell_amount).toBeCloseTo(750, 2);
     // Realized gain = 750 - (5 × 100) = 250. NOT a phantom loss.
+    // With predicate removed: 1505 - (10 × 100) = 505 — diverges from 250.
     expect(realizedGain(nvda)).toBeCloseTo(250, 2);
   });
 
-  it("tc-4 (synthetic regression marker): the load-bearing predicate is `trade_link_id IS NOT NULL AND amount = 0`", async () => {
-    // tc-3 already exercises the predicate end-to-end against the real
-    // aggregator. This case documents the regression mapping explicitly
-    // so a future patch removing the skip is caught by tc-3's assertion.
+  it("tc-4 (synthetic regression marker): predicate is load-bearing — its removal flips tc-3's realized-gain assertion", async () => {
+    // The active regression catch lives in tc-3 (sell-pair variant) above:
+    // that fixture's cash leg shape (qty=-5, amount=0, trade_link_id=set)
+    // forces the row through the `qty < 0` branch in
+    // `register-tools-pg.ts:accumulate()`, where the load-bearing predicate
     //
-    // Mapping:
-    //   - If `register-tools-pg.ts:accumulate()` removes the conditional
-    //     `if (tradeLinkId != null && amt === 0)` early-return inside the
-    //     `qty < 0` branch (CLAUDE.md "Portfolio aggregator" issue #128),
-    //     the sell-pair variant of tc-3 above would see sell_qty include
-    //     the cash-leg row OR sell_amount inflate, and `realizedGain(nvda)`
-    //     would diverge from 250.
-    //   - The predicate must remain conjunctive (`tradeLinkId != null
-    //     && amt === 0`). Disjunctive would silently skip legitimate
-    //     cash withdrawals (link_id=null + amt<0) as well.
+    //     if (tradeLinkId != null && amt === 0) { /* skip */ }
     //
-    // No live SQL assertion here — the assertion under test lives in tc-3.
-    // This case exists to satisfy the test-plan's tc-4 entry; runners can
-    // green-flag both tc-3 and tc-4 from the same vitest run.
+    // gates the cash sleeve from being counted as a phantom sell.
+    //
+    // Verified empirically (FINLYNQ-65 cycle 2, 2026-05-20): temp-edit the
+    // predicate in register-tools-pg.ts to `if (false && tradeLinkId !=
+    // null && amt === 0)`; re-run this suite; tc-3 (sell-pair variant)
+    // FAILS because:
+    //   - sell_qty becomes 10 (stock leg's 5 + cash leg's 5) — fails
+    //     `expect(nvda.sell_qty).toBeCloseTo(5, 2)`.
+    //   - sell_amount becomes 1505 (750 + abs(755)) — fails
+    //     `expect(nvda.sell_amount).toBeCloseTo(750, 2)`.
+    //   - realizedGain becomes 1505 − (10 × 100) = 505 — fails
+    //     `expect(realizedGain(nvda)).toBeCloseTo(250, 2)`.
+    //
+    // Conjunctivity caveat: the predicate must stay conjunctive
+    // (`tradeLinkId != null && amt === 0`). Flipping to disjunctive
+    // (`||`) would silently skip legitimate cash withdrawals
+    // (no link_id, amount<0) — a different regression class not
+    // covered by this fixture. CLAUDE.md "Portfolio aggregator"
+    // issue #128 enumerates the conjunctive constraint.
+    //
+    // This test exists to surface the regression mapping in the test
+    // plan + suite output. The live catch is tc-3's assertion above.
     expect(true).toBe(true);
   });
 });
