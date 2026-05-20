@@ -625,6 +625,16 @@ export const stagedImports = pgTable("staged_imports", {
   // 'ofx' | 'qfx' | 'csv' | 'xlsx' | 'pdf' | 'plaid' | 'mcp'
   fileFormat: text("file_format"),
   originalFilename: text("original_filename"), // display only, e.g. "chase-2026-04.csv"
+  // ─── Parser knobs (FINLYNQ-54, 2026-05-20) ───────────────────────────
+  // Upload-step preprocessor configuration, persisted so the F-53E merge
+  // flow can read it back and re-run with the same shape. Defaults match
+  // pre-FINLYNQ-54 behavior (no skip, parser auto-detects date format,
+  // no per-statement currency fallback).
+  skipHeaderRows: integer("skip_header_rows").notNull().default(0),
+  skipFooterRows: integer("skip_footer_rows").notNull().default(0),
+  // 'DD/MM/YYYY' | 'MM/DD/YYYY' | 'YYYY-MM-DD' | NULL (auto-detect)
+  dateFormatOverride: text("date_format_override"),
+  defaultCurrency: text("default_currency"), // ISO 4217 from supportedCurrencyEnum
 });
 
 export const stagedTransactions = pgTable("staged_transactions", {

@@ -120,3 +120,16 @@ Rules:
 - Tag matching is **case-insensitive** for idempotency. Re-importing the same file does not duplicate `source:csv`.
 - The `source:<format>` tag is **distinct** from the audit-column `transactions.source` enum (`manual` / `import` / `mcp_http` / …). The audit column captures the writer surface (issue #28); the tag captures file shape. A WP-orchestrated CSV import has `source='connector'` in the audit column and `source:csv` in the tag — both pieces of information are preserved.
 - On Stream-D-encrypted deployments `tags` may live as ciphertext (`v1:%`). SQL-only backfills must skip those rows; see [`scripts/backfill-source-tag.sql`](../../scripts/backfill-source-tag.sql).
+
+## `staged_imports` — parser knobs (FINLYNQ-54)
+
+The unified-ingest staging tables (`staged_imports` + `staged_transactions`, see CLAUDE.md "Unified-ingest staging pipeline") carry per-statement parser configuration that the upload UI surfaces in its "Import options" panel and the F-53E merge flow reads back. Four columns added 2026-05-20 by [`scripts/migrations/20260520_finlynq-54-parser-knobs.sql`](../../scripts/migrations/20260520_finlynq-54-parser-knobs.sql):
+
+| Column | Type | Default | Meaning |
+|---|---|---|---|
+| `skip_header_rows` | `INTEGER NOT NULL` | `0` | Raw lines stripped off the top of the CSV before header detection (EU/ME bank exports often prepend title/metadata rows). Bounded by `CHECK (>= 0)`. |
+| `skip_footer_rows` | `INTEGER NOT NULL` | `0` | Raw lines stripped off the bottom (summary/total rows). Bounded by `CHECK (>= 0)`. |
+| `date_format_override` | `TEXT` | `NULL` | One of `'DD/MM/YYYY'` / `'MM/DD/YYYY'` / `'YYYY-MM-DD'` when set; `NULL` = parser auto-detect. Short-circuits the day-vs-month inference in `normalizeDate()`. Bounded by enum `CHECK`. |
+| `default_currency` | `TEXT` | `NULL` | ISO 4217 fallback applied to rows missing a `currency` / `entered_currency`. Validated against `supportedCurrencyEnum` at the API layer. |
+
+`bound_account_id` (added in `20260506_staging_unified_columns.sql`) is the fifth knob (default account) and was already present — FINLYNQ-54 only unified the UX into the same panel; the column was unchanged. Defaults preserve pre-FINLYNQ-54 behavior, so existing uploads that don't open the options panel are unaffected. `import_hash` is **not** recomputed when these knobs are toggled (load-bearing — dedup must stay stable across re-runs).

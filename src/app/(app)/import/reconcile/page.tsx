@@ -48,6 +48,11 @@ interface UploadParams {
   tolerance: number;
   templateId: number | null;
   statementBalance: number | null;
+  /** FINLYNQ-54 parser knobs — defaults preserve pre-FINLYNQ-54 behavior. */
+  skipHeaderRows: number;
+  skipFooterRows: number;
+  dateFormatOverride: "auto" | "DD/MM/YYYY" | "MM/DD/YYYY" | "YYYY-MM-DD";
+  defaultCurrency: string | null;
 }
 
 export default function ReconcilePage() {
@@ -75,6 +80,10 @@ export default function ReconcilePage() {
     accountId: number | null;
     tolerance: number;
     statementBalance: number | null;
+    skipHeaderRows: number;
+    skipFooterRows: number;
+    dateFormatOverride: "auto" | "DD/MM/YYYY" | "MM/DD/YYYY" | "YYYY-MM-DD";
+    defaultCurrency: string | null;
   } | null>(null);
 
   useEffect(() => {
@@ -102,7 +111,17 @@ export default function ReconcilePage() {
   }, []);
 
   const submitUpload = useCallback(
-    async ({ file, accountId, tolerance, templateId, statementBalance }: UploadParams) => {
+    async ({
+      file,
+      accountId,
+      tolerance,
+      templateId,
+      statementBalance,
+      skipHeaderRows,
+      skipFooterRows,
+      dateFormatOverride,
+      defaultCurrency,
+    }: UploadParams) => {
       setError(null);
       setUploadLoading(true);
       try {
@@ -114,6 +133,15 @@ export default function ReconcilePage() {
         if (statementBalance !== null) {
           fd.append("statementBalance", String(statementBalance));
         }
+        // FINLYNQ-54 — only forward knobs when they differ from the defaults
+        // so the server-side validator doesn't have to special-case "0"/"auto"
+        // strings. Server defaults to 0/0/null/null when fields are absent.
+        if (skipHeaderRows > 0) fd.append("skipHeaderRows", String(skipHeaderRows));
+        if (skipFooterRows > 0) fd.append("skipFooterRows", String(skipFooterRows));
+        if (dateFormatOverride !== "auto") {
+          fd.append("dateFormatOverride", dateFormatOverride);
+        }
+        if (defaultCurrency) fd.append("defaultCurrency", defaultCurrency);
         const res = await fetch("/api/import/staging/upload", {
           method: "POST",
           body: fd,
@@ -141,7 +169,15 @@ export default function ReconcilePage() {
                 : file.name,
             );
             setPendingFile(file);
-            setPendingParams({ accountId, tolerance, statementBalance });
+            setPendingParams({
+              accountId,
+              tolerance,
+              statementBalance,
+              skipHeaderRows,
+              skipFooterRows,
+              dateFormatOverride,
+              defaultCurrency,
+            });
             setMappingDialogOpen(true);
             return;
           }
@@ -205,7 +241,15 @@ export default function ReconcilePage() {
 
         setMappingDialogOpen(false);
         const file = pendingFile;
-        const { accountId, tolerance, statementBalance } = pendingParams;
+        const {
+          accountId,
+          tolerance,
+          statementBalance,
+          skipHeaderRows,
+          skipFooterRows,
+          dateFormatOverride,
+          defaultCurrency,
+        } = pendingParams;
         setPendingFile(null);
         setPendingParams(null);
 
@@ -215,6 +259,10 @@ export default function ReconcilePage() {
           tolerance,
           templateId: saved.id as number,
           statementBalance,
+          skipHeaderRows,
+          skipFooterRows,
+          dateFormatOverride,
+          defaultCurrency,
         });
       } catch (err) {
         const message =

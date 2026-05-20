@@ -47,6 +47,8 @@ import {
 import { normalizeDate } from "@/lib/csv-parser";
 import { parseOfx } from "@/lib/ofx-parser";
 import { parseCsvWithFallback, type ParseError } from "@/lib/external-import/parsers/csv-pipeline";
+import { isSupportedCurrency } from "@/lib/fx/supported-currencies";
+import type { DateFormatOverride } from "@/lib/csv-parser";
 import { parseOfxToCanonical } from "@/lib/external-import/parsers/ofx";
 import { parseQfxToCanonical } from "@/lib/external-import/parsers/qfx";
 import { detectProbableDuplicates } from "@/lib/external-import/duplicate-detect";
@@ -127,6 +129,63 @@ export async function POST(request: NextRequest) {
         { status: 400 },
       );
     }
+    // ─── FINLYNQ-54 parser knobs ─────────────────────────────────────
+    // All five are optional; the form sends defaults when collapsed.
+    const skipHeaderRowsRaw = formData.get("skipHeaderRows");
+    const skipFooterRowsRaw = formData.get("skipFooterRows");
+    const dateFormatOverrideRaw = formData.get("dateFormatOverride");
+    const defaultCurrencyRaw = formData.get("defaultCurrency");
+
+    let skipHeaderRows = 0;
+    if (skipHeaderRowsRaw && typeof skipHeaderRowsRaw === "string" && skipHeaderRowsRaw.trim()) {
+      const n = Number.parseInt(skipHeaderRowsRaw, 10);
+      if (Number.isNaN(n) || n < 0 || n > 100) {
+        return NextResponse.json(
+          { error: "skipHeaderRows must be an integer between 0 and 100" },
+          { status: 400 },
+        );
+      }
+      skipHeaderRows = n;
+    }
+
+    let skipFooterRows = 0;
+    if (skipFooterRowsRaw && typeof skipFooterRowsRaw === "string" && skipFooterRowsRaw.trim()) {
+      const n = Number.parseInt(skipFooterRowsRaw, 10);
+      if (Number.isNaN(n) || n < 0 || n > 100) {
+        return NextResponse.json(
+          { error: "skipFooterRows must be an integer between 0 and 100" },
+          { status: 400 },
+        );
+      }
+      skipFooterRows = n;
+    }
+
+    let dateFormatOverride: DateFormatOverride | null = null;
+    if (dateFormatOverrideRaw && typeof dateFormatOverrideRaw === "string") {
+      const v = dateFormatOverrideRaw.trim();
+      if (v && v !== "auto") {
+        if (v !== "DD/MM/YYYY" && v !== "MM/DD/YYYY" && v !== "YYYY-MM-DD") {
+          return NextResponse.json(
+            { error: "dateFormatOverride must be one of: auto, DD/MM/YYYY, MM/DD/YYYY, YYYY-MM-DD" },
+            { status: 400 },
+          );
+        }
+        dateFormatOverride = v;
+      }
+    }
+
+    let defaultCurrency: string | null = null;
+    if (defaultCurrencyRaw && typeof defaultCurrencyRaw === "string" && defaultCurrencyRaw.trim()) {
+      const code = defaultCurrencyRaw.trim().toUpperCase();
+      if (!isSupportedCurrency(code)) {
+        return NextResponse.json(
+          { error: `Unsupported defaultCurrency: ${code}` },
+          { status: 400 },
+        );
+      }
+      defaultCurrency = code;
+    }
+
     // Optional user-typed statement balance (CSV/XLSX where we can't parse it).
     const statementBalanceRaw = formData.get("statementBalance");
     let userStatementBalance: number | null = null;
@@ -182,6 +241,7 @@ export async function POST(request: NextRequest) {
       templateId,
       userId,
       defaultAccountName,
+      { skipHeaderRows, skipFooterRows, dateFormatOverride },
     );
     if ("status" in parseResult) {
       return NextResponse.json(parseResult.body, { status: parseResult.status });
@@ -413,6 +473,12 @@ export async function POST(request: NextRequest) {
         boundAccountId: accountId,
         fileFormat: parseResult.format,
         originalFilename: file.name,
+        // FINLYNQ-54 parser knobs — persisted so the F-53E merge flow can
+        // read them back. Defaults match pre-FINLYNQ-54 behavior.
+        skipHeaderRows,
+        skipFooterRows,
+        dateFormatOverride,
+        defaultCurrency,
       });
 
       if (shaped.length > 0) {
@@ -426,7 +492,10 @@ export async function POST(request: NextRequest) {
               userId,
               date: r.date,
               amount: r.amount,
-              currency: r.currency ?? boundAccountCurrency ?? "CAD",
+              // Currency priority: row-supplied > default-currency knob >
+              // bound-account currency > hard fallback. The knob only fires
+              // for rows that didn't carry a currency themselves (FINLYNQ-54).
+              currency: r.currency ?? defaultCurrency ?? boundAccountCurrency ?? "CAD",
               // User-tier encryption: DEK is available, so wrap directly under
               // the user's DEK (v1: envelope) rather than the staging key.
               // Read paths (staged/[id] GET + approve) branch on
@@ -445,7 +514,10 @@ export async function POST(request: NextRequest) {
               quantity: r.quantity ?? null,
               portfolioHoldingId: null,
               enteredAmount: r.enteredAmount ?? null,
-              enteredCurrency: r.enteredCurrency ?? null,
+              // Default-currency knob also backstops entered_currency (FINLYNQ-54)
+              // so cross-currency rows that came in without one don't get
+              // mis-interpreted as bound-account-currency at approve time.
+              enteredCurrency: r.enteredCurrency ?? defaultCurrency ?? null,
               tags: r.tags ?? null,
               fitId: r.fitId ?? null,
               peerStagedId: null,
@@ -484,6 +556,11 @@ async function parseStatement(
   templateId: number | null,
   userId: string,
   defaultAccountName: string | null,
+  knobs: {
+    skipHeaderRows: number;
+    skipFooterRows: number;
+    dateFormatOverride: DateFormatOverride | null;
+  },
 ): Promise<ParseSuccess | ParseFailure> {
   if (ext === "csv") {
     const text = await file.text();
@@ -492,6 +569,9 @@ async function parseStatement(
       userId,
       templateId,
       defaultAccountName,
+      skipHeaderRows: knobs.skipHeaderRows,
+      skipFooterRows: knobs.skipFooterRows,
+      dateFormatOverride: knobs.dateFormatOverride,
     });
     if (result.kind === "template-not-found") {
       return {
