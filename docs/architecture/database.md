@@ -160,6 +160,16 @@ Why the separate table: a flag's lifecycle is distinct from any column on `trans
 
 Backup-restore (`/api/data/import` `strip()`) gained a `transactionIdMap` remap arg in the same change. Pre-migration backups (column absent) fall back to the column default `'unmatched'` / `NULL`. The `transaction_reconciliation_flags` rows aren't in the backup format today — that's a separate decision (the table's contents are user-curated annotations on DB-side rows; if/when included they'd remap via the same `transactionIdMap`).
 
+### Reader / writer routes (FINLYNQ-56)
+
+The two-pane reconciliation UI on `/import/pending` reads + writes these columns through three endpoints:
+
+- **PATCH [`/api/import/staged/[id]/rows/[rowId]`](../../src/app/api/import/staged/%5Bid%5D/rows/%5BrowId%5D/route.ts)** — accepts optional `reconcileState` + `linkedTransactionId` fields. Cross-tenant `linkedTransactionId` returns 404 (never 403 — no existence disclosure). State `'linked'` requires a non-null `linkedTransactionId`; non-`'linked'` state forces it to null on write. `import_hash` and `encryption_tier` are NEVER touched by this PATCH. Half-pair transfer rule is enforced at APPROVE time, not PATCH (two sequential PATCHes for paired legs would deadlock on post-state validation; the approve-side classifier already handles it).
+- **GET [`/api/transactions/reconciliation`](../../src/app/api/transactions/reconciliation/route.ts)** — `?accountId=&from=&to=` returns decoded `transactions` rows for the left pane. `requireEncryption()` (no soft-fallback — the user is mid-import so they already have a DEK; decoded names are part of the reconcile contract). Each row carries `linkedStagedRowId` (back-reference computed via LEFT JOIN on `staged_transactions.linked_transaction_id`) and `reconciliationFlag` (most-recent `transaction_reconciliation_flags` row, or null).
+- **POST / DELETE [`/api/transactions/[id]/reconciliation-flag`](../../src/app/api/transactions/%5Bid%5D/reconciliation-flag/route.ts)** — `POST { flag_kind: 'missing_from_statement', note? }` inserts a row; DELETE is fully idempotent (200 with `data: { removed: 0 }` on second call). Both `requireEncryption()` for surface uniformity (the table itself is plaintext but the flag intent is gated behind a logged-in DEK-equipped session). Cross-tenant 404 on the parent `transactions` row.
+
+The approve endpoint at [`/api/import/staged/[id]/approve`](../../src/app/api/import/staged/%5Bid%5D/approve/route.ts) gained a new bucket: rows where `reconcile_state='linked'` are de-queued at cleanup (DELETED from `staged_transactions`) without an INSERT into `transactions` — the live row already exists. Response shape gains a `linked: <count>` field alongside `imported`. Half-pair transfer rule extended to this bucket via `code: 'half_pair_link'`.
+
 ## `staged_imports.date_range_*` + `idx_transactions_user_import_hash` (FINLYNQ-58)
 
 F-53E foundations for the overlap-merge prompt + already-imported marker, delivered 2026-05-20 by [`scripts/migrations/20260520_finlynq-58-date-range-and-import-hash-index.sql`](../../scripts/migrations/20260520_finlynq-58-date-range-and-import-hash-index.sql):

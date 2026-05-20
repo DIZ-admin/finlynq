@@ -360,14 +360,18 @@ function PendingImportsPageInner() {
       to: dbWindow.to,
     });
     fetch(`/api/transactions/reconciliation?${params.toString()}`)
-      .then((res) => res.json().then((data) => ({ ok: res.ok, data })))
-      .then(({ ok, data }) => {
+      .then((res) =>
+        res.json().then((data) => ({ ok: res.ok, status: res.status, data })),
+      )
+      .then(({ ok, status, data }) => {
         if (cancelled) return;
         if (!ok) {
-          setToast({
-            type: "error",
-            msg: data?.error || "Failed to load existing transactions",
-          });
+          const msg =
+            status === 423
+              ? data?.message ||
+                "Your session needs to be unlocked. Reload and sign in again."
+              : data?.error || "Failed to load existing transactions";
+          setToast({ type: "error", msg });
           setDbRows([]);
           return;
         }
@@ -457,6 +461,12 @@ function PendingImportsPageInner() {
           },
         );
         const data = await res.json();
+        if (res.status === 423) {
+          throw new Error(
+            data?.message ||
+              "Your session needs to be unlocked. Reload and sign in again.",
+          );
+        }
         if (!res.ok) {
           throw new Error(data?.error || "Failed to update row");
         }
@@ -653,6 +663,33 @@ function PendingImportsPageInner() {
     },
     [updateDbRowFlag],
   );
+
+  // FINLYNQ-56 Phase 4 — live "After approval" balance. The projection
+  // sums selected rows that will actually materialize into `transactions`
+  // on approve:
+  //   - SELECTED       (user checked it on the right pane)
+  //   - dedupStatus != 'existing'   (existing rows are already in the balance)
+  //   - reconcileState != 'linked'         (linked rows don't materialize — the
+  //                                         target tx is already in the balance)
+  //   - reconcileState != 'skipped_duplicate' (already-imported marker)
+  // Synchronous recompute on every `setDetail` / `setSelected` — the
+  // ≤500ms target is met by virtue of being client-side memoization.
+  const liveProjection = useMemo(() => {
+    if (!detail) return null;
+    const recon = detail.reconciliation;
+    const current = recon?.currentBalance ?? null;
+    if (current == null) return { current: null, projected: null };
+    const liveDelta = detail.rows
+      .filter(
+        (r) =>
+          selected.has(r.id) &&
+          r.dedupStatus !== "existing" &&
+          r.reconcileState !== "skipped_duplicate" &&
+          r.reconcileState !== "linked",
+      )
+      .reduce((acc, r) => acc + Number(r.amount ?? 0), 0);
+    return { current, projected: current + liveDelta };
+  }, [detail, selected]);
 
   // Derive the displayable suggestion cards from the matcher's pairs,
   // filtering out (a) rejected pairs, (b) staged rows already at 'linked'
@@ -977,34 +1014,17 @@ function PendingImportsPageInner() {
         </Card>
       )}
 
-      {detail && detail.staged.statementBalance != null && (() => {
-        const recon = detail.reconciliation;
-        const current = recon?.currentBalance ?? null;
-        let projected: number | null = null;
-        if (current != null) {
-          const liveDelta = detail.rows
-            .filter(
-              (r) =>
-                selected.has(r.id) &&
-                r.dedupStatus !== "existing" &&
-                r.reconcileState !== "skipped_duplicate" &&
-                r.reconcileState !== "linked",
-            )
-            .reduce((acc, r) => acc + Number(r.amount ?? 0), 0);
-          projected = current + liveDelta;
-        }
-        return (
-          <ReconciliationCallout
-            statementBalance={detail.staged.statementBalance ?? null}
-            statementBalanceDate={detail.staged.statementBalanceDate ?? null}
-            statementCurrency={detail.staged.statementCurrency ?? null}
-            boundAccountId={detail.staged.boundAccountId ?? null}
-            currentBalance={current}
-            projectedBalance={projected}
-            boundAccountCurrency={recon?.boundAccountCurrency ?? null}
-          />
-        );
-      })()}
+      {detail && detail.staged.statementBalance != null && (
+        <ReconciliationCallout
+          statementBalance={detail.staged.statementBalance ?? null}
+          statementBalanceDate={detail.staged.statementBalanceDate ?? null}
+          statementCurrency={detail.staged.statementCurrency ?? null}
+          boundAccountId={detail.staged.boundAccountId ?? null}
+          currentBalance={liveProjection?.current ?? null}
+          projectedBalance={liveProjection?.projected ?? null}
+          boundAccountCurrency={detail.reconciliation?.boundAccountCurrency ?? null}
+        />
+      )}
 
       {detail && unresolved && unresolved.rowIds.length > 0 && (
         <UnresolvedCategoriesBanner
