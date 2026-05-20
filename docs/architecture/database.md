@@ -159,3 +159,38 @@ Index on `(user_id, transaction_id)` — covers the per-user-per-tx prefix probe
 Why the separate table: a flag's lifecycle is distinct from any column on `transactions` (added, removed, can carry a note, independent of any column on the parent row), and keeping it out of the hot `transactions` table avoids touching every aggregator with a fresh `is_flagged` predicate. Per the FINLYNQ-55 issue body, the alternative of adding `reconcile_state='flagged_missing'` to staging rows was rejected — staging rows are ephemeral (deleted on approve/reject/expire) and flags need to outlive the staging row.
 
 Backup-restore (`/api/data/import` `strip()`) gained a `transactionIdMap` remap arg in the same change. Pre-migration backups (column absent) fall back to the column default `'unmatched'` / `NULL`. The `transaction_reconciliation_flags` rows aren't in the backup format today — that's a separate decision (the table's contents are user-curated annotations on DB-side rows; if/when included they'd remap via the same `transactionIdMap`).
+
+## `webhooks` + `webhook_deliveries` (FINLYNQ-60)
+
+Schema foundation for the v1 webhook delivery surface — first sub-item of the FINLYNQ-43 decomposition (F-43A). The vocabulary contract lives in [`webhook-events.md`](webhook-events.md); the worker (FINLYNQ-61 / F-43B), the tx-write wiring (FINLYNQ-62 / F-43C), and the settings UI (FINLYNQ-63 / F-43D) all depend on these two tables but ship separately. Migration: [`scripts/migrations/20260520_finlynq-60-webhooks.sql`](../../scripts/migrations/20260520_finlynq-60-webhooks.sql) (additive, idempotent, auto-applied by `deploy.sh` via the `schema_migrations` tracker).
+
+| Column on `webhooks` | Type | Default | Meaning |
+|---|---|---|---|
+| `id` | `UUID PRIMARY KEY` | `gen_random_uuid()` | PG 13+ built-in; no `pgcrypto` extension needed. |
+| `user_id` | `TEXT NOT NULL` | — | `REFERENCES users(id) ON DELETE CASCADE`. Type matches `users.id` (`text`, UUID-as-text). Cascade is load-bearing for the wipe-account flow. |
+| `url` | `TEXT NOT NULL` | — | Delivery URL — user-controlled. |
+| `secret` | `TEXT NOT NULL` | — | Random ≥32-char hex, server-generated on insert, NEVER accepted from client. **Plaintext on purpose** — the delivery worker fires async from background jobs (cron, retry queue) where the user DEK isn't in scope. The secret is a row-scoped HMAC key, not user-derived data; rotation is via revoke-and-recreate. Storing under user DEK would break the worker. Do NOT add a `name_ct` sibling here. |
+| `event_filter` | `TEXT[] NOT NULL` | — | Closed v1 event list. `CHECK (array_length(event_filter, 1) > 0 AND event_filter <@ ARRAY['transaction.created', 'transaction.updated', 'transaction.deleted', 'transfer.created', 'import.approved'])` — every element must be in the v1 set, and an empty filter is rejected. Adding a new event in v1 requires a follow-up migration widening this CHECK and the matching `webhook_deliveries.event` CHECK. |
+| `created_at` | `TIMESTAMPTZ NOT NULL` | `NOW()` | |
+| `last_failed_at` | `TIMESTAMPTZ NULL` | `NULL` | Surfaced as a warning dot on the settings UI after a delivery's retry budget runs out (3 attempts at 1m/5m/25m per `webhook-events.md`). |
+
+| Column on `webhook_deliveries` | Type | Default | Meaning |
+|---|---|---|---|
+| `id` | `UUID PRIMARY KEY` | `gen_random_uuid()` | |
+| `webhook_id` | `UUID NOT NULL` | — | `REFERENCES webhooks(id) ON DELETE CASCADE` — revoking a webhook cleans up its delivery history without the revoke endpoint touching this table. |
+| `event` | `TEXT NOT NULL` | — | `CHECK (event IN (<v1 list>))`. The list MUST mirror the `webhooks.event_filter` element CHECK; drift between the two or vs. `webhook-events.md` is a contract breach. |
+| `payload_hash` | `TEXT NOT NULL` | — | SHA-256 hex of the raw request body bytes (NOT the HMAC signature). Lets the UI display a delivery fingerprint without storing the body itself (the "no PII in webhook payloads" rule applies to anything persisted alongside the row). |
+| `status_code` | `INTEGER NULL` | `NULL` | `NULL` = enqueued, not-yet-attempted. `2xx` = success. Negative sentinel (`-1`) = exhausted retries per the retry policy in `webhook-events.md`. |
+| `attempted_at` | `TIMESTAMPTZ NOT NULL` | `NOW()` | |
+
+Indexes:
+
+| Index | Purpose |
+|---|---|
+| `idx_webhooks_user_id` | List-all-webhooks-for-user. |
+| `idx_webhooks_user_id_created_at_desc` | Settings UI "recent first" sort. |
+| `idx_webhook_deliveries_webhook_id_attempted_at_desc` | Per-webhook "recent deliveries" pane in the settings UI. |
+
+FK cascades summary: `webhooks.user_id → users(id) ON DELETE CASCADE` AND `webhook_deliveries.webhook_id → webhooks(id) ON DELETE CASCADE`. Both are load-bearing for the wipe-account flow (CLAUDE.md "Wipe-account is single-transaction + user_id-only filters") — deleting a user cascades through `webhooks` into `webhook_deliveries` automatically, no orphans.
+
+Strict scope of FINLYNQ-60: schema only. No worker code (FINLYNQ-61), no tx-write callsite wiring (FINLYNQ-62), no UI page (FINLYNQ-63), no MCP tools — those land in their own sub-items.

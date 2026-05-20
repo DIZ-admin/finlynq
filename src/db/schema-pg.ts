@@ -845,3 +845,76 @@ export const revokedJtis = pgTable("revoked_jtis", {
   jti: text("jti").primaryKey(),
   expiresAt: timestamp("expires_at", { withTimezone: true }).notNull(),
 });
+
+// ─── Webhooks — schema for the v1 webhook delivery surface (FINLYNQ-60) ────
+//
+// Foundation for the FINLYNQ-43 cohort. Spec lives in
+// pf-app/docs/architecture/webhook-events.md; the worker (FINLYNQ-61), the
+// UI (FINLYNQ-63), and the tx-write wiring (FINLYNQ-62) ship separately.
+//
+// `secret` is plaintext on purpose — the delivery worker fires async from
+// background jobs (cron, retry queue) where the user DEK isn't in scope.
+// The secret is a row-scoped HMAC key, not user-derived data; rotation is
+// via revoke-and-recreate. Storing under user DEK would break the worker.
+// Do NOT add a `name_ct` sibling here.
+//
+// `event_filter` element type and `webhookDeliveries.event` MUST stay in
+// sync with webhook-events.md's v1 vocabulary — drift is a contract
+// breach. The SQL migration encodes the closed list as CHECK constraints
+// (`webhooks_event_filter_check`, `webhook_deliveries_event_check`); a new
+// event in v1 requires a follow-up migration widening BOTH CHECKs and a
+// CHANGELOG entry. v2-shape breaks rev `Content-Type`, not the column.
+//
+// FK cascades: `webhooks.user_id -> users(id) ON DELETE CASCADE` AND
+// `webhook_deliveries.webhook_id -> webhooks(id) ON DELETE CASCADE` — both
+// load-bearing for the wipe-account flow (CLAUDE.md "Wipe-account is
+// single-transaction + user_id-only filters"): deleting a user cleans up
+// the webhook rows automatically without the wipe endpoint touching this
+// table.
+//
+// `gen_random_uuid()` is built-in to Postgres 13+ (no pgcrypto extension
+// needed). Finlynq runs on Postgres 16.
+export const webhooks = pgTable("webhooks", {
+  id: uuid("id").primaryKey().default(sql`gen_random_uuid()`),
+  // text("user_id") — users.id is text (UUID stored as text); matches the
+  // pattern across every other userId column in this schema.
+  userId: text("user_id")
+    .notNull()
+    .references(() => users.id, { onDelete: "cascade" }),
+  url: text("url").notNull(),
+  // Random >=32-char hex, server-generated on insert, NEVER accepted from
+  // client. Plaintext for worker access — see file header comment above.
+  secret: text("secret").notNull(),
+  // Closed v1 event list, enforced by CHECK at the SQL layer (see
+  // webhooks_event_filter_check in the matching migration). Drizzle's
+  // text-array column type is `text("...").array()`.
+  eventFilter: text("event_filter").array().notNull(),
+  createdAt: timestamp("created_at", { withTimezone: true })
+    .notNull()
+    .defaultNow(),
+  // Surfaced as a warning dot on the settings UI after a delivery's retry
+  // budget is exhausted (3 attempts at 1m/5m/25m per webhook-events.md).
+  lastFailedAt: timestamp("last_failed_at", { withTimezone: true }),
+});
+
+// `event` mirrors the same v1 closed list as `webhooks.event_filter`'s
+// element type (enforced by `webhook_deliveries_event_check` in SQL).
+// `payload_hash` is SHA-256 hex of the raw request body bytes (NOT the
+// HMAC signature) — lets the UI display a delivery fingerprint without
+// storing the body itself (the "no PII in webhook payloads" rule from
+// webhook-events.md applies to anything we'd persist alongside the row).
+// `status_code` is NULL until the dispatcher attempts; on exhausted
+// retries the worker writes a negative sentinel (-1) per the retry
+// policy in webhook-events.md.
+export const webhookDeliveries = pgTable("webhook_deliveries", {
+  id: uuid("id").primaryKey().default(sql`gen_random_uuid()`),
+  webhookId: uuid("webhook_id")
+    .notNull()
+    .references(() => webhooks.id, { onDelete: "cascade" }),
+  event: text("event").notNull(),
+  payloadHash: text("payload_hash").notNull(),
+  statusCode: integer("status_code"),
+  attemptedAt: timestamp("attempted_at", { withTimezone: true })
+    .notNull()
+    .defaultNow(),
+});
