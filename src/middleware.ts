@@ -210,6 +210,48 @@ function csrfCheck(request: NextRequest): NextResponse | null {
 }
 
 /**
+ * SHA-256 hashes of framework-injected inline <style> blocks (FINLYNQ-83 phase 3).
+ *
+ * These are the inline CSS blocks emitted into the SSR HTML by Next.js itself
+ * — today there's exactly one, the 222-byte stylesheet Next.js bakes into its
+ * default `_global-error.html` (the 500 page) and the equivalent `<style>` that
+ * the in-bundle error / not-found React boundary injects at runtime. Both
+ * render the identical CSS string, so a single hash covers both surfaces.
+ *
+ * Extraction: `node` walked `.next/server/app/_global-error.html` plus the
+ * SSR chunks under `.next/server/chunks/ssr/`, regex-matched every
+ * `<style>...</style>` block, and hashed the inner text with SHA-256.
+ *
+ * The hash is appended to BOTH the enforcing `style-src` (after phase 5 flips
+ * `'unsafe-inline'` out) AND the Report-Only `style-src` today (so the
+ * Report-Only sink stops logging the not-found / 500 pages as violations).
+ *
+ * Re-snapshotting: any Next.js minor bump that touches the error-page CSS
+ * (rare — the string hasn't changed since Next 12) will surface as
+ * `[csp-report]` lines on /not-found / /error after deploy. Re-run the
+ * extraction and update this const.
+ *
+ * Hash for the current Next.js (^16, app router): the 222-byte error CSS.
+ */
+const FRAMEWORK_STYLE_HASHES = [
+  "'sha256-ybR9Y4T3awQNBE4FheACcusKsc8nree1t2vQRl3tP7w='",
+] as const;
+
+/**
+ * SHA-256 hashes of library-injected inline styles — Recharts SVG attrs,
+ * framer-motion runtime <style> blocks, etc. (FINLYNQ-83 phase 4).
+ *
+ * Currently empty: phase 4 lands AFTER ≥7 days of Report-Only telemetry from
+ * prod, at which point we journalctl-grep `[csp-report]` lines, extract every
+ * distinct `style-sample` from the violations, and populate this list. Keeping
+ * the const here so phase 4 is a one-file edit.
+ *
+ * HASH SNAPSHOT FOR <recharts@TBD, framer-motion@TBD> — when populated, name
+ * the exact versions in this comment so dep bumps surface as drift.
+ */
+const LIBRARY_STYLE_HASHES: readonly string[] = [];
+
+/**
  * Generate a cryptographically random nonce for per-request CSP.
  * 16 random bytes encoded as base64 — meets the CSP spec's recommendation
  * (≥128 bits of entropy). `crypto.randomUUID` would also work but base64
@@ -349,6 +391,13 @@ export function middleware(request: NextRequest) {
   // 'object-src none' + 'frame-ancestors none' + nonce-based script-src
   // already block the more direct exfiltration paths; style-based exfil is
   // narrow but real. Worth eventually closing.
+  // Reporting endpoints (FINLYNQ-83 phase 1) — wired into BOTH the enforcing
+  // and Report-Only CSP directives below. `report-uri` is the legacy CSP-L2
+  // directive still required by older browsers; `report-to` is the modern
+  // Reporting-API channel, named via the matching `Report-To` response
+  // header set further down.
+  const cspReportDirectives = "report-uri /api/csp-report; report-to csp-endpoint";
+
   const cspDirectives = [
     "default-src 'self'",
     scriptSrc,
@@ -360,6 +409,7 @@ export function middleware(request: NextRequest) {
     "frame-ancestors 'none'",
     "base-uri 'self'",
     "form-action 'self'",
+    cspReportDirectives,
   ];
   response.headers.set("Content-Security-Policy", cspDirectives.join("; "));
 
@@ -371,18 +421,29 @@ export function middleware(request: NextRequest) {
   // it). This gives us the inventory of inline-style callsites we need
   // before we can remove `'unsafe-inline'` from the enforcing policy.
   //
-  // No `report-uri` / `report-to` configured yet — browsers still surface
-  // violations in DevTools Console, which is the inventory channel the
-  // migration plan needs. Adding a server-side report endpoint is a
-  // separate follow-up once we know the violation volume.
+  // Reports flow into `/api/csp-report` (Phase 1) via both `report-uri`
+  // (legacy) and `report-to` (Reporting API). The endpoint logs structured
+  // JSON to stdout → journalctl, which the Phase 3/4 hash-extraction step
+  // greps to build the framework + library style-hash snapshot.
   //
   // Route-aware in the same way as the enforcing CSP: `scriptSrc`,
   // `imgSrc`, and `connectSrc` are already computed per-request based on
   // `isWebsite`, so reusing them here keeps the two policies in sync.
+  // Report-Only style-src includes the framework + library hash sets (phase
+  // 3 + 4 deliverables). Each hash drops a known framework / library inline
+  // <style> block from the violation log. Today phase 3 covers the Next.js
+  // error-page hash; phase 4 will append the Recharts / framer-motion set
+  // after ≥7 days of prod telemetry.
+  const reportOnlyStyleSrc = [
+    "style-src 'self'",
+    ...FRAMEWORK_STYLE_HASHES,
+    ...LIBRARY_STYLE_HASHES,
+  ].join(" ");
+
   const reportOnlyDirectives = [
     "default-src 'self'",
     scriptSrc,
-    "style-src 'self'",
+    reportOnlyStyleSrc,
     imgSrc,
     "font-src 'self'",
     connectSrc,
@@ -390,10 +451,24 @@ export function middleware(request: NextRequest) {
     "frame-ancestors 'none'",
     "base-uri 'self'",
     "form-action 'self'",
+    cspReportDirectives,
   ];
   response.headers.set(
     "Content-Security-Policy-Report-Only",
     reportOnlyDirectives.join("; ")
+  );
+
+  // Report-To response header — names the `csp-endpoint` group referenced
+  // by the `report-to csp-endpoint` CSP directives above. Modern browsers
+  // use this Reporting API channel; older browsers fall back to the
+  // `report-uri /api/csp-report` directive. Both target the same handler.
+  response.headers.set(
+    "Report-To",
+    JSON.stringify({
+      group: "csp-endpoint",
+      max_age: 86400,
+      endpoints: [{ url: "/api/csp-report" }],
+    })
   );
 
   // Expose the nonce on the response so route handlers / debugging tools

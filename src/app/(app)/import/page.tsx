@@ -20,13 +20,16 @@ import {
   Copy,
   RefreshCw,
   BookTemplate,
-  Sparkles,
   Link as LinkIcon,
   ListChecks,
 } from "lucide-react";
 import Link from "next/link";
 import { FileDropZone } from "./components/file-drop-zone";
-import { ImportPreviewDialog, type ProbableDuplicateMatch } from "./components/import-preview-dialog";
+import {
+  ImportPreviewDialog,
+  type ProbableDuplicateMatch,
+  type ExactDuplicateMatch,
+} from "./components/import-preview-dialog";
 import { OfxPreview } from "./components/ofx-preview";
 import {
   InvestmentStatementPreview,
@@ -35,6 +38,10 @@ import {
 import { TemplateManager } from "./components/template-manager";
 import { ColumnMappingDialog } from "./components/column-mapping-dialog";
 import { ConnectorTab } from "./components/connector-tab";
+import {
+  TemplatePickerDialog,
+  extractCsvHeadersFromFile,
+} from "./components/template-picker-dialog";
 import type { RawTransaction } from "@/lib/import-pipeline";
 import type { OfxTransaction, OfxAccountInfo } from "@/lib/ofx-parser";
 import type { ColumnMapping, ImportTemplate } from "@/lib/import-templates";
@@ -49,6 +56,7 @@ export default function ImportPage() {
   const [previewOpen, setPreviewOpen] = useState(false);
   const [validRows, setValidRows] = useState<PreviewRow[]>([]);
   const [duplicateRows, setDuplicateRows] = useState<PreviewRow[]>([]);
+  const [duplicateMatches, setDuplicateMatches] = useState<ExactDuplicateMatch[]>([]);
   const [probableDuplicates, setProbableDuplicates] = useState<ProbableDuplicateMatch[]>([]);
   const [errorRows, setErrorRows] = useState<Array<{ rowIndex: number; message: string }>>([]);
   const [isImporting, setIsImporting] = useState(false);
@@ -57,10 +65,14 @@ export default function ImportPage() {
   // CSV template state
   const [csvHeaders, setCsvHeaders] = useState<string[]>([]);
   const [appliedTemplateId, setAppliedTemplateId] = useState<number | null>(null);
-  const [suggestedTemplate, setSuggestedTemplate] = useState<{ id: number; name: string; score: number } | null>(null);
   const [selectedTemplateId, setSelectedTemplateId] = useState<string>("");
   const [templates, setTemplates] = useState<ImportTemplate[]>([]);
   const [lastUploadedFile, setLastUploadedFile] = useState<File | null>(null);
+
+  // Template picker (shown for CSV uploads when the user has saved templates).
+  const [pickerOpen, setPickerOpen] = useState(false);
+  const [pickerHeaders, setPickerHeaders] = useState<string[]>([]);
+  const [pickerFile, setPickerFile] = useState<File | null>(null);
 
   const [accountNames, setAccountNames] = useState<string[]>([]);
 
@@ -122,14 +134,16 @@ export default function ImportPage() {
       .catch(() => {});
   }, []);
 
-  // Core file preview function — called with optional templateId override
-  const previewFile = useCallback(async (file: File, templateId?: number) => {
+  // Core file preview function — called with optional templateId override.
+  // `noTemplate=true` is set when the user picked "Auto-detect" in the
+  // template-picker dialog so the server also skips its auto-match fallback.
+  const previewFile = useCallback(async (file: File, templateId?: number, noTemplate?: boolean) => {
     setUploadStatus(null);
-    setSuggestedTemplate(null);
 
     const formData = new FormData();
     formData.append("file", file);
     if (templateId !== undefined) formData.append("templateId", String(templateId));
+    if (noTemplate) formData.append("noTemplate", "1");
 
     try {
       const res = await fetch("/api/import/preview", { method: "POST", body: formData });
@@ -171,14 +185,9 @@ export default function ImportPage() {
       } else if (data.type === "csv" || data.valid !== undefined) {
         setCsvHeaders(data.headers ?? []);
         setAppliedTemplateId(data.appliedTemplateId ?? null);
-
-        // Show suggestion banner if server found a match and no template was forced
-        if (!templateId && data.suggestedTemplate) {
-          setSuggestedTemplate(data.suggestedTemplate);
-        }
-
         setValidRows(data.valid ?? []);
         setDuplicateRows(data.duplicates ?? []);
+        setDuplicateMatches(data.duplicateMatches ?? []);
         setProbableDuplicates(data.probableDuplicates ?? []);
         setErrorRows(data.errors ?? []);
         setPreviewOpen(true);
@@ -191,20 +200,63 @@ export default function ImportPage() {
     }
   }, []);
 
-  // Universal file upload handler
+  // Universal file upload handler.
+  //
+  // For CSV uploads with saved templates, intercept and show the template
+  // picker first so the user can pick which mapping to use before we run
+  // the preview. The picker is skipped when:
+  //   - The dropdown already has a template selected (user already chose).
+  //   - The file isn't a `.csv` (OFX / QFX / Excel / PDF / XML don't use templates).
+  //   - The user has no saved templates yet.
+  //   - We can't read CSV headers from the file (empty / unreadable).
   const handleFileUpload = useCallback(async (file: File) => {
     setLastUploadedFile(file);
     const tid = selectedTemplateId ? parseInt(selectedTemplateId, 10) : undefined;
-    await previewFile(file, tid);
-  }, [previewFile, selectedTemplateId]);
 
-  // Apply suggested template
-  const applySuggested = useCallback(async () => {
-    if (!suggestedTemplate || !lastUploadedFile) return;
-    setSuggestedTemplate(null);
+    const isCsv = file.name.toLowerCase().endsWith(".csv");
+    if (!isCsv || tid !== undefined || templates.length === 0) {
+      await previewFile(file, tid);
+      return;
+    }
+
+    const headers = await extractCsvHeadersFromFile(file).catch(() => []);
+    if (headers.length === 0) {
+      await previewFile(file, tid);
+      return;
+    }
+
+    setPickerHeaders(headers);
+    setPickerFile(file);
+    setPickerOpen(true);
+  }, [previewFile, selectedTemplateId, templates.length]);
+
+  // Picker "Continue" — null = auto-detect (no templateId forced).
+  // Also pass noTemplate so the server skips its auto-match fallback —
+  // otherwise step 3 of the CSV pipeline would silently apply a template
+  // the user just declined.
+  const handlePickerContinue = useCallback(
+    async (templateId: number | null) => {
+      setPickerOpen(false);
+      const file = pickerFile;
+      if (!file) return;
+      if (templateId === null) {
+        await previewFile(file, undefined, true);
+      } else {
+        await previewFile(file, templateId);
+      }
+    },
+    [pickerFile, previewFile],
+  );
+
+  // "Change template" from the preview dialog — reopen the picker for
+  // the last uploaded file. Falls back to a no-op if headers / file went
+  // out of scope (e.g. the user reloaded the page).
+  const handleReopenPicker = useCallback(() => {
+    if (!lastUploadedFile || pickerHeaders.length === 0) return;
     setPreviewOpen(false);
-    await previewFile(lastUploadedFile, suggestedTemplate.id);
-  }, [suggestedTemplate, lastUploadedFile, previewFile]);
+    setPickerFile(lastUploadedFile);
+    setPickerOpen(true);
+  }, [lastUploadedFile, pickerHeaders.length]);
 
   // Column mapping dialog confirm — parse with the user-supplied mapping,
   // open the regular preview, and auto-save the mapping as a template.
@@ -254,6 +306,7 @@ export default function ImportPage() {
         setCsvHeaders(data.headers ?? []);
         setValidRows(data.valid ?? []);
         setDuplicateRows(data.duplicates ?? []);
+        setDuplicateMatches(data.duplicateMatches ?? []);
         setProbableDuplicates(data.probableDuplicates ?? []);
         setErrorRows(data.errors ?? []);
         setMappingDialogOpen(false);
@@ -477,31 +530,6 @@ export default function ImportPage() {
               </CardContent>
             </Card>
 
-            {/* Auto-match suggestion banner */}
-            {suggestedTemplate && (
-              <Card className="border-blue-200 bg-blue-50/40">
-                <CardContent className="py-3">
-                  <div className="flex items-center justify-between gap-3">
-                    <div className="flex items-center gap-2">
-                      <Sparkles className="h-4 w-4 text-blue-600 shrink-0" />
-                      <p className="text-sm text-blue-800">
-                        This looks like <span className="font-medium">{suggestedTemplate.name}</span>
-                        {" "}({suggestedTemplate.score}% match). Re-import using this template?
-                      </p>
-                    </div>
-                    <div className="flex gap-2 shrink-0">
-                      <Button size="sm" variant="outline" className="h-7 text-xs" onClick={() => setSuggestedTemplate(null)}>
-                        Ignore
-                      </Button>
-                      <Button size="sm" className="h-7 text-xs" onClick={applySuggested}>
-                        Apply
-                      </Button>
-                    </div>
-                  </div>
-                </CardContent>
-              </Card>
-            )}
-
             {uploadStatus && (
               <Card className={uploadStatus.type === "success" ? "border-emerald-200 bg-emerald-50/30" : "border-rose-200 bg-rose-50/30"}>
                 <CardContent className="py-3">
@@ -616,21 +644,42 @@ export default function ImportPage() {
             </div>
             <TemplateManager
               templates={templates}
+              accounts={accountNames}
               onDeleted={(id) => setTemplates((prev) => prev.filter((t) => t.id !== id))}
-              onRenamed={(id, name) =>
-                setTemplates((prev) => prev.map((t) => (t.id === id ? { ...t, name } : t)))
-              }
+              onUpdated={(updated) => {
+                if (updated.isDefault) {
+                  // Server-side branch clears isDefault on every OTHER template when this
+                  // one is set true; the PUT response only returns the updated row, so we
+                  // refetch to keep the "default" badge in sync across rows.
+                  fetch("/api/import/templates")
+                    .then((r) => r.json())
+                    .then((data) => { if (Array.isArray(data)) setTemplates(data); })
+                    .catch(() => {});
+                } else {
+                  setTemplates((prev) => prev.map((t) => (t.id === updated.id ? updated : t)));
+                }
+              }}
             />
           </div>
         </TabsContent>
       </Tabs>
 
       {/* Dialogs */}
+      <TemplatePickerDialog
+        open={pickerOpen}
+        onOpenChange={setPickerOpen}
+        templates={templates}
+        fileHeaders={pickerHeaders}
+        fileName={pickerFile?.name ?? ""}
+        onContinue={handlePickerContinue}
+      />
+
       <ImportPreviewDialog
         open={previewOpen}
         onOpenChange={setPreviewOpen}
         validRows={validRows}
         duplicateRows={duplicateRows}
+        duplicateMatches={duplicateMatches}
         probableDuplicates={probableDuplicates}
         errorRows={errorRows}
         onConfirm={handleImportConfirm}
@@ -638,6 +687,9 @@ export default function ImportPage() {
         csvHeaders={csvHeaders}
         accounts={accountNames}
         appliedTemplateId={appliedTemplateId}
+        onChangeTemplate={
+          pickerHeaders.length > 0 && templates.length > 0 ? handleReopenPicker : undefined
+        }
         onTemplateSaved={(t) => {
           setTemplates((prev) => {
             if (prev.find((x) => x.id === t.id)) return prev;

@@ -1,7 +1,16 @@
 import { db, schema } from "@/db";
 import { and, eq } from "drizzle-orm";
-import { generateImportHash, checkDuplicates, checkFitIdDuplicates } from "./import-hash";
+import {
+  generateImportHash,
+  checkDuplicates,
+  checkFitIdDuplicates,
+  findDuplicateMatches,
+  findFitIdMatches,
+  type ExactDuplicateMatchInfo,
+} from "./import-hash";
 import { applyRulesToBatch, type TransactionRule } from "./auto-categorize";
+import { computePureActionPatch } from "./rules/execute";
+import type { ConditionGroup, Action } from "./rules/schema";
 import { normalizeDate, parseAmount as parseAmountStr } from "./csv-parser";
 import { encryptField, decryptField, tryDecryptField } from "./crypto/envelope";
 import { nameLookup } from "./crypto/encrypted-columns";
@@ -62,9 +71,24 @@ export interface RawTransaction {
   linkId?: string;
 }
 
+/** Per-row explanation for an exact-match duplicate, mirrors `DuplicateMatch`. */
+export interface ExactDuplicateMatch {
+  rowIndex: number;
+  /** Which key triggered the match. */
+  matchBasis: "fit_id" | "import_hash";
+  /** Metadata about the existing transaction that this row collided with. */
+  matchedTx: ExactDuplicateMatchInfo;
+}
+
 export interface PreviewResult {
   valid: Array<RawTransaction & { hash: string; rowIndex: number }>;
   duplicates: Array<RawTransaction & { hash: string; rowIndex: number }>;
+  /**
+   * Per-row "Matches transaction #X" detail for the exact-match duplicates
+   * above. Same lookup pattern as `probableDuplicates` — UI cross-references
+   * via `rowIndex`. Empty when there are no exact duplicates.
+   */
+  duplicateMatches: ExactDuplicateMatch[];
   /**
    * Issue #65: rows that survived exact-match dedup but look like a fuzzy
    * match against an existing transaction (FX-spread + settlement-vs-posting
@@ -143,7 +167,7 @@ export async function previewImport(
 
   if (rows.length === 0) {
     errors.push({ rowIndex: 0, message: "No data to import" });
-    return { valid: [], duplicates: [], probableDuplicates: [], errors };
+    return { valid: [], duplicates: [], duplicateMatches: [], probableDuplicates: [], errors };
   }
 
   if (rows.length > MAX_IMPORT_ROWS) {
@@ -151,7 +175,7 @@ export async function previewImport(
       rowIndex: 0,
       message: `File contains ${rows.length.toLocaleString()} rows, which exceeds the ${MAX_IMPORT_ROWS.toLocaleString()} row limit. Please split the file into smaller chunks.`,
     });
-    return { valid: [], duplicates: [], probableDuplicates: [], errors };
+    return { valid: [], duplicates: [], duplicateMatches: [], probableDuplicates: [], errors };
   }
 
   for (let i = 0; i < rows.length; i++) {
@@ -200,28 +224,41 @@ export async function previewImport(
     valid.push({ ...row, hash, rowIndex: i });
   }
 
-  // Check duplicates — use fitId when available, fall back to content hash
+  // Check duplicates — use fitId when available, fall back to content hash.
+  // Both branches use the *match-returning* helpers so the preview UI can
+  // show "Matches existing transaction #X" alongside each flagged row.
   const fitIdRows = valid.filter((v) => v.fitId);
   const hashOnlyRows = valid.filter((v) => !v.fitId);
 
-  // fitId-based dedup
-  const existingFitIds = await checkFitIdDuplicates(fitIdRows.map((v) => v.fitId!), userId);
-  // hash-based dedup
-  const existingHashes = await checkDuplicates(hashOnlyRows.map((v) => v.hash), userId);
+  const fitIdMatches = await findFitIdMatches(fitIdRows.map((v) => v.fitId!), userId);
+  const hashMatches = await findDuplicateMatches(hashOnlyRows.map((v) => v.hash), userId);
 
   const duplicates: PreviewResult["valid"] = [];
+  const duplicateMatches: ExactDuplicateMatch[] = [];
   const nonDuplicates: PreviewResult["valid"] = [];
 
   for (const row of fitIdRows) {
-    if (existingFitIds.has(row.fitId!)) {
+    const match = fitIdMatches.get(row.fitId!);
+    if (match) {
       duplicates.push(row);
+      duplicateMatches.push({
+        rowIndex: row.rowIndex,
+        matchBasis: "fit_id",
+        matchedTx: match,
+      });
     } else {
       nonDuplicates.push(row);
     }
   }
   for (const row of hashOnlyRows) {
-    if (existingHashes.has(row.hash)) {
+    const match = hashMatches.get(row.hash);
+    if (match) {
       duplicates.push(row);
+      duplicateMatches.push({
+        rowIndex: row.rowIndex,
+        matchBasis: "import_hash",
+        matchedTx: match,
+      });
     } else {
       nonDuplicates.push(row);
     }
@@ -238,7 +275,7 @@ export async function previewImport(
     dek ?? null,
   );
 
-  return { valid: nonDuplicates, duplicates, probableDuplicates, errors };
+  return { valid: nonDuplicates, duplicates, duplicateMatches, probableDuplicates, errors };
 }
 
 /**
@@ -480,28 +517,70 @@ export async function executeImport(
     return true;
   });
 
-  // Auto-categorize uncategorized transactions using rules
+  // Auto-categorize uncategorized transactions using rules.
+  //
+  // FINLYNQ-84: pipeline path applies PURE actions only via
+  // `computePureActionPatch`. Side-effect actions (`set_account`,
+  // `create_transfer`) are skipped here — they need approve-time context
+  // and run only via the staging-approve materialization path. The import
+  // pipeline never sees a `staged_imports` id; if a user's rule has a
+  // side-effect action and matches a pre-pipeline row, the row falls
+  // through uncategorized and the user resolves it at approve time.
   try {
-    const activeRules = await db
+    const rawRules = await db
       .select()
       .from(schema.transactionRules)
-      .where(eq(schema.transactionRules.isActive, true))
-      .all() as TransactionRule[];
+      .where(and(
+        eq(schema.transactionRules.userId, userId),
+        eq(schema.transactionRules.isActive, true),
+      ))
+      .all() as Array<{
+        id: number;
+        userId: string;
+        name: string;
+        conditions: unknown;
+        actions: unknown;
+        isActive: boolean;
+        priority: number;
+      }>;
+    const activeRules: TransactionRule[] = rawRules.map((r) => ({
+      id: r.id,
+      name: r.name,
+      conditions: (r.conditions ?? { all: [] }) as ConditionGroup,
+      actions: (Array.isArray(r.actions) ? r.actions : []) as Action[],
+      isActive: r.isActive,
+      priority: r.priority,
+    }));
 
     if (activeRules.length > 0) {
       const uncategorized = toInsert.filter((r) => !r.categoryId);
       if (uncategorized.length > 0) {
+        // accountId is intentionally null at the pre-pipeline stage: RawTransaction
+        // carries `account` (name string), not the resolved id. Rules with
+        // `account.is/is_not` predicates trivially fail here and the row falls
+        // through to the user at approve-time — accepted tradeoff (the row is
+        // still safely importable; user resolves at /import/pending).
         const results = applyRulesToBatch(
-          uncategorized.map((r) => ({ payee: r.payee, amount: r.amount, tags: r.tags })),
+          uncategorized.map((r) => ({
+            payee: r.payee,
+            amount: r.amount,
+            tags: r.tags,
+            note: r.note,
+            date: r.date,
+            accountId: null,
+            enteredCurrency: r.enteredCurrency ?? r.currency ?? null,
+          })),
           activeRules,
         );
         for (const { index, match } of results) {
-          if (match) {
-            const row = uncategorized[index];
-            if (match.assignCategoryId) row.categoryId = match.assignCategoryId;
-            if (match.assignTags) row.tags = match.assignTags;
-            if (match.renameTo) row.payee = match.renameTo;
-          }
+          if (!match) continue;
+          const row = uncategorized[index];
+          const patch = computePureActionPatch(match.actions);
+          if (patch.categoryId != null) row.categoryId = patch.categoryId;
+          if (patch.tags != null) row.tags = patch.tags;
+          if (patch.payee != null) row.payee = patch.payee;
+          if (patch.enteredCurrency != null) row.enteredCurrency = patch.enteredCurrency;
+          if (patch.portfolioHoldingId != null) row.portfolioHoldingId = patch.portfolioHoldingId;
         }
       }
     }

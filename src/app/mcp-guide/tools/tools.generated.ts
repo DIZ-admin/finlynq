@@ -451,8 +451,8 @@ export const TOOLS: ReadonlyArray<CatalogTool> = [
   },
   {
     name: "create_rule",
-    description: "Create an auto-categorization rule for future imports",
-    blurb: "Create an auto-categorization rule for future imports",
+    description: "Create an auto-categorization rule for future imports. Legacy shorthand (match_payee + assign_category) is synthesized into a v2 rule (FINLYNQ-84).",
+    blurb: "Create an auto-categorization rule for future imports.",
     category: "write",
     readOnly: false,
     destructive: false,
@@ -475,8 +475,8 @@ export const TOOLS: ReadonlyArray<CatalogTool> = [
   },
   {
     name: "apply_rules_to_uncategorized",
-    description: "Run all active categorization rules against uncategorized transactions",
-    blurb: "Run all active categorization rules against uncategorized transactions",
+    description: "Run all active categorization rules against uncategorized transactions. Rules with side-effect actions (set_account, create_transfer) are refused and surfaced in skipped[]; they need approve-time context.",
+    blurb: "Run all active categorization rules against uncategorized transactions.",
     category: "write",
     readOnly: false,
     destructive: false,
@@ -775,8 +775,8 @@ export const TOOLS: ReadonlyArray<CatalogTool> = [
   },
   {
     name: "list_rules",
-    description: "List all auto-categorization rules with their match patterns and target categories",
-    blurb: "List all auto-categorization rules with their match patterns and target categories",
+    description: "List all auto-categorization rules. Returns JSONB conditions + actions (FINLYNQ-84 v2 shape) plus decrypted FK names for human-readable rendering.",
+    blurb: "List all auto-categorization rules.",
     category: "read",
     readOnly: true,
     destructive: false,
@@ -787,8 +787,8 @@ export const TOOLS: ReadonlyArray<CatalogTool> = [
   },
   {
     name: "update_rule",
-    description: "Update any field of an existing transaction rule",
-    blurb: "Update any field of an existing transaction rule",
+    description: "Update an existing transaction rule. Accepts legacy shorthand (match_payee + assign_category) OR the v2 shape (conditions + actions, FINLYNQ-84).",
+    blurb: "Update an existing transaction rule.",
     category: "write",
     readOnly: false,
     destructive: false,
