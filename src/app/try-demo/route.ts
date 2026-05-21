@@ -172,7 +172,20 @@ export async function GET(request: NextRequest) {
       enqueueUpgradeStagingEncryption(user.id, dek);
     }
 
-    const response = NextResponse.redirect(new URL(next, request.url));
+    // Build the absolute redirect URL from the X-Forwarded-* headers Caddy
+    // sets, NOT from request.url. Behind the reverse proxy the upstream URL
+    // is the systemd-bound 0.0.0.0:3456 form, so `new URL(next, request.url)`
+    // produces a Location header that breaks in the browser
+    // ("ERR_ADDRESS_INVALID"). Forwarded-host headers carry the original
+    // public origin (finlynq.com) and are the standard pattern for routes
+    // behind a reverse proxy.
+    const forwardedHost = request.headers.get("x-forwarded-host");
+    const forwardedProto = request.headers.get("x-forwarded-proto");
+    const host = forwardedHost ?? request.nextUrl.host;
+    const proto =
+      forwardedProto ?? request.nextUrl.protocol.replace(/:$/, "");
+    const redirectUrl = `${proto}://${host}${next}`;
+    const response = NextResponse.redirect(redirectUrl);
     response.cookies.set(AUTH_COOKIE, token, {
       httpOnly: true,
       secure: process.env.NODE_ENV === "production",
