@@ -276,6 +276,33 @@ export async function getLatestBankAnchor(
 }
 
 /**
+ * List every anchor for an account, ordered by date DESC. Used by the
+ * bank-ledger route to enrich per-row Balance cells with the actual
+ * loaded anchor value alongside the computed running balance — so the
+ * user can sanity-check that anchors match the running sum on dates
+ * where the bank reported a balance.
+ */
+export async function listBankAnchors(
+  userId: string,
+  accountId: number,
+): Promise<Array<{ date: string; balance: number; source: string; currency: string }>> {
+  return await db
+    .select({
+      date: schema.bankDailyBalances.date,
+      balance: schema.bankDailyBalances.balance,
+      source: schema.bankDailyBalances.source,
+      currency: schema.bankDailyBalances.currency,
+    })
+    .from(schema.bankDailyBalances)
+    .where(and(
+      eq(schema.bankDailyBalances.userId, userId),
+      eq(schema.bankDailyBalances.accountId, accountId),
+    ))
+    .orderBy(desc(schema.bankDailyBalances.date))
+    .all();
+}
+
+/**
  * Sum bank_transactions.amount for rows strictly AFTER the given date,
  * within the account. Used to project from the latest anchor forward to
  * the current bank-side balance.

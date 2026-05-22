@@ -43,7 +43,7 @@ import { db, schema } from "@/db";
 import { requireEncryption } from "@/lib/auth/require-encryption";
 import { tryDecryptField } from "@/lib/crypto/envelope";
 import { decryptStaged } from "@/lib/crypto/staging-envelope";
-import { getLatestBankAnchor } from "@/lib/bank-ledger-balance";
+import { getLatestBankAnchor, listBankAnchors } from "@/lib/bank-ledger-balance";
 
 export const dynamic = "force-dynamic";
 
@@ -156,6 +156,15 @@ export async function GET(request: NextRequest) {
   //
   // Falls back to null on every row when no anchor exists.
   const anchor = await getLatestBankAnchor(userId, accountId);
+  // 2026-05-22 — also fetch every anchor so we can surface the actual
+  // loaded balance per date alongside the computed running balance.
+  // Users want to see "what the bank told us" vs "what the system
+  // computed" side-by-side for visual sanity-checking.
+  const allAnchors = await listBankAnchors(userId, accountId);
+  const anchorByDate = new Map<string, { balance: number; source: string }>();
+  for (const a of allAnchors) {
+    anchorByDate.set(a.date, { balance: a.balance, source: a.source });
+  }
   const endOfDayBalance = new Map<string, number>();
   if (anchor) {
     const dailySum = new Map<string, number>();
@@ -218,6 +227,12 @@ export async function GET(request: NextRequest) {
       // first row of each day in display order to reduce noise. Null
       // when the account has no anchor yet.
       runningBalance: endOfDayBalance.get(r.date) ?? null,
+      // 2026-05-22 — the actual loaded anchor for this date, if any. The
+      // UI renders this alongside `runningBalance` so the user can see
+      // both "what the bank told us" (anchor) and "what the system
+      // computed" (running). Null when no anchor exists for this date.
+      anchorBalance: anchorByDate.get(r.date)?.balance ?? null,
+      anchorSource: anchorByDate.get(r.date)?.source ?? null,
     };
   });
 
