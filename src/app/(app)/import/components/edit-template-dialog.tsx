@@ -139,43 +139,48 @@ export function EditTemplateDialog({
 
   return (
     <Dialog open={open} onOpenChange={onOpenChange}>
-      <DialogContent className="sm:max-w-lg">
+      {/* `flex flex-col` overrides DialogContent's default `grid` via tailwind-merge;
+          `max-h-[90vh]` + the inner scroll region keeps the footer reachable when
+          the import-options panel is expanded. */}
+      <DialogContent className="sm:max-w-2xl max-h-[90vh] flex flex-col overflow-hidden">
         <DialogHeader>
           <DialogTitle>Edit Template</DialogTitle>
           <DialogDescription>
-            Update this template&apos;s name, default account, and column mapping.
+            Update this template&apos;s name, default account, column mapping, and parser options.
           </DialogDescription>
         </DialogHeader>
 
-        <div className="space-y-4">
-          <div className="space-y-1.5">
-            <Label htmlFor="edit-tpl-name">Template Name</Label>
-            <Input
-              id="edit-tpl-name"
-              placeholder="e.g. TD Chequing, RBC Visa"
-              value={name}
-              onChange={(e) => setName(e.target.value)}
-            />
-          </div>
+        <div className="flex-1 min-h-0 overflow-y-auto space-y-4 pr-1">
+          <div className="grid gap-3 sm:grid-cols-2">
+            <div className="space-y-1.5">
+              <Label htmlFor="edit-tpl-name">Template Name</Label>
+              <Input
+                id="edit-tpl-name"
+                placeholder="e.g. TD Chequing, RBC Visa"
+                value={name}
+                onChange={(e) => setName(e.target.value)}
+              />
+            </div>
 
-          <div className="space-y-1.5">
-            <Label>Default Account (optional)</Label>
-            <Select
-              value={defaultAccount || NONE_ACCOUNT}
-              onValueChange={(v) =>
-                setDefaultAccount(!v || v === NONE_ACCOUNT ? "" : v)
-              }
-            >
-              <SelectTrigger>
-                <SelectValue placeholder="Leave blank to keep per-row account" />
-              </SelectTrigger>
-              <SelectContent>
-                <SelectItem value={NONE_ACCOUNT}>— none —</SelectItem>
-                {accounts.map((a) => (
-                  <SelectItem key={a} value={a}>{a}</SelectItem>
-                ))}
-              </SelectContent>
-            </Select>
+            <div className="space-y-1.5">
+              <Label>Default Account (optional)</Label>
+              <Select
+                value={defaultAccount || NONE_ACCOUNT}
+                onValueChange={(v) =>
+                  setDefaultAccount(!v || v === NONE_ACCOUNT ? "" : v)
+                }
+              >
+                <SelectTrigger>
+                  <SelectValue placeholder="Leave blank to keep per-row account" />
+                </SelectTrigger>
+                <SelectContent>
+                  <SelectItem value={NONE_ACCOUNT}>— none —</SelectItem>
+                  {accounts.map((a) => (
+                    <SelectItem key={a} value={a}>{a}</SelectItem>
+                  ))}
+                </SelectContent>
+              </Select>
+            </div>
           </div>
 
           <div className="flex items-start gap-3 rounded-lg border px-3 py-2.5">
@@ -199,10 +204,10 @@ export function EditTemplateDialog({
           <div className="space-y-2">
             <Label className="text-sm font-medium">Column Mapping</Label>
             <p className="text-xs text-muted-foreground">Map CSV columns to transaction fields.</p>
-            <div className="rounded-lg border divide-y">
+            <div className="grid gap-2 sm:grid-cols-2 rounded-lg border p-2">
               {MAPPING_FIELDS.map((field) => (
-                <div key={field} className="flex items-center gap-3 px-3 py-2">
-                  <span className="w-36 text-xs text-muted-foreground shrink-0">
+                <div key={field} className="flex items-center gap-2 px-2 py-1.5">
+                  <span className="w-28 text-xs text-muted-foreground shrink-0">
                     {FIELD_LABELS[field]}
                   </span>
                   <Select
@@ -211,7 +216,7 @@ export function EditTemplateDialog({
                       setMappingField(field, (!v || v === "__none__") ? "" : v)
                     }
                   >
-                    <SelectTrigger className="h-7 text-xs">
+                    <SelectTrigger className="h-7 text-xs flex-1">
                       <SelectValue placeholder="—" />
                     </SelectTrigger>
                     <SelectContent>
@@ -257,8 +262,6 @@ export function EditTemplateDialog({
                     onChange={(e) => setSkipFooterRows(e.target.value)}
                   />
                 </div>
-              </div>
-              <div className="grid gap-3 sm:grid-cols-2">
                 <div className="space-y-1">
                   <Label className="text-xs">Date format</Label>
                   <select

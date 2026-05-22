@@ -4,7 +4,6 @@ import { useState } from "react";
 import { Combobox } from "@/components/ui/combobox";
 import { FileDropZone } from "@/app/(app)/import/components/file-drop-zone";
 import { Loader2 } from "lucide-react";
-import { SUPPORTED_CURRENCIES } from "@/lib/fx/supported-currencies";
 
 import type { AccountOption } from "./preview-table";
 
@@ -97,11 +96,6 @@ export function ReconcileUploadCard({
     label: t.name,
   }));
 
-  const currencyItems = SUPPORTED_CURRENCIES.map((c) => ({
-    value: c,
-    label: c,
-  }));
-
   return (
     <div className="space-y-4">
       <div className="grid gap-3 sm:grid-cols-2">
@@ -171,79 +165,6 @@ export function ReconcileUploadCard({
           />
         </div>
       </div>
-
-      <details className="rounded-md border bg-muted/30 p-3">
-        <summary className="cursor-pointer text-xs font-medium text-muted-foreground">
-          Import options (skip header / footer rows, date format, default currency)
-        </summary>
-        <div className="mt-3 space-y-3">
-          <p className="text-xs text-muted-foreground">
-            Use when the parser&rsquo;s auto-detect mis-reads your bank&rsquo;s
-            export. Leave at defaults for canonical exports.
-          </p>
-          <div className="grid gap-3 sm:grid-cols-2">
-            <div className="space-y-1">
-              <label className="text-xs font-medium text-muted-foreground">
-                Skip N header rows
-              </label>
-              <input
-                type="number"
-                min={0}
-                max={100}
-                value={skipHeaderRows}
-                onChange={(e) => setSkipHeaderRows(e.target.value)}
-                className="h-9 w-full rounded-md border bg-transparent px-3 text-sm"
-              />
-            </div>
-            <div className="space-y-1">
-              <label className="text-xs font-medium text-muted-foreground">
-                Skip N footer rows
-              </label>
-              <input
-                type="number"
-                min={0}
-                max={100}
-                value={skipFooterRows}
-                onChange={(e) => setSkipFooterRows(e.target.value)}
-                className="h-9 w-full rounded-md border bg-transparent px-3 text-sm"
-              />
-            </div>
-          </div>
-          <div className="grid gap-3 sm:grid-cols-2">
-            <div className="space-y-1">
-              <label className="text-xs font-medium text-muted-foreground">
-                Date format
-              </label>
-              <select
-                value={dateFormatOverride}
-                onChange={(e) =>
-                  setDateFormatOverride(e.target.value as DateFormatOverrideUi)
-                }
-                className="h-9 w-full rounded-md border bg-transparent px-3 text-sm"
-              >
-                <option value="auto">Auto-detect</option>
-                <option value="DD/MM/YYYY">DD/MM/YYYY</option>
-                <option value="MM/DD/YYYY">MM/DD/YYYY</option>
-                <option value="YYYY-MM-DD">YYYY-MM-DD</option>
-              </select>
-            </div>
-            <div className="space-y-1">
-              <label className="text-xs font-medium text-muted-foreground">
-                Default currency (rows missing one)
-              </label>
-              <Combobox
-                value={defaultCurrency}
-                onValueChange={(v) => setDefaultCurrency(v ?? "")}
-                items={currencyItems}
-                placeholder="— None —"
-                searchPlaceholder="Search…"
-                emptyMessage="No matching currency"
-                className="w-full"
-              />
-            </div>
-          </div>
-        </div>
-      </details>
 
       <FileDropZone
         accept={ACCEPT}

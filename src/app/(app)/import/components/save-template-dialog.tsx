@@ -132,7 +132,7 @@ export function SaveTemplateDialog({
 
   return (
     <Dialog open={open} onOpenChange={handleOpenChange}>
-      <DialogContent className="sm:max-w-lg">
+      <DialogContent className="sm:max-w-2xl max-h-[90vh] flex flex-col overflow-hidden">
         <DialogHeader>
           <DialogTitle>Save as Template</DialogTitle>
           <DialogDescription>
@@ -140,45 +140,47 @@ export function SaveTemplateDialog({
           </DialogDescription>
         </DialogHeader>
 
-        <div className="space-y-4">
-          <div className="space-y-1.5">
-            <Label htmlFor="tpl-name">Template Name</Label>
-            <Input
-              id="tpl-name"
-              placeholder="e.g. TD Chequing, RBC Visa"
-              value={name}
-              onChange={(e) => setName(e.target.value)}
-            />
-          </div>
+        <div className="flex-1 min-h-0 overflow-y-auto space-y-4 pr-1">
+          <div className="grid gap-3 sm:grid-cols-2">
+            <div className="space-y-1.5">
+              <Label htmlFor="tpl-name">Template Name</Label>
+              <Input
+                id="tpl-name"
+                placeholder="e.g. TD Chequing, RBC Visa"
+                value={name}
+                onChange={(e) => setName(e.target.value)}
+              />
+            </div>
 
-          <div className="space-y-1.5">
-            <Label>Default Account (optional)</Label>
-            <Select value={defaultAccount} onValueChange={(v) => setDefaultAccount(v ?? "")}>
-              <SelectTrigger>
-                <SelectValue placeholder="Leave blank to keep per-row account" />
-              </SelectTrigger>
-              <SelectContent>
-                {accounts.map((a) => (
-                  <SelectItem key={a} value={a}>{a}</SelectItem>
-                ))}
-              </SelectContent>
-            </Select>
+            <div className="space-y-1.5">
+              <Label>Default Account (optional)</Label>
+              <Select value={defaultAccount} onValueChange={(v) => setDefaultAccount(v ?? "")}>
+                <SelectTrigger>
+                  <SelectValue placeholder="Leave blank to keep per-row account" />
+                </SelectTrigger>
+                <SelectContent>
+                  {accounts.map((a) => (
+                    <SelectItem key={a} value={a}>{a}</SelectItem>
+                  ))}
+                </SelectContent>
+              </Select>
+            </div>
           </div>
 
           <div className="space-y-2">
             <Label className="text-sm font-medium">Column Mapping</Label>
             <p className="text-xs text-muted-foreground">Map CSV columns to transaction fields.</p>
-            <div className="rounded-lg border divide-y">
+            <div className="grid gap-2 sm:grid-cols-2 rounded-lg border p-2">
               {MAPPING_FIELDS.map((field) => (
-                <div key={field} className="flex items-center gap-3 px-3 py-2">
-                  <span className="w-36 text-xs text-muted-foreground shrink-0">
+                <div key={field} className="flex items-center gap-2 px-2 py-1.5">
+                  <span className="w-28 text-xs text-muted-foreground shrink-0">
                     {FIELD_LABELS[field]}
                   </span>
                   <Select
                     value={mapping[field] ?? "__none__"}
                     onValueChange={(v) => setMappingField(field, (!v || v === "__none__") ? "" : v)}
                   >
-                    <SelectTrigger className="h-7 text-xs">
+                    <SelectTrigger className="h-7 text-xs flex-1">
                       <SelectValue placeholder="—" />
                     </SelectTrigger>
                     <SelectContent>
@@ -224,8 +226,6 @@ export function SaveTemplateDialog({
                     onChange={(e) => setSkipFooterRows(e.target.value)}
                   />
                 </div>
-              </div>
-              <div className="grid gap-3 sm:grid-cols-2">
                 <div className="space-y-1">
                   <Label className="text-xs">Date format</Label>
                   <select
