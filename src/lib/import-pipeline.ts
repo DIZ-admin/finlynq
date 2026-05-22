@@ -812,11 +812,29 @@ export async function executeImport(
         row.bankTransactionId = id;
       } catch (err) {
         // Two-ledger invariant — bank-ledger upserts MUST succeed or the
-        // import is rolled back. Silent-continue was the original
-        // behavior, but it produced exactly the symptom we saw on dev:
-        // transactions land with NULL bank_transaction_id, the left pane
-        // of /import/pending stays empty, and the user has no way to
-        // diagnose. Make it loud + fatal.
+        // import is rolled back. Make it loud + fatal.
+        //
+        // Drizzle's db.execute() wraps the underlying PG error in
+        // "Failed query: ... params: ..." form on `err.message` and
+        // attaches the original pg error as `err.cause`. We unwrap both
+        // so the surfaced error includes the actual PG message (e.g.
+        // "column \"X\" does not exist" / "violates check constraint
+        // \"Y\"") instead of just the wrapped query.
+        const cause = err instanceof Error ? (err as { cause?: unknown }).cause : null;
+        const causeMessage =
+          cause instanceof Error
+            ? cause.message
+            : typeof cause === "string"
+              ? cause
+              : null;
+        const causeCode =
+          cause && typeof cause === "object" && "code" in cause
+            ? String((cause as { code: unknown }).code ?? "")
+            : null;
+        const causeDetail =
+          cause && typeof cause === "object" && "detail" in cause
+            ? String((cause as { detail: unknown }).detail ?? "")
+            : null;
         // eslint-disable-next-line no-console
         console.error("[bank-ledger] upsert failed", {
           userId,
@@ -824,10 +842,21 @@ export async function executeImport(
           importHash: row.importHash,
           occurrenceIndex: occurrenceIndices[j],
           source: bankSource,
+          pgCode: causeCode,
+          pgMessage: causeMessage,
+          pgDetail: causeDetail,
           err: err instanceof Error ? { name: err.name, message: err.message, stack: err.stack } : String(err),
         });
+        // Build a human-readable message that surfaces the PG-level cause
+        // FIRST (typically "column does not exist" / "violates constraint")
+        // and the wrapped query string only as a fallback.
+        const pgPart = causeMessage
+          ? `${causeCode ? `[${causeCode}] ` : ""}${causeMessage}${causeDetail ? ` — ${causeDetail}` : ""}`
+          : err instanceof Error
+            ? err.message
+            : String(err);
         throw new Error(
-          `Bank-ledger upsert failed for row ${row.rowIndex + 1} (${row.date} / ${row.payeePlaintext.slice(0, 40)}): ${err instanceof Error ? err.message : String(err)}`,
+          `Bank-ledger upsert failed for row ${row.rowIndex + 1} (${row.date} / ${row.payeePlaintext.slice(0, 40)}): ${pgPart}`,
         );
       }
     }
