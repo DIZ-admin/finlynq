@@ -132,9 +132,13 @@ export async function upsertBankTransaction(
         ? encryptField(dek, row.accountName)
         : encryptStaged(row.accountName);
 
-  // Single-element array — array_append(EXCLUDED.source_filenames[1], …)
-  // on conflict.
-  const filenames = row.filename ? [row.filename] : [];
+  // source_filenames is TEXT[]. Drizzle's `${jsArray}::TEXT[]` pattern
+  // doesn't serialize a JS array to PG's `{elem1,elem2}` literal form —
+  // PG sees a bare string and 22P02s ("malformed array literal"). Build
+  // the array inline with ARRAY[…] using a properly-bound element instead.
+  const filenamesFragment = row.filename
+    ? sql`ARRAY[${row.filename}]::TEXT[]`
+    : sql`ARRAY[]::TEXT[]`;
 
   // The `xmax = 0` trick distinguishes a fresh INSERT from an ON CONFLICT
   // UPDATE — xmax is 0 for newly-inserted tuples and non-0 for the
@@ -165,7 +169,7 @@ export async function upsertBankTransaction(
       ${accountName},
       ${tier},
       ${row.source},
-      ${filenames}::TEXT[],
+      ${filenamesFragment},
       ${row.originalStagedImportId ?? null}
     )
     ON CONFLICT (user_id, account_id, import_hash, occurrence_index)
@@ -173,7 +177,8 @@ export async function upsertBankTransaction(
       last_seen_at = NOW(),
       seen_count = bank_transactions.seen_count + 1,
       source_filenames = CASE
-        WHEN EXCLUDED.source_filenames = ARRAY[]::TEXT[] THEN bank_transactions.source_filenames
+        WHEN array_length(EXCLUDED.source_filenames, 1) IS NULL
+          THEN bank_transactions.source_filenames
         ELSE array_append(bank_transactions.source_filenames, EXCLUDED.source_filenames[1])
       END
     RETURNING id, (xmax = 0) AS was_inserted
