@@ -317,6 +317,16 @@ export default function ReconcilePage() {
             fileHeaders: mappingHeaders,
             columnMapping: params.mapping,
             defaultAccount: params.defaultAccount ?? undefined,
+            // Persist the user's current parser knobs on the new template so
+            // the next upload from this source auto-applies them. The server
+            // clamps + validates these — UI sends raw values from pendingParams.
+            skipHeaderRows: pendingParams.skipHeaderRows,
+            skipFooterRows: pendingParams.skipFooterRows,
+            dateFormatOverride:
+              pendingParams.dateFormatOverride === "auto"
+                ? null
+                : pendingParams.dateFormatOverride,
+            defaultCurrency: pendingParams.defaultCurrency,
           }),
         });
         const saved = await tplRes.json();
@@ -370,7 +380,15 @@ export default function ReconcilePage() {
   );
 
   const templateOptions = useMemo(
-    () => templates.map((t) => ({ id: t.id, name: t.name })),
+    () =>
+      templates.map((t) => ({
+        id: t.id,
+        name: t.name,
+        skipHeaderRows: t.skipHeaderRows,
+        skipFooterRows: t.skipFooterRows,
+        dateFormatOverride: t.dateFormatOverride,
+        defaultCurrency: t.defaultCurrency,
+      })),
     [templates],
   );
 

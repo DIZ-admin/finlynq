@@ -11,6 +11,14 @@ import type { AccountOption } from "./preview-table";
 export interface TemplateOption {
   id: number;
   name: string;
+  /** FINLYNQ-54 follow-up — parser knobs persisted on the template. When a
+   *  user picks this template the upload card pre-fills the Import-options
+   *  panel from these fields (template wins per product decision). All four
+   *  are optional so legacy callers passing `{id, name}` still typecheck. */
+  skipHeaderRows?: number;
+  skipFooterRows?: number;
+  dateFormatOverride?: DateFormatOverrideUi | null;
+  defaultCurrency?: string | null;
 }
 
 /**
@@ -66,6 +74,19 @@ export function ReconcileUploadCard({
     useState<DateFormatOverrideUi>("auto");
   const [defaultCurrency, setDefaultCurrency] = useState<string>("");
 
+  /** Apply a picked template's parser knobs to the panel. Template wins;
+   *  any value the user typed before picking is overwritten. Statement
+   *  balance is intentionally NOT touched — that changes per upload. */
+  const applyTemplateKnobs = (templateId: string) => {
+    if (!templateId) return;
+    const tpl = templates.find((t) => String(t.id) === templateId);
+    if (!tpl) return;
+    setSkipHeaderRows(String(tpl.skipHeaderRows ?? 0));
+    setSkipFooterRows(String(tpl.skipFooterRows ?? 0));
+    setDateFormatOverride(tpl.dateFormatOverride ?? "auto");
+    setDefaultCurrency(tpl.defaultCurrency ?? "");
+  };
+
   const accountItems = accounts.map((a) => ({
     value: String(a.id),
     label: `${a.name} (${a.currency})`,
@@ -120,7 +141,11 @@ export function ReconcileUploadCard({
           </label>
           <Combobox
             value={selectedTemplateId}
-            onValueChange={(v) => setSelectedTemplateId(v ?? "")}
+            onValueChange={(v) => {
+              const next = v ?? "";
+              setSelectedTemplateId(next);
+              applyTemplateKnobs(next);
+            }}
             items={templateItems}
             placeholder="— Auto-detect —"
             searchPlaceholder="Search templates…"

@@ -495,6 +495,12 @@ export const importTemplates = pgTable("import_templates", {
   columnMapping: text("column_mapping").notNull(), // JSON: {date, amount, account?, payee?, category?, currency?, note?, tags?}
   defaultAccount: text("default_account"),
   isDefault: integer("is_default").notNull().default(0),
+  // FINLYNQ-54 follow-up — parser knobs persisted on the template so the
+  // upload UI can pre-fill them on next import. Mirrors staged_imports.
+  skipHeaderRows: integer("skip_header_rows").notNull().default(0),
+  skipFooterRows: integer("skip_footer_rows").notNull().default(0),
+  dateFormatOverride: text("date_format_override"),
+  defaultCurrency: text("default_currency"),
   createdAt: text("created_at").notNull(),
   updatedAt: text("updated_at").notNull(),
 });

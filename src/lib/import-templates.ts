@@ -15,6 +15,15 @@ export interface ColumnMapping {
   tags?: string;
 }
 
+/** Parser-knob shape persisted on `import_templates`. Mirrors the upload
+ *  UI's "Import options" panel and the same columns on `staged_imports`.
+ *  All fields have a sensible default that preserves pre-FINLYNQ-54 behavior
+ *  so templates created before the knobs landed read back as no-ops. */
+export type DateFormatOverride =
+  | "DD/MM/YYYY"
+  | "MM/DD/YYYY"
+  | "YYYY-MM-DD";
+
 export interface ImportTemplate {
   id: number;
   userId: string;
@@ -23,6 +32,10 @@ export interface ImportTemplate {
   columnMapping: ColumnMapping;
   defaultAccount?: string | null;
   isDefault: boolean;
+  skipHeaderRows: number;
+  skipFooterRows: number;
+  dateFormatOverride: DateFormatOverride | null;
+  defaultCurrency: string | null;
   createdAt: string;
   updatedAt: string;
 }
@@ -121,6 +134,10 @@ export function deserializeTemplate(row: {
   columnMapping: string;
   defaultAccount?: string | null;
   isDefault: number;
+  skipHeaderRows?: number | null;
+  skipFooterRows?: number | null;
+  dateFormatOverride?: string | null;
+  defaultCurrency?: string | null;
   createdAt: string;
   updatedAt: string;
 }): ImportTemplate {
@@ -132,7 +149,19 @@ export function deserializeTemplate(row: {
     columnMapping: JSON.parse(row.columnMapping) as ColumnMapping,
     defaultAccount: row.defaultAccount ?? null,
     isDefault: row.isDefault === 1,
+    skipHeaderRows: row.skipHeaderRows ?? 0,
+    skipFooterRows: row.skipFooterRows ?? 0,
+    dateFormatOverride: isDateFormatOverride(row.dateFormatOverride)
+      ? row.dateFormatOverride
+      : null,
+    defaultCurrency: row.defaultCurrency ?? null,
     createdAt: row.createdAt,
     updatedAt: row.updatedAt,
   };
+}
+
+function isDateFormatOverride(
+  v: string | null | undefined,
+): v is DateFormatOverride {
+  return v === "DD/MM/YYYY" || v === "MM/DD/YYYY" || v === "YYYY-MM-DD";
 }

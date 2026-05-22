@@ -4,7 +4,42 @@ import { eq } from "drizzle-orm";
 import { requireAuth } from "@/lib/auth/require-auth";
 import { safeErrorMessage } from "@/lib/validate";
 import { deserializeTemplate, autoDetectColumnMapping } from "@/lib/import-templates";
-import type { ColumnMapping } from "@/lib/import-templates";
+import type { ColumnMapping, DateFormatOverride } from "@/lib/import-templates";
+import { SUPPORTED_CURRENCIES } from "@/lib/fx/supported-currencies";
+
+/** Coerce + clamp the int knobs and validate the enum knobs. Returns the
+ *  shape we feed to Drizzle. Centralized so POST and PUT can't drift. */
+function sanitizeKnobs(body: {
+  skipHeaderRows?: unknown;
+  skipFooterRows?: unknown;
+  dateFormatOverride?: unknown;
+  defaultCurrency?: unknown;
+}): {
+  skipHeaderRows: number;
+  skipFooterRows: number;
+  dateFormatOverride: DateFormatOverride | null;
+  defaultCurrency: string | null;
+} {
+  const clampInt = (raw: unknown) => {
+    const n = typeof raw === "number" ? raw : Number.parseInt(String(raw ?? 0), 10);
+    if (!Number.isFinite(n) || n < 0) return 0;
+    return Math.min(100, Math.floor(n));
+  };
+  const fmtRaw = body.dateFormatOverride;
+  const fmt: DateFormatOverride | null =
+    fmtRaw === "DD/MM/YYYY" || fmtRaw === "MM/DD/YYYY" || fmtRaw === "YYYY-MM-DD"
+      ? fmtRaw
+      : null;
+  const ccyRaw = typeof body.defaultCurrency === "string" ? body.defaultCurrency.toUpperCase() : null;
+  const ccy =
+    ccyRaw && (SUPPORTED_CURRENCIES as readonly string[]).includes(ccyRaw) ? ccyRaw : null;
+  return {
+    skipHeaderRows: clampInt(body.skipHeaderRows),
+    skipFooterRows: clampInt(body.skipFooterRows),
+    dateFormatOverride: fmt,
+    defaultCurrency: ccy,
+  };
+}
 
 export async function GET(request: NextRequest) {
   const auth = await requireAuth(request);
@@ -36,6 +71,10 @@ export async function POST(request: NextRequest) {
       columnMapping?: ColumnMapping;
       defaultAccount?: string;
       isDefault?: boolean;
+      skipHeaderRows?: number;
+      skipFooterRows?: number;
+      dateFormatOverride?: string | null;
+      defaultCurrency?: string | null;
     };
 
     if (!body.name?.trim()) {
@@ -66,6 +105,8 @@ export async function POST(request: NextRequest) {
         ;
     }
 
+    const knobs = sanitizeKnobs(body);
+
     const result = await db
       .insert(schema.importTemplates)
       .values({
@@ -75,6 +116,10 @@ export async function POST(request: NextRequest) {
         columnMapping: JSON.stringify(mapping),
         defaultAccount: body.defaultAccount ?? null,
         isDefault: body.isDefault ? 1 : 0,
+        skipHeaderRows: knobs.skipHeaderRows,
+        skipFooterRows: knobs.skipFooterRows,
+        dateFormatOverride: knobs.dateFormatOverride,
+        defaultCurrency: knobs.defaultCurrency,
         createdAt: now,
         updatedAt: now,
       })
