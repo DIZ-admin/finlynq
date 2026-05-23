@@ -19,18 +19,28 @@ Tx-mutating MCP HTTP tools (`record_transaction`, `bulk_record_transactions`, `u
 
 ## Tool surface — current count
 
-**91 tools registered on HTTP / 87 on stdio** as of 2026-05-10 (#237 — `delete_category` added on both transports).
+**94 tools registered on HTTP / 87 on stdio** as of 2026-05-23 (FINLYNQ-95 — 3 lot/perf tools added to HTTP only).
 
 **Server version 3.1.0 as of 2026-05-10 (#237).** Every read/write tool returns the canonical `{ success: true, data: <T> }` envelope; `dataResponse(data)` helper at the top of `register-tools-pg.ts` (and twin `dataResponse` in `register-core-tools.ts` for stdio) wraps raw values consistently. `err(msg)` / `sqliteErr(msg)` continue to return the `{ content: [{ type: "text", text: "Error: ..." }] }` shape, with `isError: true` on stdio. Idempotency-key replay paths in `bulk_record_transactions` + `approve_staged_rows` defensively wrap pre-3.1.0 cached envelopes on the lookup branch (72h window) so the outer shape stays consistent across the rollover. **Callers that destructure top-level fields (`result.transactionId`, `result.imported`, raw arrays) MUST migrate to `result.data.*`.**
 
-The 6 HTTP-only tools (legacy carve-outs) are:
+The 9 HTTP-only tools (legacy carve-outs + Phase 2/3 lots) are:
 - File-upload flow: `list_pending_uploads`, `preview_import`, `execute_import`, `cancel_import`
 - `get_loans` (pre-existing HTTP-only read — stdio ships `list_loans` instead)
 - (1 historical adjustment — see consolidation log)
+- FINLYNQ-95 Phase 2/3 (2026-05-23): `get_realized_gains`, `get_dividend_income`, `get_portfolio_performance_v2` — HTTP-only because they JOIN through Stream-D-encrypted display columns (`portfolio_holdings.name_ct`, `accounts.name_ct`) which can't be decrypted on stdio. Stdio variants are tracked as a follow-up; would return numeric payloads with `holdingId` only, no decrypted names.
 
 The 7 staging-review tools added in #156 are HTTP-only behaviorally — stdio registers them too but every handler refuses with a "use HTTP MCP" error (so they appear in `tools/list` for discoverability instead of vanishing).
 
 ### Tool surface evolution
+
+- **2026-05-23 — Portfolio lots Phase 2 + 3 ([FINLYNQ-95](plan/portfolio-lots-and-performance.md))** (91 → 94 HTTP, no stdio change):
+  - **HTTP `get_realized_gains`.** Lot-level realized gains from `holding_lot_closures`. Filters: `from` / `to` / `taxYear` / `holdingId` / `accountId` / `term` (`short` ≤ 365d / `long` > 365d / `all`). Each row carries pre-computed `realizedGain` in the holding's own currency (post issue #96 paired-cash-leg substitution; issue #128 paired-cash-leg sell skipped at close time). JOIN through `portfolio_holdings` + `accounts` for decrypted display names — HTTP-only because stdio has no DEK to resolve `name_ct`. Reads return an empty list pre-backfill (no closure rows yet); the user-facing copy on `/portfolio/realized-gains` calls this out.
+  - **HTTP `get_dividend_income`.** Reads `transactions` where `category_id = (user's Dividends category)` per issue #84. Surfaces reinvested dividends (`qty > 0`) and withholding-tax entries (`amount < 0`) as separate `reinvestedCount` / `withholdingCount` per group (NOT netted, per issue #84 explicit choice). Group-by modes: `quarter` / `year` / `holding`; omit for raw rows. Same encryption surface as `get_realized_gains` — HTTP-only.
+  - **HTTP `get_portfolio_performance_v2`.** Reads `portfolio_snapshots` (populated nightly by the cron + admin backfill). Returns daily `marketValue` / `costBasis` / `contribution` series + TWRR (Modified Dietz chained daily) + MWRR (Newton-Raphson XIRR) + annualized TWRR. `gapsFilledDays` count flags ranges where `price_cache` or `fx_rates` fell back to last-known. Period choices: `1m` / `3m` / `6m` / `ytd` / `1y` / `all`; `accountId` scopes to one account (omit = whole-portfolio aggregate). Distinct from the legacy `get_portfolio_performance` (avg-cost aggregate); both coexist while the per-user `portfolio_lots_status.enabled` flag rolls out.
+  - **No stdio variants.** All three JOIN through Stream-D-encrypted columns. Adding stdio variants returning `holdingId` only is tracked as a follow-up; would need careful audit since stdio MCP currently refuses every portfolio-read tool (`get_portfolio_analysis` / `get_portfolio_performance` / `analyze_holding`) via `streamDRefuseRead` and that refusal stays in place until aggregator-level lot wiring lands.
+  - **Server version unchanged** at 3.1.0 — no envelope-shape break, just three additions.
+  - **Auto-annotations.** All three carry `readOnlyHint: true` (inferred from `get_*` prefix in `mcp-server/auto-annotations.ts`); none are destructive.
+  - **OAuth scope classification.** All three land in `mcp:read` (the `get_*` prefix rule in `src/lib/oauth-scopes.ts`).
 
 - **2026-05-10 — `delete_category` + envelope unification ([#237](https://github.com/finlynq/finlynq/issues/237))** (90 → 91 HTTP, 86 → 87 stdio; **BREAKING — server version 3.0.0 → 3.1.0**):
   - **HTTP `preview_delete_category` + `delete_category`.** Confirmation-token preview/execute pattern (mirrors `preview_bulk_categorize` / `execute_bulk_categorize`). Preview returns `{ id, name, txCount, ruleCount, subscriptionCount, inUse, confirmationToken }` with a 5-min TTL token; execute verifies + re-checks FK references atomically + commits. Refuses with explicit row counts when any `transactions.category_id` / `transaction_rules.assign_category_id` / `subscriptions.category_id` still references the row. Stream D Phase 4 read pattern: resolve `id` exact-match OR fuzzy-by-name when DEK is available (using `decryptNameish` + `fuzzyFind`, mirrors PR #228 fix to `delete_budget`). Calls `invalidateUserTxCache(userId)` after the commit (load-bearing per CLAUDE.md).
