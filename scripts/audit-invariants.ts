@@ -8,7 +8,7 @@
  * one" class of regression (issues #214, #211, #230, #205 cohort) before it
  * ships, not to prove soundness.
  *
- * Six invariants today (see CLAUDE.md "Load-bearing gotchas"):
+ * Seven invariants today (see CLAUDE.md "Load-bearing gotchas"):
  *
  *   1. sign-vs-category          — every transactions INSERT must call
  *                                  `validateSignVsCategory` or use
@@ -39,6 +39,13 @@
  *                                  or `SET name_ct = ...`) — schema defs,
  *                                  SELECT lists, comments, blog posts, etc.
  *                                  are excluded.
+ *   7. lots-write-hook           — every transactions write-site that
+ *                                  touches `portfolio_holding_id` must
+ *                                  apply lot effects via
+ *                                  `applyLotEffectsForTx` /
+ *                                  `*LotHook` / `reverseLotsForDeleteHook`
+ *                                  (plan/portfolio-lots-and-performance.md
+ *                                  Phase 1).
  *
  * Output:
  *   ALL INVARIANTS PASS                  (exit 0)
@@ -119,6 +126,19 @@ const BASELINE_EXCEPTIONS: Record<string, string> = {
   // redundant DB round-trip with no behavioral effect.
   "src/lib/queries.ts:sign-vs-category":
     "FINLYNQ-97 — validator moved to /api/transactions route boundary; advisory warning on success body",
+  // Lot-tracking wiring TODOs (Phase 1, 2026-05-25). The big-three MCP HTTP
+  // write tools below need lot hooks wired before portfolio_lots_status.enabled
+  // can flip TRUE for any user. Tracked as Phase 1 follow-up; backfill catches
+  // the gap in the meantime. Each baseline exception is a known wiring
+  // task, NOT a permanent "doesn't need lots" carve-out. Remove the
+  // exception line as each tool gets wired.
+  //
+  // bulk_record_transactions — needs per-row applyLotEffectsForTx loop after the batch INSERT.
+  // record_trade — buy-pair tool, needs openLotForBuyHook on the stock leg + paired-cash-leg substitution.
+  // update_transaction — needs reverseLotsForDeleteHook + redo via applyLotEffectsForTx.
+  // (record_transaction + delete_transaction are already wired as of 2026-05-25.)
+  "mcp-server/register-tools-pg.ts:lots-write-hook":
+    "Phase 1 follow-up — bulk_record_transactions / record_trade / update_transaction need lot wiring; record_transaction + delete_transaction already wired; backfill covers the gap until flag-flip",
 };
 
 interface InvariantConfig {
@@ -228,6 +248,31 @@ const INVARIANTS: InvariantConfig[] = [
     requiredHelper:
       /updated_at\s*=\s*NOW\(\)|updatedAt\s*:\s*sql`NOW\(\)`|updatedAt\s*:\s*sql\.raw\(['"`]NOW\(\)['"`]\)|updates\.push\(\s*["'`]updated_at\s*=\s*NOW\(\)/,
     helperName: "updated_at = NOW() (Drizzle: updatedAt: sql`NOW()`)",
+  },
+  {
+    id: "lots-write-hook",
+    description:
+      "every write-site touching transactions.portfolio_holding_id must apply lot effects (plan/portfolio-lots-and-performance.md Phase 1)",
+    // Narrow file globs — only the canonical writer surfaces. Other paths
+    // route through these (e.g. /api/import/staged/[id]/approve calls into
+    // executeImport + createTransferPair, both already wired).
+    fileGlobs: [
+      "src/app/api/transactions/route.ts",
+      "src/lib/transfer.ts",
+      "src/lib/import-pipeline.ts",
+      "mcp-server/register-tools-pg.ts",
+    ],
+    // Trigger fires only on writes that ACTUALLY touch portfolio_holding_id
+    // (raw SQL column reference) or portfolioHoldingId (Drizzle camelCase).
+    // A bare `db.delete(transactions)` doesn't flip the lot state on its
+    // own; the matching write-side INSERT/UPDATE flagged for the same file
+    // gets the hook.
+    writeSite:
+      /(?:INSERT\s+INTO\s+transactions[\s\S]{0,2000}?portfolio_holding_id|UPDATE\s+transactions\b[\s\S]{0,1000}?portfolio_holding_id|portfolioHoldingId\s*:)/i,
+    // Any of the lot hooks (or the dispatcher) satisfies the invariant.
+    requiredHelper:
+      /\b(?:applyLotEffectsForTx|openLotForBuyHook|closeLotsForSellHook|transferLotHook|reverseLotsForDeleteHook|openLotForBuy|closeLotsForSell|transferLot)\b/,
+    helperName: "applyLotEffectsForTx / *LotHook (Phase 1 lot tracking)",
   },
   {
     id: "buildNameFields-on-stream-d-tables",

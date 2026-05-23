@@ -49,6 +49,12 @@ import {
   getUserTransactions,
 } from "../src/lib/mcp/user-tx-cache";
 import {
+  applyLotEffectsForTx,
+  buildLotContext,
+  reverseLotsForDeleteHook,
+} from "../src/lib/portfolio/lots/write-hooks";
+import type { TxRowForLots } from "../src/lib/portfolio/lots/types";
+import {
   scanForPossibleDuplicates,
   dateBoundsForScan,
   type CommittedInsert,
@@ -2908,6 +2914,29 @@ export function registerPgTools(
       `);
 
       invalidateUserTxCache(userId);
+
+      // Portfolio lot tracking — open/close a lot for any row touching a
+      // holding with non-zero quantity. Soft-fails internally; never
+      // blocks the MCP response on lot-side errors.
+      if (resolvedHoldingId != null && quantity != null && quantity !== 0) {
+        const lotCtx = await buildLotContext(userId, dek);
+        const lotTx: TxRowForLots = {
+          id: result[0]?.id,
+          userId,
+          date: txDate,
+          amount: persistedAmount,
+          currency: resolved.currency,
+          enteredAmount: persistedEnteredAmount,
+          enteredCurrency: resolved.enteredCurrency,
+          quantity,
+          accountId: acct.id,
+          categoryId: catId ?? null,
+          portfolioHoldingId: resolvedHoldingId,
+          tradeLinkId: tradeLinkId ?? null,
+          source: "mcp_http",
+        };
+        await applyLotEffectsForTx(lotTx, lotCtx);
+      }
       return text({
         success: true,
         data: {
@@ -3764,6 +3793,10 @@ export function registerPgTools(
       if (!existing.length) return err(`Transaction #${id} not found`);
       const t = existing[0];
       const plainPayee = dek ? (decryptField(dek, String(t.payee ?? "")) ?? "") : t.payee;
+      // Portfolio lot tracking — reverse BEFORE the DELETE so closure rows
+      // are still in place for the lookup. CASCADE on holding_lots.open_tx_id
+      // catches anything reverseLotsForDeleteHook missed.
+      await reverseLotsForDeleteHook(userId, id);
       await db.execute(sql`DELETE FROM transactions WHERE id = ${id} AND user_id = ${userId}`);
       invalidateUserTxCache(userId);
       return text({ success: true, data: { message: `Deleted transaction #${id}: "${plainPayee}" ${t.amount} on ${t.date}` } });

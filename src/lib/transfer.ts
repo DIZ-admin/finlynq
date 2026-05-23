@@ -44,6 +44,8 @@ import {
   InvestmentHoldingRequiredError,
   isInvestmentAccount,
 } from "@/lib/investment-account";
+import { transferLotHook } from "@/lib/portfolio/lots/write-hooks";
+import type { TxRowForLots } from "@/lib/portfolio/lots/types";
 import type { FormatTag, TransactionSource } from "@/lib/tx-source";
 import { isFormatTag } from "@/lib/tx-source";
 
@@ -838,6 +840,50 @@ export async function createTransferPair(
 
   invalidateUserTxCache(userId);
 
+  // Portfolio lot tracking — in-kind transfer carryover (createTransferPair,
+  // Drizzle path). Inherits source lot's open_date + cost_per_share onto
+  // the dest lot so tax-lot age is preserved across the move. Soft-fails
+  // internally; never blocks the transfer-pair response on lot-side errors.
+  if (
+    holdingResolved &&
+    holdingResolved.fromHoldingId != null &&
+    holdingResolved.toHoldingId != null &&
+    holdingResolved.quantity != null &&
+    holdingResolved.quantity !== 0
+  ) {
+    const sourceTx: TxRowForLots = {
+      id: fromTransactionId,
+      userId,
+      date,
+      amount: -sentAmount,
+      currency: fromCurrency,
+      enteredAmount: -sentAmount,
+      enteredCurrency: fromCurrency,
+      quantity: -Math.abs(holdingResolved.quantity),
+      accountId: fromAcct.id,
+      categoryId,
+      portfolioHoldingId: holdingResolved.fromHoldingId,
+      tradeLinkId: null,
+      source: txSource,
+    };
+    const destTx: TxRowForLots = {
+      id: toTransactionId,
+      userId,
+      date,
+      amount: receivedAmount,
+      currency: toCurrency,
+      enteredAmount: sentAmount,
+      enteredCurrency: fromCurrency,
+      quantity: Math.abs(holdingResolved.destQuantity ?? holdingResolved.quantity),
+      accountId: toAcct.id,
+      categoryId,
+      portfolioHoldingId: holdingResolved.toHoldingId,
+      tradeLinkId: null,
+      source: txSource,
+    };
+    await transferLotHook(sourceTx, destTx, { holdingCurrency: fromCurrency });
+  }
+
   return {
     ok: true,
     linkId,
@@ -1586,6 +1632,16 @@ export async function deleteTransferPair(
     };
   }
 
+  // Portfolio lot tracking — reverse BOTH legs' lot effects before the
+  // bulk DELETE so closure rows are still in place for the
+  // reverseLotsForDeleteHook lookup. CASCADE on holdingLots.openTxId
+  // catches any leftovers as defense in depth.
+  const { reverseLotsForDeleteHook: reverseHook } = await import(
+    "@/lib/portfolio/lots/write-hooks"
+  );
+  await reverseHook(opts.userId, pair.source.id);
+  await reverseHook(opts.userId, pair.destination.id);
+
   // Use a SQL DELETE keyed on link_id + user_id so the operation is single-
   // statement atomic. (db.transaction would also work; prefer the simpler
   // path when both branches of the pair share an indexed key.)
@@ -2193,6 +2249,49 @@ export async function createTransferPairViaSql(
 
   invalidateUserTxCache(userId);
 
+  // Portfolio lot tracking — in-kind transfer carryover
+  // (createTransferPairViaSql, raw-SQL path). Same semantics as the
+  // Drizzle-path hook in createTransferPair above. Soft-fails internally.
+  if (
+    holdingResolved &&
+    holdingResolved.fromHoldingId != null &&
+    holdingResolved.toHoldingId != null &&
+    holdingResolved.quantity != null &&
+    holdingResolved.quantity !== 0
+  ) {
+    const sourceTx: TxRowForLots = {
+      id: fromTransactionId,
+      userId,
+      date,
+      amount: -sentAmount,
+      currency: fromCurrency,
+      enteredAmount: -sentAmount,
+      enteredCurrency: fromCurrency,
+      quantity: -Math.abs(holdingResolved.quantity),
+      accountId: fromAcct.id,
+      categoryId,
+      portfolioHoldingId: holdingResolved.fromHoldingId,
+      tradeLinkId: null,
+      source: txSource,
+    };
+    const destTx: TxRowForLots = {
+      id: toTransactionId,
+      userId,
+      date,
+      amount: receivedAmount,
+      currency: toCurrency,
+      enteredAmount: sentAmount,
+      enteredCurrency: fromCurrency,
+      quantity: Math.abs(holdingResolved.destQuantity ?? holdingResolved.quantity),
+      accountId: toAcct.id,
+      categoryId,
+      portfolioHoldingId: holdingResolved.toHoldingId,
+      tradeLinkId: null,
+      source: txSource,
+    };
+    await transferLotHook(sourceTx, destTx, { holdingCurrency: fromCurrency });
+  }
+
   return {
     ok: true,
     linkId,
@@ -2449,6 +2548,15 @@ export async function deleteTransferPairViaSql(
       code: "not-a-transfer-pair",
       message: "No transfer pair found for the given linkId/transactionId",
     };
+  }
+  // Portfolio lot tracking — reverse BOTH legs' lot effects before the
+  // DELETE so closure rows are still available to reverseLotsForDeleteHook.
+  {
+    const { reverseLotsForDeleteHook: reverseHook } = await import(
+      "@/lib/portfolio/lots/write-hooks"
+    );
+    await reverseHook(userId, pair.source.id);
+    await reverseHook(userId, pair.destination.id);
   }
   const result = await withClient(pool as unknown as SqlPool, (c) =>
     c.query(

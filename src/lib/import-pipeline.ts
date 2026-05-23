@@ -29,6 +29,11 @@ import {
   type DuplicateMatch,
 } from "./external-import/duplicate-detect";
 import { buildDuplicateCandidatePool } from "./external-import/duplicate-detect-pool";
+import {
+  applyLotEffectsForTx,
+  buildLotContext,
+} from "./portfolio/lots/write-hooks";
+import type { TxRowForLots } from "./portfolio/lots/types";
 
 export interface RawTransaction {
   date: string;
@@ -850,6 +855,11 @@ export async function executeImport(
     }
   }
 
+  // Portfolio lot tracking — one context per import, used for every
+  // inserted row that touches a portfolio holding. The hook itself
+  // soft-fails so a lot-side bug never breaks the import.
+  const lotCtx = await buildLotContext(userId, userDek ?? null);
+
   // Batch insert — encrypt text fields at the boundary (hash was computed on
   // plaintext above, so dedup stays stable across imports). Phase 6
   // (2026-04-29) dropped the legacy portfolio_holding text column; the
@@ -891,6 +901,33 @@ export async function executeImport(
             bankTransactionId: schema.transactions.bankTransactionId,
           });
         imported += inserted.length;
+
+        // Portfolio lot tracking — for each inserted row that has a
+        // portfolio_holding_id + non-zero quantity, open/close a lot.
+        // Soft-fails internally; never blocks the import batch.
+        // `inserted` preserves input order (PG INSERT RETURNING), so we
+        // can pair `inserted[k]` with `batch[k]` 1:1.
+        for (let k = 0; k < inserted.length; k++) {
+          const v = values[k];
+          if (v.portfolioHoldingId == null) continue;
+          if (v.quantity == null || v.quantity === 0) continue;
+          const lotTx: TxRowForLots = {
+            id: inserted[k].id,
+            userId,
+            date: v.date,
+            amount: v.amount ?? 0,
+            currency: v.currency,
+            enteredAmount: v.enteredAmount ?? null,
+            enteredCurrency: v.enteredCurrency ?? null,
+            quantity: v.quantity,
+            accountId: v.accountId,
+            categoryId: v.categoryId ?? null,
+            portfolioHoldingId: v.portfolioHoldingId,
+            tradeLinkId: null, // import-pipeline doesn't carry trade_link_id lineage
+            source: v.source,
+          };
+          await applyLotEffectsForTx(lotTx, lotCtx);
+        }
 
         // Dual-write retrofit for the two-ledger M:N model (Phase 5,
         // 2026-05-23). Insert a 'primary' join row for every

@@ -1183,3 +1183,149 @@ export const bankDailyBalances = pgTable("bank_daily_balances", {
     table.date,
   ),
 ]);
+
+// ─── holding_lots — per-lot cost basis tracking (Phase 1, 2026-05-25)
+//
+// Foundation for plan/portfolio-lots-and-performance.md. Each row is one
+// open lot (buy / dividend-reinvest / transfer-in / split-adjust /
+// backfilled). FIFO depletion on sell writes holdingLotClosures rows.
+//
+// No encrypted columns — display name lives on portfolioHoldings. Stdio
+// MCP can read this table directly without a DEK (unblocks the
+// streamDRefuseRead refusal on get_portfolio_analysis et al.).
+//
+// Migration: scripts/migrations/20260525_holding_lots_phase1.sql.
+export const holdingLots = pgTable(
+  "holding_lots",
+  {
+    id: serial("id").primaryKey(),
+    userId: text("user_id").notNull(),
+    holdingId: integer("holding_id")
+      .notNull()
+      .references(() => portfolioHoldings.id, { onDelete: "cascade" }),
+    accountId: integer("account_id")
+      .notNull()
+      .references(() => accounts.id, { onDelete: "cascade" }),
+    openTxId: integer("open_tx_id")
+      .notNull()
+      .references(() => transactions.id, { onDelete: "cascade" }),
+    // YYYY-MM-DD; inherits parent_lot's date on transfer-in legs.
+    openDate: text("open_date").notNull(),
+    qtyOriginal: doublePrecision("qty_original").notNull(),
+    qtyRemaining: doublePrecision("qty_remaining").notNull(),
+    // In `currency`. Multi-currency trades (issue #96): cost_per_share is
+    // computed from the cash leg's entered_amount, not the stock leg's amount.
+    costPerShare: doublePrecision("cost_per_share").notNull(),
+    currency: text("currency").notNull(),
+    fxToUsdAtOpen: doublePrecision("fx_to_usd_at_open"),
+    // 'buy' | 'reinvest_div' | 'transfer_in' | 'split_adj' | 'backfill'
+    // CHECK enforced in SQL.
+    origin: text("origin").notNull(),
+    parentLotId: integer("parent_lot_id").references(
+      (): any => holdingLots.id,
+      { onDelete: "set null" },
+    ),
+    // 'open' | 'closed' | 'transferred_out' — CHECK enforced in SQL.
+    status: text("status").notNull().default("open"),
+    // Mirrors transactions.source (tx-source.ts SOURCES tuple).
+    source: text("source").notNull().default("manual"),
+    createdAt: timestamp("created_at", { withTimezone: true }).notNull().defaultNow(),
+    updatedAt: timestamp("updated_at", { withTimezone: true }).notNull().defaultNow(),
+  },
+  (table) => [
+    // FIFO selection hot path: "open lots for (user, holding, account)
+    // ordered by open_date ASC, id ASC".
+    index("holding_lots_user_hold_acct_status_open_idx").on(
+      table.userId,
+      table.holdingId,
+      table.accountId,
+      table.status,
+      table.openDate,
+      table.id,
+    ),
+    // Reverse-by-tx hot path: reverseLotsForDelete maps a deleted
+    // transaction back to its lot.
+    index("holding_lots_open_tx_idx").on(table.openTxId),
+  ],
+);
+
+// ─── holding_lot_closures — one row per (close_tx, lot) pair
+//
+// A single sell can deplete multiple FIFO lots; a single transfer-out
+// closes exactly one lot. Realized gain is computed once at close time
+// and stored, so the Phase 2 tax-year query is a simple date filter.
+export const holdingLotClosures = pgTable(
+  "holding_lot_closures",
+  {
+    id: serial("id").primaryKey(),
+    userId: text("user_id").notNull(),
+    lotId: integer("lot_id")
+      .notNull()
+      .references(() => holdingLots.id, { onDelete: "cascade" }),
+    closeTxId: integer("close_tx_id")
+      .notNull()
+      .references(() => transactions.id, { onDelete: "cascade" }),
+    closeDate: text("close_date").notNull(),
+    qtyClosed: doublePrecision("qty_closed").notNull(),
+    // Post-issue-#96 substitution: paired sells use the cash leg's
+    // entered_amount as proceeds, not the stock leg's amount.
+    proceedsPerShare: doublePrecision("proceeds_per_share").notNull(),
+    // Snapshot of holdingLots.costPerShare at close time.
+    costPerShare: doublePrecision("cost_per_share").notNull(),
+    realizedGain: doublePrecision("realized_gain").notNull(),
+    currency: text("currency").notNull(),
+    daysHeld: integer("days_held").notNull(),
+    // 'sell' | 'transfer_out' — CHECK enforced in SQL.
+    closeKind: text("close_kind").notNull(),
+    source: text("source").notNull().default("manual"),
+    createdAt: timestamp("created_at", { withTimezone: true }).notNull().defaultNow(),
+    updatedAt: timestamp("updated_at", { withTimezone: true }).notNull().defaultNow(),
+  },
+  (table) => [
+    index("holding_lot_closures_user_close_date_idx").on(
+      table.userId,
+      table.closeDate,
+      table.lotId,
+    ),
+    index("holding_lot_closures_close_tx_idx").on(table.closeTxId),
+  ],
+);
+
+// ─── portfolio_lots_status — per-user feature flag + backfill watermark
+//
+// The three aggregators (REST overview, holdings-value lib, MCP HTTP)
+// branch on `enabled` to pick the lot-derived metrics path
+// (src/lib/portfolio/metrics.ts) vs the legacy avg-cost math. The
+// scripts/backfill-portfolio-lots.ts admin script sets `backfill_done`
+// after writing lot rows for every (holding, account) pair; an admin
+// flips `enabled` after canary verification.
+export const portfolioLotsStatus = pgTable("portfolio_lots_status", {
+  userId: text("user_id").primaryKey(),
+  backfillDone: boolean("backfill_done").notNull().default(false),
+  enabled: boolean("enabled").notNull().default(false),
+  backfilledAt: timestamp("backfilled_at", { withTimezone: true }),
+  notes: text("notes").notNull().default(""),
+});
+
+// ─── portfolio_legacy_realized_gain_snapshot — pre-cutover avg-cost gain
+//
+// Avg-cost realized gain ≠ FIFO realized gain on partial-sell users. This
+// table is the one-time snapshot of the legacy value per
+// (user, holding, account) at backfill time, surfaced as a tooltip on the
+// Phase 1 realized-gain column ("Pre-2026-05 avg-cost: $X"). Written
+// exactly once; never updated. DROPpable after a release cycle of
+// stability with all users enabled.
+export const portfolioLegacyRealizedGainSnapshot = pgTable(
+  "portfolio_legacy_realized_gain_snapshot",
+  {
+    userId: text("user_id").notNull(),
+    holdingId: integer("holding_id").notNull(),
+    accountId: integer("account_id").notNull(),
+    avgCostRealized: doublePrecision("avg_cost_realized").notNull(),
+    currency: text("currency").notNull(),
+    snappedAt: timestamp("snapped_at", { withTimezone: true }).notNull().defaultNow(),
+  },
+  (table) => [
+    primaryKey({ columns: [table.userId, table.holdingId, table.accountId] }),
+  ],
+);

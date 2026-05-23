@@ -10,6 +10,12 @@ import { buildHoldingResolver } from "@/lib/external-import/portfolio-holding-re
 import { convertToAccountCurrency } from "@/lib/currency-conversion";
 import { InvestmentHoldingRequiredError } from "@/lib/investment-account";
 import { validateSignVsCategoryById } from "@/lib/transactions/sign-category-invariant";
+import {
+  applyLotEffectsForTx,
+  buildLotContext,
+  reverseLotsForDeleteHook,
+} from "@/lib/portfolio/lots/write-hooks";
+import type { TxRowForLots } from "@/lib/portfolio/lots/types";
 import { db, schema } from "@/db";
 import { and, eq } from "drizzle-orm";
 import { z } from "zod";
@@ -492,6 +498,13 @@ export async function POST(request: NextRequest) {
     // path that forgets to set it — every entry point is grep-discoverable.
     const tx = await createTransaction(auth.userId, { ...encrypted, source: "manual" }, auth.dek);
     invalidateUserTxCache(auth.userId);
+    // Portfolio lot tracking — open/close a lot when the row touches a
+    // portfolio holding. Soft-fails internally; never blocks the REST
+    // response on lot-side errors.
+    if (tx && tx.portfolioHoldingId != null && tx.quantity != null && tx.quantity !== 0) {
+      const ctx = await buildLotContext(auth.userId, auth.dek);
+      await applyLotEffectsForTx(tx as TxRowForLots, ctx);
+    }
     return NextResponse.json(
       signWarn ? { ...tx, warning: signWarn.message } : tx,
       { status: 201 },
@@ -600,6 +613,16 @@ export async function PUT(request: NextRequest) {
     const encrypted = encryptTxWrite(auth.dek, data);
     const tx = await updateTransaction(id, auth.userId, encrypted, auth.dek);
     invalidateUserTxCache(auth.userId);
+    // Portfolio lot tracking — UPDATE may have changed quantity / amount /
+    // category / holding, so the conservative move is reverse + redo.
+    // Pure-metadata edits (note / payee / tags / date) still spend the
+    // reverse cycle, but reverseLotsForDeleteHook is a no-op when there
+    // are no lots tied to this tx.
+    await reverseLotsForDeleteHook(auth.userId, id);
+    if (tx && tx.portfolioHoldingId != null && tx.quantity != null && tx.quantity !== 0) {
+      const ctx = await buildLotContext(auth.userId, auth.dek);
+      await applyLotEffectsForTx(tx as TxRowForLots, ctx);
+    }
     return NextResponse.json(
       signWarn ? { ...tx, warning: signWarn.message } : tx,
     );
@@ -631,6 +654,11 @@ export async function DELETE(request: NextRequest) {
   const params = request.nextUrl.searchParams;
   const id = parseInt(params.get("id") ?? "0");
   if (!id) return NextResponse.json({ error: "Missing id" }, { status: 400 });
+  // Portfolio lot tracking — reverse BEFORE the tx delete so the closure
+  // rows are still in the table for the reverseLotsForDeleteHook lookup.
+  // The DELETE statement's ON DELETE CASCADE on holding_lots.open_tx_id
+  // would catch any lots reverseLotsForDeleteHook missed, defense in depth.
+  await reverseLotsForDeleteHook(auth.context.userId, id);
   await deleteTransaction(id, auth.context.userId);
   invalidateUserTxCache(auth.context.userId);
   return NextResponse.json({ success: true });
