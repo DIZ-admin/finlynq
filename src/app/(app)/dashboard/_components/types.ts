@@ -32,10 +32,29 @@ export type DashboardData = {
   displayCurrency?: string;
 };
 
+export type HealthExclusion = { name: string; reason: string; detail: string };
+
+export type HealthTotals = {
+  totalIncome3m?: { amount: number; currency: string; type: string };
+  totalExpenses3m?: { amount: number; currency: string; type: string };
+  totalIncome12m?: { amount: number; currency: string; type: string };
+  totalDebtPayments12m?: { amount: number; currency: string; type: string };
+  totalLiabilities?: { amount: number; currency: string; type: string };
+  liquidAssets?: { amount: number; currency: string; type: string };
+  netWorthToday?: { amount: number; currency: string; type: string };
+  netWorth90DaysAgo?: { amount: number; currency: string; type: string };
+  avgMonthlyExpenses3m?: { amount: number; currency: string; type: string };
+  ageOfMoneyDays?: number;
+  ageOfMoneyTrendDays?: number;
+};
+
 export type HealthData = {
   score: number;
   grade: string;
   components: { name: string; score: number; weight: number; weighted: number; detail: string }[];
+  excludedComponents?: HealthExclusion[];
+  reportingCurrency?: string;
+  totals?: HealthTotals;
 };
 
 export type SpotlightItem = {
