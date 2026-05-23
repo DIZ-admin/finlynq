@@ -229,27 +229,44 @@ When a parser-source anchor and an `upload_form` anchor share a date in the same
 ### Lifecycle
 
 ```
-upload   → extracted at /api/import/staging/upload, stored on
-           staged_imports.parsed_anchors (JSONB) + the form-typed
-           statementBalance / statementBalanceDate columns
+upload   → /api/import/staging/upload extracts anchors from the
+           parser (CSV Balance column / OFX <LEDGERBAL>) and stores
+           them on staged_imports.parsed_anchors (JSONB). The form-
+           typed statementBalance / statementBalanceDate / Currency
+           columns carry the upload_form anchor when set.
+           
+           The upload form's accountId is THE input that becomes
+           staged_imports.bound_account_id. Templates with
+           `default_account` set auto-fill the dropdown via
+           ReconcileUploadCard.applyTemplateKnobs which resolves
+           the stored account name against the loaded accounts
+           list. Without this, the dropdown stays empty even
+           when the user picked a template, accountId never
+           reaches the upload, and bound_account_id ends up NULL.
 
-approve  → /api/import/staged/[id]/approve dedups across sources
-           (parser-source wins over upload_form on date collision),
-           then upserts into bank_daily_balances via
+approve  → /api/import/staged/[id]/approve dedups anchors across
+           sources (parser-source wins over upload_form on date
+           collision), then upserts into bank_daily_balances via
            upsertBankBalanceAnchors. Gate:
              boundAccountId != null
              && dedupedAnchors.length > 0
-             && importErrors.length === 0
-           Explicitly NOT gated on `imported > 0`:
+           Explicitly NOT gated on `imported > 0` or on
+           `importErrors.length === 0`:
              - Anchors-only approve (every staged row is a duplicate,
                nothing to materialize) IS a valid commit path. The
-               default-approve filter at the top of the route also no
-               longer 400s "No rows selected" in this case — it short-
-               circuits the materialization loops, computes zero new
-               bank_transactions rows, then falls through to the
-               anchor upsert.
-             - importErrors.length > 0 (per-row materialization
-               failures) DOES suppress the upsert — rollback semantics.
+               default-approve filter at the top of the route also
+               no longer 400s "No rows selected" in this case — it
+               short-circuits the materialization loops, computes
+               zero new bank_transactions rows, then falls through
+               to the anchor upsert.
+             - The importErrors clause was tried as a rollback signal
+               but executeImport pushes per-row WARNINGS (not failures)
+               into that array, and a single warning silently
+               discarded every anchor. Real catastrophic failures
+               (bank-ledger upsert throws, FX engine throws) abort
+               the approve before reaching this block via earlier
+               returns, so the gate has full rollback semantics
+               without the false-positive clause.
 
 reject   → DELETE /api/import/staged/[id] cascades, dropping the
            staged_imports row + parsed_anchors JSONB. No anchors
@@ -257,6 +274,39 @@ reject   → DELETE /api/import/staged/[id] cascades, dropping the
 ```
 
 The anchors-only approve path is the load-bearing fix for "re-uploading a statement to refresh the bank-side balance silently no-ops when every row is already in the bank ledger" (the bug fixed 2026-05-22). UI hint on `/import/pending`: when `dedupedAnchorsCount > 0 && eligibleRowCount === 0`, an info banner above the row table tells the user that clicking Approve will still commit the anchors.
+
+### Calculated balance algorithm (2026-05-22 refactor)
+
+The bank-ledger pane shows two distinct Balance columns: **Calculated** (system-computed) and **Loaded** (bank's reported anchor for that date). Each column applies the one-balance-per-day display rule independently; both render "—" when null.
+
+**Calculated** uses per-date nearest-prior-anchor lookup with strict `<`:
+
+```
+For each visible row date d:
+  lastAnchor = most recent anchor in bank_daily_balances with
+               anchor.date < d  (STRICTLY before — not on the day itself)
+  if no lastAnchor:
+    calculated[d] = null    # no backward extrapolation from a future anchor
+  else:
+    calculated[d] = lastAnchor.balance
+                    + Σ(bank_tx.amount where lastAnchor.date < tx.date <= d)
+```
+
+Three properties fall out of strict-`<`:
+
+1. **On an anchor day, Calculated is derived from the PRIOR anchor** — independent of d's own anchor. The two columns become a real cross-check: agreement on an anchor day means the system's row sum matches the bank's reported balance for that day; disagreement is a real reconciliation signal (missing row, wrong amount, sign flip).
+
+2. **Between two anchors, drift only accumulates within that gap.** Crossing the next anchor going forward resets the segment to that anchor's truth. Errors never compound past an anchor boundary.
+
+3. **Dates before the first-ever anchor stay null.** We do not extrapolate backward from a future anchor — the bank never told us anything about that period.
+
+The previous algorithm picked the single LATEST anchor as a global checkpoint and projected from it across all dates via a uniform offset. With multiple anchors loaded (the typical case — one per day from a statement upload), every anchor except the latest was silently ignored by the math and drift compounded linearly across the whole history.
+
+Implementation lives in [/api/import/bank-ledger/route.ts](../../src/app/api/import/bank-ledger/route.ts) and uses [listBankAnchors](../../src/lib/bank-ledger-balance.ts) (returns all anchors for the account, DESC by date). Binary search over ASC-sorted anchors + precomputed cumulative sum of bank_tx amounts indexed by date gives O((N+M) log N) per request where N = unique row dates, M = anchor count.
+
+**Loaded** is a straight lookup: `anchorByDate.get(r.date) ?? null`. It's the same anchor row that drives the next-day Calculated for an adjacent date.
+
+**Critical**: when displaying mismatches between Calculated and Loaded on an anchor day, the discrepancy reveals real data issues. A pure same-day comparison (using d's own anchor as both source and validator) would always agree by construction and be useless.
 
 ### Validation algorithm
 
@@ -278,7 +328,7 @@ Checkpoint-style. **Errors do NOT compound forward**: a mismatched anchor in per
 
 ### Surfaces
 
-- `/import/pending` — pre-approve banner via [BalanceWarningBanner](../../src/components/staging/balance-warning-banner.tsx) when the staged batch's anchors don't line up with the running total. Approve still works regardless (warn-but-allow).
+- `/import/pending` — three balance-related surfaces. (a) [BalanceWarningBanner](../../src/components/staging/balance-warning-banner.tsx) above the row list when the staged batch's anchors don't line up with the running total. Approve still works regardless (warn-but-allow). (b) [BalanceSummaryCard](../../src/components/reconcile/balance-summary-card.tsx) header card for the bound account. (c) Two-column **Calculated + Loaded** Balance display in the bank-ledger pane's [DbPane](../../src/components/import/reconcile/db-pane.tsx) (split 2026-05-22 — was a single column with a stacked sub-line). Calculated uses the per-date nearest-prior-anchor algorithm above; Loaded shows the actual anchor value for that date. Both columns always render; cells show "—" when null. Disagreement between the two columns on an anchor day is the real reconciliation signal.
 - `/import/pending` — header card via [BalanceSummaryCard](../../src/components/reconcile/balance-summary-card.tsx) showing bank-side latest balance (`latestAnchor.balance + Σ(bank_tx.amount where date > latestAnchor.date)` when an anchor exists, **null when no anchor** — UI renders "—"), system-side latest balance (canonical account-balance rule), delta (null when bankSide is null), and status (`balanced | mismatch | no_anchor`). Relocated from `/reconcile` per user decision 2026-05-22 — surface compare at import time when the batch can still be rejected.
 - Approve route also returns `balanceWarnings: BalanceMismatch[]` in its JSON response so the post-approve toast can echo any final mismatch.
 
