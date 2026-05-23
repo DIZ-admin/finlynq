@@ -347,14 +347,14 @@ export default function AccountsPage() {
     SectionIcon: typeof TrendingUp,
     avatarClasses: string,
   ) => (
-    <div className="space-y-4">
+    <div className="space-y-2">
       <div className="flex items-center gap-2">
         <SectionIcon className={`h-5 w-5 ${color}`} />
         <h2 className="text-xl font-semibold">{title}</h2>
       </div>
       {groups(list).map(([group, accts]) => (
-        <Card key={group}>
-          <CardHeader className="pb-2">
+        <Card key={group} size="sm">
+          <CardHeader>
             <CardTitle className="text-xs font-medium uppercase tracking-wider text-muted-foreground">
               {group}
             </CardTitle>
@@ -364,23 +364,21 @@ export default function AccountsPage() {
               <div key={a.accountId} className={`flex items-center gap-1 rounded-lg hover:bg-muted/50 transition-colors group ${a.archived ? "opacity-60" : ""}`}>
                 <Link
                   href={`/accounts/${a.accountId}`}
-                  className="flex items-center justify-between flex-1 py-2.5 px-3 gap-2 min-w-0"
+                  className="flex items-center justify-between flex-1 py-1.5 px-3 gap-2 min-w-0"
                 >
                   <div className="flex items-center gap-3 min-w-0 flex-1">
                     <div
-                      className={`h-8 w-8 shrink-0 rounded-lg flex items-center justify-center text-xs font-bold ${avatarClasses}`}
+                      className={`h-7 w-7 shrink-0 rounded-lg flex items-center justify-center text-xs font-bold ${avatarClasses}`}
                     >
                       {a.accountName.charAt(0).toUpperCase()}
                     </div>
-                    <div className="min-w-0">
+                    <div className="flex items-center gap-2 min-w-0">
                       <p className="font-medium text-sm truncate">
                         {a.accountName}
                         {a.alias && <span className="ml-1.5 text-xs text-muted-foreground font-normal">({a.alias})</span>}
                       </p>
-                      <div className="flex items-center gap-1.5 mt-0.5">
-                        <Badge variant="outline" className="text-[10px]">{a.currency}</Badge>
-                        {a.archived && <Badge variant="secondary" className="text-[10px]">Archived</Badge>}
-                      </div>
+                      <Badge variant="outline" className="text-[10px] shrink-0">{a.currency}</Badge>
+                      {a.archived && <Badge variant="secondary" className="text-[10px] shrink-0">Archived</Badge>}
                     </div>
                   </div>
                   <span className={`font-mono text-sm font-semibold shrink-0 ${a.balance >= 0 ? color : "text-rose-600"}`}>
@@ -542,7 +540,7 @@ export default function AccountsPage() {
 
   if (accounts.length === 0) {
     return (
-      <div className="space-y-6">
+      <div className="space-y-4">
         <OnboardingTips page="accounts" />
         <div className="flex items-center justify-between">
           <div>
@@ -562,7 +560,7 @@ export default function AccountsPage() {
   }
 
   return (
-    <div className="space-y-6">
+    <div className="space-y-4">
       <OnboardingTips page="accounts" />
       <div className="flex items-center justify-between">
         <div>
@@ -591,12 +589,12 @@ export default function AccountsPage() {
           { label: "Total Liabilities", value: totalLiabilitiesConverted, Icon: TrendingDown, color: "rose" },
         ].map(({ label, value, Icon, color }) => (
           <Card key={label}>
-            <CardContent className="pt-4 pb-3">
-              <div className={`flex h-8 w-8 items-center justify-center rounded-lg mb-2 ${color === "emerald" ? "bg-emerald-100 text-emerald-600" : "bg-rose-100 text-rose-600"}`}>
+            <CardContent className="pt-3 pb-3">
+              <div className={`flex h-7 w-7 items-center justify-center rounded-lg mb-1.5 ${color === "emerald" ? "bg-emerald-100 text-emerald-600" : "bg-rose-100 text-rose-600"}`}>
                 <Icon className="h-4 w-4" />
               </div>
               <p className="text-xs text-muted-foreground truncate">{label}</p>
-              <p className={`text-lg font-bold mt-0.5 ${color === "emerald" ? "text-emerald-600" : "text-rose-600"}`}>
+              <p className={`text-lg font-bold mt-0 ${color === "emerald" ? "text-emerald-600" : "text-rose-600"}`}>
                 {formatCurrency(value, displayCurrency)}
               </p>
             </CardContent>
@@ -604,7 +602,7 @@ export default function AccountsPage() {
         ))}
       </div>
 
-      <div className="grid grid-cols-1 lg:grid-cols-2 gap-8">
+      <div className="grid grid-cols-1 lg:grid-cols-2 gap-4">
         {renderSection("Assets", assets, "text-emerald-600", ArrowUpRight, "bg-indigo-100 text-indigo-700")}
         {renderSection("Liabilities", liabilities, "text-rose-600", ArrowDownRight, "bg-rose-100 text-rose-700")}
       </div>
