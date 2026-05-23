@@ -14,7 +14,7 @@
  */
 
 import { useEffect, useMemo, useState } from "react";
-import { useRouter } from "next/navigation";
+import { useRouter, useSearchParams } from "next/navigation";
 import Link from "next/link";
 import {
   Card,
@@ -61,6 +61,11 @@ function todayISO(): string {
 
 export default function TransferForm() {
   const router = useRouter();
+  const searchParams = useSearchParams();
+  const editIdParam = searchParams.get("editId");
+  const editId = editIdParam ? Number(editIdParam) : null;
+  const isEdit =
+    editId != null && Number.isFinite(editId) && editId > 0;
 
   const [accounts, setAccounts] = useState<AccountRow[]>([]);
   const [holdings, setHoldings] = useState<HoldingRow[]>([]);
@@ -78,6 +83,9 @@ export default function TransferForm() {
   const [submitting, setSubmitting] = useState(false);
   const [errors, setErrors] = useState<Record<string, string>>({});
   const [submitError, setSubmitError] = useState<string | null>(null);
+  const [blockingClosureTxIds, setBlockingClosureTxIds] = useState<number[]>(
+    [],
+  );
 
   useEffect(() => {
     let cancelled = false;
@@ -101,6 +109,65 @@ export default function TransferForm() {
       cancelled = true;
     };
   }, []);
+
+  // Load existing operation data on mount when editId is present.
+  useEffect(() => {
+    if (!isEdit) return;
+    let cancelled = false;
+    fetch(`/api/portfolio/operations/load?id=${editId}`)
+      .then(async (r) => {
+        if (cancelled) return;
+        const json: {
+          error?: string;
+          data?: {
+            op?: string;
+            sourceAccountId?: number;
+            destAccountId?: number;
+            holdingId?: number;
+            qty?: number;
+            date?: string;
+            payee?: string | null;
+            note?: string | null;
+          };
+        } = await r.json().catch(() => ({}));
+        if (cancelled) return;
+        if (!r.ok) {
+          setLoadError(
+            json.error ?? `Failed to load edit data (${r.status})`,
+          );
+          return;
+        }
+        const d = json.data;
+        if (!d) {
+          setLoadError("Failed to load edit data (empty response)");
+          return;
+        }
+        if (d.op !== "transfer") {
+          setLoadError(
+            `This edit link is for "${d.op}" — use that form instead.`,
+          );
+          return;
+        }
+        if (d.sourceAccountId != null)
+          setSourceAccountId(String(d.sourceAccountId));
+        if (d.destAccountId != null)
+          setDestAccountId(String(d.destAccountId));
+        if (d.holdingId != null) setHoldingId(String(d.holdingId));
+        if (d.qty != null) setQty(String(d.qty));
+        if (d.date) setDate(d.date);
+        setPayee(d.payee ?? "");
+        setNote(d.note ?? "");
+      })
+      .catch((e: unknown) => {
+        if (cancelled) return;
+        setLoadError(
+          e instanceof Error ? e.message : "Failed to load edit data",
+        );
+      });
+    return () => {
+      cancelled = true;
+    };
+  }, [editId, isEdit]);
 
   const investmentAccounts = useMemo(
     () => accounts.filter((a) => a.isInvestment === true),
@@ -159,6 +226,7 @@ export default function TransferForm() {
   async function handleSubmit(e: React.FormEvent) {
     e.preventDefault();
     setSubmitError(null);
+    setBlockingClosureTxIds([]);
     if (!validate()) return;
     setSubmitting(true);
     try {
@@ -171,16 +239,32 @@ export default function TransferForm() {
       };
       if (payee.trim()) body.payee = payee.trim();
       if (note.trim()) body.note = note.trim();
+      if (isEdit) body.editId = editId;
       const res = await fetch("/api/portfolio/operations/transfer", {
         method: "POST",
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify(body),
       });
       if (!res.ok) {
-        const data: { error?: string; code?: string } = await res
-          .json()
-          .catch(() => ({}));
-        setSubmitError(data.error ?? `Save failed (${res.status})`);
+        const data: {
+          error?: string;
+          code?: string;
+          blockingClosureTxIds?: unknown;
+        } = await res.json().catch(() => ({}));
+        if (data.code === "portfolio_edit_blocked") {
+          setBlockingClosureTxIds(
+            Array.isArray(data.blockingClosureTxIds)
+              ? (data.blockingClosureTxIds.filter(
+                  (n) => typeof n === "number",
+                ) as number[])
+              : [],
+          );
+          setSubmitError(
+            data.error ?? "Edit blocked — dependent transactions exist",
+          );
+        } else {
+          setSubmitError(data.error ?? `Save failed (${res.status})`);
+        }
         return;
       }
       router.push("/transactions");
@@ -231,7 +315,9 @@ export default function TransferForm() {
   return (
     <Card>
       <CardHeader>
-        <CardTitle>In-kind transfer</CardTitle>
+        <CardTitle>
+          {isEdit ? "Edit In-kind transfer" : "In-kind transfer"}
+        </CardTitle>
         <CardDescription>
           Move shares of a single holding between two investment accounts. No
           cash leg — qty leaves the source and arrives in the destination at the
@@ -391,6 +477,26 @@ export default function TransferForm() {
             <p className="text-sm text-destructive">{submitError}</p>
           )}
 
+          {blockingClosureTxIds.length > 0 && (
+            <div className="rounded-md border border-amber-300/60 bg-amber-50 dark:bg-amber-950/40 dark:border-amber-800/60 p-3 text-xs">
+              <p className="font-medium text-amber-900 dark:text-amber-200 mb-1.5">
+                Delete these dependent transactions first:
+              </p>
+              <ul className="space-y-1">
+                {blockingClosureTxIds.map((id) => (
+                  <li key={id}>
+                    <Link
+                      href={`/transactions?search=%23${id}`}
+                      className="text-amber-700 dark:text-amber-300 underline hover:no-underline"
+                    >
+                      Transaction #{id}
+                    </Link>
+                  </li>
+                ))}
+              </ul>
+            </div>
+          )}
+
           <div className="flex gap-2 pt-1">
             <Button
               type="button"
@@ -401,8 +507,18 @@ export default function TransferForm() {
             >
               Cancel
             </Button>
-            <Button type="submit" className="flex-1" disabled={submitting}>
-              {submitting ? "Recording…" : "Record transfer"}
+            <Button
+              type="submit"
+              className="flex-1"
+              disabled={submitting || !!loadError}
+            >
+              {submitting
+                ? isEdit
+                  ? "Saving…"
+                  : "Recording…"
+                : isEdit
+                  ? "Save edit"
+                  : "Record transfer"}
             </Button>
           </div>
         </form>

@@ -668,29 +668,104 @@ export async function DELETE(request: NextRequest) {
   // DELETE doesn't need the DEK — IDs and user-scope only.
   const auth = await requireAuth(request);
   if (!auth.authenticated) return auth.response;
+  const { userId } = auth.context;
   const params = request.nextUrl.searchParams;
   const id = parseInt(params.get("id") ?? "0");
   if (!id) return NextResponse.json({ error: "Missing id" }, { status: 400 });
-  // Portfolio edit-guard — same rule as PUT. Refuses to delete a buy
-  // whose lot has been sold/transferred out; the user must delete the
-  // dependent closure rows first.
-  const guard = await canEditPortfolioRow(auth.context.userId, id);
-  if (!guard.allowed) {
+
+  // Phase 2 portfolio-ops refactor (2026-05-25): paired rows from
+  // operations.ts share a `trade_link_id` (buy/sell cash leg pairs) or
+  // `link_id` (in-kind transfers, FX conversions). Deleting one leg without
+  // the sibling leaves an orphan that breaks account-level invariants
+  // (cash sleeve sum drifts, lot bookkeeping desyncs). Compute the full
+  // "delete set" up front — the target + every sibling sharing either
+  // link — then run the edit-guard + delete loop over the entire set.
+  const target = await db
+    .select({
+      id: schema.transactions.id,
+      tradeLinkId: schema.transactions.tradeLinkId,
+      linkId: schema.transactions.linkId,
+    })
+    .from(schema.transactions)
+    .where(
+      and(
+        eq(schema.transactions.id, id),
+        eq(schema.transactions.userId, userId),
+      ),
+    )
+    .get();
+  if (!target) {
+    return NextResponse.json({ error: "Transaction not found" }, { status: 404 });
+  }
+  const idSet = new Set<number>([id]);
+  if (target.tradeLinkId) {
+    const siblings = await db
+      .select({ id: schema.transactions.id })
+      .from(schema.transactions)
+      .where(
+        and(
+          eq(schema.transactions.userId, userId),
+          eq(schema.transactions.tradeLinkId, target.tradeLinkId),
+        ),
+      );
+    for (const r of siblings) idSet.add(r.id);
+  }
+  if (target.linkId) {
+    const siblings = await db
+      .select({ id: schema.transactions.id })
+      .from(schema.transactions)
+      .where(
+        and(
+          eq(schema.transactions.userId, userId),
+          eq(schema.transactions.linkId, target.linkId),
+        ),
+      );
+    for (const r of siblings) idSet.add(r.id);
+  }
+  const allIds = Array.from(idSet);
+
+  // Portfolio edit-guard — applies to EVERY id in the delete set. The user
+  // can't delete a buy that has been sold (the sell's closures lock the buy
+  // in place); they have to delete the sell first. We check each row in the
+  // set and aggregate any blocking ids so the UI can surface a single
+  // actionable list.
+  const blockingClosureTxIds: number[] = [];
+  for (const txId of allIds) {
+    const guard = await canEditPortfolioRow(userId, txId);
+    if (!guard.allowed && guard.blockingClosureTxIds) {
+      for (const b of guard.blockingClosureTxIds) {
+        // Exclude ids already in the delete set — the user is deleting
+        // them, so they're not "blocking" the operation.
+        if (!idSet.has(b)) blockingClosureTxIds.push(b);
+      }
+    }
+  }
+  if (blockingClosureTxIds.length > 0) {
     return NextResponse.json(
       {
-        error: guard.reason,
+        error:
+          `This transaction opens one or more lots that have been sold or transferred out. ` +
+          `Delete the ${blockingClosureTxIds.length} dependent transaction(s) first, then retry.`,
         code: "portfolio_edit_blocked",
-        blockingClosureTxIds: guard.blockingClosureTxIds ?? [],
+        blockingClosureTxIds,
       },
       { status: 409 },
     );
   }
-  // Portfolio lot tracking — reverse BEFORE the tx delete so the closure
-  // rows are still in the table for the reverseLotsForDeleteHook lookup.
-  // The DELETE statement's ON DELETE CASCADE on holding_lots.open_tx_id
-  // would catch any lots reverseLotsForDeleteHook missed, defense in depth.
-  await reverseLotsForDeleteHook(auth.context.userId, id);
-  await deleteTransaction(id, auth.context.userId);
-  invalidateUserTxCache(auth.context.userId);
-  return NextResponse.json({ success: true });
+
+  // Reverse lots BEFORE deleting tx rows so reverseLotsForDeleteHook can
+  // see them. ON DELETE CASCADE on holding_lots.open_tx_id catches any
+  // strays as defense-in-depth.
+  for (const txId of allIds) {
+    await reverseLotsForDeleteHook(userId, txId);
+  }
+  for (const txId of allIds) {
+    await deleteTransaction(txId, userId);
+  }
+  invalidateUserTxCache(userId);
+  return NextResponse.json({
+    success: true,
+    deletedIds: allIds,
+    cascaded: allIds.length > 1,
+  });
 }

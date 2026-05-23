@@ -13,7 +13,7 @@
  */
 
 import { useEffect, useMemo, useState } from "react";
-import { useRouter } from "next/navigation";
+import { useRouter, useSearchParams } from "next/navigation";
 import Link from "next/link";
 import {
   Card,
@@ -58,7 +58,38 @@ function todayISO(): string {
   return new Date().toISOString().slice(0, 10);
 }
 
+function SwapEditNotice() {
+  return (
+    <Card>
+      <CardHeader>
+        <CardTitle>Edit Swap</CardTitle>
+      </CardHeader>
+      <CardContent className="space-y-3">
+        <p className="text-sm text-muted-foreground">
+          Swaps are two independent operations (a sell + a buy) under the hood,
+          so they can&apos;t be edited as one unit. Delete the original sell and
+          buy from the transactions list, then create a fresh swap here.
+        </p>
+        <Link href="/transactions" className="text-sm text-primary underline">
+          ← Back to transactions
+        </Link>
+      </CardContent>
+    </Card>
+  );
+}
+
 export default function SwapForm() {
+  const searchParams = useSearchParams();
+  const editIdParam = searchParams.get("editId");
+  const isEdit = editIdParam != null && /^\d+$/.test(editIdParam);
+  // Swaps are recorded as two unlinked op pairs (a sell + a buy), so the load
+  // endpoint can't reconstruct a single swap. Render a notice early — note
+  // that all hooks below live in SwapCreateForm to keep hook order stable.
+  if (isEdit) return <SwapEditNotice />;
+  return <SwapCreateForm />;
+}
+
+function SwapCreateForm() {
   const router = useRouter();
 
   const [accounts, setAccounts] = useState<AccountRow[]>([]);

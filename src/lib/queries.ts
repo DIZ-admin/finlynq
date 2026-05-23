@@ -300,6 +300,13 @@ export async function getTransactions(userId: string, filters?: TxSortFilter) {
       createdAt: transactions.createdAt,
       updatedAt: transactions.updatedAt,
       source: transactions.source,
+      // Phase 2 portfolio-ops refactor (2026-05-25) — surface kind +
+      // tradeLinkId so the transactions UI can:
+      //   - route the Edit button on portfolio rows to /portfolio/new
+      //   - mark paired cash legs as such in the ledger
+      //   - show "cascade delete will also remove sibling X" in the confirm
+      kind: transactions.kind,
+      tradeLinkId: transactions.tradeLinkId,
     })
     .from(transactions)
     .leftJoin(accounts, eq(transactions.accountId, accounts.id))

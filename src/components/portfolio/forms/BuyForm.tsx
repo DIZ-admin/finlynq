@@ -12,7 +12,7 @@
  */
 
 import { useEffect, useMemo, useState } from "react";
-import { useRouter } from "next/navigation";
+import { useRouter, useSearchParams } from "next/navigation";
 import Link from "next/link";
 import {
   Card,
@@ -60,6 +60,11 @@ function todayISO(): string {
 
 export default function BuyForm() {
   const router = useRouter();
+  const searchParams = useSearchParams();
+  const editIdParam = searchParams.get("editId");
+  const editId = editIdParam ? Number(editIdParam) : null;
+  const isEdit =
+    editId != null && Number.isFinite(editId) && editId > 0;
 
   const [accounts, setAccounts] = useState<AccountRow[]>([]);
   const [holdings, setHoldings] = useState<HoldingRow[]>([]);
@@ -78,6 +83,9 @@ export default function BuyForm() {
   const [submitting, setSubmitting] = useState(false);
   const [errors, setErrors] = useState<Record<string, string>>({});
   const [submitError, setSubmitError] = useState<string | null>(null);
+  const [blockingClosureTxIds, setBlockingClosureTxIds] = useState<number[]>(
+    [],
+  );
 
   useEffect(() => {
     let cancelled = false;
@@ -101,6 +109,65 @@ export default function BuyForm() {
       cancelled = true;
     };
   }, []);
+
+  // Load existing operation data on mount when editId is present.
+  useEffect(() => {
+    if (!isEdit) return;
+    let cancelled = false;
+    fetch(`/api/portfolio/operations/load?id=${editId}`)
+      .then(async (r) => {
+        if (cancelled) return;
+        const json: {
+          error?: string;
+          data?: {
+            op?: string;
+            accountId?: number;
+            holdingId?: number;
+            qty?: number;
+            totalCost?: number;
+            date?: string;
+            payee?: string | null;
+            note?: string | null;
+            tags?: string | null;
+          };
+        } = await r.json().catch(() => ({}));
+        if (cancelled) return;
+        if (!r.ok) {
+          setLoadError(
+            json.error ?? `Failed to load edit data (${r.status})`,
+          );
+          return;
+        }
+        const d = json.data;
+        if (!d) {
+          setLoadError("Failed to load edit data (empty response)");
+          return;
+        }
+        if (d.op !== "buy") {
+          setLoadError(
+            `This edit link is for "${d.op}" — use that form instead.`,
+          );
+          return;
+        }
+        if (d.accountId != null) setAccountId(String(d.accountId));
+        if (d.holdingId != null) setHoldingId(String(d.holdingId));
+        if (d.qty != null) setQty(String(d.qty));
+        if (d.totalCost != null) setTotalCost(String(d.totalCost));
+        if (d.date) setDate(d.date);
+        setPayee(d.payee ?? "");
+        setNote(d.note ?? "");
+        setTags(d.tags ?? "");
+      })
+      .catch((e: unknown) => {
+        if (cancelled) return;
+        setLoadError(
+          e instanceof Error ? e.message : "Failed to load edit data",
+        );
+      });
+    return () => {
+      cancelled = true;
+    };
+  }, [editId, isEdit]);
 
   const investmentAccounts = useMemo(
     () => accounts.filter((a) => a.isInvestment === true),
@@ -166,6 +233,7 @@ export default function BuyForm() {
   async function handleSubmit(e: React.FormEvent) {
     e.preventDefault();
     setSubmitError(null);
+    setBlockingClosureTxIds([]);
     if (!validate()) return;
     if (cashSleeveMissing) {
       setSubmitError(
@@ -185,18 +253,33 @@ export default function BuyForm() {
       if (payee.trim()) body.payee = payee.trim();
       if (note.trim()) body.note = note.trim();
       if (tags.trim()) body.tags = tags.trim();
+      if (isEdit) body.editId = editId;
       const res = await fetch("/api/portfolio/operations/buy", {
         method: "POST",
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify(body),
       });
       if (!res.ok) {
-        const data: { error?: string; code?: string; currency?: string } = await res
-          .json()
-          .catch(() => ({}));
+        const data: {
+          error?: string;
+          code?: string;
+          currency?: string;
+          blockingClosureTxIds?: unknown;
+        } = await res.json().catch(() => ({}));
         if (data.code === "cash_sleeve_not_found") {
           setSubmitError(
             `No ${data.currency ?? selectedHolding?.currency ?? ""} cash sleeve exists in this account. Create one via the account's Cash sleeves panel first.`,
+          );
+        } else if (data.code === "portfolio_edit_blocked") {
+          setBlockingClosureTxIds(
+            Array.isArray(data.blockingClosureTxIds)
+              ? (data.blockingClosureTxIds.filter(
+                  (n) => typeof n === "number",
+                ) as number[])
+              : [],
+          );
+          setSubmitError(
+            data.error ?? "Edit blocked — dependent transactions exist",
           );
         } else {
           setSubmitError(data.error ?? `Save failed (${res.status})`);
@@ -255,7 +338,7 @@ export default function BuyForm() {
   return (
     <Card>
       <CardHeader>
-        <CardTitle>Buy</CardTitle>
+        <CardTitle>{isEdit ? "Edit Buy" : "Buy"}</CardTitle>
         <CardDescription>
           Acquire shares in an existing holding. The cash leg is debited from the
           matching {selectedHolding?.currency ?? "<currency>"} sleeve in the same
@@ -440,6 +523,26 @@ export default function BuyForm() {
             <p className="text-sm text-destructive">{submitError}</p>
           )}
 
+          {blockingClosureTxIds.length > 0 && (
+            <div className="rounded-md border border-amber-300/60 bg-amber-50 dark:bg-amber-950/40 dark:border-amber-800/60 p-3 text-xs">
+              <p className="font-medium text-amber-900 dark:text-amber-200 mb-1.5">
+                Delete these dependent transactions first:
+              </p>
+              <ul className="space-y-1">
+                {blockingClosureTxIds.map((id) => (
+                  <li key={id}>
+                    <Link
+                      href={`/transactions?search=%23${id}`}
+                      className="text-amber-700 dark:text-amber-300 underline hover:no-underline"
+                    >
+                      Transaction #{id}
+                    </Link>
+                  </li>
+                ))}
+              </ul>
+            </div>
+          )}
+
           <div className="flex gap-2 pt-1">
             <Button
               type="button"
@@ -453,9 +556,15 @@ export default function BuyForm() {
             <Button
               type="submit"
               className="flex-1"
-              disabled={submitting || cashSleeveMissing}
+              disabled={submitting || cashSleeveMissing || !!loadError}
             >
-              {submitting ? "Recording…" : "Record buy"}
+              {submitting
+                ? isEdit
+                  ? "Saving…"
+                  : "Recording…"
+                : isEdit
+                  ? "Save edit"
+                  : "Record buy"}
             </Button>
           </div>
         </form>

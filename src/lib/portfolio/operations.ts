@@ -13,21 +13,31 @@
  * The seed-demo uses these helpers directly to populate the demo with
  * each of the six operation shapes.
  *
- * Sign convention (cash effect on account, preserved from existing code):
- *   - Buy:  stock leg `qty>0, amount<0` (cash leaves);
- *           paired cash leg `qty<0, amount<0` (cash sleeve qty decreases)
- *   - Sell: stock leg `qty<0, amount>0` (cash arrives);
- *           paired cash leg `qty>0, amount>0` (cash sleeve qty increases)
+ * Sign convention — a Buy is an internal swap inside the account (cash → asset),
+ * so the stock leg + cash leg `amount` sum to ~0. The same applies to Sell
+ * (asset → cash). Income / Expense / FX involve real cash movement and
+ * mirror the cash effect on both fields of the single (or paired) leg:
+ *
+ *   - Buy:  stock leg `qty>0, amount>0` (asset acquired, value positive on the books);
+ *           paired cash leg `qty<0, amount<0` (cash departed). Sum = 0.
+ *   - Sell: stock leg `qty<0, amount<0` (asset depleted from book);
+ *           paired cash leg `qty>0, amount>0` (cash arrived). Sum = 0.
  *   - Income (dividend/interest): single row on cash sleeve, qty>0, amount>0
  *   - Expense (fees): single row on cash sleeve, qty<0, amount<0
  *   - FX from-leg: cash sleeve A, qty<0, amount<0
  *   - FX to-leg:   cash sleeve B, qty>0, amount>0
  *   - In-kind transfer: source qty<0, dest qty>0, both same holding, no cash leg
  *
- * Cash leg `amount` mirrors `quantity` (1 unit = $1) so account-level
- * SUM(amount) stays consistent (stock leg + cash leg of a Buy net to
- * roughly 0; the holdings.value path is the authoritative balance for
- * investment accounts per CLAUDE.md).
+ * **Note** (2026-05-25, post user-feedback): the original Phase 1 implementation
+ * put the cash effect on the stock leg (`amount=-totalCost`) with `amount=0`
+ * on the cash leg, which displayed as "AAPL: -$2000" in the transactions
+ * ledger — confusing because AAPL acquisition is a positive event. The current
+ * convention puts the cash effect on the cash leg where it belongs.
+ *
+ * The lot engine uses `Math.abs(amount)` for `cost_per_share`, so the
+ * stock-leg sign flip does NOT change realized-gain or cost-basis math. The
+ * `holdings.value` path is the authoritative balance for investment accounts
+ * per CLAUDE.md (not SUM(amount) on transactions).
  */
 
 import { randomUUID } from "crypto";
@@ -215,7 +225,9 @@ export async function recordBuy(input: RecordBuyInput): Promise<RecordBuyResult>
   const note = enc(input.dek, input.note ?? "");
   const tags = enc(input.dek, input.tags ?? "");
 
-  // Stock leg: qty positive (acquired shares), amount negative (cash out of account)
+  // Stock leg: qty positive (acquired shares), amount POSITIVE (asset value
+  // acquired). The stock leg's amount represents the book value of the new
+  // position, NOT the cash effect — that lives on the paired cash leg below.
   const stockInsert = await db
     .insert(schema.transactions)
     .values({
@@ -224,7 +236,7 @@ export async function recordBuy(input: RecordBuyInput): Promise<RecordBuyResult>
       accountId: input.accountId,
       portfolioHoldingId: input.holdingId,
       quantity: input.qty,
-      amount: -input.totalCost,
+      amount: input.totalCost,
       currency: holding.currency,
       payee,
       note,
@@ -236,8 +248,8 @@ export async function recordBuy(input: RecordBuyInput): Promise<RecordBuyResult>
     .returning({ id: schema.transactions.id });
   const stockLegTxId = stockInsert[0]!.id;
 
-  // Cash leg: qty mirrors cash movement (-$N), amount=0 to avoid double-
-  // counting in account-level sums (stock leg already has the -N amount).
+  // Cash leg: qty + amount both negative (cash sleeve qty decreases, cash
+  // amount departs the books). Sum with stock leg = 0 (internal swap).
   const cashInsert = await db
     .insert(schema.transactions)
     .values({
@@ -246,7 +258,7 @@ export async function recordBuy(input: RecordBuyInput): Promise<RecordBuyResult>
       accountId: input.accountId,
       portfolioHoldingId: cashSleeve.id,
       quantity: -input.totalCost,
-      amount: 0,
+      amount: -input.totalCost,
       currency: holding.currency,
       payee,
       note,
@@ -258,14 +270,14 @@ export async function recordBuy(input: RecordBuyInput): Promise<RecordBuyResult>
     .returning({ id: schema.transactions.id });
   const cashLegTxId = cashInsert[0]!.id;
 
-  // Open the lot. closeLotsForSell-style hook uses Math.abs(amount) so
-  // the stock leg's `amount=-totalCost` produces cost_per_share = totalCost/qty.
+  // Open the lot. The hook uses Math.abs(amount) for cost_per_share so the
+  // sign of the stock-leg amount doesn't change cost-basis math.
   const lotId = await openLotForBuyHook(
     {
       id: stockLegTxId,
       userId: input.userId,
       date: input.date,
-      amount: -input.totalCost,
+      amount: input.totalCost,
       currency: holding.currency,
       enteredAmount: null,
       enteredCurrency: null,
@@ -340,7 +352,9 @@ export async function recordSell(input: RecordSellInput): Promise<RecordSellResu
   const note = enc(input.dek, input.note ?? "");
   const tags = enc(input.dek, input.tags ?? "");
 
-  // Stock leg: qty negative (shares depleted), amount positive (cash arrives at account)
+  // Stock leg: qty negative (shares depleted), amount NEGATIVE (asset value
+  // leaves the book). The stock leg's amount is the book-value delta; the
+  // cash effect lives on the paired cash leg.
   const stockInsert = await db
     .insert(schema.transactions)
     .values({
@@ -349,7 +363,7 @@ export async function recordSell(input: RecordSellInput): Promise<RecordSellResu
       accountId: input.accountId,
       portfolioHoldingId: input.holdingId,
       quantity: -input.qty,
-      amount: input.totalProceeds,
+      amount: -input.totalProceeds,
       currency: holding.currency,
       payee,
       note,
@@ -361,8 +375,8 @@ export async function recordSell(input: RecordSellInput): Promise<RecordSellResu
     .returning({ id: schema.transactions.id });
   const stockLegTxId = stockInsert[0]!.id;
 
-  // Cash leg: qty positive (cash sleeve grows), amount=0 to avoid
-  // double-counting (stock leg has the +N amount).
+  // Cash leg: qty + amount both positive (cash sleeve grows, cash arrives
+  // on the books). Sum with stock leg = 0 (internal swap).
   const cashInsert = await db
     .insert(schema.transactions)
     .values({
@@ -371,7 +385,7 @@ export async function recordSell(input: RecordSellInput): Promise<RecordSellResu
       accountId: input.accountId,
       portfolioHoldingId: cashSleeve.id,
       quantity: input.totalProceeds,
-      amount: 0,
+      amount: input.totalProceeds,
       currency: holding.currency,
       payee,
       note,
@@ -388,7 +402,7 @@ export async function recordSell(input: RecordSellInput): Promise<RecordSellResu
       id: stockLegTxId,
       userId: input.userId,
       date: input.date,
-      amount: input.totalProceeds,
+      amount: -input.totalProceeds,
       currency: holding.currency,
       enteredAmount: null,
       enteredCurrency: null,

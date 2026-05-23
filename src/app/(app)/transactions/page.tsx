@@ -1,7 +1,7 @@
 "use client";
 
 import { useEffect, useState, useCallback, useRef, Suspense } from "react";
-import { useSearchParams } from "next/navigation";
+import { useSearchParams, useRouter } from "next/navigation";
 import Link from "next/link";
 import { Card, CardContent, CardHeader, CardTitle } from "@/components/ui/card";
 import { Table, TableBody, TableCell, TableHead, TableHeader, TableRow } from "@/components/ui/table";
@@ -70,6 +70,13 @@ type Transaction = {
   createdAt?: string | null;
   updatedAt?: string | null;
   source?: TransactionSource | null;
+  // Phase 2 portfolio-ops refactor (2026-05-25) — `kind` is the operation
+  // discriminator (buy/sell/buy_cash_leg/etc). When set, Edit routes to
+  // the dedicated /portfolio/new form instead of the generic edit dialog.
+  // `tradeLinkId` is the buy/sell pair UUID — used to fetch the sibling
+  // cash leg in the editor.
+  kind?: string | null;
+  tradeLinkId?: string | null;
 };
 
 type LinkedSibling = {
@@ -484,6 +491,7 @@ export default function TransactionsPage() {
 
 function TransactionsPageInner() {
   const urlParams = useSearchParams();
+  const router = useRouter();
   const [txns, setTxns] = useState<Transaction[]>([]);
   const [total, setTotal] = useState(0);
   const [accounts, setAccounts] = useState<Account[]>([]);
@@ -1516,6 +1524,51 @@ function TransactionsPageInner() {
   }
 
   function startEdit(t: Transaction) {
+    // Phase 2 portfolio-ops refactor (2026-05-25): when the row has a
+    // portfolio-op kind, route to the dedicated /portfolio/new editor
+    // (which loads the existing pair, lets the user edit, and persists
+    // as a replace). The generic dialog can't safely edit paired rows
+    // because it would leave the cash-leg sibling stale.
+    //
+    // `*_cash_leg` rows are addressed via their STOCK leg sibling —
+    // looking up the sibling by trade_link_id lets the editor open in the
+    // logical "edit this trade" view rather than "edit the cash leg of a
+    // trade".
+    if (t.kind) {
+      const portfolioKinds = new Set([
+        "buy",
+        "sell",
+        "buy_cash_leg",
+        "sell_cash_leg",
+        "in_kind_transfer_in",
+        "in_kind_transfer_out",
+        "fx_from",
+        "fx_to",
+        "fx_fee",
+        "portfolio_income",
+        "portfolio_expense",
+      ]);
+      if (portfolioKinds.has(t.kind)) {
+        const opForKind: Record<string, string> = {
+          buy: "buy",
+          buy_cash_leg: "buy",
+          sell: "sell",
+          sell_cash_leg: "sell",
+          in_kind_transfer_in: "transfer",
+          in_kind_transfer_out: "transfer",
+          fx_from: "fx-conversion",
+          fx_to: "fx-conversion",
+          fx_fee: "fx-conversion",
+          portfolio_income: "income-expense",
+          portfolio_expense: "income-expense",
+        };
+        const op = opForKind[t.kind] ?? "buy";
+        // Use the stock-leg / primary-leg id for editing — for cash legs
+        // we resolve back via trade_link_id on the form's load path.
+        router.push(`/portfolio/new?op=${op}&editId=${t.id}`);
+        return;
+      }
+    }
     setEditId(t.id);
     setSubmitError(null);
     setLinkedSiblings([]);
@@ -1849,10 +1902,79 @@ function TransactionsPageInner() {
           <h1 className="text-2xl font-bold">Transactions</h1>
           <p className="text-sm text-muted-foreground mt-0.5">Manage and track all your financial transactions</p>
         </div>
-        <Dialog open={dialogOpen} onOpenChange={(open) => { setDialogOpen(open); if (!open) { setEditId(null); setDialogMode("transaction"); resetForm(); setSubmitError(null); } }}>
-          <DialogTrigger render={<Button className="bg-gradient-to-r from-primary to-primary/80 hover:from-primary/90 hover:to-primary/70 shadow-sm" />}>
+        <div className="flex items-center gap-1.5">
+          {/* Split button: main click → quick Transaction dialog. Chevron →
+              dropdown with every kind (Transfer + the 6 portfolio operations).
+              Phase 2 portfolio-ops UX (2026-05-25). */}
+          <Button
+            className="bg-gradient-to-r from-primary to-primary/80 hover:from-primary/90 hover:to-primary/70 shadow-sm"
+            onClick={() => {
+              setDialogMode("transaction");
+              setEditId(null);
+              setSubmitError(null);
+              setDialogOpen(true);
+            }}
+          >
             <Plus className="h-4 w-4 mr-2" /> Add Transaction
-          </DialogTrigger>
+          </Button>
+          <DropdownMenu>
+            <DropdownMenuTrigger
+              render={
+                <Button
+                  variant="outline"
+                  size="icon"
+                  aria-label="More transaction types"
+                />
+              }
+            >
+              <ChevronDown className="h-4 w-4" />
+            </DropdownMenuTrigger>
+            <DropdownMenuContent align="end" className="min-w-56">
+              <DropdownMenuLabel>Quick add</DropdownMenuLabel>
+              <DropdownMenuItem
+                onClick={() => {
+                  setDialogMode("transaction");
+                  setEditId(null);
+                  setSubmitError(null);
+                  setDialogOpen(true);
+                }}
+              >
+                <Receipt className="h-4 w-4 mr-2" /> Transaction
+              </DropdownMenuItem>
+              <DropdownMenuItem
+                onClick={() => {
+                  setDialogMode("transfer");
+                  setEditId(null);
+                  setSubmitError(null);
+                  setDialogOpen(true);
+                }}
+              >
+                <ArrowRightLeft className="h-4 w-4 mr-2" /> Transfer
+              </DropdownMenuItem>
+              <DropdownMenuSeparator />
+              <DropdownMenuLabel>Portfolio operations</DropdownMenuLabel>
+              <DropdownMenuItem onClick={() => router.push("/portfolio/new?op=buy")}>
+                Buy
+              </DropdownMenuItem>
+              <DropdownMenuItem onClick={() => router.push("/portfolio/new?op=sell")}>
+                Sell
+              </DropdownMenuItem>
+              <DropdownMenuItem onClick={() => router.push("/portfolio/new?op=swap")}>
+                Swap
+              </DropdownMenuItem>
+              <DropdownMenuItem onClick={() => router.push("/portfolio/new?op=transfer")}>
+                In-kind transfer
+              </DropdownMenuItem>
+              <DropdownMenuItem onClick={() => router.push("/portfolio/new?op=income-expense")}>
+                Income / expense
+              </DropdownMenuItem>
+              <DropdownMenuItem onClick={() => router.push("/portfolio/new?op=fx-conversion")}>
+                FX conversion
+              </DropdownMenuItem>
+            </DropdownMenuContent>
+          </DropdownMenu>
+        </div>
+        <Dialog open={dialogOpen} onOpenChange={(open) => { setDialogOpen(open); if (!open) { setEditId(null); setDialogMode("transaction"); resetForm(); setSubmitError(null); } }}>
           <DialogContent className="max-w-lg">
             <DialogHeader>
               <DialogTitle>

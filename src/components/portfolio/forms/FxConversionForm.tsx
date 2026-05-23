@@ -13,7 +13,7 @@
  */
 
 import { useEffect, useMemo, useState } from "react";
-import { useRouter } from "next/navigation";
+import { useRouter, useSearchParams } from "next/navigation";
 import Link from "next/link";
 import {
   Card,
@@ -60,6 +60,11 @@ function todayISO(): string {
 
 export default function FxConversionForm() {
   const router = useRouter();
+  const searchParams = useSearchParams();
+  const editIdParam = searchParams.get("editId");
+  const editId = editIdParam ? Number(editIdParam) : null;
+  const isEdit =
+    editId != null && Number.isFinite(editId) && editId > 0;
 
   const [accounts, setAccounts] = useState<AccountRow[]>([]);
   const [holdings, setHoldings] = useState<HoldingRow[]>([]);
@@ -80,6 +85,9 @@ export default function FxConversionForm() {
   const [submitting, setSubmitting] = useState(false);
   const [errors, setErrors] = useState<Record<string, string>>({});
   const [submitError, setSubmitError] = useState<string | null>(null);
+  const [blockingClosureTxIds, setBlockingClosureTxIds] = useState<number[]>(
+    [],
+  );
 
   useEffect(() => {
     let cancelled = false;
@@ -103,6 +111,76 @@ export default function FxConversionForm() {
       cancelled = true;
     };
   }, []);
+
+  // Load existing operation data on mount when editId is present.
+  useEffect(() => {
+    if (!isEdit) return;
+    let cancelled = false;
+    fetch(`/api/portfolio/operations/load?id=${editId}`)
+      .then(async (r) => {
+        if (cancelled) return;
+        const json: {
+          error?: string;
+          data?: {
+            op?: string;
+            accountId?: number;
+            fromCurrency?: string;
+            fromAmount?: number;
+            toCurrency?: string;
+            toAmount?: number;
+            feeAmount?: number | null;
+            feeCurrency?: string | null;
+            feeOnSleeveCurrency?: string | null;
+            date?: string;
+            payee?: string | null;
+            note?: string | null;
+          };
+        } = await r.json().catch(() => ({}));
+        if (cancelled) return;
+        if (!r.ok) {
+          setLoadError(
+            json.error ?? `Failed to load edit data (${r.status})`,
+          );
+          return;
+        }
+        const d = json.data;
+        if (!d) {
+          setLoadError("Failed to load edit data (empty response)");
+          return;
+        }
+        if (d.op !== "fx-conversion") {
+          setLoadError(
+            `This edit link is for "${d.op}" — use that form instead.`,
+          );
+          return;
+        }
+        if (d.accountId != null) setAccountId(String(d.accountId));
+        if (d.fromCurrency) setFromCurrency(d.fromCurrency);
+        if (d.fromAmount != null) setFromAmount(String(d.fromAmount));
+        if (d.toCurrency) setToCurrency(d.toCurrency);
+        if (d.toAmount != null) setToAmount(String(d.toAmount));
+        if (d.feeAmount != null && d.feeAmount > 0) {
+          setFeeAmount(String(d.feeAmount));
+          // feeOnSleeveCurrency is the form's authoritative field; fall back
+          // to feeCurrency if the load only returned the legacy name.
+          setFeeOnSleeveCurrency(
+            d.feeOnSleeveCurrency ?? d.feeCurrency ?? "",
+          );
+        }
+        if (d.date) setDate(d.date);
+        setPayee(d.payee ?? "");
+        setNote(d.note ?? "");
+      })
+      .catch((e: unknown) => {
+        if (cancelled) return;
+        setLoadError(
+          e instanceof Error ? e.message : "Failed to load edit data",
+        );
+      });
+    return () => {
+      cancelled = true;
+    };
+  }, [editId, isEdit]);
 
   const investmentAccounts = useMemo(
     () => accounts.filter((a) => a.isInvestment === true),
@@ -173,6 +251,7 @@ export default function FxConversionForm() {
   async function handleSubmit(e: React.FormEvent) {
     e.preventDefault();
     setSubmitError(null);
+    setBlockingClosureTxIds([]);
     if (!validate()) return;
     setSubmitting(true);
     try {
@@ -196,18 +275,33 @@ export default function FxConversionForm() {
       }
       if (payee.trim()) body.payee = payee.trim();
       if (note.trim()) body.note = note.trim();
+      if (isEdit) body.editId = editId;
       const res = await fetch("/api/portfolio/operations/fx-conversion", {
         method: "POST",
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify(body),
       });
       if (!res.ok) {
-        const data: { error?: string; code?: string; currency?: string } = await res
-          .json()
-          .catch(() => ({}));
+        const data: {
+          error?: string;
+          code?: string;
+          currency?: string;
+          blockingClosureTxIds?: unknown;
+        } = await res.json().catch(() => ({}));
         if (data.code === "cash_sleeve_not_found") {
           setSubmitError(
             `No ${data.currency ?? ""} cash sleeve exists in this account. Create one via the account's Cash sleeves panel first.`,
+          );
+        } else if (data.code === "portfolio_edit_blocked") {
+          setBlockingClosureTxIds(
+            Array.isArray(data.blockingClosureTxIds)
+              ? (data.blockingClosureTxIds.filter(
+                  (n) => typeof n === "number",
+                ) as number[])
+              : [],
+          );
+          setSubmitError(
+            data.error ?? "Edit blocked — dependent transactions exist",
           );
         } else {
           setSubmitError(data.error ?? `Save failed (${res.status})`);
@@ -262,7 +356,7 @@ export default function FxConversionForm() {
   return (
     <Card>
       <CardHeader>
-        <CardTitle>FX conversion</CardTitle>
+        <CardTitle>{isEdit ? "Edit FX conversion" : "FX conversion"}</CardTitle>
         <CardDescription>
           Move cash between two currency sleeves in the same account. Inferred
           rate = to / from. Optional fee deducts from a chosen sleeve.
@@ -502,6 +596,26 @@ export default function FxConversionForm() {
             <p className="text-sm text-destructive">{submitError}</p>
           )}
 
+          {blockingClosureTxIds.length > 0 && (
+            <div className="rounded-md border border-amber-300/60 bg-amber-50 dark:bg-amber-950/40 dark:border-amber-800/60 p-3 text-xs">
+              <p className="font-medium text-amber-900 dark:text-amber-200 mb-1.5">
+                Delete these dependent transactions first:
+              </p>
+              <ul className="space-y-1">
+                {blockingClosureTxIds.map((id) => (
+                  <li key={id}>
+                    <Link
+                      href={`/transactions?search=%23${id}`}
+                      className="text-amber-700 dark:text-amber-300 underline hover:no-underline"
+                    >
+                      Transaction #{id}
+                    </Link>
+                  </li>
+                ))}
+              </ul>
+            </div>
+          )}
+
           <div className="flex gap-2 pt-1">
             <Button
               type="button"
@@ -512,8 +626,18 @@ export default function FxConversionForm() {
             >
               Cancel
             </Button>
-            <Button type="submit" className="flex-1" disabled={submitting}>
-              {submitting ? "Recording…" : "Record conversion"}
+            <Button
+              type="submit"
+              className="flex-1"
+              disabled={submitting || !!loadError}
+            >
+              {submitting
+                ? isEdit
+                  ? "Saving…"
+                  : "Recording…"
+                : isEdit
+                  ? "Save edit"
+                  : "Record conversion"}
             </Button>
           </div>
         </form>

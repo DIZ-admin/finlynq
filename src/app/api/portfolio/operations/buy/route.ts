@@ -4,7 +4,7 @@ import { requireEncryption } from "@/lib/auth/require-encryption";
 import { validateBody, safeErrorMessage, logApiError } from "@/lib/validate";
 import { recordBuy } from "@/lib/portfolio/operations";
 import { invalidateUser as invalidateUserTxCache } from "@/lib/mcp/user-tx-cache";
-import { mapOperationError } from "../_helpers";
+import { mapOperationError, cascadeDeleteForReplace } from "../_helpers";
 
 const schema = z.object({
   accountId: z.number().int().positive(),
@@ -16,6 +16,10 @@ const schema = z.object({
   note: z.string().optional(),
   tags: z.string().optional(),
   cashSleeveHoldingId: z.number().int().positive().optional(),
+  // Phase 2 edit-as-replace (2026-05-25 follow-up). When set, cascade-deletes
+  // the existing pair (via trade_link_id) before creating the new one.
+  // Refused with 409 if the edit guard fires (lot has downstream closures).
+  editId: z.number().int().positive().optional(),
 });
 
 export async function POST(request: NextRequest) {
@@ -25,14 +29,22 @@ export async function POST(request: NextRequest) {
     const body = await request.json();
     const parsed = validateBody(body, schema);
     if (parsed.error) return parsed.error;
+    const { editId, ...input } = parsed.data;
+    if (editId != null) {
+      const refusal = await cascadeDeleteForReplace(auth.userId, editId);
+      if (refusal) return refusal;
+    }
     const result = await recordBuy({
-      ...parsed.data,
+      ...input,
       userId: auth.userId,
       dek: auth.dek,
       source: "manual",
     });
     invalidateUserTxCache(auth.userId);
-    return NextResponse.json(result, { status: 201 });
+    return NextResponse.json(
+      editId != null ? { ...result, replaced: editId } : result,
+      { status: 201 },
+    );
   } catch (err: unknown) {
     const mapped = mapOperationError(err);
     if (mapped) return mapped;

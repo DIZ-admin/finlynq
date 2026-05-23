@@ -677,6 +677,14 @@ export async function applyLotEffectsForTx(
 ): Promise<void> {
   if (tx.portfolioHoldingId == null || tx.accountId == null) return;
   if (tx.quantity == null || tx.quantity === 0) return;
+  // Phase 2 portfolio-ops refactor (2026-05-25): cash-leg siblings of
+  // buy/sell pairs land here too when the caller iterates over every
+  // tx row. They're paired with their stock leg which already drove the
+  // lot write, so skip them. Without this guard, a buy_cash_leg
+  // (qty=-totalCost, amount=-totalCost) would be misclassified as a sell
+  // by the qty<0 dispatch below and spam shortfall warnings (cash sleeves
+  // never have lots opened against them).
+  if (tx.kind && /_cash_leg$/.test(tx.kind)) return;
 
   const holdingCurrency =
     ctx.holdingCurrencyById.get(tx.portfolioHoldingId) ??

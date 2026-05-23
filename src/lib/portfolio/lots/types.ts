@@ -186,4 +186,12 @@ export interface TxRowForLots {
   portfolioHoldingId: number | null;
   tradeLinkId: string | null;
   source: TransactionSource;
+  /**
+   * Portfolio-ops discriminator (Phase 1 of the 2026-05-25 refactor).
+   * Optional because legacy callers (pre-Phase-1 rows, backfill scripts)
+   * don't carry it. Used by `applyLotEffectsForTx` to skip rows that are
+   * `*_cash_leg` siblings — those are paired with their stock leg, which
+   * is the one that drives the lot write.
+   */
+  kind?: string | null;
 }
