@@ -56,8 +56,12 @@ import {
 
 interface Account {
   id: number;
-  /** Decrypted formal name (post `decryptNamedRows`). */
-  name: string;
+  /** Decrypted formal name (post `decryptNamedRows`). Nullable because
+   *  `decryptNamedRows` returns null when the DEK isn't in cache (post-
+   *  deploy idle timeout) or when the ciphertext won't decrypt under the
+   *  user's current DEK (pathfinder mismatch). The display layer falls
+   *  back to `Account #<id>` in that case. */
+  name: string | null;
   /** Decrypted alias — friendly display name. Preferred over `name`
    *  when set, matching the convention on other pages. */
   alias?: string | null;
@@ -119,11 +123,15 @@ function describeRange(from: string | null, to: string | null): string {
   return "all time";
 }
 
-/** Friendly display name for an account — alias when set, formal name otherwise. */
+/** Friendly display name for an account — alias when set, formal name
+ *  otherwise. Falls back to `Account #<id>` if both are missing (DEK
+ *  not in cache → decryptNamedRows returns null on both fields). */
 function accountDisplayName(a: Account): string {
   const alias = a.alias?.trim();
   if (alias) return alias;
-  return a.name;
+  const name = a.name?.trim();
+  if (name) return name;
+  return `Account #${a.id}`;
 }
 
 interface ReconcileLink {
@@ -229,18 +237,21 @@ export default function ReconcilePage() {
   const [balanceSummaryLoading, setBalanceSummaryLoading] = useState(false);
 
   // ─── Load accounts ──────────────────────────────────────────────────
+  // We fetch with `includeArchived=1` so the materialize dialog can render
+  // a friendly name for a bank row whose account was archived after the
+  // statement landed. The per-page dropdown still filters out archived
+  // (reconcile is rarely useful there) but the full list is available for
+  // dialog lookups.
   useEffect(() => {
     let cancelled = false;
     (async () => {
       try {
-        const res = await fetch("/api/accounts");
+        const res = await fetch("/api/accounts?includeArchived=1");
         if (!res.ok) throw new Error(`accounts: ${res.status}`);
         const rows: Account[] = await res.json();
         if (cancelled) return;
-        // Filter out archived accounts — they don't get new statements so
-        // reconcile is rarely useful. Power users can revisit later.
+        setAccounts(rows);
         const visible = rows.filter((a) => !a.archived);
-        setAccounts(visible);
 
         // Restore from URL or default to the first account.
         const params = new URLSearchParams(window.location.search);
@@ -291,12 +302,17 @@ export default function ReconcilePage() {
         if (!res.ok) return;
         const rows = (await res.json()) as Array<{
           id: number;
-          name: string;
+          // Nullable for the same DEK-missing reason as Account.name.
+          name: string | null;
           type: string;
         }>;
         if (cancelled) return;
         setCategories(
-          rows.map((r) => ({ id: r.id, name: r.name, type: r.type })),
+          rows.map((r) => ({
+            id: r.id,
+            name: r.name?.trim() ? r.name : `Category #${r.id}`,
+            type: r.type,
+          })),
         );
       } catch {
         // Non-fatal — the dialog will just show an empty category list.
@@ -370,6 +386,14 @@ export default function ReconcilePage() {
       cancelled = true;
     };
   }, [selectedAccountId, data]);
+
+  // Visible accounts for the per-page dropdown — archived excluded.
+  // The full `accounts` list (incl. archived) is passed to the materialize
+  // dialog so bank rows on archived accounts still render friendly names.
+  const visibleAccounts = useMemo(
+    () => accounts.filter((a) => !a.archived),
+    [accounts],
+  );
 
   // ─── Derive BankRow[] + TxRow[] for the panes ──────────────────────
   const { bankRows, txRows, counts } = useMemo(() => {
@@ -635,7 +659,7 @@ export default function ReconcilePage() {
             <span className="text-xs text-muted-foreground italic">
               Loading…
             </span>
-          ) : accounts.length === 0 ? (
+          ) : visibleAccounts.length === 0 ? (
             <span className="text-xs text-muted-foreground italic">
               No accounts found. Create an account first.
             </span>
@@ -659,7 +683,7 @@ export default function ReconcilePage() {
                 <SelectValue placeholder="Select an account" />
               </SelectTrigger>
               <SelectContent>
-                {accounts.map((a) => (
+                {visibleAccounts.map((a) => (
                   <SelectItem key={a.id} value={String(a.id)}>
                     {accountDisplayName(a)} · {a.currency}
                   </SelectItem>

@@ -293,13 +293,20 @@ function PendingImportsPageInner() {
       if (!name) continue;
       byName.set(name, (byName.get(name) ?? 0) + 1);
     }
+    // Fall back to `Account #<id>` when the loaded account's name decrypted
+    // to null/empty (DEK not in cache → decryptNamedRows returns null). The
+    // raw integer would otherwise surface in the AccountSelector trigger.
+    const friendlyName = (a: EditorAccountOption): string => {
+      const trimmed = a.name?.trim();
+      return trimmed ? trimmed : `Account #${a.id}`;
+    };
     const opts: AccountOption[] = [];
     for (const [name, count] of byName) {
       const match = accounts.find((a) => a.name === name);
       if (match) {
         opts.push({
           id: match.id,
-          name: match.name,
+          name: friendlyName(match),
           currency: match.currency,
           rowCount: count,
         });
@@ -310,7 +317,7 @@ function PendingImportsPageInner() {
       if (bound) {
         opts.push({
           id: bound.id,
-          name: bound.name,
+          name: friendlyName(bound),
           currency: bound.currency,
           rowCount: detail.rows.length,
         });

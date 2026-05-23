@@ -100,6 +100,28 @@ export function MaterializeDialog({
     );
   }, [bank, categories]);
 
+  // Synthesize a fallback option when the current categoryId / accountId
+  // isn't in the loaded lists yet (fetch race) or refers to a row the
+  // user can't see (e.g. account archived after the bank row landed).
+  // Without this, the SelectTrigger falls back to displaying the raw
+  // integer value, which surfaces as e.g. "504" / "619" in the UI.
+  const categoryOptions = useMemo<CategoryOption[]>(() => {
+    if (categoryId == null) return categories;
+    if (categories.some((c) => c.id === categoryId)) return categories;
+    return [
+      { id: categoryId, name: `Category #${categoryId}`, type: "" },
+      ...categories,
+    ];
+  }, [categories, categoryId]);
+  const accountOptions = useMemo<AccountOption[]>(() => {
+    if (accountId == null) return accounts;
+    if (accounts.some((a) => a.id === accountId)) return accounts;
+    return [
+      { id: accountId, name: `Account #${accountId}`, currency: "" },
+      ...accounts,
+    ];
+  }, [accounts, accountId]);
+
   const onSubmit = async () => {
     if (!bank) return;
     setBusy(true);
@@ -188,7 +210,7 @@ export function MaterializeDialog({
                   <SelectItem value="__none__">
                     Uncategorized
                   </SelectItem>
-                  {categories.map((c) => (
+                  {categoryOptions.map((c) => (
                     <SelectItem key={c.id} value={String(c.id)}>
                       {c.name} {c.type ? `· ${c.type}` : ""}
                     </SelectItem>
@@ -220,9 +242,10 @@ export function MaterializeDialog({
                   <SelectValue placeholder="Select an account" />
                 </SelectTrigger>
                 <SelectContent>
-                  {accounts.map((a) => (
+                  {accountOptions.map((a) => (
                     <SelectItem key={a.id} value={String(a.id)}>
-                      {a.name} · {a.currency}
+                      {a.name}
+                      {a.currency ? ` · ${a.currency}` : ""}
                     </SelectItem>
                   ))}
                 </SelectContent>
