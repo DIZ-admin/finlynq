@@ -43,7 +43,7 @@ import { db, schema } from "@/db";
 import { requireEncryption } from "@/lib/auth/require-encryption";
 import { tryDecryptField } from "@/lib/crypto/envelope";
 import { decryptStaged } from "@/lib/crypto/staging-envelope";
-import { getLatestBankAnchor, listBankAnchors } from "@/lib/bank-ledger-balance";
+import { listBankAnchors } from "@/lib/bank-ledger-balance";
 
 export const dynamic = "force-dynamic";
 
@@ -137,56 +137,101 @@ export async function GET(request: NextRequest) {
   }
   const deduped = Array.from(byBankId.values());
 
-  // ─── End-of-day running balance per date (2026-05-24) ─────────────────
+  // ─── End-of-day calculated balance per date (2026-05-22 refactor) ─────
   //
-  // Anchor from `bank_daily_balances` acts as a checkpoint; end-of-day
-  // balance for any other date is offset from the anchor by the cumulative
-  // sum of intervening amounts. Algorithm:
+  // For each date d we want to display: find the most-recent anchor STRICTLY
+  // before d (anchor.date < d, not <= d), then:
   //
-  //   1. Group amounts by date → dailySum
-  //   2. Compute forward cumulative sum cumByDate (sorted ASC)
-  //   3. offset = anchor.balance - cumByDate[anchor.date]
-  //      (or cum-as-of-the-latest-date-≤-anchor.date when anchor isn't in
-  //       the row set — e.g., anchor is for a day with no transactions)
-  //   4. endOfDay[date] = cumByDate[date] + offset
+  //   calculated[d] = lastAnchor.balance + Σ(bank_tx.amount in (lastAnchor.date, d])
   //
-  // Math: endOfDay[d] = anchor.balance + (cumByDate[d] - cumByDate[anchor.date])
-  // = anchor.balance + Σ(amounts in (anchor.date, d]) for d > anchor.date
-  // = anchor.balance - Σ(amounts in (d, anchor.date]) for d < anchor.date.
+  // Three properties fall out of strict-<:
+  //   1. On an anchor day (d IS itself an anchor), calculated is derived
+  //      from the PRIOR anchor + every tx up through d — independent of
+  //      d's own anchor. The Calculated and Loaded columns then become a
+  //      real cross-check rather than circular logic.
+  //   2. Between two anchors, drift only accumulates within that gap. The
+  //      moment we cross the next anchor going forward, drift resets to
+  //      that anchor's truth.
+  //   3. For d before the first-ever anchor → no lastAnchor exists →
+  //      calculated stays null. We do NOT extrapolate backward from a
+  //      future anchor; the bank never told us anything about that period.
   //
-  // Falls back to null on every row when no anchor exists.
-  const anchor = await getLatestBankAnchor(userId, accountId);
-  // 2026-05-22 — also fetch every anchor so we can surface the actual
-  // loaded balance per date alongside the computed running balance.
-  // Users want to see "what the bank told us" vs "what the system
-  // computed" side-by-side for visual sanity-checking.
+  // The previous algorithm picked the single LATEST anchor as a global
+  // checkpoint and projected from it across all dates. That silently
+  // ignored every other loaded anchor and let drift compound linearly.
+  // Per CLAUDE.md "Bank balance anchors" — errors must not compound
+  // forward across anchor boundaries.
   const allAnchors = await listBankAnchors(userId, accountId);
+  // listBankAnchors returns DESC; reverse for ASC processing.
+  const anchorsAsc = [...allAnchors].reverse();
   const anchorByDate = new Map<string, { balance: number; source: string }>();
   for (const a of allAnchors) {
     anchorByDate.set(a.date, { balance: a.balance, source: a.source });
   }
+
+  // Daily sum + cumulative sum of bank_tx amounts. Pure aggregation over
+  // the rows the user will see — anchors on dates with no rows are still
+  // valid for "Loaded" but contribute nothing to the cum walk.
+  const dailySum = new Map<string, number>();
+  for (const r of deduped) {
+    dailySum.set(r.date, (dailySum.get(r.date) ?? 0) + Number(r.amount));
+  }
+  const datesAsc = Array.from(dailySum.keys()).sort();
+  const cumByDate = new Map<string, number>();
+  let running = 0;
+  for (const d of datesAsc) {
+    running += dailySum.get(d) ?? 0;
+    cumByDate.set(d, running);
+  }
+
+  // cumUpTo(date) = Σ(amounts on dates <= argument). Binary search over
+  // datesAsc; returns 0 when no row date is <= argument.
+  const cumUpTo = (date: string): number => {
+    if (datesAsc.length === 0) return 0;
+    let lo = 0;
+    let hi = datesAsc.length - 1;
+    let ans = -1;
+    while (lo <= hi) {
+      const mid = (lo + hi) >> 1;
+      if (datesAsc[mid] <= date) {
+        ans = mid;
+        lo = mid + 1;
+      } else {
+        hi = mid - 1;
+      }
+    }
+    return ans < 0 ? 0 : cumByDate.get(datesAsc[ans]) ?? 0;
+  };
+
+  // Find the most recent anchor whose date is STRICTLY before `d`.
+  // Binary search over anchorsAsc; returns null when no prior anchor.
+  const findLastAnchorBefore = (d: string): { date: string; balance: number } | null => {
+    if (anchorsAsc.length === 0) return null;
+    let lo = 0;
+    let hi = anchorsAsc.length - 1;
+    let ans = -1;
+    while (lo <= hi) {
+      const mid = (lo + hi) >> 1;
+      if (anchorsAsc[mid].date < d) {
+        ans = mid;
+        lo = mid + 1;
+      } else {
+        hi = mid - 1;
+      }
+    }
+    if (ans < 0) return null;
+    const a = anchorsAsc[ans];
+    return { date: a.date, balance: a.balance };
+  };
+
+  // Compute calculated[d] for every unique row date. Σ(amounts in
+  // (lastAnchor.date, d]) = cumUpTo(d) - cumUpTo(lastAnchor.date).
   const endOfDayBalance = new Map<string, number>();
-  if (anchor) {
-    const dailySum = new Map<string, number>();
-    for (const r of deduped) {
-      dailySum.set(r.date, (dailySum.get(r.date) ?? 0) + Number(r.amount));
-    }
-    const datesAsc = Array.from(dailySum.keys()).sort();
-    let running = 0;
-    const cumByDate = new Map<string, number>();
-    for (const d of datesAsc) {
-      running += dailySum.get(d) ?? 0;
-      cumByDate.set(d, running);
-    }
-    let cumAtAnchor = 0;
-    for (const d of datesAsc) {
-      if (d <= anchor.date) cumAtAnchor = cumByDate.get(d)!;
-      else break;
-    }
-    const offset = anchor.balance - cumAtAnchor;
-    for (const [d, c] of cumByDate) {
-      endOfDayBalance.set(d, c + offset);
-    }
+  for (const d of datesAsc) {
+    const lastAnchor = findLastAnchorBefore(d);
+    if (!lastAnchor) continue; // no backward extrapolation
+    const sum = (cumByDate.get(d) ?? 0) - cumUpTo(lastAnchor.date);
+    endOfDayBalance.set(d, lastAnchor.balance + sum);
   }
 
   // Per-row decrypt. Tier-aware: 'user' → DEK, 'service' → PF_STAGING_KEY.
@@ -236,11 +281,15 @@ export async function GET(request: NextRequest) {
     };
   });
 
+  // latestAnchor — return the most recent loaded anchor for the page
+  // header. allAnchors is DESC by date; index 0 is the latest.
+  const latestAnchor = allAnchors.length > 0 ? allAnchors[0] : null;
+
   return NextResponse.json({
     success: true,
     data: {
       transactions,
-      latestAnchor: anchor,
+      latestAnchor,
     },
   });
 }
