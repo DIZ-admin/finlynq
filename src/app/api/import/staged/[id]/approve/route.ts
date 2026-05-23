@@ -963,18 +963,19 @@ export async function POST(
   // anchors". Skipped when the staged batch had no bound account or no
   // anchors; balanceWarnings still surfaces above for context.
   // Gate: anchors land whenever the user explicitly approved a batch with
-  // a bound account + at least one anchor AND no per-row errors. The old
-  // `imported > 0 || linkedRows.length > 0` condition silently discarded
-  // anchors when every row was a `skipped_duplicate` — re-uploading a
-  // statement to refresh the bank-side balance silently no-oped. Anchors
-  // are a sibling fact to bank rows (CLAUDE.md "Bank balance anchors");
-  // row-materialization absence does not invalidate them, only
-  // row-materialization FAILURE does (importErrors gate preserves the
-  // rollback semantics).
+  // a bound account + at least one anchor. Anchors are a sibling fact to
+  // bank rows (CLAUDE.md "Bank balance anchors") — completely independent
+  // of row materialization. A previous gate clause `importErrors.length
+  // === 0` was meant to be a rollback signal but turned out to be wrong:
+  // executeImport pushes per-row WARNINGS (not failures) to that array
+  // ("category not found, defaulted to X", "auto-created holding", etc.).
+  // Even a single warning silently discarded all anchors. The real
+  // catastrophic-failure paths (bank-ledger upsert throws, FX engine
+  // throws) abort the approve before reaching this block via early returns,
+  // so the gate has full rollback semantics without checking importErrors.
   if (
     staged.boundAccountId != null &&
-    dedupedAnchors.length > 0 &&
-    importErrors.length === 0
+    dedupedAnchors.length > 0
   ) {
     try {
       await upsertBankBalanceAnchors(
