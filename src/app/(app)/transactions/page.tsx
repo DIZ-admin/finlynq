@@ -854,6 +854,14 @@ function TransactionsPageInner() {
 
   // Delete confirmation
   const [deleteConfirmId, setDeleteConfirmId] = useState<number | null>(null);
+  // Phase 2 portfolio-ops refactor: server returns 409 with this shape when
+  // the row being deleted is the open-tx of a lot that's already been sold
+  // or transferred out. UI surfaces the blocking tx ids so the user knows
+  // exactly which rows to delete first.
+  const [deleteBlockedError, setDeleteBlockedError] = useState<{
+    message: string;
+    blockingIds: number[];
+  } | null>(null);
   const [deleteConfirmPayee, setDeleteConfirmPayee] = useState("");
   const [deleting, setDeleting] = useState(false);
 
@@ -1698,9 +1706,28 @@ function TransactionsPageInner() {
   async function handleDelete() {
     if (!deleteConfirmId) return;
     setDeleting(true);
-    await fetch(`/api/transactions?id=${deleteConfirmId}`, { method: "DELETE" });
-    setDeleteConfirmId(null);
+    setDeleteBlockedError(null);
+    const res = await fetch(`/api/transactions?id=${deleteConfirmId}`, { method: "DELETE" });
     setDeleting(false);
+    if (!res.ok) {
+      // Portfolio edit-guard refusal (Phase 2 of the ops refactor). The server
+      // returns 409 + the list of dependent closure tx ids when the row being
+      // deleted opens a lot that's been sold or transferred out. Surface the
+      // list so the user can jump to the blocking row and delete it first.
+      const data = await res.json().catch(() => ({}));
+      if (data?.code === "portfolio_edit_blocked") {
+        setDeleteBlockedError({
+          message: data.error ?? "Delete blocked by portfolio dependencies",
+          blockingIds: Array.isArray(data.blockingClosureTxIds)
+            ? (data.blockingClosureTxIds as number[])
+            : [],
+        });
+        return;
+      }
+      alert(data?.error ?? `Delete failed (${res.status})`);
+      return;
+    }
+    setDeleteConfirmId(null);
     loadTxns();
   }
 
@@ -1859,6 +1886,30 @@ function TransactionsPageInner() {
 
             {dialogMode === "transaction" && (
             <form onSubmit={handleSubmit} className="space-y-4">
+              {/* Phase 2 portfolio-ops refactor: when the picked account is an
+                  investment account, recommend the dedicated /portfolio/new
+                  flow so trades land as the two-row buy/sell representation
+                  with explicit cash-sleeve effects + lot tracking. The generic
+                  form still works for back-compat (it auto-routes to the Cash
+                  sleeve), but new investment activity should prefer the
+                  dedicated form. Edits stay here for now. */}
+              {!editId && (() => {
+                const sel = accounts.find((a) => String(a.id) === form.accountId);
+                if (!sel?.isInvestment) return null;
+                return (
+                  <div className="rounded-md border border-amber-300/60 bg-amber-50 dark:bg-amber-950/40 dark:border-amber-800/60 p-3 text-xs flex items-start gap-2">
+                    <AlertTriangle className="h-4 w-4 text-amber-600 dark:text-amber-400 mt-0.5 shrink-0" />
+                    <div className="space-y-1">
+                      <p className="font-medium text-amber-900 dark:text-amber-200">
+                        This is an investment account
+                      </p>
+                      <p className="text-amber-800/80 dark:text-amber-300/80">
+                        Use the dedicated <Link href="/portfolio/new" className="underline font-medium hover:no-underline">Portfolio actions</Link> page for Buys, Sells, Swaps, Income, and FX — they record cash-sleeve effects + lot tracking automatically.
+                      </p>
+                    </div>
+                  </div>
+                );
+              })()}
               <div className="grid grid-cols-2 gap-4">
                 <div className="space-y-1.5">
                   <Label>Date</Label>
@@ -2281,6 +2332,29 @@ function TransactionsPageInner() {
                 old linked-siblings panel renders for navigation. */}
             {dialogMode === "transfer" && (
             <form onSubmit={handleTransferSubmit} className="space-y-4">
+              {/* Phase 2 portfolio-ops refactor: in-kind transfers (both legs
+                  investment, same holding) should go through /portfolio/new
+                  where the new helper enforces the same-holding rule and
+                  cascades cost basis correctly. This dialog still supports
+                  in-kind for edits + back-compat. */}
+              {!editId && (() => {
+                const fromAcct = accounts.find((a) => String(a.id) === transferForm.fromAccountId);
+                const toAcct = accounts.find((a) => String(a.id) === transferForm.toAccountId);
+                if (!fromAcct?.isInvestment || !toAcct?.isInvestment) return null;
+                return (
+                  <div className="rounded-md border border-amber-300/60 bg-amber-50 dark:bg-amber-950/40 dark:border-amber-800/60 p-3 text-xs flex items-start gap-2">
+                    <AlertTriangle className="h-4 w-4 text-amber-600 dark:text-amber-400 mt-0.5 shrink-0" />
+                    <div className="space-y-1">
+                      <p className="font-medium text-amber-900 dark:text-amber-200">
+                        Investment-to-investment transfer
+                      </p>
+                      <p className="text-amber-800/80 dark:text-amber-300/80">
+                        For in-kind share moves between two brokerages, use the dedicated <Link href="/portfolio/new?op=transfer" className="underline font-medium hover:no-underline">In-kind transfer</Link> form — it enforces the same-holding rule and cascades cost basis to the destination lot.
+                      </p>
+                    </div>
+                  </div>
+                );
+              })()}
               <div className="grid grid-cols-2 gap-4">
                 <div className="space-y-1.5">
                   <Label>Date</Label>
@@ -3377,7 +3451,12 @@ function TransactionsPageInner() {
       </div>
 
       {/* Single delete confirmation dialog */}
-      <Dialog open={deleteConfirmId !== null} onOpenChange={(open) => { if (!open) setDeleteConfirmId(null); }}>
+      <Dialog open={deleteConfirmId !== null} onOpenChange={(open) => {
+        if (!open) {
+          setDeleteConfirmId(null);
+          setDeleteBlockedError(null);
+        }
+      }}>
         <DialogContent className="max-w-sm">
           <DialogHeader>
             <DialogTitle className="flex items-center gap-2 text-destructive">
@@ -3385,15 +3464,60 @@ function TransactionsPageInner() {
               Delete Transaction
             </DialogTitle>
           </DialogHeader>
-          <p className="text-sm text-muted-foreground">
-            Are you sure you want to delete <strong>{deleteConfirmPayee}</strong>? This cannot be undone.
-          </p>
-          <div className="flex gap-2 mt-2">
-            <Button variant="outline" className="flex-1" onClick={() => setDeleteConfirmId(null)}>Cancel</Button>
-            <Button variant="destructive" className="flex-1" disabled={deleting} onClick={handleDelete}>
-              {deleting ? "Deleting…" : "Delete"}
-            </Button>
-          </div>
+          {deleteBlockedError ? (
+            <div className="space-y-3">
+              <p className="text-sm text-amber-900 dark:text-amber-200">
+                {deleteBlockedError.message}
+              </p>
+              {deleteBlockedError.blockingIds.length > 0 && (
+                <div className="rounded-md border border-amber-300/60 bg-amber-50 dark:bg-amber-950/40 dark:border-amber-800/60 p-3 text-xs">
+                  <p className="font-medium text-amber-900 dark:text-amber-200 mb-1.5">
+                    Dependent rows:
+                  </p>
+                  <ul className="space-y-1">
+                    {deleteBlockedError.blockingIds.map((id) => (
+                      <li key={id}>
+                        <Link
+                          href={`/transactions?search=%23${id}`}
+                          className="text-amber-700 dark:text-amber-300 underline hover:no-underline"
+                          onClick={() => {
+                            setDeleteConfirmId(null);
+                            setDeleteBlockedError(null);
+                          }}
+                        >
+                          Transaction #{id}
+                        </Link>
+                      </li>
+                    ))}
+                  </ul>
+                </div>
+              )}
+              <div className="flex gap-2 mt-2">
+                <Button
+                  variant="outline"
+                  className="flex-1"
+                  onClick={() => {
+                    setDeleteConfirmId(null);
+                    setDeleteBlockedError(null);
+                  }}
+                >
+                  Close
+                </Button>
+              </div>
+            </div>
+          ) : (
+            <>
+              <p className="text-sm text-muted-foreground">
+                Are you sure you want to delete <strong>{deleteConfirmPayee}</strong>? This cannot be undone.
+              </p>
+              <div className="flex gap-2 mt-2">
+                <Button variant="outline" className="flex-1" onClick={() => setDeleteConfirmId(null)}>Cancel</Button>
+                <Button variant="destructive" className="flex-1" disabled={deleting} onClick={handleDelete}>
+                  {deleting ? "Deleting…" : "Delete"}
+                </Button>
+              </div>
+            </>
+          )}
         </DialogContent>
       </Dialog>
 

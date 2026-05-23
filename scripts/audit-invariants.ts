@@ -166,6 +166,16 @@ const BASELINE_EXCEPTIONS: Record<string, string> = {
   // cash sleeve qty is derived from the backfill, not literal rows).
   "scripts/seed-demo.ts:portfolio-ops-kind-via-operations":
     "Phase 2 follow-up — seed uses legacy raw-SQL with `kind` tagged by qty sign; lots-backfill at end wires cost basis",
+  // The Phase 2 one-off backfill script INSERTs cash-leg rows for legacy
+  // single-row buys/sells. It uses raw `pg.Pool` SQL (not Drizzle, not the
+  // app helpers) so it can run against any environment without pulling the
+  // PostgresAdapter bootstrap chain. The TypeScript `kind: "buy" | "sell"`
+  // type annotation at line 130 is what trips the regex — there are no
+  // actual `kind: "buy"` value writes; the script writes `kind: 'buy_cash_leg'`
+  // / `'sell_cash_leg'` literals which are correctly paired with the source
+  // rows. Accepted as a one-off-script exception (file is delete-after-use).
+  "scripts/backfill-buy-sell-cash-legs.ts:portfolio-ops-kind-via-operations":
+    "One-off raw-SQL backfill script; regex false-positive on a TypeScript union type annotation. Writes only `*_cash_leg` literals.",
 };
 
 interface InvariantConfig {

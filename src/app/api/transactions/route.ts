@@ -15,6 +15,7 @@ import {
   buildLotContext,
   reverseLotsForDeleteHook,
 } from "@/lib/portfolio/lots/write-hooks";
+import { canEditPortfolioRow } from "@/lib/portfolio/operations";
 import type { TxRowForLots } from "@/lib/portfolio/lots/types";
 import { db, schema } from "@/db";
 import { and, eq } from "drizzle-orm";
@@ -544,6 +545,22 @@ export async function PUT(request: NextRequest) {
     if (parsed.error) return parsed.error;
     const { id, ...data } = parsed.data;
 
+    // Portfolio edit-guard (Phase 2 of the operations refactor) — refuse
+    // edits to a buy/transfer-in tx whose opened lot has been sold or
+    // transferred out. Returns the dependent closure tx ids so the UI can
+    // render a modal listing the rows the user must delete first.
+    const guard = await canEditPortfolioRow(auth.userId, id);
+    if (!guard.allowed) {
+      return NextResponse.json(
+        {
+          error: guard.reason,
+          code: "portfolio_edit_blocked",
+          blockingClosureTxIds: guard.blockingClosureTxIds ?? [],
+        },
+        { status: 409 },
+      );
+    }
+
     const resolved = await resolveTxAmounts(data, auth.userId, true);
     if (!resolved.ok) return resolved.response;
     Object.assign(data, resolved.fields);
@@ -654,6 +671,20 @@ export async function DELETE(request: NextRequest) {
   const params = request.nextUrl.searchParams;
   const id = parseInt(params.get("id") ?? "0");
   if (!id) return NextResponse.json({ error: "Missing id" }, { status: 400 });
+  // Portfolio edit-guard — same rule as PUT. Refuses to delete a buy
+  // whose lot has been sold/transferred out; the user must delete the
+  // dependent closure rows first.
+  const guard = await canEditPortfolioRow(auth.context.userId, id);
+  if (!guard.allowed) {
+    return NextResponse.json(
+      {
+        error: guard.reason,
+        code: "portfolio_edit_blocked",
+        blockingClosureTxIds: guard.blockingClosureTxIds ?? [],
+      },
+      { status: 409 },
+    );
+  }
   // Portfolio lot tracking — reverse BEFORE the tx delete so the closure
   // rows are still in the table for the reverseLotsForDeleteHook lookup.
   // The DELETE statement's ON DELETE CASCADE on holding_lots.open_tx_id

@@ -135,6 +135,7 @@ export async function getOrCreateCashHolding(
         accountId,
         currency,
         isCrypto: 0,
+        isCash: true,
         note: "auto-created for cash sleeve",
         ...enc,
       })
