@@ -314,6 +314,11 @@ export const priceCache = pgTable("price_cache", {
   date: text("date").notNull(),
   price: doublePrecision("price").notNull(),
   currency: text("currency").notNull(),
+  // FINLYNQ-92 (2026-05-23): nullable, additive. Persists Yahoo's `meta.previousClose`
+  // so day-change badges survive cache hits. Null on historical bars (fetchQuoteAtDate
+  // doesn't have a prior-day reference) and on rows written before this migration.
+  // Readers fall back to change: 0, changePct: 0 when null.
+  previousClose: doublePrecision("previous_close"),
 });
 
 // Canonical USD-anchored FX rate cache. Cross-rates are derived by
