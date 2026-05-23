@@ -3,7 +3,9 @@
 import { useEffect, useState } from "react";
 import { Card, CardContent } from "@/components/ui/card";
 import { motion } from "framer-motion";
+import { Info } from "lucide-react";
 import type { HealthData } from "./types";
+import { HealthInfoDialog } from "./health-info-dialog";
 
 const itemVariants = {
   hidden: { opacity: 0, y: 16 },
@@ -102,6 +104,7 @@ function ScoreBar({ label, score, detail }: { label: string; score: number; deta
 
 export function HealthScoreCard() {
   const [health, setHealth] = useState<HealthData | null>(null);
+  const [dialogOpen, setDialogOpen] = useState(false);
 
   useEffect(() => {
     fetch("/api/health-score")
@@ -114,9 +117,22 @@ export function HealthScoreCard() {
       <Card className="h-full relative overflow-hidden">
         <div className="absolute -top-12 -right-12 w-32 h-32 rounded-full bg-emerald-500/5 blur-2xl pointer-events-none" />
         <CardContent className="relative pt-5 pb-5 h-full">
-          <p className="text-xs font-medium text-muted-foreground tracking-wide uppercase mb-4">
-            Financial Health
-          </p>
+          <div className="flex items-center justify-between mb-4">
+            <p className="text-xs font-medium text-muted-foreground tracking-wide uppercase">
+              Financial Health
+            </p>
+            {health ? (
+              <button
+                type="button"
+                onClick={() => setDialogOpen(true)}
+                className="text-muted-foreground hover:text-foreground transition-colors rounded-md p-0.5 -m-0.5 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring"
+                aria-label="How is this calculated?"
+                title="How is this calculated?"
+              >
+                <Info className="h-3.5 w-3.5" />
+              </button>
+            ) : null}
+          </div>
 
           {health ? (
             <div className="flex gap-5 items-start">
@@ -155,6 +171,9 @@ export function HealthScoreCard() {
           )}
         </CardContent>
       </Card>
+      {health ? (
+        <HealthInfoDialog data={health} open={dialogOpen} onOpenChange={setDialogOpen} />
+      ) : null}
     </motion.div>
   );
 }
