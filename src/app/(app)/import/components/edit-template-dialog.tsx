@@ -19,7 +19,14 @@ import {
   SelectTrigger,
   SelectValue,
 } from "@/components/ui/select";
-import type { ColumnMapping, ImportTemplate } from "@/lib/import-templates";
+import type {
+  ColumnMapping,
+  DateFormatOverride,
+  ImportTemplate,
+} from "@/lib/import-templates";
+import { SUPPORTED_CURRENCIES } from "@/lib/fx/supported-currencies";
+
+type DateFormatUi = "auto" | DateFormatOverride;
 
 interface EditTemplateDialogProps {
   open: boolean;
@@ -38,6 +45,7 @@ const FIELD_LABELS: Record<keyof ColumnMapping, string> = {
   currency: "Currency",
   note: "Note",
   tags: "Tags",
+  balance: "Balance (running)",
 };
 
 const MAPPING_FIELDS = Object.keys(FIELD_LABELS) as (keyof ColumnMapping)[];
@@ -55,6 +63,10 @@ export function EditTemplateDialog({
   const [defaultAccount, setDefaultAccount] = useState("");
   const [isDefault, setIsDefault] = useState(false);
   const [mapping, setMapping] = useState<ColumnMapping>({ date: "", amount: "" });
+  const [skipHeaderRows, setSkipHeaderRows] = useState("0");
+  const [skipFooterRows, setSkipFooterRows] = useState("0");
+  const [dateFormatOverride, setDateFormatOverride] = useState<DateFormatUi>("auto");
+  const [defaultCurrency, setDefaultCurrency] = useState("");
   const [saving, setSaving] = useState(false);
   const [error, setError] = useState("");
 
@@ -65,6 +77,10 @@ export function EditTemplateDialog({
       setDefaultAccount(template.defaultAccount ?? "");
       setIsDefault(template.isDefault);
       setMapping({ ...template.columnMapping });
+      setSkipHeaderRows(String(template.skipHeaderRows ?? 0));
+      setSkipFooterRows(String(template.skipFooterRows ?? 0));
+      setDateFormatOverride(template.dateFormatOverride ?? "auto");
+      setDefaultCurrency(template.defaultCurrency ?? "");
       setError("");
     }
   }, [open, template]);
@@ -87,6 +103,9 @@ export function EditTemplateDialog({
     setSaving(true);
     setError("");
 
+    const skipH = Number.parseInt(skipHeaderRows, 10);
+    const skipF = Number.parseInt(skipFooterRows, 10);
+
     try {
       const res = await fetch(`/api/import/templates/${template.id}`, {
         method: "PUT",
@@ -96,6 +115,10 @@ export function EditTemplateDialog({
           defaultAccount: defaultAccount ? defaultAccount : null,
           isDefault,
           columnMapping: mapping,
+          skipHeaderRows: Number.isFinite(skipH) ? Math.max(0, Math.min(100, skipH)) : 0,
+          skipFooterRows: Number.isFinite(skipF) ? Math.max(0, Math.min(100, skipF)) : 0,
+          dateFormatOverride: dateFormatOverride === "auto" ? null : dateFormatOverride,
+          defaultCurrency: defaultCurrency || null,
         }),
       });
       const data = await res.json();
@@ -117,43 +140,48 @@ export function EditTemplateDialog({
 
   return (
     <Dialog open={open} onOpenChange={onOpenChange}>
-      <DialogContent className="sm:max-w-lg">
+      {/* `flex flex-col` overrides DialogContent's default `grid` via tailwind-merge;
+          `max-h-[90vh]` + the inner scroll region keeps the footer reachable when
+          the import-options panel is expanded. */}
+      <DialogContent className="sm:max-w-2xl max-h-[90vh] flex flex-col overflow-hidden">
         <DialogHeader>
           <DialogTitle>Edit Template</DialogTitle>
           <DialogDescription>
-            Update this template&apos;s name, default account, and column mapping.
+            Update this template&apos;s name, default account, column mapping, and parser options.
           </DialogDescription>
         </DialogHeader>
 
-        <div className="space-y-4">
-          <div className="space-y-1.5">
-            <Label htmlFor="edit-tpl-name">Template Name</Label>
-            <Input
-              id="edit-tpl-name"
-              placeholder="e.g. TD Chequing, RBC Visa"
-              value={name}
-              onChange={(e) => setName(e.target.value)}
-            />
-          </div>
+        <div className="flex-1 min-h-0 overflow-y-auto space-y-4 pr-1">
+          <div className="grid gap-3 sm:grid-cols-2">
+            <div className="space-y-1.5">
+              <Label htmlFor="edit-tpl-name">Template Name</Label>
+              <Input
+                id="edit-tpl-name"
+                placeholder="e.g. TD Chequing, RBC Visa"
+                value={name}
+                onChange={(e) => setName(e.target.value)}
+              />
+            </div>
 
-          <div className="space-y-1.5">
-            <Label>Default Account (optional)</Label>
-            <Select
-              value={defaultAccount || NONE_ACCOUNT}
-              onValueChange={(v) =>
-                setDefaultAccount(!v || v === NONE_ACCOUNT ? "" : v)
-              }
-            >
-              <SelectTrigger>
-                <SelectValue placeholder="Leave blank to keep per-row account" />
-              </SelectTrigger>
-              <SelectContent>
-                <SelectItem value={NONE_ACCOUNT}>— none —</SelectItem>
-                {accounts.map((a) => (
-                  <SelectItem key={a} value={a}>{a}</SelectItem>
-                ))}
-              </SelectContent>
-            </Select>
+            <div className="space-y-1.5">
+              <Label>Default Account (optional)</Label>
+              <Select
+                value={defaultAccount || NONE_ACCOUNT}
+                onValueChange={(v) =>
+                  setDefaultAccount(!v || v === NONE_ACCOUNT ? "" : v)
+                }
+              >
+                <SelectTrigger>
+                  <SelectValue placeholder="Leave blank to keep per-row account" />
+                </SelectTrigger>
+                <SelectContent>
+                  <SelectItem value={NONE_ACCOUNT}>— none —</SelectItem>
+                  {accounts.map((a) => (
+                    <SelectItem key={a} value={a}>{a}</SelectItem>
+                  ))}
+                </SelectContent>
+              </Select>
+            </div>
           </div>
 
           <div className="flex items-start gap-3 rounded-lg border px-3 py-2.5">
@@ -177,10 +205,10 @@ export function EditTemplateDialog({
           <div className="space-y-2">
             <Label className="text-sm font-medium">Column Mapping</Label>
             <p className="text-xs text-muted-foreground">Map CSV columns to transaction fields.</p>
-            <div className="rounded-lg border divide-y">
+            <div className="grid gap-2 sm:grid-cols-2 rounded-lg border p-2">
               {MAPPING_FIELDS.map((field) => (
-                <div key={field} className="flex items-center gap-3 px-3 py-2">
-                  <span className="w-36 text-xs text-muted-foreground shrink-0">
+                <div key={field} className="flex items-center gap-2 px-2 py-1.5">
+                  <span className="w-28 text-xs text-muted-foreground shrink-0">
                     {FIELD_LABELS[field]}
                   </span>
                   <Select
@@ -189,7 +217,7 @@ export function EditTemplateDialog({
                       setMappingField(field, (!v || v === "__none__") ? "" : v)
                     }
                   >
-                    <SelectTrigger className="h-7 text-xs">
+                    <SelectTrigger className="h-7 text-xs flex-1">
                       <SelectValue placeholder="—" />
                     </SelectTrigger>
                     <SelectContent>
@@ -203,6 +231,73 @@ export function EditTemplateDialog({
               ))}
             </div>
           </div>
+
+          <details className="rounded-lg border bg-muted/30 p-3">
+            <summary className="cursor-pointer text-sm font-medium">
+              Import options (skip header / footer rows, date format, default currency)
+            </summary>
+            <div className="mt-3 space-y-3">
+              <p className="text-xs text-muted-foreground">
+                Apply these parser knobs whenever this template is used. Leave at defaults for canonical exports.
+              </p>
+              <div className="grid gap-3 sm:grid-cols-2">
+                <div className="space-y-1">
+                  <Label htmlFor="edit-tpl-skip-h" className="text-xs">Skip N header rows</Label>
+                  <Input
+                    id="edit-tpl-skip-h"
+                    type="number"
+                    min={0}
+                    max={100}
+                    value={skipHeaderRows}
+                    onChange={(e) => setSkipHeaderRows(e.target.value)}
+                  />
+                </div>
+                <div className="space-y-1">
+                  <Label htmlFor="edit-tpl-skip-f" className="text-xs">Skip N footer rows</Label>
+                  <Input
+                    id="edit-tpl-skip-f"
+                    type="number"
+                    min={0}
+                    max={100}
+                    value={skipFooterRows}
+                    onChange={(e) => setSkipFooterRows(e.target.value)}
+                  />
+                </div>
+                <div className="space-y-1">
+                  <Label className="text-xs">Date format</Label>
+                  <select
+                    value={dateFormatOverride}
+                    onChange={(e) => setDateFormatOverride(e.target.value as DateFormatUi)}
+                    className="h-9 w-full rounded-md border bg-transparent px-3 text-sm"
+                  >
+                    <option value="auto">Auto-detect</option>
+                    <option value="DD/MM/YYYY">DD/MM/YYYY</option>
+                    <option value="MM/DD/YYYY">MM/DD/YYYY</option>
+                    <option value="YYYY-MM-DD">YYYY-MM-DD</option>
+                  </select>
+                </div>
+                <div className="space-y-1">
+                  <Label className="text-xs">Default currency (rows missing one)</Label>
+                  <Select
+                    value={defaultCurrency || "__none__"}
+                    onValueChange={(v) =>
+                      setDefaultCurrency(!v || v === "__none__" ? "" : v)
+                    }
+                  >
+                    <SelectTrigger>
+                      <SelectValue placeholder="— None —" />
+                    </SelectTrigger>
+                    <SelectContent>
+                      <SelectItem value="__none__">— None —</SelectItem>
+                      {SUPPORTED_CURRENCIES.map((c) => (
+                        <SelectItem key={c} value={c}>{c}</SelectItem>
+                      ))}
+                    </SelectContent>
+                  </Select>
+                </div>
+              </div>
+            </div>
+          </details>
 
           {error && <p className="text-xs text-rose-600">{error}</p>}
         </div>

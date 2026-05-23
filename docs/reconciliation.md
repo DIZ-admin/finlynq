@@ -6,6 +6,16 @@ captures the design + phasing; this doc tracks what's actually shipped,
 the surface contract, and the roadmap for follow-up work on the same
 page.
 
+> **Related surface (2026-05-23, FINLYNQ-98)**: a separate standalone
+> `/reconcile` page now exists for **bank_transactions ↔ transactions**
+> reconciliation, backed by a new `transaction_bank_links` M:N join
+> table. Use cases: link bank-ledger rows to transactions after the fact,
+> materialize a transaction from a bank-only row, accept rule-suggested
+> categories via a dedicated dialog. That surface is documented in
+> [architecture/bank-ledger.md](./architecture/bank-ledger.md)
+> "Standalone reconcile page + M:N join (2026-05-23)". This doc covers
+> only the staged-import-pending two-pane UI.
+
 Cross-references:
 
 - Schema: [database.md](./architecture/database.md) — `staged_transactions`
@@ -73,7 +83,8 @@ account selector updates `?account=`.
 | `/api/import/staged/[id]/rows/[rowId]` | PATCH | Per-row edit; extended with `reconcileState` + `linkedTransactionId` |
 | `/api/import/staged/[id]/approve` | POST | Materialize; de-queues `linked` rows |
 | `/api/import/staged/[id]` | DELETE | Reject (cascade-delete staged rows) |
-| `/api/transactions/reconciliation` | GET | Left-pane rows for `?accountId=&from=&to=` |
+| `/api/import/bank-ledger` | GET | Left-pane rows for `?accountId=` — full continuous bank-side history (no date window). Two-ledger refactor 2026-05-22. |
+| ~~`/api/transactions/reconciliation`~~ | ~~GET~~ | ~~Pre-refactor left-pane source (±7d window over `transactions`).~~ No longer used by `/import/pending`. |
 | `/api/transactions/[id]/reconciliation-flag` | POST / DELETE | Add/remove flag; idempotent DELETE |
 
 All require an unlocked DEK (`requireEncryption()`) — no soft-fallback.
@@ -114,7 +125,7 @@ Under [src/components/import/reconcile/](../src/components/import/reconcile/):
 | `account-selector.tsx` | Single-account label OR multi-account `<Select>`; emits change upward |
 | `two-pane-layout.tsx` | lg+ side-by-side, narrow viewports stack with DB pane on top |
 | `file-pane.tsx` | Staged rows + RowBadge + existing `<StagedRowEditor>` expansion + optional `rowActions` / `header` slots |
-| `db-pane.tsx` | DB rows from `/api/transactions/reconciliation` + linked / flagged indicators + optional `rowActions` slot |
+| `db-pane.tsx` | Bank-ledger rows from `/api/import/bank-ledger` + linked / flagged indicators + optional `rowActions` slot. Row `id` is `bank_transactions.id` UUID (string); separate `linkedTransactionId: number \| null` carries the live tx id. Bank-only rows render "bank-only" instead of link / flag actions. |
 | `suggestions-group.tsx` | Pinned auto-match cards above FilePane; accept/reject per pair; multi-candidate friendly |
 | `row-badge.tsx` | Colored pill for `reconcile_state` (linked → emerald, suggested → sky, skipped → amber, unmatched → null) |
 
@@ -258,3 +269,4 @@ What's NOT shipped, ordered by likelihood of next pickup:
 | 2026-05-20 | F-53E overlap-merge prompt + already-imported marker | FINLYNQ-58 |
 | 2026-05-20 | Approve gate: refuse unresolved categories | FINLYNQ-57 |
 | 2026-05-20 | Parser knobs on upload UI | FINLYNQ-54 |
+| 2026-05-22 | **Two-ledger refactor**: F-53E overlap-merge dialog removed; dedup source moved from `transactions.import_hash` → `bank_transactions.import_hash`. Re-uploads still produce a staged batch but every row auto-flagged `skipped_duplicate`. See [bank-ledger.md](architecture/bank-ledger.md). | — |

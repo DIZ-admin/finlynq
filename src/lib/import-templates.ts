@@ -13,7 +13,21 @@ export interface ColumnMapping {
   currency?: string;
   note?: string;
   tags?: string;
+  // 2026-05-24 — per-row bank balance column. When set, the parser
+  // extracts the last-in-file-order balance per date and persists the
+  // resulting anchors on `staged_imports.parsed_anchors`. Approve-time
+  // validation compares them against the running total.
+  balance?: string;
 }
+
+/** Parser-knob shape persisted on `import_templates`. Mirrors the upload
+ *  UI's "Import options" panel and the same columns on `staged_imports`.
+ *  All fields have a sensible default that preserves pre-FINLYNQ-54 behavior
+ *  so templates created before the knobs landed read back as no-ops. */
+export type DateFormatOverride =
+  | "DD/MM/YYYY"
+  | "MM/DD/YYYY"
+  | "YYYY-MM-DD";
 
 export interface ImportTemplate {
   id: number;
@@ -23,6 +37,10 @@ export interface ImportTemplate {
   columnMapping: ColumnMapping;
   defaultAccount?: string | null;
   isDefault: boolean;
+  skipHeaderRows: number;
+  skipFooterRows: number;
+  dateFormatOverride: DateFormatOverride | null;
+  defaultCurrency: string | null;
   createdAt: string;
   updatedAt: string;
 }
@@ -100,6 +118,21 @@ export function autoDetectColumnMapping(headers: string[]): ColumnMapping | null
     findExact(["payee", "description", "merchant", "name", "memo", "narrative"]) ??
     findContains(["description", "merchant", "payee", "narrative", "memo"]);
 
+  // Balance column — exact-match first ("Balance", "Running Balance"),
+  // then contains. "balance after" / "closing balance" cover common
+  // bank export header variants. Skipped when the file has no such
+  // column (typical for OFX/QFX where LEDGERBAL carries the anchor
+  // out-of-band).
+  const balance =
+    findExact([
+      "balance",
+      "running balance",
+      "balance after",
+      "closing balance",
+      "ending balance",
+      "account balance",
+    ]) ?? findContains(["balance"]);
+
   return {
     date,
     amount,
@@ -109,6 +142,7 @@ export function autoDetectColumnMapping(headers: string[]): ColumnMapping | null
     currency: findExact(["currency", "ccy"]) ?? findContains(["currency"]),
     note: findExact(["note", "notes", "reference", "ref"]) ?? findContains(["note", "reference"]),
     tags: findExact(["tags", "labels", "label"]) ?? findContains(["tags", "labels"]),
+    balance,
   };
 }
 
@@ -121,6 +155,10 @@ export function deserializeTemplate(row: {
   columnMapping: string;
   defaultAccount?: string | null;
   isDefault: number;
+  skipHeaderRows?: number | null;
+  skipFooterRows?: number | null;
+  dateFormatOverride?: string | null;
+  defaultCurrency?: string | null;
   createdAt: string;
   updatedAt: string;
 }): ImportTemplate {
@@ -132,7 +170,19 @@ export function deserializeTemplate(row: {
     columnMapping: JSON.parse(row.columnMapping) as ColumnMapping,
     defaultAccount: row.defaultAccount ?? null,
     isDefault: row.isDefault === 1,
+    skipHeaderRows: row.skipHeaderRows ?? 0,
+    skipFooterRows: row.skipFooterRows ?? 0,
+    dateFormatOverride: isDateFormatOverride(row.dateFormatOverride)
+      ? row.dateFormatOverride
+      : null,
+    defaultCurrency: row.defaultCurrency ?? null,
     createdAt: row.createdAt,
     updatedAt: row.updatedAt,
   };
+}
+
+function isDateFormatOverride(
+  v: string | null | undefined,
+): v is DateFormatOverride {
+  return v === "DD/MM/YYYY" || v === "MM/DD/YYYY" || v === "YYYY-MM-DD";
 }

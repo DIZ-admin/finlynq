@@ -6,8 +6,10 @@ import {
   checkFitIdDuplicates,
   findDuplicateMatches,
   findFitIdMatches,
+  assignOccurrenceIndices,
   type ExactDuplicateMatchInfo,
 } from "./import-hash";
+import { upsertBankTransaction, type BankLedgerSource } from "./bank-ledger";
 import { applyRulesToBatch, type TransactionRule } from "./auto-categorize";
 import { computePureActionPatch } from "./rules/execute";
 import type { ConditionGroup, Action } from "./rules/schema";
@@ -69,6 +71,14 @@ export interface RawTransaction {
    *  so the UI can display them as linked siblings. Every row in one group
    *  shares the same linkId; unset for standalone transactions. */
   linkId?: string;
+  /**
+   * Two-ledger refactor (2026-05-22) — pre-resolved `bank_transactions.id`
+   * lineage. Honored only when `executeImport` is called with
+   * `bankLedgerMode: 'preserve_ids'` (backup-restore flow). For the default
+   * `'merge'` mode this field is ignored; the helper computes a fresh
+   * upsert id per row.
+   */
+  bankTransactionId?: string | null;
 }
 
 /** Per-row explanation for an exact-match duplicate, mirrors `DuplicateMatch`. */
@@ -337,6 +347,36 @@ async function runProbableDuplicateDetection(
   }
 }
 
+/**
+ * Bank-ledger integration mode for {@link executeImport}.
+ *
+ *  - `'merge'` (default for new imports): each non-duplicate row is
+ *     upserted into `bank_transactions` and its returned id stamped onto
+ *     the `transactions` INSERT as `bank_transaction_id`.
+ *  - `'preserve_ids'` (backup-restore): the caller has already resolved
+ *     `bankTransactionId` on each `RawTransaction` via the `bankTxIdMap`
+ *     remap. The per-row upsert is skipped; the FK is stamped through.
+ *  - `'skip'` (test / opt-out): no bank-ledger writes at all.
+ *     `transactions.bank_transaction_id` stays NULL.
+ */
+export type BankLedgerMode = "merge" | "preserve_ids" | "skip";
+
+export interface ExecuteImportOptions {
+  /** Default: 'merge'. */
+  bankLedgerMode?: BankLedgerMode;
+  /**
+   * Display-filename for `bank_transactions.source_filenames`. Appended
+   * via `array_append` on every re-import hit. NULL skips the append.
+   */
+  filename?: string | null;
+  /**
+   * Lineage hint — the `staged_imports` row this batch came from. NULL
+   * for direct-import paths (legacy self-hosted email webhook,
+   * backup-restore).
+   */
+  stagedImportId?: string | null;
+}
+
 export async function executeImport(
   rows: RawTransaction[],
   forceImportIndices: number[] = [],
@@ -347,7 +387,11 @@ export async function executeImport(
   // import flow. Connector orchestrators (WP, future brokerages) call into
   // reconciliation.ts directly and pass 'connector' on those INSERTs.
   txSource: "import" | "connector" = "import",
+  options: ExecuteImportOptions = {},
 ): Promise<ImportResult> {
+  const bankLedgerMode: BankLedgerMode = options.bankLedgerMode ?? "merge";
+  const filename = options.filename ?? null;
+  const stagedImportId = options.stagedImportId ?? null;
   if (rows.length === 0) {
     return { total: 0, imported: 0, skippedDuplicates: 0 };
   }
@@ -411,6 +455,14 @@ export async function executeImport(
     importHash: string;
     fitId: string | null;
     linkId: string | null;
+    /** Filled in below before INSERT, depending on `bankLedgerMode`. */
+    bankTransactionId: string | null;
+    /** Plaintext payee — needed for {@link upsertBankTransaction} since
+     *  the bank-ledger row is encrypted under the same DEK as the
+     *  transactions.payee column. */
+    payeePlaintext: string;
+    notePlaintext: string;
+    tagsPlaintext: string;
     rowIndex: number;
   }> = [];
 
@@ -492,6 +544,10 @@ export async function executeImport(
       importHash: hash,
       fitId: row.fitId ?? null,
       linkId: row.linkId ?? null,
+      bankTransactionId: row.bankTransactionId ?? null,
+      payeePlaintext: row.payee ?? "",
+      notePlaintext: row.note ?? "",
+      tagsPlaintext: row.tags ?? "",
       rowIndex: i,
     });
   }
@@ -699,6 +755,113 @@ export async function executeImport(
     }
   }
 
+  // ─── Bank-ledger upsert pass (2026-05-22 two-ledger refactor) ────────
+  //
+  // For every row about to land in `transactions`, ensure a matching row
+  // exists in `bank_transactions` and capture its id for the lineage FK.
+  // Occurrence indices are deterministic within this batch via
+  // `assignOccurrenceIndices` — same-day collisions across rows in the
+  // SAME upload get distinct 0,1,2,… so the unique constraint
+  // (user_id, account_id, import_hash, occurrence_index) doesn't collapse
+  // them. Cross-batch collisions (re-uploading a file with already-
+  // approved rows) are idempotent via ON CONFLICT DO UPDATE inside the
+  // helper — but those rows are filtered out as duplicates upstream
+  // already (the bank-ledger dedup check), so this loop only sees fresh
+  // rows in steady state.
+  //
+  // `bankLedgerMode === 'preserve_ids'` (backup-restore) skips the upsert
+  // entirely and trusts the caller to have stamped the FK via the
+  // bankTxIdMap remap. `'skip'` leaves the FK NULL on every row (test /
+  // opt-out).
+  //
+  // `txSource` ('import' | 'connector') maps directly to the bank-ledger
+  // source enum — `BankLedgerSource` is a strict subset of
+  // `TransactionSource`.
+  if (bankLedgerMode === "merge" && toInsert.length > 0) {
+    const bankSource: BankLedgerSource = txSource;
+    const occurrenceIndices = assignOccurrenceIndices(
+      toInsert.map((r) => ({ accountId: r.accountId, hash: r.importHash })),
+    );
+    for (let j = 0; j < toInsert.length; j++) {
+      const row = toInsert[j];
+      // Skip rows whose caller pre-resolved the FK (e.g., the staging
+      // approve flow's transfer-pair bucket, which mints both legs'
+      // bank-ledger rows server-side before calling executeImport).
+      if (row.bankTransactionId) continue;
+      try {
+        const { id } = await upsertBankTransaction(userDek ?? null, {
+          userId,
+          accountId: row.accountId,
+          importHash: row.importHash,
+          occurrenceIndex: occurrenceIndices[j],
+          fitId: row.fitId,
+          date: row.date,
+          amount: row.amount,
+          currency: row.currency,
+          enteredAmount: row.enteredAmount,
+          enteredCurrency: row.enteredCurrency,
+          enteredFxRate: row.enteredFxRate,
+          quantity: row.quantity,
+          payee: row.payeePlaintext,
+          note: row.notePlaintext || null,
+          tags: row.tagsPlaintext || null,
+          source: bankSource,
+          filename,
+          originalStagedImportId: stagedImportId,
+        });
+        row.bankTransactionId = id;
+      } catch (err) {
+        // Two-ledger invariant — bank-ledger upserts MUST succeed or the
+        // import is rolled back. Make it loud + fatal.
+        //
+        // Drizzle's db.execute() wraps the underlying PG error in
+        // "Failed query: ... params: ..." form on `err.message` and
+        // attaches the original pg error as `err.cause`. We unwrap both
+        // so the surfaced error includes the actual PG message (e.g.
+        // "column \"X\" does not exist" / "violates check constraint
+        // \"Y\"") instead of just the wrapped query.
+        const cause = err instanceof Error ? (err as { cause?: unknown }).cause : null;
+        const causeMessage =
+          cause instanceof Error
+            ? cause.message
+            : typeof cause === "string"
+              ? cause
+              : null;
+        const causeCode =
+          cause && typeof cause === "object" && "code" in cause
+            ? String((cause as { code: unknown }).code ?? "")
+            : null;
+        const causeDetail =
+          cause && typeof cause === "object" && "detail" in cause
+            ? String((cause as { detail: unknown }).detail ?? "")
+            : null;
+        // eslint-disable-next-line no-console
+        console.error("[bank-ledger] upsert failed", {
+          userId,
+          accountId: row.accountId,
+          importHash: row.importHash,
+          occurrenceIndex: occurrenceIndices[j],
+          source: bankSource,
+          pgCode: causeCode,
+          pgMessage: causeMessage,
+          pgDetail: causeDetail,
+          err: err instanceof Error ? { name: err.name, message: err.message, stack: err.stack } : String(err),
+        });
+        // Build a human-readable message that surfaces the PG-level cause
+        // FIRST (typically "column does not exist" / "violates constraint")
+        // and the wrapped query string only as a fallback.
+        const pgPart = causeMessage
+          ? `${causeCode ? `[${causeCode}] ` : ""}${causeMessage}${causeDetail ? ` — ${causeDetail}` : ""}`
+          : err instanceof Error
+            ? err.message
+            : String(err);
+        throw new Error(
+          `Bank-ledger upsert failed for row ${row.rowIndex + 1} (${row.date} / ${row.payeePlaintext.slice(0, 40)}): ${pgPart}`,
+        );
+      }
+    }
+  }
+
   // Batch insert — encrypt text fields at the boundary (hash was computed on
   // plaintext above, so dedup stays stable across imports). Phase 6
   // (2026-04-29) dropped the legacy portfolio_holding text column; the
@@ -706,7 +869,14 @@ export async function executeImport(
   // is stripped before each insert via destructuring.
   for (let i = 0; i < toInsert.length; i += batchSize) {
     const batch = toInsert.slice(i, i + batchSize);
-    const values = batch.map(({ rowIndex: _, portfolioHolding: _ph, ...rest }) => {
+    const values = batch.map(({
+      rowIndex: _,
+      portfolioHolding: _ph,
+      payeePlaintext: _pp,
+      notePlaintext: _np,
+      tagsPlaintext: _tp,
+      ...rest
+    }) => {
       // Issue #28: stamp the writer surface explicitly. Default 'import'
       // covers CSV/Excel/PDF/OFX/email; connector orchestrators pass
       // 'connector' so reconciliation lineage stays distinct from
@@ -721,8 +891,51 @@ export async function executeImport(
     });
     if (values.length > 0) {
       try {
-        await db.insert(schema.transactions).values(values);
-        imported += values.length;
+        // RETURNING ids so we can dual-write into transaction_bank_links
+        // for any row whose bank_transaction_id FK was set above. PG's
+        // INSERT RETURNING preserves the input order, so we can pair
+        // `inserted[k]` with `values[k]` 1:1.
+        const inserted = await db
+          .insert(schema.transactions)
+          .values(values)
+          .returning({
+            id: schema.transactions.id,
+            bankTransactionId: schema.transactions.bankTransactionId,
+          });
+        imported += inserted.length;
+
+        // Dual-write retrofit for the two-ledger M:N model (Phase 5,
+        // 2026-05-23). Insert a 'primary' join row for every
+        // freshly-INSERTed tx whose FK is non-NULL. ON CONFLICT DO NOTHING
+        // so a future re-run is a no-op. Failures here append to
+        // importErrors but do not roll back — the FK is still set and
+        // the migration's backfill catches drift on the next deploy.
+        const linkValues = inserted
+          .filter((r) => r.bankTransactionId != null)
+          .map((r) => ({
+            userId,
+            transactionId: r.id,
+            bankTransactionId: r.bankTransactionId as string,
+            linkType: "primary" as const,
+            source: txSource,
+          }));
+        if (linkValues.length > 0) {
+          try {
+            await db
+              .insert(schema.transactionBankLinks)
+              .values(linkValues)
+              .onConflictDoNothing({
+                target: [
+                  schema.transactionBankLinks.transactionId,
+                  schema.transactionBankLinks.bankTransactionId,
+                ],
+              });
+          } catch (linkErr) {
+            importErrors.push(
+              `Bank-link insert failed at row ${i + 1}: ${linkErr instanceof Error ? linkErr.message : "Unknown error"}`,
+            );
+          }
+        }
       } catch (e) {
         importErrors.push(`Batch insert failed at row ${i + 1}: ${e instanceof Error ? e.message : "Unknown error"}`);
       }

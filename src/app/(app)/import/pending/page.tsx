@@ -28,10 +28,11 @@ import {
 import Link from "next/link";
 import { useSearchParams } from "next/navigation";
 import { Card, CardContent } from "@/components/ui/card";
-import { Button } from "@/components/ui/button";
+import { Button, buttonVariants } from "@/components/ui/button";
 import { Badge } from "@/components/ui/badge";
 import {
   ArrowLeft,
+  ArrowRight,
   Inbox,
   Mail,
   Upload,
@@ -39,6 +40,7 @@ import {
   Check,
   X,
   RefreshCw,
+  Info,
 } from "lucide-react";
 import { ReconciliationCallout } from "@/components/staging/reconciliation-callout";
 import {
@@ -47,6 +49,10 @@ import {
   type HoldingOption,
 } from "@/components/staging/staged-row-editor";
 import { UnresolvedCategoriesBanner } from "@/components/staging/unresolved-categories-banner";
+import {
+  BalanceWarningBanner,
+  type BalanceWarning,
+} from "@/components/staging/balance-warning-banner";
 import { AccountSelector, type AccountOption } from "@/components/import/reconcile/account-selector";
 import { TwoPaneLayout } from "@/components/import/reconcile/two-pane-layout";
 import { FilePane } from "@/components/import/reconcile/file-pane";
@@ -70,6 +76,13 @@ interface StagedRow {
   fileFormat?: string | null;
 }
 
+interface ParsedAnchorRow {
+  date: string;
+  balance: number;
+  currency?: string;
+  source?: string;
+}
+
 interface StagedDetail {
   staged: StagedRow & {
     status: string;
@@ -81,6 +94,9 @@ interface StagedDetail {
     boundAccountId?: number | null;
     dateRangeStart?: string | null;
     dateRangeEnd?: string | null;
+    /** 2026-05-24 — anchors parsed from the file's Balance column.
+     *  Same shape persisted to staged_imports.parsed_anchors. */
+    parsedAnchors?: ParsedAnchorRow[] | null;
   };
   rows: StagedEditableRow[];
   reconciliation?: {
@@ -94,6 +110,9 @@ interface StagedDetail {
     transactionId: number;
     confidence: "exact" | "fuzzy";
   }>;
+  /** 2026-05-24 — bank balance pre-flight mismatches. Empty array =
+   *  every anchor in the batch lines up with the running total. */
+  balanceWarnings?: BalanceWarning[];
 }
 
 function daysUntil(iso: string): number {
@@ -274,13 +293,20 @@ function PendingImportsPageInner() {
       if (!name) continue;
       byName.set(name, (byName.get(name) ?? 0) + 1);
     }
+    // Fall back to `Account #<id>` when the loaded account's name decrypted
+    // to null/empty (DEK not in cache → decryptNamedRows returns null). The
+    // raw integer would otherwise surface in the AccountSelector trigger.
+    const friendlyName = (a: EditorAccountOption): string => {
+      const trimmed = a.name?.trim();
+      return trimmed ? trimmed : `Account #${a.id}`;
+    };
     const opts: AccountOption[] = [];
     for (const [name, count] of byName) {
       const match = accounts.find((a) => a.name === name);
       if (match) {
         opts.push({
           id: match.id,
-          name: match.name,
+          name: friendlyName(match),
           currency: match.currency,
           rowCount: count,
         });
@@ -291,7 +317,7 @@ function PendingImportsPageInner() {
       if (bound) {
         opts.push({
           id: bound.id,
-          name: bound.name,
+          name: friendlyName(bound),
           currency: bound.currency,
           rowCount: detail.rows.length,
         });
@@ -329,26 +355,22 @@ function PendingImportsPageInner() {
     window.history.replaceState({}, "", url.toString());
   }, [openId, accountId]);
 
-  // Compute the ±7d window from the batch's date range, falling back to
-  // min/max of staged-row dates for pre-FINLYNQ-58 rows with NULL ranges.
-  const dbWindow = useMemo(() => {
-    if (!detail) return null;
-    const stagedDates = detail.rows
-      .map((r) => r.date)
-      .filter((d): d is string => !!d)
-      .sort();
-    const minDate = detail.staged.dateRangeStart ?? stagedDates[0] ?? null;
-    const maxDate =
-      detail.staged.dateRangeEnd ??
-      stagedDates[stagedDates.length - 1] ??
-      null;
-    if (!minDate || !maxDate) return null;
-    return { from: shiftDays(minDate, -7), to: shiftDays(maxDate, 7) };
-  }, [detail]);
+  // dbWindow was the ±7d date window used by the previous reconciliation
+  // endpoint (transactions). The bank-ledger endpoint shows the full
+  // continuous history per account — the window is no longer needed.
+  // shiftDays is still imported for any future date-arithmetic; keeping
+  // the helper alive avoids an unused-import warning.
+  void shiftDays;
 
-  // Fetch DB rows when accountId or window changes.
+  // Fetch the bank-side ledger for the selected account whenever the
+  // selection changes. Two-ledger refactor (2026-05-22): the left pane
+  // now shows the continuous `bank_transactions` history (no date
+  // window) — previously this fetched live `transactions` rows in a
+  // ±7d window via /api/transactions/reconciliation. The window param
+  // is dropped; the bank ledger is the truthful "continuous statement
+  // from the bank side" view per the refactor.
   useEffect(() => {
-    if (!accountId || !dbWindow) {
+    if (!accountId) {
       setDbRows([]);
       return;
     }
@@ -356,10 +378,8 @@ function PendingImportsPageInner() {
     setDbRowsLoading(true);
     const params = new URLSearchParams({
       accountId: String(accountId),
-      from: dbWindow.from,
-      to: dbWindow.to,
     });
-    fetch(`/api/transactions/reconciliation?${params.toString()}`)
+    fetch(`/api/import/bank-ledger?${params.toString()}`)
       .then((res) =>
         res.json().then((data) => ({ ok: res.ok, status: res.status, data })),
       )
@@ -370,7 +390,7 @@ function PendingImportsPageInner() {
             status === 423
               ? data?.message ||
                 "Your session needs to be unlocked. Reload and sign in again."
-              : data?.error || "Failed to load existing transactions";
+              : data?.error || "Failed to load bank ledger";
           setToast({ type: "error", msg });
           setDbRows([]);
           return;
@@ -392,7 +412,7 @@ function PendingImportsPageInner() {
     return () => {
       cancelled = true;
     };
-  }, [accountId, dbWindow?.from, dbWindow?.to]);
+  }, [accountId]);
 
   // Filter staged rows to the currently-selected account. Empty
   // accountName matches every account (legacy rows pre-FINLYNQ-58 where
@@ -406,6 +426,49 @@ function PendingImportsPageInner() {
       return !rn || rn === account.name;
     });
   }, [detail, accountId, accounts]);
+
+  // 2026-05-24 — parsed anchors → date map for the FilePane's per-day
+  // Balance column. Plus the upload-form statement_balance lifted as a
+  // synthetic anchor when present (mirrors the approve-time dedup pass:
+  // parser-extracted source wins over upload_form on date collision).
+  const stagedAnchorsByDate = useMemo(() => {
+    const map = new Map<string, number>();
+    const parsed = detail?.staged.parsedAnchors;
+    if (Array.isArray(parsed)) {
+      for (const a of parsed) {
+        if (typeof a?.date === "string" && typeof a?.balance === "number") {
+          map.set(a.date, a.balance);
+        }
+      }
+    }
+    const sb = detail?.staged.statementBalance;
+    const sd = detail?.staged.statementBalanceDate;
+    if (typeof sb === "number" && typeof sd === "string" && !map.has(sd)) {
+      map.set(sd, sb);
+    }
+    return map;
+  }, [detail]);
+
+  // Anchors-only approve detector. When every staged row is already in
+  // the bank ledger (skipped_duplicate) or already linked to a system-side
+  // transaction, the default-approve path materializes zero rows but
+  // STILL commits the file's balance anchors. Surface a hint so the user
+  // knows clicking Approve isn't a no-op.
+  const anchorsOnlyHint = useMemo(() => {
+    if (!detail || detail.staged.boundAccountId == null) return null;
+    const anchorCount = stagedAnchorsByDate.size;
+    if (anchorCount === 0) return null;
+    const eligibleRowCount = detail.rows.filter(
+      (r) =>
+        r.reconcileState !== "skipped_duplicate" &&
+        r.reconcileState !== "linked",
+    ).length;
+    if (eligibleRowCount > 0) return null;
+    return {
+      anchorCount,
+      totalRows: detail.rows.length,
+    };
+  }, [detail, stagedAnchorsByDate]);
 
   const toggleSelect = useCallback((id: string) => {
     setSelected((s) => {
@@ -500,7 +563,10 @@ function PendingImportsPageInner() {
     (transactionId: number, linkedStagedRowId: string | null) => {
       setDbRows((rows) =>
         rows.map((r) =>
-          r.id === transactionId ? { ...r, linkedStagedRowId } : r,
+          // Two-ledger refactor (2026-05-22): DbPane rows are keyed by
+          // bank-ledger UUID (r.id), but link state attaches to the
+          // system-side transaction. Match on linkedTransactionId.
+          r.linkedTransactionId === transactionId ? { ...r, linkedStagedRowId } : r,
         ),
       );
     },
@@ -511,7 +577,7 @@ function PendingImportsPageInner() {
     (transactionId: number, flag: { kind: string; note: string | null } | null) => {
       setDbRows((rows) =>
         rows.map((r) =>
-          r.id === transactionId ? { ...r, reconciliationFlag: flag } : r,
+          r.linkedTransactionId === transactionId ? { ...r, reconciliationFlag: flag } : r,
         ),
       );
     },
@@ -700,13 +766,20 @@ function PendingImportsPageInner() {
   const displaySuggestions: SuggestionDisplay[] = useMemo(() => {
     if (!detail?.suggestedMatches) return [];
     const stagedById = new Map(detail.rows.map((r) => [r.id, r]));
-    const dbById = new Map(dbRows.map((r) => [r.id, r]));
+    // Two-ledger refactor (2026-05-22): DbPane rows are keyed by bank-
+    // ledger UUID (r.id). The auto-match suggestion carries the system-
+    // side transactionId, so we key the lookup map by linkedTransactionId.
+    // Rows without a linked transaction (bank-only history) are skipped.
+    const dbByTxId = new Map<number, typeof dbRows[number]>();
+    for (const r of dbRows) {
+      if (r.linkedTransactionId != null) dbByTxId.set(r.linkedTransactionId, r);
+    }
     const out: SuggestionDisplay[] = [];
     for (const s of detail.suggestedMatches) {
       const key = `${s.stagedRowId}:${s.transactionId}`;
       if (rejectedSuggestions.has(key)) continue;
       const sRow = stagedById.get(s.stagedRowId);
-      const dRow = dbById.get(s.transactionId);
+      const dRow = dbByTxId.get(s.transactionId);
       if (!sRow || !dRow) continue;
       if (sRow.reconcileState === "linked" || sRow.reconcileState === "skipped_duplicate") continue;
       if (dRow.linkedStagedRowId != null && dRow.linkedStagedRowId !== sRow.id) continue;
@@ -747,6 +820,16 @@ function PendingImportsPageInner() {
           msg: `${data?.data?.rowIds?.length ?? 0} row${
             (data?.data?.rowIds?.length ?? 0) === 1 ? "" : "s"
           } need a category before import`,
+        });
+        return;
+      }
+      if (!res.ok && data?.code === "bank_ledger_upsert_failed") {
+        // Two-ledger refactor — bank_transactions upsert is now fatal.
+        // Surface the exact error so the user can report it and we can
+        // fix the underlying schema/migration issue.
+        setToast({
+          type: "error",
+          msg: `Bank-ledger write failed: ${data.error ?? "Unknown error"}`,
         });
         return;
       }
@@ -986,6 +1069,17 @@ function PendingImportsPageInner() {
           )}
         </div>
         <div className="flex gap-2">
+          <Link
+            href={
+              accountId != null
+                ? `/reconcile?account=${accountId}`
+                : "/reconcile"
+            }
+            className={buttonVariants({ variant: "outline" })}
+          >
+            Open reconciliation
+            <ArrowRight className="h-4 w-4 ml-1.5" />
+          </Link>
           <Button
             variant="ghost"
             onClick={reject}
@@ -1024,6 +1118,36 @@ function PendingImportsPageInner() {
           projectedBalance={liveProjection?.projected ?? null}
           boundAccountCurrency={detail.reconciliation?.boundAccountCurrency ?? null}
         />
+      )}
+
+      {detail && (detail.balanceWarnings?.length ?? 0) > 0 && (
+        <BalanceWarningBanner
+          warnings={detail.balanceWarnings ?? []}
+          currency={
+            detail.staged.statementCurrency ??
+            detail.reconciliation?.boundAccountCurrency ??
+            null
+          }
+        />
+      )}
+
+      {anchorsOnlyHint && (
+        <Card className="border-sky-300 bg-sky-50/50">
+          <CardContent className="py-2.5 px-3 text-sm flex items-start gap-3">
+            <Info className="h-4 w-4 text-sky-700 shrink-0 mt-0.5" />
+            <div className="text-sky-900">
+              All {anchorsOnlyHint.totalRows} transaction
+              {anchorsOnlyHint.totalRows === 1 ? "" : "s"} in this file are
+              already in the bank ledger. Clicking <strong>Approve</strong> will
+              still load{" "}
+              <strong>
+                {anchorsOnlyHint.anchorCount} balance anchor
+                {anchorsOnlyHint.anchorCount === 1 ? "" : "s"}
+              </strong>{" "}
+              from this file into the bank-side ledger.
+            </div>
+          </CardContent>
+        </Card>
       )}
 
       {detail && unresolved && unresolved.rowIds.length > 0 && (
@@ -1071,7 +1195,7 @@ function PendingImportsPageInner() {
           </Card>
         ) : detail ? (
           <TwoPaneLayout
-            leftLabel="What's in Finlynq (existing)"
+            leftLabel="Bank ledger (continuous)"
             left={
               <DbPane
                 rows={dbRows}
@@ -1085,6 +1209,12 @@ function PendingImportsPageInner() {
                     !r.linkedStagedRowId ||
                     r.linkedStagedRowId === linkMode?.stagedRowId;
                   const linkBusy = busyKey === `link:${linkMode?.stagedRowId}`;
+                  // Two-ledger refactor (2026-05-22): link / flag actions
+                  // target the system-side transaction. Bank-only rows
+                  // (linkedTransactionId == null) can't be linked / flagged
+                  // — they're historical bank entries without a current
+                  // system-side row.
+                  const txId = r.linkedTransactionId;
                   if (linkMode) {
                     if (!eligibleForLink) {
                       return (
@@ -1093,11 +1223,18 @@ function PendingImportsPageInner() {
                         </span>
                       );
                     }
+                    if (txId == null) {
+                      return (
+                        <span className="text-[10px] text-muted-foreground italic">
+                          bank-only
+                        </span>
+                      );
+                    }
                     return (
                       <Button
                         size="sm"
                         variant="outline"
-                        onClick={() => completeLink(r.id)}
+                        onClick={() => completeLink(txId)}
                         disabled={linkBusy}
                         className="h-7 px-2"
                       >
@@ -1106,15 +1243,19 @@ function PendingImportsPageInner() {
                       </Button>
                     );
                   }
+                  if (txId == null) {
+                    // Bank-only history row — flag actions don't apply.
+                    return null;
+                  }
                   // Default mode: flag / unflag toggle.
                   const flagBusy =
-                    busyKey === `flag:${r.id}` || busyKey === `unflag:${r.id}`;
+                    busyKey === `flag:${txId}` || busyKey === `unflag:${txId}`;
                   if (r.reconciliationFlag) {
                     return (
                       <Button
                         size="sm"
                         variant="ghost"
-                        onClick={() => unflagDbRow(r.id)}
+                        onClick={() => unflagDbRow(txId)}
                         disabled={flagBusy}
                         className="h-7 px-2 text-rose-700"
                         title="Remove 'missing from statement' flag"
@@ -1127,7 +1268,7 @@ function PendingImportsPageInner() {
                     <Button
                       size="sm"
                       variant="ghost"
-                      onClick={() => flagDbRow(r.id)}
+                      onClick={() => flagDbRow(txId)}
                       disabled={flagBusy}
                       className="h-7 px-2 text-muted-foreground hover:text-rose-700"
                       title="Mark as missing from this statement"
@@ -1150,6 +1291,7 @@ function PendingImportsPageInner() {
                 onToggleSelect={toggleSelect}
                 onToggleExpand={toggleExpanded}
                 onRowUpdated={onRowUpdated}
+                anchorsByDate={stagedAnchorsByDate}
                 header={
                   displaySuggestions.length > 0 && (
                     <SuggestionsGroup

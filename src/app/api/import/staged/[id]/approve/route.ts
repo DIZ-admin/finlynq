@@ -63,7 +63,16 @@ import {
   defaultHoldingForInvestmentAccount,
   getInvestmentAccountIds,
 } from "@/lib/investment-account";
-import { generateImportHash } from "@/lib/import-hash";
+import { generateImportHash, assignOccurrenceIndices } from "@/lib/import-hash";
+import { upsertBankTransaction } from "@/lib/bank-ledger";
+import {
+  validateBankBalances,
+  upsertBankBalanceAnchors,
+  type BalanceAnchor,
+  type BalanceMismatch,
+  ANCHOR_SOURCES,
+  type AnchorSource,
+} from "@/lib/bank-ledger-balance";
 import { matchesRule, type TransactionRule } from "@/lib/auto-categorize";
 import { computePureActionPatch } from "@/lib/rules/execute";
 import type { ConditionGroup, Action } from "@/lib/rules/schema";
@@ -100,6 +109,16 @@ export async function POST(
       id: schema.stagedImports.id,
       source: schema.stagedImports.source,
       fileFormat: schema.stagedImports.fileFormat,
+      originalFilename: schema.stagedImports.originalFilename,
+      // 2026-05-24 — bank balance anchors carried from upload through to
+      // approve. `parsed_anchors` is the JSONB array of CSV/OFX anchors;
+      // `statement_balance` + date + currency carry the upload-form anchor
+      // (single value). All three are nullable.
+      boundAccountId: schema.stagedImports.boundAccountId,
+      parsedAnchors: schema.stagedImports.parsedAnchors,
+      statementBalance: schema.stagedImports.statementBalance,
+      statementBalanceDate: schema.stagedImports.statementBalanceDate,
+      statementCurrency: schema.stagedImports.statementCurrency,
     })
     .from(schema.stagedImports)
     .where(and(
@@ -164,7 +183,71 @@ export async function POST(
   }
   const selected = allSelected.filter((r) => r.reconcileState !== "linked");
 
-  if (selected.length === 0 && linkedRows.length === 0) {
+  // ─── Bank balance anchor dedup (moved up 2026-05-22) ───────────────────
+  //
+  // Computed BEFORE the "no rows selected" early-return so an anchors-only
+  // approve (every row is `skipped_duplicate`) can still commit the file's
+  // balance anchors. Anchors are a sibling fact to bank rows — re-uploading
+  // a fully-duplicate statement to refresh the bank-side balance is a
+  // valid commit path. Load-bearing per CLAUDE.md "Bank balance anchors".
+  //
+  // The validation pass (projectedBankRows + validateBankBalances) stays
+  // at its original location below — it depends on `selected`, which is
+  // legitimately empty in the anchors-only case (no projected rows means
+  // validateBankBalances compares anchors against the existing bank
+  // ledger only, which is the right behavior).
+  const balanceAnchors: BalanceAnchor[] = [];
+  if (staged.boundAccountId != null) {
+    const parsed = staged.parsedAnchors;
+    if (Array.isArray(parsed)) {
+      for (const raw of parsed as unknown[]) {
+        if (!raw || typeof raw !== "object") continue;
+        const a = raw as Record<string, unknown>;
+        if (typeof a.date !== "string") continue;
+        if (typeof a.balance !== "number") continue;
+        const ccy = typeof a.currency === "string" ? a.currency : "CAD";
+        const src = typeof a.source === "string" ? a.source : "csv_column";
+        if (!(ANCHOR_SOURCES as readonly string[]).includes(src)) continue;
+        balanceAnchors.push({
+          date: a.date,
+          balance: a.balance,
+          currency: ccy,
+          source: src as AnchorSource,
+        });
+      }
+    }
+    if (
+      typeof staged.statementBalance === "number" &&
+      typeof staged.statementBalanceDate === "string"
+    ) {
+      balanceAnchors.push({
+        date: staged.statementBalanceDate,
+        balance: staged.statementBalance,
+        currency: staged.statementCurrency ?? "CAD",
+        source: "upload_form",
+      });
+    }
+  }
+  const anchorByDate = new Map<string, BalanceAnchor>();
+  for (const a of balanceAnchors) {
+    const existing = anchorByDate.get(a.date);
+    if (!existing || existing.source === "upload_form") {
+      anchorByDate.set(a.date, a);
+    }
+  }
+  const dedupedAnchors = Array.from(anchorByDate.values());
+
+  // Anchors-only approve — when every row is a duplicate (selected empty)
+  // and the user has nothing linked, but the file carries balance anchors
+  // for a bound account, the approve still goes through to commit anchors.
+  const anchorsOnlyApprove =
+    staged.boundAccountId != null && dedupedAnchors.length > 0;
+
+  if (
+    selected.length === 0 &&
+    linkedRows.length === 0 &&
+    !anchorsOnlyApprove
+  ) {
     return NextResponse.json({ error: "No rows selected" }, { status: 400 });
   }
 
@@ -288,6 +371,35 @@ export async function POST(
   // deletes only what actually went through.
   const materializedRowIds = new Set<string>();
   let imported = 0;
+
+  // ─── Bank balance pre-flight validation (2026-05-24) ───────────────────
+  //
+  // `dedupedAnchors` was computed earlier (above the "no rows selected"
+  // early-return) so an anchors-only approve can still commit anchors.
+  // This pass compares them to the rolling sum of bank rows produced by
+  // the materialization preview — surfaced as `balanceWarnings` on the
+  // response. Approve still goes through; user decision is warn-but-allow
+  // per CLAUDE.md "Bank balance anchors".
+  //
+  // Skipped when there's no bound account (multi-account CSVs don't
+  // carry a single coherent anchor) or no anchors at all.
+
+  // Projected rows = the bank rows the materialization step is about to
+  // upsert into bank_transactions. Mirror what the row-by-row classifier
+  // produces (cash + transfer-pair legs + target-transfers, both signs).
+  const projectedBankRows = selected
+    .filter((r) => staged.boundAccountId != null)
+    .map((r) => ({ date: r.date, amount: r.amount }));
+
+  let balanceWarnings: BalanceMismatch[] = [];
+  if (staged.boundAccountId != null && dedupedAnchors.length > 0) {
+    balanceWarnings = await validateBankBalances(
+      userId,
+      staged.boundAccountId,
+      dedupedAnchors,
+      projectedBankRows,
+    );
+  }
 
   // ─── Step 1: classify selected rows ─────────────────────────────────────
   //
@@ -450,16 +562,50 @@ export async function POST(
   }));
 
   if (rawForPipeline.length > 0) {
-    const result = await executeImport(rawForPipeline, forceImportIndices, userId, dek);
-    imported += result.imported;
-    if (result.errors) importErrors.push(...result.errors);
-    // Mark cash rows as materialized for the partial-approve cleanup. We
-    // don't have a fine-grained "this specific row was inserted" signal
-    // out of executeImport (it returns counts, not per-row outcomes), so
-    // we treat all cashRows as materialized when at least one inserted.
-    // Rows that got rejected as duplicates are still removed from staging
-    // (they were the bank's view of an existing transaction).
-    for (const r of cashRows) materializedRowIds.add(r.id);
+    try {
+      const result = await executeImport(
+        rawForPipeline,
+        forceImportIndices,
+        userId,
+        dek,
+        "import",
+        {
+          bankLedgerMode: "merge",
+          filename: staged.originalFilename ?? null,
+          stagedImportId: staged.id,
+        },
+      );
+      imported += result.imported;
+      if (result.errors) importErrors.push(...result.errors);
+      // Mark cash rows as materialized for the partial-approve cleanup. We
+      // don't have a fine-grained "this specific row was inserted" signal
+      // out of executeImport (it returns counts, not per-row outcomes), so
+      // we treat all cashRows as materialized when at least one inserted.
+      // Rows that got rejected as duplicates are still removed from staging
+      // (they were the bank's view of an existing transaction).
+      for (const r of cashRows) materializedRowIds.add(r.id);
+    } catch (err) {
+      // executeImport now throws on bank-ledger upsert failure (the
+      // two-ledger invariant — see import-pipeline.ts). Surface it cleanly
+      // instead of letting Next.js return an opaque 500.
+      // eslint-disable-next-line no-console
+      console.error("[approve] executeImport threw", {
+        userId,
+        stagedImportId: staged.id,
+        rowCount: rawForPipeline.length,
+        err: err instanceof Error
+          ? { name: err.name, message: err.message, stack: err.stack }
+          : String(err),
+      });
+      return NextResponse.json(
+        {
+          success: false,
+          code: "bank_ledger_upsert_failed",
+          error: err instanceof Error ? err.message : "Bank-ledger upsert failed",
+        },
+        { status: 500 },
+      );
+    }
   }
 
   // ─── Step 3: handle peer-paired transfer rows ──────────────────────────
@@ -534,6 +680,61 @@ export async function POST(
       const aHash = generateImportHash(pair.a.date, aAcctId, pair.a.amount, aPayee);
       const bHash = generateImportHash(pair.b.date, bAcctId, pair.b.amount, bPayee);
 
+      // Two-ledger refactor: mint a bank_transactions row for each leg
+      // before the INSERT and stamp the FK onto the transactions row.
+      // Both legs come from the bank's record of the same transfer, so
+      // both get their own immutable bank-ledger entries.
+      const aOccIdx = assignOccurrenceIndices([{ accountId: aAcctId, hash: aHash }])[0];
+      const bOccIdx = assignOccurrenceIndices([{ accountId: bAcctId, hash: bHash }])[0];
+      let aBankTxId: string | null = null;
+      let bBankTxId: string | null = null;
+      try {
+        const aResult = await upsertBankTransaction(dek, {
+          userId,
+          accountId: aAcctId,
+          importHash: aHash,
+          occurrenceIndex: aOccIdx,
+          fitId: pair.a.fitId ?? null,
+          date: pair.a.date,
+          amount: pair.a.amount,
+          currency: (pair.a.currency ?? "CAD").toUpperCase(),
+          enteredAmount: pair.a.enteredAmount ?? null,
+          enteredCurrency: pair.a.enteredCurrency ?? null,
+          quantity: pair.a.quantity ?? null,
+          payee: aPayee,
+          note: aNote || null,
+          source: "import",
+          filename: staged.originalFilename ?? null,
+          originalStagedImportId: staged.id,
+        });
+        aBankTxId = aResult.id;
+        const bResult = await upsertBankTransaction(dek, {
+          userId,
+          accountId: bAcctId,
+          importHash: bHash,
+          occurrenceIndex: bOccIdx,
+          fitId: pair.b.fitId ?? null,
+          date: pair.b.date,
+          amount: pair.b.amount,
+          currency: (pair.b.currency ?? "CAD").toUpperCase(),
+          enteredAmount: pair.b.enteredAmount ?? null,
+          enteredCurrency: pair.b.enteredCurrency ?? null,
+          quantity: pair.b.quantity ?? null,
+          payee: bPayee,
+          note: bNote || null,
+          source: "import",
+          filename: staged.originalFilename ?? null,
+          originalStagedImportId: staged.id,
+        });
+        bBankTxId = bResult.id;
+      } catch (err) {
+        importErrors.push(
+          `Transfer pair ${pair.a.rowIndex + 1}/${pair.b.rowIndex + 1}: bank-ledger upsert failed (${err instanceof Error ? err.message : "Unknown error"})`,
+        );
+        // Continue — both legs land with NULL bank_transaction_id; lineage
+        // is lost but the transfer pair still materializes correctly.
+      }
+
       const aValues = {
         userId,
         date: pair.a.date,
@@ -552,6 +753,7 @@ export async function POST(
         importHash: aHash,
         fitId: pair.a.fitId ?? null,
         linkId,
+        bankTransactionId: aBankTxId,
         source: "import" as const,
       };
       const bValues = {
@@ -572,14 +774,68 @@ export async function POST(
         importHash: bHash,
         fitId: pair.b.fitId ?? null,
         linkId,
+        bankTransactionId: bBankTxId,
         source: "import" as const,
       };
       // Single INSERT with both rows. Drizzle's PG driver runs this as
-      // one statement; either both legs land or neither does.
-      await db.insert(schema.transactions).values([aValues, bValues]);
-      imported += 2;
+      // one statement; either both legs land or neither does. RETURNING
+      // ids so the M:N join row insert below pairs them with the bank
+      // transaction ids (Phase 5 dual-write retrofit, 2026-05-23).
+      const inserted = await db
+        .insert(schema.transactions)
+        .values([aValues, bValues])
+        .returning({ id: schema.transactions.id });
+      imported += inserted.length;
       materializedRowIds.add(pair.a.id);
       materializedRowIds.add(pair.b.id);
+
+      // Dual-write retrofit — insert one 'primary' join row per leg whose
+      // bank_transaction_id was successfully minted above. ON CONFLICT
+      // DO NOTHING so a future re-run is harmless. Failures are tracked
+      // as importErrors (the FK is set; the migration's backfill will
+      // catch drift on next deploy).
+      const linkRows: Array<{
+        userId: string;
+        transactionId: number;
+        bankTransactionId: string;
+        linkType: "primary";
+        source: "import";
+      }> = [];
+      if (aBankTxId) {
+        linkRows.push({
+          userId,
+          transactionId: inserted[0].id,
+          bankTransactionId: aBankTxId,
+          linkType: "primary",
+          source: "import",
+        });
+      }
+      if (bBankTxId) {
+        linkRows.push({
+          userId,
+          transactionId: inserted[1].id,
+          bankTransactionId: bBankTxId,
+          linkType: "primary",
+          source: "import",
+        });
+      }
+      if (linkRows.length > 0) {
+        try {
+          await db
+            .insert(schema.transactionBankLinks)
+            .values(linkRows)
+            .onConflictDoNothing({
+              target: [
+                schema.transactionBankLinks.transactionId,
+                schema.transactionBankLinks.bankTransactionId,
+              ],
+            });
+        } catch (linkErr) {
+          importErrors.push(
+            `Transfer pair ${pair.a.rowIndex + 1}/${pair.b.rowIndex + 1}: bank-link insert failed (${linkErr instanceof Error ? linkErr.message : "Unknown error"})`,
+          );
+        }
+      }
     } catch (err) {
       importErrors.push(
         `Transfer pair ${pair.a.rowIndex + 1}/${pair.b.rowIndex + 1}: ${err instanceof Error ? err.message : "unknown error"}`,
@@ -618,6 +874,50 @@ export async function POST(
       const isIncoming = Number(r.amount) > 0;
       const fromAccountId = isIncoming ? r.targetAccountId! : fromAcctId;
       const toAccountId = isIncoming ? fromAcctId : r.targetAccountId!;
+
+      // Two-ledger refactor: mint a bank-ledger row for the leg whose data
+      // came from the staged row (the bank's record of the transfer). The
+      // synthetic peer leg gets NULL — it's not in any bank statement we
+      // have. When isIncoming, the staged side is the TO leg; otherwise
+      // the FROM leg.
+      const stagedPayee = decode(r.payee, r.encryptionTier) ?? "";
+      const stagedHash = generateImportHash(
+        r.date,
+        fromAcctId,
+        r.amount,
+        stagedPayee,
+      );
+      const stagedOccIdx = assignOccurrenceIndices([
+        { accountId: fromAcctId, hash: stagedHash },
+      ])[0];
+      let stagedBankTxId: string | null = null;
+      try {
+        const upsertResult = await upsertBankTransaction(dek, {
+          userId,
+          accountId: fromAcctId,
+          importHash: stagedHash,
+          occurrenceIndex: stagedOccIdx,
+          fitId: r.fitId ?? null,
+          date: r.date,
+          amount: r.amount,
+          currency: (r.currency ?? "CAD").toUpperCase(),
+          enteredAmount: r.enteredAmount ?? null,
+          enteredCurrency: r.enteredCurrency ?? null,
+          quantity: r.quantity ?? null,
+          payee: stagedPayee,
+          note: decode(r.note, r.encryptionTier) || null,
+          source: "import",
+          filename: staged.originalFilename ?? null,
+          originalStagedImportId: staged.id,
+        });
+        stagedBankTxId = upsertResult.id;
+      } catch (err) {
+        importErrors.push(
+          `Row ${r.rowIndex + 1}: bank-ledger upsert failed (${err instanceof Error ? err.message : "Unknown error"})`,
+        );
+        // Continue — transfer pair still materializes; FK left null.
+      }
+
       const result = await createTransferPair({
         userId,
         dek,
@@ -634,6 +934,8 @@ export async function POST(
           return undefined;
         })(),
         txSource: "import",
+        fromLegBankTransactionId: !isIncoming ? stagedBankTxId : null,
+        toLegBankTransactionId: isIncoming ? stagedBankTxId : null,
       });
       if (!result.ok) {
         importErrors.push(
@@ -651,6 +953,46 @@ export async function POST(
   }
 
   if (imported > 0) invalidateUserTxCache(userId);
+
+  // ─── Bank balance anchors — INSERT (2026-05-24) ────────────────────────
+  //
+  // Persist anchors AFTER the materialization succeeds so we don't write
+  // anchors for an approve that rolled back. ON CONFLICT (user, account,
+  // date) DO UPDATE — newer balance wins (a corrected re-download from
+  // the bank should overwrite). Load-bearing per CLAUDE.md "Bank balance
+  // anchors". Skipped when the staged batch had no bound account or no
+  // anchors; balanceWarnings still surfaces above for context.
+  // Gate: anchors land whenever the user explicitly approved a batch with
+  // a bound account + at least one anchor. Anchors are a sibling fact to
+  // bank rows (CLAUDE.md "Bank balance anchors") — completely independent
+  // of row materialization. A previous gate clause `importErrors.length
+  // === 0` was meant to be a rollback signal but turned out to be wrong:
+  // executeImport pushes per-row WARNINGS (not failures) to that array
+  // ("category not found, defaulted to X", "auto-created holding", etc.).
+  // Even a single warning silently discarded all anchors. The real
+  // catastrophic-failure paths (bank-ledger upsert throws, FX engine
+  // throws) abort the approve before reaching this block via early returns,
+  // so the gate has full rollback semantics without checking importErrors.
+  if (
+    staged.boundAccountId != null &&
+    dedupedAnchors.length > 0
+  ) {
+    try {
+      await upsertBankBalanceAnchors(
+        userId,
+        staged.boundAccountId,
+        dedupedAnchors,
+        staged.originalFilename ?? null,
+      );
+    } catch (err) {
+      // Don't fail the whole approve over an anchor INSERT — the
+      // transactions and bank-ledger rows are already in. Surface as a
+      // soft error in the response payload.
+      importErrors.push(
+        `Bank balance anchors: insert failed (${err instanceof Error ? err.message : "unknown error"})`,
+      );
+    }
+  }
 
   // FINLYNQ-56 — linked rows are de-queued, not materialized. Add them to
   // materializedRowIds so the cleanup pass below deletes them from the
@@ -703,5 +1045,11 @@ export async function POST(
     skippedDuplicates: 0, // accounted for inside executeImport's per-call result
     total: allSelected.length,
     errors: importErrors.length > 0 ? importErrors : undefined,
+    // 2026-05-24 — per-day bank balance mismatches surfaced by the
+    // pre-flight validation. Empty array means the new anchors line up
+    // with the running total; non-empty means at least one anchor's
+    // expected balance doesn't match what the bank reported. Approve
+    // still went through (warn-but-allow); the UI banner explains.
+    balanceWarnings: balanceWarnings.length > 0 ? balanceWarnings : undefined,
   });
 }

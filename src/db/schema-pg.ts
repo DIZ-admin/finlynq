@@ -18,6 +18,7 @@ import {
   timestamp,
   boolean,
   uniqueIndex,
+  index,
   uuid,
   jsonb,
 } from "drizzle-orm/pg-core";
@@ -118,6 +119,17 @@ export const transactions = pgTable("transactions", {
   // from `link_id`, which the four-check transfer-pair rule reserves for
   // `record_transfer` siblings.
   tradeLinkId: text("trade_link_id"),
+  // Two-ledger import refactor (2026-05-22) — lineage FK back to the bank-
+  // side record of this row. Set on import-sourced INSERTs (executeImport,
+  // createTransferPair source leg, approve route's three buckets); NULL on
+  // manual entries (REST POST /transactions, MCP HTTP record_transaction /
+  // bulk_record_transactions / record_transfer / record_trade). ON DELETE
+  // SET NULL — the bank ledger and the system-side transaction have
+  // independent lifecycles; deleting either does not cascade. After a user
+  // account-move, transactions.account_id may diverge from
+  // bank_transactions.account_id — that's intentional, the FK is lineage
+  // only. Do NOT auto-relink. See docs/architecture/bank-ledger.md.
+  bankTransactionId: uuid("bank_transaction_id"),
 });
 
 // tx_currency_audit — flagged rows where transactions.currency != accounts.currency
@@ -495,6 +507,12 @@ export const importTemplates = pgTable("import_templates", {
   columnMapping: text("column_mapping").notNull(), // JSON: {date, amount, account?, payee?, category?, currency?, note?, tags?}
   defaultAccount: text("default_account"),
   isDefault: integer("is_default").notNull().default(0),
+  // FINLYNQ-54 follow-up — parser knobs persisted on the template so the
+  // upload UI can pre-fill them on next import. Mirrors staged_imports.
+  skipHeaderRows: integer("skip_header_rows").notNull().default(0),
+  skipFooterRows: integer("skip_footer_rows").notNull().default(0),
+  dateFormatOverride: text("date_format_override"),
+  defaultCurrency: text("default_currency"),
   createdAt: text("created_at").notNull(),
   updatedAt: text("updated_at").notNull(),
 });
@@ -647,6 +665,16 @@ export const stagedImports = pgTable("staged_imports", {
   // staged_imports rows; overlap detection skips NULL rows.
   dateRangeStart: text("date_range_start"), // YYYY-MM-DD
   dateRangeEnd: text("date_range_end"), // YYYY-MM-DD
+  // ─── Bank balance anchors parsed at upload time (2026-05-24) ─────────
+  // JSONB array of { date, balance, currency, source }. Carries CSV
+  // balance-column anchors and OFX <LEDGERBAL> from the upload step
+  // through to the approve step (where they're INSERTed into
+  // bank_daily_balances + validated against the running total). Null
+  // means no anchors were parsed; the upload form's statement_balance
+  // is a SEPARATE upload_form source carried via the existing
+  // statement_balance / statement_balance_date / statement_currency
+  // columns above.
+  parsedAnchors: jsonb("parsed_anchors"),
 });
 
 export const stagedTransactions = pgTable("staged_transactions", {
@@ -735,6 +763,168 @@ export const stagedTransactions = pgTable("staged_transactions", {
     { onDelete: "set null" },
   ),
 });
+
+// ─── bank_transactions — persistent bank-side ledger (2026-05-22)
+//
+// Two-ledger import refactor. Records every row from every statement the
+// user has ever approved. Re-importing an already-approved row silently
+// bumps `seen_count` / `last_seen_at` / `source_filenames` instead of
+// overwriting anything — content (import_hash, fit_id, date, amount,
+// payee, tx_type) is immutable once written.
+//
+// The `transactions.bank_transaction_id` FK above links the system-side
+// row back to its bank-side lineage. User edits to `transactions` (rename
+// payee, recategorize, split, transfer-pair) never propagate to the bank
+// ledger; bank-side updates from re-imports never overwrite the user's
+// transaction. After a user account-move, `transactions.account_id` and
+// `bank_transactions.account_id` may diverge — that's intentional.
+//
+// Two-tier encryption mirrors staged_transactions:
+//   - 'service' (default at ingest): wrapped with PF_STAGING_KEY (sv1:).
+//     Used by the email-webhook ingest path where no user DEK is in scope.
+//   - 'user': wrapped with the user's DEK (v1:). Approve-time ingest writes
+//     directly to user-tier; the login-time upgrade job
+//     (upgradeStagingEncryption) flips service-tier rows to user-tier when
+//     the DEK becomes available.
+// Read paths branch on `encryption_tier` to pick decryptStaged() vs
+// tryDecryptField(dek, ...).
+//
+// Dedup key is `(user_id, account_id, import_hash, occurrence_index)` —
+// the `occurrence_index` disambiguates intentional same-day duplicates.
+// `(user_id, account_id, fit_id)` is the partial-unique fallback when the
+// bank provides a FITID. CHECK constraints on `encryption_tier` and
+// `source` enforce the enum membership.
+//
+// See pf-app/docs/architecture/bank-ledger.md for the full design and the
+// load-bearing invariants in CLAUDE.md "Two-ledger import model".
+export const bankTransactions = pgTable("bank_transactions", {
+  id: uuid("id").primaryKey().defaultRandom(),
+  userId: text("user_id")
+    .notNull()
+    .references(() => users.id, { onDelete: "cascade" }),
+  accountId: integer("account_id")
+    .notNull()
+    .references(() => accounts.id, { onDelete: "cascade" }),
+  importHash: text("import_hash").notNull(),
+  occurrenceIndex: integer("occurrence_index").notNull().default(0),
+  fitId: text("fit_id"),
+  date: text("date").notNull(), // YYYY-MM-DD, matches transactions.date
+  amount: doublePrecision("amount").notNull(),
+  currency: text("currency").notNull(),
+  enteredAmount: doublePrecision("entered_amount"),
+  enteredCurrency: text("entered_currency"),
+  enteredFxRate: doublePrecision("entered_fx_rate"),
+  quantity: doublePrecision("quantity"),
+  // Encrypted-in-place text columns (v1: or sv1: envelope per encryption_tier).
+  payee: text("payee").notNull(),
+  note: text("note"),
+  tags: text("tags"),
+  // Free-text account label from the source file's header. Display-only —
+  // the `account_id` FK is the truth.
+  accountName: text("account_name"),
+  // 'service' | 'user' — CHECK enforced in SQL.
+  encryptionTier: text("encryption_tier").notNull().default("service"),
+  // 'upload' | 'email' | 'connector' | 'mcp_import' | 'backup_restore' —
+  // subset of the SOURCES tuple in src/lib/tx-source.ts. Manual entries
+  // never carry bank-statement lineage; they bypass this table entirely.
+  source: text("source").notNull(),
+  firstSeenAt: timestamp("first_seen_at", { withTimezone: true })
+    .notNull()
+    .defaultNow(),
+  lastSeenAt: timestamp("last_seen_at", { withTimezone: true })
+    .notNull()
+    .defaultNow(),
+  seenCount: integer("seen_count").notNull().default(1),
+  // Array of filenames this row has appeared in. Append-only. Bumped on
+  // every re-import hit via array_append(EXCLUDED.source_filenames[1]).
+  sourceFilenames: text("source_filenames")
+    .array()
+    .notNull()
+    .default(sql`ARRAY[]::TEXT[]`),
+  // Lineage hint — which staged_imports row first introduced this. NULL
+  // for backfilled rows and for direct-import paths (legacy self-hosted
+  // email webhook + backup-restore) that bypass staging. ON DELETE SET
+  // NULL because staged_imports rows are TTL'd at 60 days.
+  originalStagedImportId: text("original_staged_import_id").references(
+    () => stagedImports.id,
+    { onDelete: "set null" },
+  ),
+});
+
+// ─── transaction_bank_links — many-to-many between transactions and bank_transactions
+//
+// 2026-05-23. The 2026-05-22 two-ledger refactor added a 1:1 lineage FK
+// `transactions.bank_transaction_id`. This join table lifts that to many-to-many
+// in both directions so the standalone /reconcile page can express:
+//   - 1 bank row → N transactions  (a single bank charge split into multiple
+//     system-side transactions because the user tracks them separately)
+//   - N bank rows → 1 transaction  (a recurring fee spread across statements
+//     that the user wants to track as one annual line)
+//
+// The existing `transactions.bank_transaction_id` FK stays as the "primary
+// link" hint — every primary join row mirrors it. Aggregators / wipe-account /
+// backup-restore that already read the FK keep working unchanged; only the
+// new reconcile surface consults this table.
+//
+// CASCADE on both FKs:
+//   - Deleting a transaction removes its join rows (the bank row persists).
+//   - Deleting a bank row removes its join rows (transactions persist; their
+//     FK independently flips to NULL via the existing ON DELETE SET NULL rule).
+// Net: wipe-account's existing "delete transactions THEN bank_transactions"
+// ordering keeps working without modification.
+//
+// `link_type` is one of 'primary' | 'extra' — NOT enforced by SQL CHECK in v1
+// (rules-v2 precedent — drift between code enum + SQL CHECK is a CLAUDE.md
+// contract breach unless documented; the API layer's Zod schema is the
+// enforcement layer). `source` mirrors the SOURCES tuple in src/lib/tx-source.ts.
+export const transactionBankLinks = pgTable(
+  "transaction_bank_links",
+  {
+    id: serial("id").primaryKey(),
+    userId: text("user_id").notNull(),
+    transactionId: integer("transaction_id")
+      .notNull()
+      .references(() => transactions.id, { onDelete: "cascade" }),
+    bankTransactionId: uuid("bank_transaction_id")
+      .notNull()
+      .references(() => bankTransactions.id, { onDelete: "cascade" }),
+    // 'primary' | 'extra'. Exactly one 'primary' per transaction at a time
+    // (application-layer invariant — when a primary link is removed the
+    // transactions.bank_transaction_id FK is cleared in the same DB tx).
+    linkType: text("link_type").notNull().default("extra"),
+    // Writer-surface attribution. Mirrors the SOURCES tuple. Today's writers:
+    //   'manual'         — user clicked Accept on a reconcile suggestion
+    //   'import'         — backfilled from the FK by Phase 1 / dual-write
+    //                      retrofit on the 4 import chokepoints (Phase 5)
+    //   'reconcile_link' — created during materialize-from-bank-row flow
+    //   'backup_restore' — restored from an export
+    source: text("source").notNull().default("manual"),
+    createdAt: timestamp("created_at", { withTimezone: true })
+      .notNull()
+      .defaultNow(),
+  },
+  (table) => [
+    // The pair (transaction_id, bank_transaction_id) is globally unique —
+    // a given tx can link to a given bank row at most once, regardless of
+    // link_type. Re-linking with a different link_type goes through
+    // UPDATE rather than INSERT.
+    uniqueIndex("transaction_bank_links_pair_uq").on(
+      table.transactionId,
+      table.bankTransactionId,
+    ),
+    // Hot paths for the /api/reconcile/suggestions endpoint:
+    //   - "give me every join row for these tx ids"
+    //   - "give me every join row for these bank ids"
+    index("transaction_bank_links_user_tx_idx").on(
+      table.userId,
+      table.transactionId,
+    ),
+    index("transaction_bank_links_user_bank_idx").on(
+      table.userId,
+      table.bankTransactionId,
+    ),
+  ],
+);
 
 // ─── transaction_reconciliation_flags — DB-side reconciliation annotations
 //
@@ -930,3 +1120,61 @@ export const webhookDeliveries = pgTable("webhook_deliveries", {
     .notNull()
     .defaultNow(),
 });
+
+// ─── bank_daily_balances — per-day bank-reported anchor balances (2026-05-24)
+//
+// Independent of `bank_transactions`. An anchor is "the bank told us X
+// on date D" — it survives row deletion and may exist on days that have
+// no row at all (e.g., user-typed statement balance for a statement-end
+// date with no transactions on it).
+//
+// Re-import semantics: ON CONFLICT (user_id, account_id, date) DO UPDATE
+// — newer balance wins. A re-downloaded statement with a corrected value
+// should overwrite. Load-bearing per CLAUDE.md "Bank balance anchors".
+//
+// CASCADE on user_id + account_id so wipe-account and account delete
+// clean up automatically. PK enforces "at most one anchor per day".
+export const bankDailyBalances = pgTable("bank_daily_balances", {
+  userId: text("user_id")
+    .notNull()
+    .references(() => users.id, { onDelete: "cascade" }),
+  accountId: integer("account_id")
+    .notNull()
+    .references(() => accounts.id, { onDelete: "cascade" }),
+  // YYYY-MM-DD, matches bank_transactions.date format.
+  date: text("date").notNull(),
+  balance: doublePrecision("balance").notNull(),
+  // ISO 4217. Captured at insert from accounts.currency or the
+  // statement's CURDEF. Drives /reconcile header's FX hop decision.
+  currency: text("currency").notNull(),
+  // 'csv_column' | 'ofx_ledgerbal' | 'upload_form' today.
+  // 'email' | 'connector' | 'backup_restore' reserved for future
+  // surfaces. CHECK enforced in SQL; keep this enum in sync with the
+  // SOURCES tuple in src/lib/bank-ledger-balance.ts.
+  source: text("source").notNull(),
+  // Append-only history of filenames that produced or re-confirmed
+  // this anchor. Mirrors bank_transactions.source_filenames pattern.
+  sourceFilenames: text("source_filenames")
+    .array()
+    .notNull()
+    .default(sql`ARRAY[]::TEXT[]`),
+  firstSeenAt: timestamp("first_seen_at", { withTimezone: true })
+    .notNull()
+    .defaultNow(),
+  lastSeenAt: timestamp("last_seen_at", { withTimezone: true })
+    .notNull()
+    .defaultNow(),
+}, (table) => [
+  primaryKey({ columns: [table.userId, table.accountId, table.date] }),
+  // Hot path: "give me the most recent anchor for this account" — drives
+  // the /reconcile header's "bank says (as of <date>): $X" display, and
+  // the validation helper's "find prior anchor" lookup. The DESC
+  // ordering on `date` lives in the SQL migration; PG scans the index
+  // either direction so the Drizzle reflection can omit it without
+  // changing the runtime plan.
+  index("bank_daily_balances_account_date_desc_idx").on(
+    table.userId,
+    table.accountId,
+    table.date,
+  ),
+]);

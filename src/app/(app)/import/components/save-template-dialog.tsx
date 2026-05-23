@@ -19,8 +19,11 @@ import {
   SelectTrigger,
   SelectValue,
 } from "@/components/ui/select";
-import type { ColumnMapping } from "@/lib/import-templates";
+import type { ColumnMapping, DateFormatOverride } from "@/lib/import-templates";
 import { autoDetectColumnMapping } from "@/lib/import-templates";
+import { SUPPORTED_CURRENCIES } from "@/lib/fx/supported-currencies";
+
+type DateFormatUi = "auto" | DateFormatOverride;
 
 interface SaveTemplateDialogProps {
   open: boolean;
@@ -39,6 +42,7 @@ const FIELD_LABELS: Record<keyof ColumnMapping, string> = {
   currency: "Currency",
   note: "Note",
   tags: "Tags",
+  balance: "Balance (running)",
 };
 
 const MAPPING_FIELDS = Object.keys(FIELD_LABELS) as (keyof ColumnMapping)[];
@@ -55,6 +59,10 @@ export function SaveTemplateDialog({
   const [mapping, setMapping] = useState<ColumnMapping>(() => {
     return autoDetectColumnMapping(csvHeaders) ?? { date: "", amount: "" };
   });
+  const [skipHeaderRows, setSkipHeaderRows] = useState("0");
+  const [skipFooterRows, setSkipFooterRows] = useState("0");
+  const [dateFormatOverride, setDateFormatOverride] = useState<DateFormatUi>("auto");
+  const [defaultCurrency, setDefaultCurrency] = useState("");
   const [saving, setSaving] = useState(false);
   const [error, setError] = useState("");
 
@@ -64,6 +72,10 @@ export function SaveTemplateDialog({
       setName("");
       setDefaultAccount("");
       setMapping(autoDetectColumnMapping(csvHeaders) ?? { date: "", amount: "" });
+      setSkipHeaderRows("0");
+      setSkipFooterRows("0");
+      setDateFormatOverride("auto");
+      setDefaultCurrency("");
       setError("");
     }
     onOpenChange(val);
@@ -86,6 +98,9 @@ export function SaveTemplateDialog({
     setSaving(true);
     setError("");
 
+    const skipH = Number.parseInt(skipHeaderRows, 10);
+    const skipF = Number.parseInt(skipFooterRows, 10);
+
     try {
       const res = await fetch("/api/import/templates", {
         method: "POST",
@@ -95,6 +110,10 @@ export function SaveTemplateDialog({
           fileHeaders: csvHeaders,
           columnMapping: mapping,
           defaultAccount: defaultAccount || undefined,
+          skipHeaderRows: Number.isFinite(skipH) ? Math.max(0, Math.min(100, skipH)) : 0,
+          skipFooterRows: Number.isFinite(skipF) ? Math.max(0, Math.min(100, skipF)) : 0,
+          dateFormatOverride: dateFormatOverride === "auto" ? null : dateFormatOverride,
+          defaultCurrency: defaultCurrency || null,
         }),
       });
       const data = await res.json();
@@ -114,7 +133,7 @@ export function SaveTemplateDialog({
 
   return (
     <Dialog open={open} onOpenChange={handleOpenChange}>
-      <DialogContent className="sm:max-w-lg">
+      <DialogContent className="sm:max-w-2xl max-h-[90vh] flex flex-col overflow-hidden">
         <DialogHeader>
           <DialogTitle>Save as Template</DialogTitle>
           <DialogDescription>
@@ -122,45 +141,47 @@ export function SaveTemplateDialog({
           </DialogDescription>
         </DialogHeader>
 
-        <div className="space-y-4">
-          <div className="space-y-1.5">
-            <Label htmlFor="tpl-name">Template Name</Label>
-            <Input
-              id="tpl-name"
-              placeholder="e.g. TD Chequing, RBC Visa"
-              value={name}
-              onChange={(e) => setName(e.target.value)}
-            />
-          </div>
+        <div className="flex-1 min-h-0 overflow-y-auto space-y-4 pr-1">
+          <div className="grid gap-3 sm:grid-cols-2">
+            <div className="space-y-1.5">
+              <Label htmlFor="tpl-name">Template Name</Label>
+              <Input
+                id="tpl-name"
+                placeholder="e.g. TD Chequing, RBC Visa"
+                value={name}
+                onChange={(e) => setName(e.target.value)}
+              />
+            </div>
 
-          <div className="space-y-1.5">
-            <Label>Default Account (optional)</Label>
-            <Select value={defaultAccount} onValueChange={(v) => setDefaultAccount(v ?? "")}>
-              <SelectTrigger>
-                <SelectValue placeholder="Leave blank to keep per-row account" />
-              </SelectTrigger>
-              <SelectContent>
-                {accounts.map((a) => (
-                  <SelectItem key={a} value={a}>{a}</SelectItem>
-                ))}
-              </SelectContent>
-            </Select>
+            <div className="space-y-1.5">
+              <Label>Default Account (optional)</Label>
+              <Select value={defaultAccount} onValueChange={(v) => setDefaultAccount(v ?? "")}>
+                <SelectTrigger>
+                  <SelectValue placeholder="Leave blank to keep per-row account" />
+                </SelectTrigger>
+                <SelectContent>
+                  {accounts.map((a) => (
+                    <SelectItem key={a} value={a}>{a}</SelectItem>
+                  ))}
+                </SelectContent>
+              </Select>
+            </div>
           </div>
 
           <div className="space-y-2">
             <Label className="text-sm font-medium">Column Mapping</Label>
             <p className="text-xs text-muted-foreground">Map CSV columns to transaction fields.</p>
-            <div className="rounded-lg border divide-y">
+            <div className="grid gap-2 sm:grid-cols-2 rounded-lg border p-2">
               {MAPPING_FIELDS.map((field) => (
-                <div key={field} className="flex items-center gap-3 px-3 py-2">
-                  <span className="w-36 text-xs text-muted-foreground shrink-0">
+                <div key={field} className="flex items-center gap-2 px-2 py-1.5">
+                  <span className="w-28 text-xs text-muted-foreground shrink-0">
                     {FIELD_LABELS[field]}
                   </span>
                   <Select
                     value={mapping[field] ?? "__none__"}
                     onValueChange={(v) => setMappingField(field, (!v || v === "__none__") ? "" : v)}
                   >
-                    <SelectTrigger className="h-7 text-xs">
+                    <SelectTrigger className="h-7 text-xs flex-1">
                       <SelectValue placeholder="—" />
                     </SelectTrigger>
                     <SelectContent>
@@ -174,6 +195,73 @@ export function SaveTemplateDialog({
               ))}
             </div>
           </div>
+
+          <details className="rounded-lg border bg-muted/30 p-3">
+            <summary className="cursor-pointer text-sm font-medium">
+              Import options (skip header / footer rows, date format, default currency)
+            </summary>
+            <div className="mt-3 space-y-3">
+              <p className="text-xs text-muted-foreground">
+                Apply these parser knobs whenever this template is used. Leave at defaults for canonical exports.
+              </p>
+              <div className="grid gap-3 sm:grid-cols-2">
+                <div className="space-y-1">
+                  <Label htmlFor="save-tpl-skip-h" className="text-xs">Skip N header rows</Label>
+                  <Input
+                    id="save-tpl-skip-h"
+                    type="number"
+                    min={0}
+                    max={100}
+                    value={skipHeaderRows}
+                    onChange={(e) => setSkipHeaderRows(e.target.value)}
+                  />
+                </div>
+                <div className="space-y-1">
+                  <Label htmlFor="save-tpl-skip-f" className="text-xs">Skip N footer rows</Label>
+                  <Input
+                    id="save-tpl-skip-f"
+                    type="number"
+                    min={0}
+                    max={100}
+                    value={skipFooterRows}
+                    onChange={(e) => setSkipFooterRows(e.target.value)}
+                  />
+                </div>
+                <div className="space-y-1">
+                  <Label className="text-xs">Date format</Label>
+                  <select
+                    value={dateFormatOverride}
+                    onChange={(e) => setDateFormatOverride(e.target.value as DateFormatUi)}
+                    className="h-9 w-full rounded-md border bg-transparent px-3 text-sm"
+                  >
+                    <option value="auto">Auto-detect</option>
+                    <option value="DD/MM/YYYY">DD/MM/YYYY</option>
+                    <option value="MM/DD/YYYY">MM/DD/YYYY</option>
+                    <option value="YYYY-MM-DD">YYYY-MM-DD</option>
+                  </select>
+                </div>
+                <div className="space-y-1">
+                  <Label className="text-xs">Default currency (rows missing one)</Label>
+                  <Select
+                    value={defaultCurrency || "__none__"}
+                    onValueChange={(v) =>
+                      setDefaultCurrency(!v || v === "__none__" ? "" : v)
+                    }
+                  >
+                    <SelectTrigger>
+                      <SelectValue placeholder="— None —" />
+                    </SelectTrigger>
+                    <SelectContent>
+                      <SelectItem value="__none__">— None —</SelectItem>
+                      {SUPPORTED_CURRENCIES.map((c) => (
+                        <SelectItem key={c} value={c}>{c}</SelectItem>
+                      ))}
+                    </SelectContent>
+                  </Select>
+                </div>
+              </div>
+            </div>
+          </details>
 
           {error && <p className="text-xs text-rose-600">{error}</p>}
         </div>
