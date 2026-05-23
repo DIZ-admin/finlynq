@@ -42,6 +42,15 @@ import {
   RefreshCw,
   Info,
 } from "lucide-react";
+import {
+  Dialog,
+  DialogContent,
+  DialogDescription,
+  DialogFooter,
+  DialogHeader,
+  DialogTitle,
+} from "@/components/ui/dialog";
+import { Sparkles } from "lucide-react";
 import { ReconciliationCallout } from "@/components/staging/reconciliation-callout";
 import {
   type StagedEditableRow,
@@ -165,6 +174,9 @@ function PendingImportsPageInner() {
   // The suggestion-card or row whose action is currently in flight —
   // disables its buttons so a double-click can't double-fire the PATCH.
   const [busyKey, setBusyKey] = useState<string | null>(null);
+  // FINLYNQ-88 — Re-apply rules confirmation modal.
+  const [reapplyModalOpen, setReapplyModalOpen] = useState(false);
+  const [reapplying, setReapplying] = useState(false);
 
   const loadList = useCallback(async () => {
     setLoading(true);
@@ -876,6 +888,44 @@ function PendingImportsPageInner() {
     }
   }, [openId]);
 
+  // FINLYNQ-88 — manual "Re-apply rules" button. Operates over the whole
+  // batch (no per-row scope) so the user can refresh rule effects after
+  // editing /settings/rules or after a side-effect rule was added late.
+  // Confirmation modal warns about overwriting manual edits — the helper
+  // SKIPS reconcile_state IN ('linked', 'skipped_duplicate') rows by
+  // construction; everything else gets re-evaluated.
+  const reapplyRules = useCallback(async () => {
+    if (!openId) return;
+    setReapplying(true);
+    try {
+      const res = await fetch(`/api/import/staged/${openId}/apply-rules`, {
+        method: "POST",
+      });
+      const data = await res.json();
+      if (!res.ok) {
+        throw new Error(data?.error ?? "Rule re-apply failed");
+      }
+      const rowsTouched = data?.data?.rowsTouched ?? 0;
+      setToast({
+        type: "success",
+        msg: `${rowsTouched} row${rowsTouched === 1 ? "" : "s"} updated by rules`,
+      });
+      setReapplyModalOpen(false);
+      // Refetch staged detail so the row table renders the new state
+      // (renamed payees, flipped tx_type, target_account_id, etc.). Also
+      // shrinks the unresolved-categories banner if rules covered any of
+      // the previously-unresolved rows.
+      await refreshDetail();
+    } catch (e) {
+      setToast({
+        type: "error",
+        msg: e instanceof Error ? e.message : "Rule re-apply failed",
+      });
+    } finally {
+      setReapplying(false);
+    }
+  }, [openId, refreshDetail]);
+
   const reject = useCallback(async () => {
     if (!openId) return;
     if (!confirm("Discard this staged import? The rows will be deleted.")) return;
@@ -1081,6 +1131,15 @@ function PendingImportsPageInner() {
             <ArrowRight className="h-4 w-4 ml-1.5" />
           </Link>
           <Button
+            variant="outline"
+            onClick={() => setReapplyModalOpen(true)}
+            disabled={acting || reapplying}
+            title="Re-apply all active rules over every row in this batch"
+          >
+            <Sparkles className="h-4 w-4 mr-1.5" />
+            Re-apply rules
+          </Button>
+          <Button
             variant="ghost"
             onClick={reject}
             disabled={acting}
@@ -1095,6 +1154,39 @@ function PendingImportsPageInner() {
           </Button>
         </div>
       </div>
+
+      {/* FINLYNQ-88 — Re-apply rules confirmation modal. */}
+      <Dialog open={reapplyModalOpen} onOpenChange={setReapplyModalOpen}>
+        <DialogContent className="sm:max-w-md">
+          <DialogHeader>
+            <DialogTitle>Re-apply rules?</DialogTitle>
+            <DialogDescription className="space-y-3 pt-2">
+              <span className="block">
+                This re-applies all active rules to every row in this batch. It
+                may overwrite manual edits to payee, category, tags, type, or
+                account on matched rows.
+              </span>
+              <span className="block">
+                Rows you&apos;ve already linked to existing transactions and
+                rows marked as duplicates are skipped.
+              </span>
+            </DialogDescription>
+          </DialogHeader>
+          <DialogFooter>
+            <Button
+              variant="ghost"
+              onClick={() => setReapplyModalOpen(false)}
+              disabled={reapplying}
+            >
+              Cancel
+            </Button>
+            <Button onClick={reapplyRules} disabled={reapplying}>
+              <Sparkles className="h-4 w-4 mr-1.5" />
+              {reapplying ? "Re-applying…" : "Re-apply"}
+            </Button>
+          </DialogFooter>
+        </DialogContent>
+      </Dialog>
 
       {toast && (
         <Card

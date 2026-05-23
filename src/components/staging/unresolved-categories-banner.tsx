@@ -166,6 +166,9 @@ export function UnresolvedCategoriesBanner({
             <p className="text-xs text-amber-800 dark:text-amber-300 mt-0.5">
               Assign a category to each row (expand the row below) or create a rule that covers a payee pattern. Transfers don&apos;t need one.
             </p>
+            <p className="text-xs text-amber-800 dark:text-amber-300 mt-0.5">
+              If you added a transfer or account rule recently, click <strong>Re-apply rules</strong> at the top of the page.
+            </p>
           </div>
           <button
             type="button"
