@@ -36,10 +36,42 @@ interface Proposal {
   status: string;
 }
 
+interface DisplacedRow {
+  id: number;
+  date: string;
+  accountId: number | null;
+  portfolioHoldingId: number | null;
+  amount: number;
+  currency: string;
+  quantity: number | null;
+  kind: string | null;
+  tradeLinkId: string | null;
+  linkId: string | null;
+}
+
+interface HoldingMeta { name: string | null; isCash: boolean; currency: string }
+interface AccountMeta { name: string | null; currency: string }
+
+const REFUSAL_EXPLANATIONS: Record<string, string> = {
+  no_cash_pair_found:
+    "No cash-sleeve row with matching amount on the same date in this account. If this brokerage's cash is tracked elsewhere, leave this proposal — manually record the matching cash debit/credit in /transactions, then re-run. If you don't track this brokerage's cash in Finlynq, start a new run in 'synthesize_orphans' mode.",
+  cross_currency_trade:
+    "Stock leg and cash leg are in different currencies — Phase 2 canonical shape requires same-currency pairs. Record an FX Conversion first (CAD↔USD whichever way), then re-run.",
+  combined_cash_leg:
+    "Multiple stock legs share one cash row. Phase 2 only supports 1:1 pairs. Split the combined cash row into per-trade rows in /transactions first.",
+  ambiguous_cash_candidates:
+    "More than one cash-sleeve row matches the stock leg by date+amount. Disambiguate in /transactions (delete or edit the wrong candidate), then re-run.",
+  no_cash_sleeve_to_synthesize_into:
+    "Synthesize mode needs a cash sleeve in the matching currency on this account, but none exists. Create one from the account detail page first.",
+};
+
 export default function BackfillReviewPage({ params }: { params: Promise<{ runId: string }> }) {
   const { runId } = use(params);
   const router = useRouter();
   const [proposals, setProposals] = useState<Proposal[]>([]);
+  const [displacedRows, setDisplacedRows] = useState<Record<number, DisplacedRow>>({});
+  const [holdingMap, setHoldingMap] = useState<Record<number, HoldingMeta>>({});
+  const [accountMap, setAccountMap] = useState<Record<number, AccountMeta>>({});
   const [loading, setLoading] = useState(true);
   const [selectedId, setSelectedId] = useState<number | null>(null);
   const [applying, setApplying] = useState(false);
@@ -52,6 +84,11 @@ export default function BackfillReviewPage({ params }: { params: Promise<{ runId
       const res = await fetch(`/api/settings/backfill/${runId}`);
       const data = await res.json();
       setProposals(data.proposals ?? []);
+      const rowsById: Record<number, DisplacedRow> = {};
+      for (const r of (data.displacedRows ?? []) as DisplacedRow[]) rowsById[r.id] = r;
+      setDisplacedRows(rowsById);
+      setHoldingMap(data.holdingMap ?? {});
+      setAccountMap(data.accountMap ?? {});
       if ((data.proposals ?? []).length > 0 && selectedId == null) {
         setSelectedId(data.proposals[0].id);
       }
@@ -167,6 +204,9 @@ export default function BackfillReviewPage({ params }: { params: Promise<{ runId
             {selected ? (
               <ProposalDetail
                 proposal={selected}
+                displacedRows={displacedRows}
+                holdingMap={holdingMap}
+                accountMap={accountMap}
                 onVariantChange={(v) => updateProposal(selected.id, { variantChoice: v })}
                 onApprove={() => updateProposal(selected.id, { status: "approved" })}
                 onReject={() => updateProposal(selected.id, { status: "rejected" })}
@@ -243,12 +283,18 @@ function ConfidenceBadge({ confidence }: { confidence: Proposal["confidence"] })
 
 function ProposalDetail({
   proposal,
+  displacedRows,
+  holdingMap,
+  accountMap,
   onVariantChange,
   onApprove,
   onReject,
   onUndo,
 }: {
   proposal: Proposal;
+  displacedRows: Record<number, DisplacedRow>;
+  holdingMap: Record<number, HoldingMeta>;
+  accountMap: Record<number, AccountMeta>;
   onVariantChange: (v: "separate_fee_row" | "absorb_into_cost" | null) => void;
   onApprove: () => void;
   onReject: () => void;
@@ -256,15 +302,16 @@ function ProposalDetail({
 }) {
   const isDrift = proposal.proposalKind === "drift";
   const isRefused = proposal.confidence === "refused";
+  const isOrphan = proposal.proposalKind === "orphan_stock_leg";
   const isApplied = proposal.status === "applied";
 
   return (
     <Card>
       <CardHeader>
-        <div className="flex items-center justify-between">
-          <CardTitle className="text-base">{proposal.summary}</CardTitle>
-          <div className="flex gap-2">
-            {!isApplied && !isRefused && (
+        <div className="flex items-center justify-between gap-3">
+          <CardTitle className="text-base leading-snug">{proposal.summary}</CardTitle>
+          <div className="flex gap-2 shrink-0">
+            {!isApplied && !isRefused && !isOrphan && (
               <>
                 <Button size="sm" variant="outline" onClick={onReject}>Reject</Button>
                 <Button size="sm" onClick={onApprove} disabled={proposal.status === "approved"}>Approve</Button>
@@ -277,12 +324,20 @@ function ProposalDetail({
         </div>
       </CardHeader>
       <CardContent className="space-y-4 text-sm">
-        {isRefused && (
+        {(isRefused || isOrphan) && (
           <div className="border border-amber-500/40 bg-amber-500/10 text-amber-700 dark:text-amber-300 rounded p-3 flex items-start gap-2">
             <AlertTriangle className="size-4 mt-0.5 shrink-0" />
             <div>
-              <div className="font-medium">Refused: {proposal.refusalReason ?? "no reason"}</div>
-              <div className="text-xs mt-1 opacity-80">This proposal can&apos;t be applied automatically. Resolve the underlying issue in /transactions, then re-run the backfill.</div>
+              <div className="font-medium">
+                {isOrphan ? "Manual fix needed" : `Refused: ${proposal.refusalReason ?? "no reason"}`}
+              </div>
+              <div className="text-xs mt-1 opacity-90">
+                {(proposal.refusalReason && REFUSAL_EXPLANATIONS[proposal.refusalReason]) ?? (
+                  isOrphan
+                    ? "This proposal can&apos;t be auto-applied because the planner couldn&apos;t propose a canonical reshape."
+                    : "Resolve the underlying issue in /transactions, then re-run the backfill."
+                )}
+              </div>
             </div>
           </div>
         )}
@@ -293,53 +348,182 @@ function ProposalDetail({
           </div>
         )}
 
-        <DisplacedRows ids={proposal.existingRowIds} />
+        <DisplacedRowsTable
+          ids={proposal.existingRowIds}
+          displacedRows={displacedRows}
+          holdingMap={holdingMap}
+          accountMap={accountMap}
+        />
 
         {isDrift && (
           <div className="space-y-2">
             <div className="font-medium">Pick fee handling</div>
-            <DriftVariantPicker
-              proposal={proposal}
-              onChange={onVariantChange}
-            />
+            <DriftVariantPicker proposal={proposal} onChange={onVariantChange} />
           </div>
         )}
 
-        {!isDrift && (
-          <ReplacementPreview proposal={proposal} />
+        {!isDrift && !isOrphan && (
+          <ReplacementPreviewTable
+            proposal={proposal}
+            holdingMap={holdingMap}
+            accountMap={accountMap}
+          />
         )}
 
-        <DeltasPanel deltas={proposal.deltasJson} />
+        <DeltasPanel deltas={proposal.deltasJson} holdingMap={holdingMap} />
       </CardContent>
     </Card>
   );
 }
 
-function DisplacedRows({ ids }: { ids: number[] }) {
+function holdingLabelFor(id: number | null, holdingMap: Record<number, HoldingMeta>): string {
+  if (id == null) return "(no holding)";
+  const h = holdingMap[id];
+  if (!h) return `holding #${id}`;
+  if (h.isCash) return `${h.currency} cash sleeve`;
+  return h.name ?? `holding #${id}`;
+}
+
+function accountLabelFor(id: number | null, accountMap: Record<number, AccountMeta>): string {
+  if (id == null) return "(no account)";
+  const a = accountMap[id];
+  if (!a) return `account #${id}`;
+  return a.name ?? `account #${id}`;
+}
+
+function DisplacedRowsTable({
+  ids,
+  displacedRows,
+  holdingMap,
+  accountMap,
+}: {
+  ids: number[];
+  displacedRows: Record<number, DisplacedRow>;
+  holdingMap: Record<number, HoldingMeta>;
+  accountMap: Record<number, AccountMeta>;
+}) {
   return (
     <div>
       <div className="text-xs uppercase tracking-wide text-muted-foreground mb-1">Existing rows being displaced</div>
-      <div className="rounded border bg-muted/30 p-2 text-xs font-mono">
-        {ids.length === 0 ? <span className="text-muted-foreground">none</span> : ids.map((id) => `Tx #${id}`).join(", ")}
+      <div className="rounded border overflow-hidden">
+        <table className="w-full text-xs">
+          <thead className="bg-muted/40">
+            <tr>
+              <th className="text-left px-2 py-1.5">Tx</th>
+              <th className="text-left px-2 py-1.5">Date</th>
+              <th className="text-left px-2 py-1.5">Account</th>
+              <th className="text-left px-2 py-1.5">Holding</th>
+              <th className="text-right px-2 py-1.5">Qty</th>
+              <th className="text-right px-2 py-1.5">Amount</th>
+              <th className="text-left px-2 py-1.5">Kind</th>
+            </tr>
+          </thead>
+          <tbody>
+            {ids.length === 0 && (
+              <tr><td colSpan={7} className="text-center text-muted-foreground px-2 py-2">none</td></tr>
+            )}
+            {ids.map((id) => {
+              const r = displacedRows[id];
+              if (!r) return (
+                <tr key={id} className="border-t"><td colSpan={7} className="px-2 py-1.5 text-muted-foreground">Tx #{id} (row not found)</td></tr>
+              );
+              return (
+                <tr key={id} className="border-t">
+                  <td className="px-2 py-1.5 font-mono">#{r.id}</td>
+                  <td className="px-2 py-1.5">{r.date}</td>
+                  <td className="px-2 py-1.5">{accountLabelFor(r.accountId, accountMap)}</td>
+                  <td className="px-2 py-1.5">{holdingLabelFor(r.portfolioHoldingId, holdingMap)}</td>
+                  <td className="px-2 py-1.5 text-right font-mono">{r.quantity ?? "—"}</td>
+                  <td className="px-2 py-1.5 text-right font-mono">{r.amount.toFixed(2)} {r.currency}</td>
+                  <td className="px-2 py-1.5 font-mono">{r.kind ?? "—"}</td>
+                </tr>
+              );
+            })}
+          </tbody>
+        </table>
       </div>
     </div>
   );
 }
 
-function ReplacementPreview({ proposal }: { proposal: Proposal }) {
-  const rows = (proposal.replacementRowsJson as Array<Record<string, unknown>> | null) ?? [];
-  const synth = (proposal.synthesizedRowsJson as Array<Record<string, unknown>> | null) ?? [];
+function ReplacementPreviewTable({
+  proposal,
+  holdingMap,
+  accountMap,
+}: {
+  proposal: Proposal;
+  holdingMap: Record<number, HoldingMeta>;
+  accountMap: Record<number, AccountMeta>;
+}) {
+  const rows = (proposal.replacementRowsJson as Array<{ txId: number; amount?: number; kind?: string; tradeLinkId?: string }> | null) ?? [];
+  const synth = (proposal.synthesizedRowsJson as Array<{
+    date: string; accountId: number; portfolioHoldingId: number | null; amount: number; currency: string; quantity: number | null; kind: string; synthReason?: string;
+  }> | null) ?? [];
   return (
-    <div className="space-y-2">
-      <div>
-        <div className="text-xs uppercase tracking-wide text-muted-foreground mb-1">Will become</div>
-        <pre className="rounded border bg-muted/30 p-2 text-xs overflow-x-auto">{JSON.stringify(rows, null, 2)}</pre>
-      </div>
+    <div className="space-y-3">
+      {rows.length > 0 && (
+        <div>
+          <div className="text-xs uppercase tracking-wide text-muted-foreground mb-1">Will become (UPDATE in place)</div>
+          <div className="rounded border overflow-hidden">
+            <table className="w-full text-xs">
+              <thead className="bg-muted/40">
+                <tr>
+                  <th className="text-left px-2 py-1.5">Tx</th>
+                  <th className="text-right px-2 py-1.5">New amount</th>
+                  <th className="text-left px-2 py-1.5">New kind</th>
+                  <th className="text-left px-2 py-1.5">trade_link_id</th>
+                </tr>
+              </thead>
+              <tbody>
+                {rows.map((r) => (
+                  <tr key={r.txId} className="border-t">
+                    <td className="px-2 py-1.5 font-mono">#{r.txId}</td>
+                    <td className="px-2 py-1.5 text-right font-mono">{r.amount?.toFixed(2) ?? "(unchanged)"}</td>
+                    <td className="px-2 py-1.5 font-mono">{r.kind ?? "(unchanged)"}</td>
+                    <td className="px-2 py-1.5 font-mono text-muted-foreground truncate max-w-[120px]">{r.tradeLinkId ?? "—"}</td>
+                  </tr>
+                ))}
+              </tbody>
+            </table>
+          </div>
+        </div>
+      )}
       {synth.length > 0 && (
         <div>
-          <div className="text-xs uppercase tracking-wide text-muted-foreground mb-1">Synthesized rows (new)</div>
-          <pre className="rounded border bg-amber-500/10 border-amber-500/40 p-2 text-xs overflow-x-auto">{JSON.stringify(synth, null, 2)}</pre>
+          <div className="text-xs uppercase tracking-wide text-muted-foreground mb-1">New rows (synthesized — tagged source=&apos;backfill_synth&apos;)</div>
+          <div className="rounded border border-amber-500/40 bg-amber-500/5 overflow-hidden">
+            <table className="w-full text-xs">
+              <thead className="bg-amber-500/10">
+                <tr>
+                  <th className="text-left px-2 py-1.5">Date</th>
+                  <th className="text-left px-2 py-1.5">Account</th>
+                  <th className="text-left px-2 py-1.5">Holding</th>
+                  <th className="text-right px-2 py-1.5">Qty</th>
+                  <th className="text-right px-2 py-1.5">Amount</th>
+                  <th className="text-left px-2 py-1.5">Kind</th>
+                </tr>
+              </thead>
+              <tbody>
+                {synth.map((r, i) => (
+                  <tr key={i} className="border-t border-amber-500/30">
+                    <td className="px-2 py-1.5">{r.date}</td>
+                    <td className="px-2 py-1.5">{accountLabelFor(r.accountId, accountMap)}</td>
+                    <td className="px-2 py-1.5">{holdingLabelFor(r.portfolioHoldingId, holdingMap)}</td>
+                    <td className="px-2 py-1.5 text-right font-mono">{r.quantity ?? "—"}</td>
+                    <td className="px-2 py-1.5 text-right font-mono">{r.amount.toFixed(2)} {r.currency}</td>
+                    <td className="px-2 py-1.5 font-mono">{r.kind}</td>
+                  </tr>
+                ))}
+              </tbody>
+            </table>
+          </div>
+          {synth[0]?.synthReason && (
+            <p className="text-xs text-muted-foreground mt-1 italic">{synth[0].synthReason}</p>
+          )}
         </div>
+      )}
+      {rows.length === 0 && synth.length === 0 && (
+        <div className="text-xs text-muted-foreground italic">No row changes proposed.</div>
       )}
     </div>
   );
@@ -396,7 +580,7 @@ function VariantOption({ label, explanation, selected, onSelect }: { label: stri
   );
 }
 
-function DeltasPanel({ deltas }: { deltas: Proposal["deltasJson"] }) {
+function DeltasPanel({ deltas, holdingMap }: { deltas: Proposal["deltasJson"]; holdingMap: Record<number, HoldingMeta> }) {
   return (
     <div>
       <div className="text-xs uppercase tracking-wide text-muted-foreground mb-1">Impact</div>
@@ -406,7 +590,7 @@ function DeltasPanel({ deltas }: { deltas: Proposal["deltasJson"] }) {
           <div>Realized gain (base): <span className="font-mono">{deltas.realizedGainBase.toFixed(2)}</span></div>
         )}
         {deltas.lots.length > 0 && (
-          <div>Lot effects: {deltas.lots.map((l) => `holding #${l.holdingId} qty ${l.qtyDelta > 0 ? "+" : ""}${l.qtyDelta}`).join(", ")}</div>
+          <div>Lot effects: {deltas.lots.map((l) => `${holdingLabelFor(l.holdingId, holdingMap)} qty ${l.qtyDelta > 0 ? "+" : ""}${l.qtyDelta}`).join(", ")}</div>
         )}
       </div>
     </div>

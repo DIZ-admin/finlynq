@@ -88,6 +88,35 @@ function holdingCurrency(tx: SnapshotTx, idx: SnapshotIndex): string | null {
   return idx.holdingById.get(tx.portfolioHoldingId)?.currency ?? null;
 }
 
+/**
+ * Friendly display label for a holding: "AAPL" if the user named it AAPL,
+ * else `holding #<id>` as a fallback. Encryption-paths (stdio MCP, CLI w/o DEK)
+ * fall back to the id.
+ */
+function holdingLabel(holdingId: number | null, idx: SnapshotIndex): string {
+  if (holdingId == null) return "(no holding)";
+  const h = idx.holdingById.get(holdingId);
+  return h?.displayName ?? `holding #${holdingId}`;
+}
+
+function accountLabel(accountId: number | null, idx: SnapshotIndex): string {
+  if (accountId == null) return "(no account)";
+  const a = idx.accountById.get(accountId);
+  return a?.displayName ?? `account #${accountId}`;
+}
+
+/**
+ * "<verb> <qty> <ticker> on <date> in <account>" — used for left-pane
+ * summaries so the user can identify the row without opening the right
+ * pane. `verb` is the human verb ("Buy", "Sell", "Dividend", etc.).
+ */
+function describeTx(verb: string, tx: SnapshotTx, idx: SnapshotIndex, qtyOverride?: number): string {
+  const qty = qtyOverride ?? (tx.quantity == null ? 0 : Math.abs(tx.quantity));
+  const ticker = holdingLabel(tx.portfolioHoldingId, idx);
+  const acct = accountLabel(tx.accountId, idx);
+  return `${verb} ${qty} ${ticker} on ${tx.date} in ${acct}`;
+}
+
 // ─── Per-row detectors ────────────────────────────────────────────────
 
 /**
@@ -164,7 +193,7 @@ export function planBackfill(
     proposals.push({
       kind: "dividend",
       confidence: "high",
-      summary: `Dividend ${t.amount.toFixed(2)} ${t.currency} on ${t.date}`,
+      summary: `Dividend ${t.amount.toFixed(2)} ${t.currency} from ${holdingLabel(t.portfolioHoldingId, idx)} on ${t.date} in ${accountLabel(t.accountId, idx)}`,
       existingRowIds: [t.id],
       replacement: [{ txId: t.id, kind: "dividend" }],
       synthesized: [],
@@ -192,11 +221,12 @@ export function planBackfill(
     if (sameDateStockLegs.length < 2) continue;
     const sumAbs = sameDateStockLegs.reduce((acc, s) => acc + Math.abs(s.amount), 0);
     if (Math.abs(sumAbs - Math.abs(c.amount)) < 0.01) {
+      const tickers = sameDateStockLegs.map((s) => holdingLabel(s.portfolioHoldingId, idx)).join(", ");
       proposals.push({
         kind: "orphan_stock_leg",
         confidence: "refused",
         refusalReason: "combined_cash_leg",
-        summary: `Combined cash leg on ${c.date}: ${sameDateStockLegs.length} stock legs share one cash row; split it manually first`,
+        summary: `Combined cash leg ${Math.abs(c.amount).toFixed(2)} ${c.currency} on ${c.date} in ${accountLabel(c.accountId, idx)} shared across ${sameDateStockLegs.length} trades (${tickers}); split manually first`,
         existingRowIds: [c.id, ...sameDateStockLegs.map((s) => s.id)],
         replacement: [],
         synthesized: [],
@@ -236,7 +266,7 @@ export function planBackfill(
           kind: "orphan_stock_leg",
           confidence: "refused",
           refusalReason: "cross_currency_trade",
-          summary: `Cross-currency trade: stock leg ${stockCcy}, cash leg ${cashCcy} on ${t.date}; record an FX Conversion first`,
+          summary: `Cross-currency trade ${holdingLabel(t.portfolioHoldingId, idx)} (${stockCcy}) vs cash (${cashCcy}) on ${t.date} in ${accountLabel(t.accountId, idx)}; record an FX Conversion first`,
           existingRowIds: [t.id, crossCcy.id],
           replacement: [],
           synthesized: [],
@@ -265,7 +295,7 @@ export function planBackfill(
         proposals.push({
           kind: "drift",
           confidence: "medium",
-          summary: `Drift ${Math.abs(drift).toFixed(2)} ${cash.currency} on ${t.date}; pick fee handling`,
+          summary: `Drift ${Math.abs(drift).toFixed(2)} ${cash.currency} on ${describeTx(t.quantity > 0 ? "buy" : "sell", t, idx)}; pick fee handling`,
           existingRowIds: [t.id, cash.id],
           replacement: [],
           synthesized: [],
@@ -280,11 +310,12 @@ export function planBackfill(
 
       // True orphan — no related cash row anywhere. Mode (S3, S8) decides.
       if (config.mode === "refuse_orphans") {
+        const verb = t.quantity > 0 ? "Buy" : "Sell";
         proposals.push({
           kind: "orphan_stock_leg",
           confidence: "low",
           refusalReason: "no_cash_pair_found",
-          summary: `Stock leg ${t.quantity > 0 ? "buy" : "sell"} ${Math.abs(t.quantity)} units on ${t.date} (no cash pair)`,
+          summary: `${describeTx(verb, t, idx)} — no cash pair found`,
           existingRowIds: [t.id],
           replacement: [],
           synthesized: [],
@@ -301,7 +332,7 @@ export function planBackfill(
           kind: "orphan_stock_leg",
           confidence: "refused",
           refusalReason: "no_cash_sleeve_to_synthesize_into",
-          summary: `Orphan stock leg ${t.date}; no ${stockCcy} cash sleeve on account ${t.accountId} to synthesize into`,
+          summary: `${describeTx(t.quantity > 0 ? "Buy" : "Sell", t, idx)}: no ${stockCcy} cash sleeve on ${accountLabel(t.accountId, idx)} — create one first`,
           existingRowIds: [t.id],
           replacement: [],
           synthesized: [],
@@ -318,7 +349,7 @@ export function planBackfill(
       proposals.push({
         kind: isBuy ? "buy_pair" : "sell_pair",
         confidence: "medium",
-        summary: `${isBuy ? "Buy" : "Sell"} ${Math.abs(t.quantity)} units on ${t.date} (cash leg synthesized)`,
+        summary: `${describeTx(isBuy ? "Buy" : "Sell", t, idx)} (cash leg synthesized)`,
         existingRowIds: [t.id],
         replacement: [{ txId: t.id, amount: normalizedStockAmount, kind: isBuy ? "buy" : "sell", tradeLinkId }],
         synthesized: [synth],
@@ -335,7 +366,7 @@ export function planBackfill(
         kind: "orphan_stock_leg",
         confidence: "refused",
         refusalReason: "ambiguous_cash_candidates",
-        summary: `Stock leg on ${t.date} has ${matches.length} candidate cash pairs; needs manual selection`,
+        summary: `${describeTx(t.quantity > 0 ? "Buy" : "Sell", t, idx)} has ${matches.length} candidate cash pairs; pick one manually`,
         existingRowIds: [t.id, ...matches.map((m) => m.id)],
         replacement: [],
         synthesized: [],
@@ -352,10 +383,11 @@ export function planBackfill(
     const cash = matches[0];
     const isBuy = (t.quantity ?? 0) > 0;
     const tradeLinkId = randomUUID();
+    const ppu = Math.abs(t.amount) / Math.max(Math.abs(t.quantity ?? 1), 0.0001);
     proposals.push({
       kind: isBuy ? "buy_pair" : "sell_pair",
       confidence: "high",
-      summary: `${isBuy ? "Buy" : "Sell"} ${Math.abs(t.quantity ?? 0)} units @ ${(Math.abs(t.amount) / Math.max(Math.abs(t.quantity ?? 1), 0.0001)).toFixed(2)} on ${t.date}`,
+      summary: `${describeTx(isBuy ? "Buy" : "Sell", t, idx)} @ ${ppu.toFixed(2)} ${t.currency}`,
       existingRowIds: [t.id, cash.id],
       replacement: buildPairReplacement(t, cash, tradeLinkId),
       synthesized: [],
