@@ -348,10 +348,29 @@ export function planBackfill(
       .filter((h) => h.accountId === t.accountId && !h.isCash)
       .map((h) => h.id);
 
+    // Default variant: if the row is ALREADY on a non-cash stock holding
+    // (the VUN.TO case from the dev review — already booked correctly,
+    // qty is the dollar amount stored as a quantity per import quirk),
+    // suggest 'cash_dividend'. Otherwise (row on a cash sleeve or no
+    // holding), suggest 'drip'. User can override either way.
+    const currentHolding = t.portfolioHoldingId != null
+      ? idx.holdingById.get(t.portfolioHoldingId)
+      : null;
+    const suggestedDividendVariant: "cash_dividend" | "drip" =
+      currentHolding != null && !currentHolding.isCash
+        ? "cash_dividend"
+        : "drip";
+
+    // Summary phrasing keys off the suggestion so users see something
+    // sensible at first glance — they can still flip the radio.
+    const summary = suggestedDividendVariant === "cash_dividend"
+      ? `Cash dividend ${amtAbs.toFixed(2)} ${t.currency} on ${t.date} in ${accountLabel(t.accountId, idx)} — confirm underlying stock`
+      : `Dividend reinvestment ${qtyAbs} shares (${amtAbs.toFixed(2)} ${t.currency}) on ${t.date} in ${accountLabel(t.accountId, idx)} — pick the underlying stock`;
+
     proposals.push({
       kind: "dividend_reinvestment",
       confidence: "medium",
-      summary: `Dividend reinvestment ${qtyAbs} shares (${amtAbs.toFixed(2)} ${t.currency}) on ${t.date} in ${accountLabel(t.accountId, idx)} — pick the underlying stock`,
+      summary,
       existingRowIds: [t.id],
       // No `kind` or `portfolioHoldingId` here — both are set by the
       // apply path once the user has chosen a holding. Carrying them in
@@ -361,6 +380,7 @@ export function planBackfill(
       synthesized: [],
       requiresUserChoice: "holding_picker",
       candidateHoldingIds,
+      suggestedDividendVariant,
       deltas: { balance: 0, lots: [], realizedGainBase: null },
       dependsOn: [],
     });

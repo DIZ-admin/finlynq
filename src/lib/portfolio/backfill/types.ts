@@ -224,6 +224,21 @@ export interface Proposal {
    * `kind` at plan time so the UI can label the proposal clearly.
    */
   lotAction?: "open" | "close" | "transfer";
+  /**
+   * For `dividend_reinvestment` proposals: planner-suggested default
+   * variant. UI pre-selects this on first render; user can override
+   * before approving. Persisted to `backfill_proposals.dividend_variant`
+   * once the user picks. Apply route refuses if NULL.
+   *
+   * 'cash_dividend' — row is a real cash dividend; apply UPDATEs
+   *                   kind='dividend', sets quantity=0, sets
+   *                   portfolio_holding_id=chosen. No lot opens.
+   * 'drip'          — row is a share reinvestment; apply UPDATEs
+   *                   kind='dividend', sets portfolio_holding_id=chosen.
+   *                   Qty preserved. Lot replay opens via
+   *                   applyLotEffectsForTx at costPerShare=amount/qty.
+   */
+  suggestedDividendVariant?: "cash_dividend" | "drip";
   deltas: ProposalDeltas;
   /**
    * Proposal indices (within the same plan result) this one depends on.

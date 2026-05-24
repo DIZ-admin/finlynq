@@ -38,6 +38,9 @@ interface Proposal {
   // mirrors `variantChoice` for the holding-picker flow.
   chosenHoldingId: number | null;
   candidateHoldingIds: number[];
+  // Phase 4b — dividend_reinvestment variant: cash_dividend (zero qty,
+  // no lot) or drip (qty as shares, lot opens).
+  dividendVariant: "cash_dividend" | "drip" | null;
   status: string;
 }
 
@@ -124,7 +127,12 @@ export default function BackfillReviewPage({ params }: { params: Promise<{ runId
 
   async function updateProposal(
     proposalId: number,
-    patch: { status?: string; variantChoice?: string | null; chosenHoldingId?: number | null },
+    patch: {
+      status?: string;
+      variantChoice?: string | null;
+      chosenHoldingId?: number | null;
+      dividendVariant?: "cash_dividend" | "drip" | null;
+    },
   ) {
     setError("");
     const res = await fetch(`/api/settings/backfill/${runId}`, {
@@ -236,6 +244,7 @@ export default function BackfillReviewPage({ params }: { params: Promise<{ runId
                 accountMap={accountMap}
                 onVariantChange={(v) => updateProposal(selected.id, { variantChoice: v })}
                 onHoldingChange={(id) => updateProposal(selected.id, { chosenHoldingId: id })}
+                onDividendVariantChange={(v) => updateProposal(selected.id, { dividendVariant: v })}
                 onApprove={() => updateProposal(selected.id, { status: "approved" })}
                 onReject={() => updateProposal(selected.id, { status: "rejected" })}
                 onUndo={() => undoProposal(selected.id)}
@@ -316,6 +325,7 @@ function ProposalDetail({
   accountMap,
   onVariantChange,
   onHoldingChange,
+  onDividendVariantChange,
   onApprove,
   onReject,
   onUndo,
@@ -326,6 +336,7 @@ function ProposalDetail({
   accountMap: Record<number, AccountMeta>;
   onVariantChange: (v: "separate_fee_row" | "absorb_into_cost" | null) => void;
   onHoldingChange: (id: number | null) => void;
+  onDividendVariantChange: (v: "cash_dividend" | "drip" | null) => void;
   onApprove: () => void;
   onReject: () => void;
   onUndo: () => void;
@@ -407,13 +418,20 @@ function ProposalDetail({
         )}
 
         {isDripReinvest && (
-          <div className="space-y-2">
-            <div className="font-medium">Pick the underlying stock</div>
+          <div className="space-y-3">
+            <div className="font-medium">How is this dividend recorded?</div>
             <p className="text-xs text-muted-foreground">
-              This row looks like a dividend reinvestment (share count ≈ dollar
-              amount) but currently points to the wrong holding. Pick the stock
-              whose dividends bought these shares. Approve only after picking.
+              The qty field equals the dollar amount — that can mean either:
+              a cash dividend on the underlying (the typical case for stocks
+              like VUN.TO), or a share reinvestment at $1/share (the typical
+              case for crypto / sub-dollar units). Pick the variant that
+              matches reality, then confirm the underlying holding.
             </p>
+            <DividendVariantPicker
+              proposal={proposal}
+              onChange={onDividendVariantChange}
+            />
+            <div className="font-medium pt-2">Pick the underlying stock</div>
             <HoldingPicker
               proposal={proposal}
               holdingMap={holdingMap}
@@ -615,6 +633,32 @@ function DriftVariantPicker({
         explanation={variants.absorb_into_cost?.explanation ?? ""}
         selected={selected === "absorb_into_cost"}
         onSelect={() => onChange("absorb_into_cost")}
+      />
+    </div>
+  );
+}
+
+function DividendVariantPicker({
+  proposal,
+  onChange,
+}: {
+  proposal: Proposal;
+  onChange: (v: "cash_dividend" | "drip") => void;
+}) {
+  const selected = proposal.dividendVariant;
+  return (
+    <div className="space-y-2">
+      <VariantOption
+        label="Cash dividend (no lot)"
+        explanation="The dividend was paid in cash and credited to the cash sleeve. Apply zeroes out the qty (the dollar amount stored there was an import quirk) and stamps kind='dividend'. No share lot opens. Pick this for normal stock dividends like VUN.TO."
+        selected={selected === "cash_dividend"}
+        onSelect={() => onChange("cash_dividend")}
+      />
+      <VariantOption
+        label="Share reinvestment (opens lot)"
+        explanation="The dividend bought additional units of the underlying. Apply keeps qty as a share count and opens a lot at costPerShare=amount/qty. Pick this for crypto staking rewards or other sub-dollar reinvestments where the qty really is a share count."
+        selected={selected === "drip"}
+        onSelect={() => onChange("drip")}
       />
     </div>
   );

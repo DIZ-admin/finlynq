@@ -24,6 +24,11 @@ const patchSchema = z.object({
   // apply route refuses with `holding_choice_missing` if it's still NULL
   // at apply time.
   chosenHoldingId: z.number().int().positive().nullable().optional(),
+  // Set by the dividend-variant radio on `dividend_reinvestment`
+  // proposals. Pre-filled with the planner's suggestion; user can flip
+  // before approving. Apply refuses with `dividend_variant_missing` if
+  // NULL at apply time.
+  dividendVariant: z.enum(["cash_dividend", "drip"]).nullable().optional(),
 });
 
 export async function GET(
@@ -133,7 +138,7 @@ export async function PATCH(
     const body = await request.json();
     const parsed = validateBody(body, patchSchema);
     if (parsed.error) return parsed.error;
-    const { proposalId, status, variantChoice, chosenHoldingId } = parsed.data;
+    const { proposalId, status, variantChoice, chosenHoldingId, dividendVariant } = parsed.data;
 
     // Verify the proposal belongs to this run+user.
     const existing = await db
@@ -165,6 +170,7 @@ export async function PATCH(
     if (status !== undefined) patch.status = status;
     if (variantChoice !== undefined) patch.variantChoice = variantChoice;
     if (chosenHoldingId !== undefined) patch.chosenHoldingId = chosenHoldingId;
+    if (dividendVariant !== undefined) patch.dividendVariant = dividendVariant;
     if (Object.keys(patch).length === 0) {
       return NextResponse.json({ ok: true, noop: true });
     }

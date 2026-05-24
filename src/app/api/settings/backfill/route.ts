@@ -86,6 +86,11 @@ export async function POST(request: NextRequest) {
           candidateHoldingIds: p.candidateHoldingIds ?? [],
           // Phase 3 — which lot op to run for missing_lot proposals.
           lotAction: p.lotAction ?? null,
+          // Phase 4b — planner's suggested default variant for
+          // dividend_reinvestment proposals (cash_dividend vs drip).
+          // Persisted as the initial pick so a 1-click Approve uses
+          // the suggestion; user can override before approving.
+          dividendVariant: p.suggestedDividendVariant ?? null,
           status: p.confidence === "refused" ? "refused_with_reason" : "pending",
         })
         .returning({ id: schema.backfillProposals.id });

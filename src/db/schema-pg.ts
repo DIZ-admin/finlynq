@@ -1483,6 +1483,11 @@ export const backfillProposals = pgTable("backfill_proposals", {
   // Phase 3 — `missing_lot` proposals carry which lot op to run.
   // CHECK enforced in SQL: NULL OR 'open' | 'close' | 'transfer'.
   lotAction: text("lot_action"),
+  // Phase 4b — `dividend_reinvestment` proposals require the user to
+  // pick between treating the row as a cash dividend (zero out qty,
+  // no lot opens) or a share reinvestment (qty interpreted as shares,
+  // lot opens). CHECK in SQL: NULL OR 'cash_dividend' | 'drip'.
+  dividendVariant: text("dividend_variant"),
   // 'pending' | 'approved' | 'rejected' | 'applied' | 'undone' | 'refused_with_reason'
   status: text("status").notNull().default("pending"),
   appliedAt: timestamp("applied_at", { withTimezone: true }),

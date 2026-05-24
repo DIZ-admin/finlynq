@@ -624,6 +624,10 @@ describe("Pass 1.6 — DRIP detection", () => {
     // the user picks. Carrying kind here would let an apply bypass the
     // picker.
     expect(proposals[0].replacement[0].kind).toBeUndefined();
+    // Row was mis-booked to a cash sleeve → planner suggests treating
+    // it as DRIP (the typical reason this shape happens — crypto-style
+    // reinvest of sub-dollar units).
+    expect(proposals[0].suggestedDividendVariant).toBe("drip");
   });
 
   it("emits dividend_reinvestment for DRIP on a stock holding too (qty≈amount is the trigger, not holding type)", () => {
@@ -656,6 +660,11 @@ describe("Pass 1.6 — DRIP detection", () => {
 
     expect(proposals).toHaveLength(1);
     expect(proposals[0].kind).toBe("dividend_reinvestment");
+    // Row already on a non-cash stock holding → planner suggests treating
+    // it as a cash dividend (the VUN.TO case — qty was a dollar amount
+    // stored quirkily). User can flip to 'drip' if it really is a share
+    // reinvestment.
+    expect(proposals[0].suggestedDividendVariant).toBe("cash_dividend");
   });
 
   it("does NOT emit dividend_reinvestment for a regular dividend with qty=0", () => {

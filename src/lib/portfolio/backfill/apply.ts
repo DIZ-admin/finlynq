@@ -71,6 +71,10 @@ interface PersistedProposal {
    *  existing row's portfolio_holding_id is UPDATEd to this id and
    *  kind='dividend' is stamped. */
   chosenHoldingId: number | null;
+  /** Set for `dividend_reinvestment` proposals — 'cash_dividend' zeroes
+   *  the qty and opens no lot; 'drip' keeps qty (as shares) and lets the
+   *  lot replay open a lot at costPerShare=amount/qty. Refuse on NULL. */
+  dividendVariant: "cash_dividend" | "drip" | null;
   status: string;
 }
 
@@ -114,6 +118,13 @@ export async function applyProposal(
       ok: false,
       code: "holding_choice_missing",
       message: `Dividend reinvestment proposal requires chosen_holding_id (the underlying stock the user picks)`,
+    };
+  }
+  if (proposal.proposalKind === "dividend_reinvestment" && proposal.dividendVariant == null) {
+    return {
+      ok: false,
+      code: "dividend_variant_missing",
+      message: `Dividend reinvestment proposal requires a variant ('cash_dividend' or 'drip')`,
     };
   }
 
@@ -275,6 +286,15 @@ export async function applyProposal(
       ) {
         patch.portfolioHoldingId = proposal.chosenHoldingId;
         patch.kind = "dividend";
+        // Phase 4b — variant branching:
+        // - 'cash_dividend' zeroes the qty so the lot replay won't open
+        //   a phantom share lot. The dollar `amount` stays as-is and
+        //   surfaces as a normal cash dividend payout.
+        // - 'drip' keeps qty as a share count so the replay opens a lot
+        //   at costPerShare=amount/qty. No change to the qty field.
+        if (proposal.dividendVariant === "cash_dividend") {
+          patch.quantity = 0;
+        }
       }
       await tx
         .update(schema.transactions)
@@ -753,6 +773,7 @@ async function loadProposal(
     dependsOnProposalIds: row.dependsOnProposalIds ?? [],
     variantChoice: row.variantChoice,
     chosenHoldingId: row.chosenHoldingId,
+    dividendVariant: row.dividendVariant as "cash_dividend" | "drip" | null,
     status: row.status,
   };
 }
