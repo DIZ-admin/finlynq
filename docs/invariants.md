@@ -193,9 +193,53 @@ A Buy is an internal swap (cash → asset). The stock leg's `amount` carries the
 
 **Pre-2026-05-25 convention put the cash effect on the stock leg (`amount=-totalCost`) with `amount=0` on the cash leg.** This displayed as "AAPL: -$2000" in the ledger — confusing because acquiring shares is a positive event. **Don't reintroduce that convention.** The lot engine uses `Math.abs(amount)` so the sign flip does NOT affect `cost_per_share` math.
 
-### `TxRowForLots` carries `kind`; `applyLotEffectsForTx` skips `*_cash_leg` rows
+### `TxRowForLots` carries `kind`; `applyLotEffectsForTx` skips `*_cash_leg` rows on non-cash holdings only
 
-(2026-05-25 follow-up.) [src/lib/portfolio/lots/types.ts](../src/lib/portfolio/lots/types.ts) `TxRowForLots` gained an optional `kind?: string | null` field. [src/lib/portfolio/lots/write-hooks.ts](../src/lib/portfolio/lots/write-hooks.ts) `applyLotEffectsForTx` early-outs when `kind` matches `/_cash_leg$/`. Without this guard, a `buy_cash_leg` (qty=-totalCost) would be misclassified as a sell by the qty<0 dispatch and spam `closeLotsForSellHook` shortfall warnings (cash sleeves never have lots opened against them). The guard is defensive — callers that don't pass `kind` (legacy paths, the generic `/api/transactions` POST) keep the existing behavior.
+(2026-05-25; revised 2026-05-26 in Phase 5c.) [src/lib/portfolio/lots/types.ts](../src/lib/portfolio/lots/types.ts) `TxRowForLots` carries an optional `kind?: string | null` field. The Phase 5c dispatcher in [src/lib/portfolio/lots/write-hooks.ts](../src/lib/portfolio/lots/write-hooks.ts) `applyLotEffectsForTx` now routes by **`is_cash` on the holding**, NOT by `kind` skip. Cash-sleeve rows go to `openCashLotHook` / `closeCashLotsHook` (cash-lot tracking). The `_cash_leg`-kind skip survives only as a defensive warn-and-skip for the data-integrity case where a `_cash_leg` kind landed on a non-cash holding (would indicate a writer bug). `LotContext` extended with `isCashHoldingById: Map<number, boolean>` to drive the branch — `buildLotContext` reads `portfolio_holdings.isCash` alongside currency.
+
+### Cash-sleeve lot tracking (Phase 5c, 2026-05-26)
+
+Cash sleeves now carry per-inflow `holding_lots` rows so currency-on-currency FX realized gains surface in `/portfolio/realized-gains`. The model:
+
+- Every cash INFLOW (deposit / income / sell-proceeds / fx-to / brokerage-deposit-in) opens a `holding_lots` row with `costPerShare=1`, `origin='buy'`, `side='long'`, `currency=sleeveCurrency`, `fxToUsdAtOpen=null`.
+- Every cash OUTFLOW (withdrawal / expense / buy-cash-leg / fx-from / brokerage-withdrawal-out / fx-fee) FIFO-closes open cash lots on the sleeve with `proceedsPerShare=1`, `realizedGain=0` (in the sleeve currency), `closeKind` inferred from the row's `kind` via `inferCashCloseKind()`.
+
+Realized gain in the sleeve currency is ALWAYS 0 (cost=1, proceeds=1). The FX gain in the user's base currency comes from `augmentWithBaseCurrency()` in [src/lib/portfolio/realized-gains.ts](../src/lib/portfolio/realized-gains.ts) which does the historical FX lookup: `costInBase = 1 × fxToUsd(sleeveCcy, openDate) / fxToUsd(baseCcy, openDate)`, `proceedsInBase = same at closeDate`, `gainInBase = (proceedsInBase - costInBase) × qtyClosed`.
+
+**Dispatch** (in [src/lib/portfolio/lots/write-hooks.ts](../src/lib/portfolio/lots/write-hooks.ts)):
+- `applyLotEffectsForTx` — routes `is_cash=true` holdings to cash hooks (open on qty>0, close on qty<0 with `inferCashCloseKind(tx.kind)`)
+- `applyLotEffectsForLinkPair` for FX-conversion pairs — calls `closeCashLotsHook` on source (closeKind=`'fx_conversion'`) + `openCashLotHook` on dest
+
+**Operations.ts wiring** ([src/lib/portfolio/operations.ts](../src/lib/portfolio/operations.ts)) — every cash-sleeve operation calls a cash hook on its cash leg:
+- `recordBuy` → `closeCashLotsHook(buy_cash_leg, closeKind='buy_sell')`
+- `recordSell` → `openCashLotHook(sell_cash_leg)`
+- `recordPortfolioIncomeOrExpense` → open (income, qty>0) or close (expense, qty<0, closeKind='income_expense')
+- `recordBrokerageDeposit` → `openCashLotHook` on the brokerage cash sleeve
+- `recordBrokerageWithdrawal` → `closeCashLotsHook` on the brokerage cash sleeve (closeKind='buy_sell')
+- `recordFxConversion` fee leg → `closeCashLotsHook` (closeKind='income_expense')
+
+**Reverse path** — `reverseLotsForDeleteHook` continues to work via cash-lot deletion/restoration on `openTxId` / `closeTxId` lookup (cash + stock lots share the same tables).
+
+**Pre-Phase-5c historical cash-sleeve activity** has no lots — closures on those sleeves log a structured `[portfolio.lots.cash]` shortfall warning. A `scripts/backfill-cash-sleeve-lots.ts` is pending — design state in [HANDOVER_2026-05-26_PHASE5C_AND_BACKFILL_PLAN.md](../../HANDOVER_2026-05-26_PHASE5C_AND_BACKFILL_PLAN.md).
+
+### Issue #128 aggregator skip — Phase 2 update (2026-05-26)
+
+The three realized-gain aggregators (REST `/api/portfolio/overview`, MCP HTTP `accumulate()`, `analyze_holding`) + the snapshot builder + the performance contributions reader updated their cash-leg skip predicate from `tradeLinkId IS NOT NULL AND amount = 0` to:
+
+```
+kind IN ('buy_cash_leg', 'sell_cash_leg') OR (trade_link_id IS NOT NULL AND amount = 0)
+```
+
+Phase 2 (2026-05-25) cash legs carry `qty != 0, amount != 0` so the original `amount = 0` predicate no longer matched them — they were phantom-counting as buys (sell_cash_leg, qty>0) or sells (buy_cash_leg, qty<0) on the cash sleeve aggregation. The new predicate uses `kind` as the discriminator for Phase 2+ rows; the legacy half stays in place for pre-Phase-2 backfilled rows where `kind` is NULL. Applied symmetrically to BOTH buy- and sell-side branches (previously only the sell branch had the issue #128 guard).
+
+Callsites:
+- [src/app/api/portfolio/overview/route.ts](../src/app/api/portfolio/overview/route.ts) — REST CASE WHEN
+- [mcp-server/register-tools-pg.ts](../mcp-server/register-tools-pg.ts) `accumulate()` — MCP HTTP aggregator (added `t.kind` to SELECT)
+- [mcp-server/register-tools-pg.ts](../mcp-server/register-tools-pg.ts) `analyze_holding` — same
+- [src/lib/portfolio/snapshots/builder.ts](../src/lib/portfolio/snapshots/builder.ts) — snapshot builder
+- [src/lib/portfolio/performance/contributions.ts](../src/lib/portfolio/performance/contributions.ts) — MWRR contribution reader
+
+Tests: 2 new Phase 2 cases (tc-5, tc-6) in [tests/portfolio-aggregator-dividends-and-sellskip.test.ts](../tests/portfolio-aggregator-dividends-and-sellskip.test.ts). The pre-existing tc-3/tc-4 still exercise the legacy half of the predicate via fixtures with `amount=0` cash legs.
 
 ### Portfolio-op kinds only originate from `operations.ts` (audit invariant #8)
 
