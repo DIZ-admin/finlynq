@@ -7,12 +7,13 @@ import { Card, CardContent, CardHeader, CardTitle } from "@/components/ui/card";
 import { Table, TableBody, TableCell, TableHead, TableHeader, TableRow } from "@/components/ui/table";
 import { Badge } from "@/components/ui/badge";
 import { formatCurrency, formatDate } from "@/lib/currency";
-import { ArrowLeft, Wallet, Layers, Hash, Pencil } from "lucide-react";
+import { ArrowLeft, Wallet, Layers, Hash, Pencil, Coins, Plus, Trash2 } from "lucide-react";
 import { Dialog, DialogContent, DialogHeader, DialogTitle } from "@/components/ui/dialog";
 import { Button } from "@/components/ui/button";
 import { Input } from "@/components/ui/input";
 import { Label } from "@/components/ui/label";
 import { Select, SelectContent, SelectItem, SelectTrigger, SelectValue } from "@/components/ui/select";
+import { SUPPORTED_FIAT_CURRENCIES } from "@/lib/fx/supported-currencies";
 
 type Transaction = {
   id: number;
@@ -32,6 +33,15 @@ type Account = {
   group: string;
   name: string;
   currency: string;
+  isInvestment?: boolean;
+};
+
+type CashSleeve = {
+  id: number;
+  currency: string;
+  name: string | null;
+  /** Total tx count referencing this sleeve — server-side from /api/portfolio's currentShares is a sum, not a count, so we derive client-side from a separate fetch. */
+  txCount?: number;
 };
 
 type AccountBalance = {
@@ -62,6 +72,114 @@ export default function AccountDetailPage() {
   const [editForm, setEditForm] = useState({ name: "", type: "A", group: "", currency: "CAD", note: "" });
   const [editSaving, setEditSaving] = useState(false);
   const [editError, setEditError] = useState("");
+
+  // Cash sleeves panel — list + create + delete.
+  // Phase 2 of the portfolio-ops refactor: cash sleeves are explicit
+  // `portfolio_holdings.is_cash=TRUE` rows, one per (account, currency).
+  // Users provision them here before recording Buy/Sell/FX operations.
+  const [sleeves, setSleeves] = useState<CashSleeve[]>([]);
+  const [sleevesLoading, setSleevesLoading] = useState(false);
+  const [newSleeveOpen, setNewSleeveOpen] = useState(false);
+  const [newSleeveCurrency, setNewSleeveCurrency] = useState<string>("");
+  const [newSleeveSaving, setNewSleeveSaving] = useState(false);
+  const [newSleeveError, setNewSleeveError] = useState("");
+
+  async function refreshSleeves() {
+    if (!id) return;
+    setSleevesLoading(true);
+    try {
+      const res = await fetch("/api/portfolio");
+      if (!res.ok) return;
+      const all: Array<{
+        id: number;
+        accountId: number | null;
+        currency: string;
+        isCash: boolean;
+        name: string | null;
+      }> = await res.json();
+      const mine = all.filter(
+        (h) => h.accountId === Number(id) && h.isCash === true,
+      );
+      // Pull tx count per sleeve for the "Delete" gating.
+      const withCounts = await Promise.all(
+        mine.map(async (h) => {
+          const r = await fetch(
+            `/api/transactions?portfolioHoldingId=${h.id}&limit=1`,
+          );
+          const j = await r.json();
+          return {
+            id: h.id,
+            currency: h.currency,
+            name: h.name,
+            txCount: Number(j.total ?? 0),
+          };
+        }),
+      );
+      setSleeves(withCounts);
+    } finally {
+      setSleevesLoading(false);
+    }
+  }
+
+  useEffect(() => {
+    void refreshSleeves();
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [id]);
+
+  function openNewSleeve() {
+    setNewSleeveCurrency(account?.currency ?? "CAD");
+    setNewSleeveError("");
+    setNewSleeveOpen(true);
+  }
+
+  async function handleCreateSleeve(e: React.FormEvent) {
+    e.preventDefault();
+    setNewSleeveSaving(true);
+    setNewSleeveError("");
+    try {
+      const res = await fetch("/api/portfolio/holdings/cash-sleeve", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          accountId: Number(id),
+          currency: newSleeveCurrency,
+        }),
+      });
+      if (!res.ok) {
+        const data = await res.json();
+        setNewSleeveError(data.error ?? "Failed to create sleeve");
+        return;
+      }
+      setNewSleeveOpen(false);
+      await refreshSleeves();
+    } catch {
+      setNewSleeveError("Failed to create sleeve");
+    } finally {
+      setNewSleeveSaving(false);
+    }
+  }
+
+  async function handleDeleteSleeve(sleeveId: number) {
+    const sleeve = sleeves.find((s) => s.id === sleeveId);
+    if (!sleeve) return;
+    if (
+      !confirm(
+        `Delete the ${sleeve.currency} cash sleeve? This is only allowed when no transactions reference it.`,
+      )
+    ) {
+      return;
+    }
+    const res = await fetch(
+      `/api/portfolio/holdings/cash-sleeve?id=${sleeveId}`,
+      { method: "DELETE" },
+    );
+    if (!res.ok) {
+      const data = await res.json();
+      alert(data.error ?? "Failed to delete sleeve");
+      return;
+    }
+    await refreshSleeves();
+  }
 
   function openEdit() {
     if (!account) return;
@@ -215,6 +333,75 @@ export default function AccountDetailPage() {
         </Card>
       </div>
 
+      {/* Cash sleeves — Phase 2 portfolio-ops UI. Visible on every account so
+          users can also see "no sleeves" on non-investment accounts. */}
+      <Card>
+        <CardHeader className="pb-2 flex flex-row items-center justify-between">
+          <div>
+            <CardTitle className="text-base flex items-center gap-2">
+              <Coins className="h-4 w-4 text-emerald-600" /> Cash sleeves
+            </CardTitle>
+            <p className="text-xs text-muted-foreground mt-1">
+              Per-currency cash positions inside this account. Required before
+              recording buys, sells, or FX conversions in a new currency.
+            </p>
+          </div>
+          <Button size="sm" variant="outline" onClick={openNewSleeve}>
+            <Plus className="h-3.5 w-3.5 mr-1.5" /> Add sleeve
+          </Button>
+        </CardHeader>
+        <CardContent>
+          {sleevesLoading && sleeves.length === 0 ? (
+            <div className="h-12 bg-muted animate-pulse rounded-md" />
+          ) : sleeves.length === 0 ? (
+            <p className="text-sm text-muted-foreground py-4 text-center">
+              No cash sleeves yet. Add one to start recording trades.
+            </p>
+          ) : (
+            <Table>
+              <TableHeader>
+                <TableRow>
+                  <TableHead className="text-xs">Currency</TableHead>
+                  <TableHead className="text-xs">Name</TableHead>
+                  <TableHead className="text-xs text-right">Transactions</TableHead>
+                  <TableHead className="text-xs text-right">Actions</TableHead>
+                </TableRow>
+              </TableHeader>
+              <TableBody>
+                {sleeves.map((s) => (
+                  <TableRow key={s.id} className="hover:bg-muted/30">
+                    <TableCell>
+                      <Badge variant="outline" className="text-[10px] font-mono">
+                        {s.currency}
+                      </Badge>
+                    </TableCell>
+                    <TableCell className="text-sm">{s.name ?? `Cash ${s.currency}`}</TableCell>
+                    <TableCell className="text-right text-sm tabular-nums">
+                      {s.txCount ?? 0}
+                    </TableCell>
+                    <TableCell className="text-right">
+                      <Button
+                        size="sm"
+                        variant="ghost"
+                        disabled={(s.txCount ?? 0) > 0}
+                        title={
+                          (s.txCount ?? 0) > 0
+                            ? "Sleeve has transactions — delete or reassign them first"
+                            : "Delete sleeve"
+                        }
+                        onClick={() => void handleDeleteSleeve(s.id)}
+                      >
+                        <Trash2 className="h-3.5 w-3.5 text-rose-600" />
+                      </Button>
+                    </TableCell>
+                  </TableRow>
+                ))}
+              </TableBody>
+            </Table>
+          )}
+        </CardContent>
+      </Card>
+
       <Card>
         <CardHeader className="pb-2">
           <CardTitle className="text-base">Recent Transactions</CardTitle>
@@ -247,6 +434,55 @@ export default function AccountDetailPage() {
           </Table>
         </CardContent>
       </Card>
+
+      {/* Create cash sleeve dialog */}
+      <Dialog open={newSleeveOpen} onOpenChange={setNewSleeveOpen}>
+        <DialogContent>
+          <DialogHeader>
+            <DialogTitle>Add cash sleeve</DialogTitle>
+          </DialogHeader>
+          <form onSubmit={handleCreateSleeve} className="space-y-4">
+            <p className="text-sm text-muted-foreground">
+              Creates a per-currency cash position inside <b>{account.name}</b>.
+              Only one sleeve per currency is allowed.
+            </p>
+            <div className="space-y-1.5">
+              <Label>Currency</Label>
+              <Select
+                value={newSleeveCurrency}
+                onValueChange={(v) => setNewSleeveCurrency(v ?? "")}
+              >
+                <SelectTrigger><SelectValue placeholder="Pick a currency" /></SelectTrigger>
+                <SelectContent>
+                  {SUPPORTED_FIAT_CURRENCIES.map((c) => (
+                    <SelectItem key={c} value={c}>{c}</SelectItem>
+                  ))}
+                </SelectContent>
+              </Select>
+            </div>
+            {newSleeveError && (
+              <p className="text-sm text-destructive">{newSleeveError}</p>
+            )}
+            <div className="flex gap-2 pt-1">
+              <Button
+                type="button"
+                variant="outline"
+                className="flex-1"
+                onClick={() => setNewSleeveOpen(false)}
+              >
+                Cancel
+              </Button>
+              <Button
+                type="submit"
+                className="flex-1"
+                disabled={newSleeveSaving || !newSleeveCurrency}
+              >
+                {newSleeveSaving ? "Creating…" : "Create sleeve"}
+              </Button>
+            </div>
+          </form>
+        </DialogContent>
+      </Dialog>
 
       {/* Edit account dialog */}
       <Dialog open={editOpen} onOpenChange={setEditOpen}>

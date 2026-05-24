@@ -119,6 +119,28 @@ export const transactions = pgTable("transactions", {
   // from `link_id`, which the four-check transfer-pair rule reserves for
   // `record_transfer` siblings.
   tradeLinkId: text("trade_link_id"),
+  // 2026-05-27 — portfolio ops Phase 4. Swaps are internally two unlinked
+  // (sell, buy) pairs; this column ties all 4 rows of a swap together so
+  // the load endpoint can return the full swap state for edit. NULL on
+  // pre-migration swaps (which fall back to delete-and-recreate UX).
+  swapLinkId: text("swap_link_id"),
+  // 2026-05-25 — portfolio ops Phase 1. Explicit type discriminator for
+  // portfolio-related rows (NULL on non-portfolio rows). Valid values
+  // listed in the CHECK constraint on the column (see
+  // 20260525_portfolio_ops_phase1.sql). The 6 operation helpers in
+  // src/lib/portfolio/operations.ts are the canonical writers; existing
+  // tx-write sites that handle portfolio rows route through them.
+  kind: text("kind"),
+  // 2026-05-25 — portfolio ops Phase 1. For portfolio_income /
+  // portfolio_expense rows that land on a cash sleeve, this points back
+  // to the holding the income/expense pertains to. Example: an AAPL
+  // dividend lands on the USD-cash sleeve (portfolio_holding_id =
+  // USD_Cash) but related_holding_id = AAPL so reports can group
+  // dividends by source holding. ON DELETE SET NULL.
+  relatedHoldingId: integer("related_holding_id").references(
+    () => portfolioHoldings.id,
+    { onDelete: "set null" }
+  ),
   // Two-ledger import refactor (2026-05-22) — lineage FK back to the bank-
   // side record of this row. Set on import-sourced INSERTs (executeImport,
   // createTransferPair source leg, approve route's three buckets); NULL on
@@ -158,6 +180,13 @@ export const portfolioHoldings = pgTable("portfolio_holdings", {
   // queries via `name_lookup`/`symbol_lookup`.
   currency: text("currency").notNull().default("CAD"),
   isCrypto: integer("is_crypto").default(0),
+  // 2026-05-25 — portfolio ops Phase 1. Explicit flag for cash sleeves.
+  // See plan/portfolio-operations-refactor and the
+  // 20260525_portfolio_ops_phase1.sql migration. Partial unique index on
+  // (user_id, account_id, currency) WHERE is_cash=TRUE enforces "at most
+  // one cash sleeve per (account, currency)". UI renders cash sleeves as
+  // "Cash <currency>" by combining is_cash=TRUE + currency column.
+  isCash: boolean("is_cash").notNull().default(false),
   note: text("note").default(""),
   nameCt: text("name_ct"),
   nameLookup: text("name_lookup"),
@@ -314,6 +343,11 @@ export const priceCache = pgTable("price_cache", {
   date: text("date").notNull(),
   price: doublePrecision("price").notNull(),
   currency: text("currency").notNull(),
+  // FINLYNQ-92 (2026-05-23): nullable, additive. Persists Yahoo's `meta.previousClose`
+  // so day-change badges survive cache hits. Null on historical bars (fetchQuoteAtDate
+  // doesn't have a prior-day reference) and on rows written before this migration.
+  // Readers fall back to change: 0, changePct: 0 when null.
+  previousClose: doublePrecision("previous_close"),
 });
 
 // Canonical USD-anchored FX rate cache. Cross-rates are derived by
@@ -461,6 +495,10 @@ export const users = pgTable(
     // bumps this column. The login flow reads it and passes through to
     // deriveKEK so unrotated rows still unwrap with the old pepper.
     pepperVersion: integer("pepper_version").notNull().default(1),
+    // 2026-05-28 Phase 5 — base currency for realized-gain accounting.
+    // Distinct from `settings.display_currency` (UI presentation) — base
+    // currency drives the lot-level realized-gain math in base.
+    baseCurrency: text("base_currency").notNull().default("USD"),
     createdAt: text("created_at").notNull(),
     updatedAt: text("updated_at").notNull(),
   },
@@ -1178,3 +1216,183 @@ export const bankDailyBalances = pgTable("bank_daily_balances", {
     table.date,
   ),
 ]);
+
+// ─── holding_lots — per-lot cost basis tracking (Phase 1, 2026-05-25)
+//
+// Foundation for plan/portfolio-lots-and-performance.md. Each row is one
+// open lot (buy / dividend-reinvest / transfer-in / split-adjust /
+// backfilled). FIFO depletion on sell writes holdingLotClosures rows.
+//
+// No encrypted columns — display name lives on portfolioHoldings. Stdio
+// MCP can read this table directly without a DEK (unblocks the
+// streamDRefuseRead refusal on get_portfolio_analysis et al.).
+//
+// Migration: scripts/migrations/20260525_holding_lots_phase1.sql.
+export const holdingLots = pgTable(
+  "holding_lots",
+  {
+    id: serial("id").primaryKey(),
+    userId: text("user_id").notNull(),
+    holdingId: integer("holding_id")
+      .notNull()
+      .references(() => portfolioHoldings.id, { onDelete: "cascade" }),
+    accountId: integer("account_id")
+      .notNull()
+      .references(() => accounts.id, { onDelete: "cascade" }),
+    openTxId: integer("open_tx_id")
+      .notNull()
+      .references(() => transactions.id, { onDelete: "cascade" }),
+    // YYYY-MM-DD; inherits parent_lot's date on transfer-in legs.
+    openDate: text("open_date").notNull(),
+    qtyOriginal: doublePrecision("qty_original").notNull(),
+    qtyRemaining: doublePrecision("qty_remaining").notNull(),
+    // In `currency`. Multi-currency trades (issue #96): cost_per_share is
+    // computed from the cash leg's entered_amount, not the stock leg's amount.
+    costPerShare: doublePrecision("cost_per_share").notNull(),
+    currency: text("currency").notNull(),
+    fxToUsdAtOpen: doublePrecision("fx_to_usd_at_open"),
+    // 'buy' | 'reinvest_div' | 'transfer_in' | 'split_adj' | 'backfill'
+    // CHECK enforced in SQL.
+    origin: text("origin").notNull(),
+    parentLotId: integer("parent_lot_id").references(
+      (): any => holdingLots.id,
+      { onDelete: "set null" },
+    ),
+    // 'open' | 'closed' | 'transferred_out' — CHECK enforced in SQL.
+    status: text("status").notNull().default("open"),
+    // 2026-05-26 Phase 3: 'long' (default) | 'short'. A short lot is
+    // opened when a Sell exceeds available long inventory; later Buys
+    // close shorts before opening fresh long lots.
+    side: text("side").notNull().default("long"),
+    // Mirrors transactions.source (tx-source.ts SOURCES tuple).
+    source: text("source").notNull().default("manual"),
+    createdAt: timestamp("created_at", { withTimezone: true }).notNull().defaultNow(),
+    updatedAt: timestamp("updated_at", { withTimezone: true }).notNull().defaultNow(),
+  },
+  (table) => [
+    // FIFO selection hot path: "open lots for (user, holding, account)
+    // ordered by open_date ASC, id ASC".
+    index("holding_lots_user_hold_acct_status_open_idx").on(
+      table.userId,
+      table.holdingId,
+      table.accountId,
+      table.status,
+      table.openDate,
+      table.id,
+    ),
+    // Reverse-by-tx hot path: reverseLotsForDelete maps a deleted
+    // transaction back to its lot.
+    index("holding_lots_open_tx_idx").on(table.openTxId),
+  ],
+);
+
+// ─── holding_lot_closures — one row per (close_tx, lot) pair
+//
+// A single sell can deplete multiple FIFO lots; a single transfer-out
+// closes exactly one lot. Realized gain is computed once at close time
+// and stored, so the Phase 2 tax-year query is a simple date filter.
+export const holdingLotClosures = pgTable(
+  "holding_lot_closures",
+  {
+    id: serial("id").primaryKey(),
+    userId: text("user_id").notNull(),
+    lotId: integer("lot_id")
+      .notNull()
+      .references(() => holdingLots.id, { onDelete: "cascade" }),
+    closeTxId: integer("close_tx_id")
+      .notNull()
+      .references(() => transactions.id, { onDelete: "cascade" }),
+    closeDate: text("close_date").notNull(),
+    qtyClosed: doublePrecision("qty_closed").notNull(),
+    // Post-issue-#96 substitution: paired sells use the cash leg's
+    // entered_amount as proceeds, not the stock leg's amount.
+    proceedsPerShare: doublePrecision("proceeds_per_share").notNull(),
+    // Snapshot of holdingLots.costPerShare at close time.
+    costPerShare: doublePrecision("cost_per_share").notNull(),
+    realizedGain: doublePrecision("realized_gain").notNull(),
+    currency: text("currency").notNull(),
+    daysHeld: integer("days_held").notNull(),
+    // 'sell' | 'transfer_out' — CHECK enforced in SQL.
+    closeKind: text("close_kind").notNull(),
+    // 2026-05-28 Phase 5 — historical FX snapshot at close time for the
+    // realized-gain-in-base-currency aggregator. Nullable; legacy
+    // closures fall back to "current rate" with a warning surfaced by
+    // the aggregator response.
+    fxToUsdAtClose: doublePrecision("fx_to_usd_at_close"),
+    source: text("source").notNull().default("manual"),
+    createdAt: timestamp("created_at", { withTimezone: true }).notNull().defaultNow(),
+    updatedAt: timestamp("updated_at", { withTimezone: true }).notNull().defaultNow(),
+  },
+  (table) => [
+    index("holding_lot_closures_user_close_date_idx").on(
+      table.userId,
+      table.closeDate,
+      table.lotId,
+    ),
+    index("holding_lot_closures_close_tx_idx").on(table.closeTxId),
+  ],
+);
+
+// ─── portfolio_lots_status — per-user feature flag + backfill watermark
+//
+// The three aggregators (REST overview, holdings-value lib, MCP HTTP)
+// branch on `enabled` to pick the lot-derived metrics path
+// (src/lib/portfolio/metrics.ts) vs the legacy avg-cost math. The
+// scripts/backfill-portfolio-lots.ts admin script sets `backfill_done`
+// after writing lot rows for every (holding, account) pair; an admin
+// flips `enabled` after canary verification.
+export const portfolioLotsStatus = pgTable("portfolio_lots_status", {
+  userId: text("user_id").primaryKey(),
+  backfillDone: boolean("backfill_done").notNull().default(false),
+  enabled: boolean("enabled").notNull().default(false),
+  backfilledAt: timestamp("backfilled_at", { withTimezone: true }),
+  notes: text("notes").notNull().default(""),
+});
+
+// ─── portfolio_snapshots — daily per-user/account value (Phase 3, 2026-06-01)
+//
+// One row per (user, day, account). account_id NULL = whole-portfolio
+// aggregate. Stored in the user's reporting currency AT SNAP TIME —
+// retroactive reporting-ccy switches don't re-FX historical bars (TWRR
+// is dimensionless, so a value-chart-currency discontinuity is the
+// only artifact, surfaced via a tooltip).
+//
+// `gaps_filled=true` marks days where price_cache or fx_rates fell
+// back to last-known. UI shows "incomplete history" on ranges
+// containing any gap-filled day.
+export const portfolioSnapshots = pgTable("portfolio_snapshots", {
+  id: serial("id").primaryKey(),
+  userId: text("user_id").notNull(),
+  snapDate: text("snap_date").notNull(),
+  accountId: integer("account_id").references(() => accounts.id, { onDelete: "cascade" }),
+  marketValue: doublePrecision("market_value").notNull(),
+  costBasis: doublePrecision("cost_basis").notNull(),
+  netContribution: doublePrecision("net_contribution").notNull().default(0),
+  currency: text("currency").notNull(),
+  gapsFilled: boolean("gaps_filled").notNull().default(false),
+  source: text("source").notNull().default("cron"),
+  createdAt: timestamp("created_at", { withTimezone: true }).notNull().defaultNow(),
+});
+
+// ─── portfolio_legacy_realized_gain_snapshot — pre-cutover avg-cost gain
+//
+// Avg-cost realized gain ≠ FIFO realized gain on partial-sell users. This
+// table is the one-time snapshot of the legacy value per
+// (user, holding, account) at backfill time, surfaced as a tooltip on the
+// Phase 1 realized-gain column ("Pre-2026-05 avg-cost: $X"). Written
+// exactly once; never updated. DROPpable after a release cycle of
+// stability with all users enabled.
+export const portfolioLegacyRealizedGainSnapshot = pgTable(
+  "portfolio_legacy_realized_gain_snapshot",
+  {
+    userId: text("user_id").notNull(),
+    holdingId: integer("holding_id").notNull(),
+    accountId: integer("account_id").notNull(),
+    avgCostRealized: doublePrecision("avg_cost_realized").notNull(),
+    currency: text("currency").notNull(),
+    snappedAt: timestamp("snapped_at", { withTimezone: true }).notNull().defaultNow(),
+  },
+  (table) => [
+    primaryKey({ columns: [table.userId, table.holdingId, table.accountId] }),
+  ],
+);

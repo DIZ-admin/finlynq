@@ -1,7 +1,7 @@
 "use client";
 
 import { useEffect, useState, useCallback, useRef, Suspense } from "react";
-import { useSearchParams } from "next/navigation";
+import { useSearchParams, useRouter } from "next/navigation";
 import Link from "next/link";
 import { Card, CardContent, CardHeader, CardTitle } from "@/components/ui/card";
 import { Table, TableBody, TableCell, TableHead, TableHeader, TableRow } from "@/components/ui/table";
@@ -17,7 +17,7 @@ import { EmptyState } from "@/components/empty-state";
 import { Badge } from "@/components/ui/badge";
 import { formatCurrency, formatDate } from "@/lib/currency";
 import { SUPPORTED_FIAT_CURRENCIES } from "@/lib/fx/supported-currencies";
-import { Plus, ChevronLeft, ChevronRight, Trash2, Pencil, SlidersHorizontal, ChevronDown, Receipt, Search, X, Scissors, AlertTriangle, Link2, ArrowRightLeft, Columns3, ArrowUp, ArrowDown, Filter } from "lucide-react";
+import { Plus, ChevronLeft, ChevronRight, Trash2, Pencil, SlidersHorizontal, ChevronDown, Receipt, Search, X, Scissors, AlertTriangle, Link2, ArrowRightLeft, Columns3, ArrowUp, ArrowDown, Filter, TrendingUp } from "lucide-react";
 import { DropdownMenu, DropdownMenuTrigger, DropdownMenuContent, DropdownMenuGroup, DropdownMenuLabel, DropdownMenuCheckboxItem, DropdownMenuItem, DropdownMenuSeparator } from "@/components/ui/dropdown-menu";
 import { SplitDialog } from "./_components/split-dialog";
 import { formatAccountLabel } from "@/lib/account-label";
@@ -70,6 +70,13 @@ type Transaction = {
   createdAt?: string | null;
   updatedAt?: string | null;
   source?: TransactionSource | null;
+  // Phase 2 portfolio-ops refactor (2026-05-25) — `kind` is the operation
+  // discriminator (buy/sell/buy_cash_leg/etc). When set, Edit routes to
+  // the dedicated /portfolio/new form instead of the generic edit dialog.
+  // `tradeLinkId` is the buy/sell pair UUID — used to fetch the sibling
+  // cash leg in the editor.
+  kind?: string | null;
+  tradeLinkId?: string | null;
 };
 
 type LinkedSibling = {
@@ -484,6 +491,7 @@ export default function TransactionsPage() {
 
 function TransactionsPageInner() {
   const urlParams = useSearchParams();
+  const router = useRouter();
   const [txns, setTxns] = useState<Transaction[]>([]);
   const [total, setTotal] = useState(0);
   const [accounts, setAccounts] = useState<Account[]>([]);
@@ -854,6 +862,14 @@ function TransactionsPageInner() {
 
   // Delete confirmation
   const [deleteConfirmId, setDeleteConfirmId] = useState<number | null>(null);
+  // Phase 2 portfolio-ops refactor: server returns 409 with this shape when
+  // the row being deleted is the open-tx of a lot that's already been sold
+  // or transferred out. UI surfaces the blocking tx ids so the user knows
+  // exactly which rows to delete first.
+  const [deleteBlockedError, setDeleteBlockedError] = useState<{
+    message: string;
+    blockingIds: number[];
+  } | null>(null);
   const [deleteConfirmPayee, setDeleteConfirmPayee] = useState("");
   const [deleting, setDeleting] = useState(false);
 
@@ -1508,6 +1524,59 @@ function TransactionsPageInner() {
   }
 
   function startEdit(t: Transaction) {
+    // Phase 2 portfolio-ops refactor (2026-05-25): when the row has a
+    // portfolio-op kind, route to the dedicated /portfolio/new editor
+    // (which loads the existing pair, lets the user edit, and persists
+    // as a replace). The generic dialog can't safely edit paired rows
+    // because it would leave the cash-leg sibling stale.
+    //
+    // `*_cash_leg` rows are addressed via their STOCK leg sibling —
+    // looking up the sibling by trade_link_id lets the editor open in the
+    // logical "edit this trade" view rather than "edit the cash leg of a
+    // trade".
+    if (t.kind) {
+      const portfolioKinds = new Set([
+        "buy",
+        "sell",
+        "buy_cash_leg",
+        "sell_cash_leg",
+        "in_kind_transfer_in",
+        "in_kind_transfer_out",
+        "fx_from",
+        "fx_to",
+        "fx_fee",
+        "portfolio_income",
+        "portfolio_expense",
+        "brokerage_deposit_in",
+        "brokerage_deposit_out",
+        "brokerage_withdrawal_in",
+        "brokerage_withdrawal_out",
+      ]);
+      if (portfolioKinds.has(t.kind)) {
+        const opForKind: Record<string, string> = {
+          buy: "buy",
+          buy_cash_leg: "buy",
+          sell: "sell",
+          sell_cash_leg: "sell",
+          in_kind_transfer_in: "transfer",
+          in_kind_transfer_out: "transfer",
+          fx_from: "fx-conversion",
+          fx_to: "fx-conversion",
+          fx_fee: "fx-conversion",
+          portfolio_income: "income-expense",
+          portfolio_expense: "income-expense",
+          brokerage_deposit_in: "deposit",
+          brokerage_deposit_out: "deposit",
+          brokerage_withdrawal_in: "withdrawal",
+          brokerage_withdrawal_out: "withdrawal",
+        };
+        const op = opForKind[t.kind] ?? "buy";
+        // Use the stock-leg / primary-leg id for editing — for cash legs
+        // we resolve back via trade_link_id on the form's load path.
+        router.push(`/portfolio/new?op=${op}&editId=${t.id}`);
+        return;
+      }
+    }
     setEditId(t.id);
     setSubmitError(null);
     setLinkedSiblings([]);
@@ -1698,9 +1767,28 @@ function TransactionsPageInner() {
   async function handleDelete() {
     if (!deleteConfirmId) return;
     setDeleting(true);
-    await fetch(`/api/transactions?id=${deleteConfirmId}`, { method: "DELETE" });
-    setDeleteConfirmId(null);
+    setDeleteBlockedError(null);
+    const res = await fetch(`/api/transactions?id=${deleteConfirmId}`, { method: "DELETE" });
     setDeleting(false);
+    if (!res.ok) {
+      // Portfolio edit-guard refusal (Phase 2 of the ops refactor). The server
+      // returns 409 + the list of dependent closure tx ids when the row being
+      // deleted opens a lot that's been sold or transferred out. Surface the
+      // list so the user can jump to the blocking row and delete it first.
+      const data = await res.json().catch(() => ({}));
+      if (data?.code === "portfolio_edit_blocked") {
+        setDeleteBlockedError({
+          message: data.error ?? "Delete blocked by portfolio dependencies",
+          blockingIds: Array.isArray(data.blockingClosureTxIds)
+            ? (data.blockingClosureTxIds as number[])
+            : [],
+        });
+        return;
+      }
+      alert(data?.error ?? `Delete failed (${res.status})`);
+      return;
+    }
+    setDeleteConfirmId(null);
     loadTxns();
   }
 
@@ -1822,10 +1910,95 @@ function TransactionsPageInner() {
           <h1 className="text-2xl font-bold">Transactions</h1>
           <p className="text-sm text-muted-foreground mt-0.5">Manage and track all your financial transactions</p>
         </div>
-        <Dialog open={dialogOpen} onOpenChange={(open) => { setDialogOpen(open); if (!open) { setEditId(null); setDialogMode("transaction"); resetForm(); setSubmitError(null); } }}>
-          <DialogTrigger render={<Button className="bg-gradient-to-r from-primary to-primary/80 hover:from-primary/90 hover:to-primary/70 shadow-sm" />}>
+        <div className="flex items-center gap-1.5">
+          {/* Split button: main click → quick Transaction dialog. Chevron →
+              dropdown with every kind (Transfer + the 6 portfolio operations).
+              Phase 2 portfolio-ops UX (2026-05-25). */}
+          <Button
+            className="bg-gradient-to-r from-primary to-primary/80 hover:from-primary/90 hover:to-primary/70 shadow-sm"
+            onClick={() => {
+              setDialogMode("transaction");
+              setEditId(null);
+              setSubmitError(null);
+              setDialogOpen(true);
+            }}
+          >
             <Plus className="h-4 w-4 mr-2" /> Add Transaction
-          </DialogTrigger>
+          </Button>
+          <DropdownMenu>
+            <DropdownMenuTrigger
+              render={
+                <Button
+                  variant="outline"
+                  size="icon"
+                  aria-label="More transaction types"
+                >
+                  <ChevronDown className="h-4 w-4" />
+                </Button>
+              }
+            />
+            <DropdownMenuContent align="end" className="min-w-56">
+              <DropdownMenuGroup>
+                <DropdownMenuLabel>Quick add</DropdownMenuLabel>
+                <DropdownMenuItem
+                  onClick={() => {
+                    setDialogMode("transaction");
+                    setEditId(null);
+                    setSubmitError(null);
+                    setDialogOpen(true);
+                  }}
+                >
+                  <Receipt className="h-4 w-4 mr-2" /> Transaction
+                </DropdownMenuItem>
+                <DropdownMenuItem
+                  onClick={() => {
+                    setDialogMode("transfer");
+                    setEditId(null);
+                    setSubmitError(null);
+                    setDialogOpen(true);
+                  }}
+                >
+                  <ArrowRightLeft className="h-4 w-4 mr-2" /> Transfer
+                </DropdownMenuItem>
+              </DropdownMenuGroup>
+              <DropdownMenuSeparator />
+              <DropdownMenuGroup>
+                <DropdownMenuLabel>Portfolio operations</DropdownMenuLabel>
+                <DropdownMenuItem onClick={() => router.push("/portfolio/new?op=buy")}>
+                  Buy
+                </DropdownMenuItem>
+                <DropdownMenuItem onClick={() => router.push("/portfolio/new?op=sell")}>
+                  Sell
+                </DropdownMenuItem>
+                <DropdownMenuItem onClick={() => router.push("/portfolio/new?op=swap")}>
+                  Swap
+                </DropdownMenuItem>
+                <DropdownMenuItem onClick={() => router.push("/portfolio/new?op=transfer")}>
+                  In-kind transfer
+                </DropdownMenuItem>
+                <DropdownMenuItem onClick={() => router.push("/portfolio/new?op=income-expense")}>
+                  Income / expense
+                </DropdownMenuItem>
+                <DropdownMenuItem onClick={() => router.push("/portfolio/new?op=fx-conversion")}>
+                  FX conversion
+                </DropdownMenuItem>
+                <DropdownMenuItem onClick={() => router.push("/portfolio/new?op=deposit")}>
+                  Brokerage deposit
+                </DropdownMenuItem>
+                <DropdownMenuItem onClick={() => router.push("/portfolio/new?op=withdrawal")}>
+                  Brokerage withdrawal
+                </DropdownMenuItem>
+              </DropdownMenuGroup>
+            </DropdownMenuContent>
+          </DropdownMenu>
+          <Button
+            variant="outline"
+            onClick={() => router.push("/portfolio/new")}
+          >
+            <TrendingUp className="h-4 w-4 mr-2" /> Investment Transactions
+          </Button>
+        </div>
+        <Dialog open={dialogOpen} onOpenChange={(open) => { setDialogOpen(open); if (!open) { setEditId(null); setDialogMode("transaction"); resetForm(); setSubmitError(null); } }}>
           <DialogContent className="max-w-lg">
             <DialogHeader>
               <DialogTitle>
@@ -1917,7 +2090,13 @@ function TransactionsPageInner() {
                       });
                     }}
                     items={sortAccount(
-                      accounts.map((a): ComboboxItemShape => ({ value: String(a.id), label: a.name })),
+                      accounts
+                        // Investment accounts can only be touched via the
+                        // Portfolio Operations surface in new-entry mode.
+                        // Edit mode keeps the picker open for legacy rows
+                        // so they remain editable. See Phase 1 plan.
+                        .filter((a) => !!editId || a.isInvestment !== true)
+                        .map((a): ComboboxItemShape => ({ value: String(a.id), label: a.name })),
                       (a) => Number(a.value),
                       (a, z) => a.label.localeCompare(z.label),
                     )}
@@ -2341,6 +2520,7 @@ function TransactionsPageInner() {
                         onValueChange={(v) => setTransferForm({ ...transferForm, fromAccountId: v })}
                         items={sortAccount(
                           accounts
+                            .filter((a) => !!editId || a.isInvestment !== true)
                             .filter((a) => allowSameAccount || String(a.id) !== transferForm.toAccountId)
                             .map((a): ComboboxItemShape => ({ value: String(a.id), label: `${a.name} · ${a.currency}` })),
                           (a) => Number(a.value),
@@ -2359,6 +2539,7 @@ function TransactionsPageInner() {
                         onValueChange={(v) => setTransferForm({ ...transferForm, toAccountId: v })}
                         items={sortAccount(
                           accounts
+                            .filter((a) => !!editId || a.isInvestment !== true)
                             .filter((a) => allowSameAccount || String(a.id) !== transferForm.fromAccountId)
                             .map((a): ComboboxItemShape => ({ value: String(a.id), label: `${a.name} · ${a.currency}` })),
                           (a) => Number(a.value),
@@ -3377,7 +3558,12 @@ function TransactionsPageInner() {
       </div>
 
       {/* Single delete confirmation dialog */}
-      <Dialog open={deleteConfirmId !== null} onOpenChange={(open) => { if (!open) setDeleteConfirmId(null); }}>
+      <Dialog open={deleteConfirmId !== null} onOpenChange={(open) => {
+        if (!open) {
+          setDeleteConfirmId(null);
+          setDeleteBlockedError(null);
+        }
+      }}>
         <DialogContent className="max-w-sm">
           <DialogHeader>
             <DialogTitle className="flex items-center gap-2 text-destructive">
@@ -3385,15 +3571,60 @@ function TransactionsPageInner() {
               Delete Transaction
             </DialogTitle>
           </DialogHeader>
-          <p className="text-sm text-muted-foreground">
-            Are you sure you want to delete <strong>{deleteConfirmPayee}</strong>? This cannot be undone.
-          </p>
-          <div className="flex gap-2 mt-2">
-            <Button variant="outline" className="flex-1" onClick={() => setDeleteConfirmId(null)}>Cancel</Button>
-            <Button variant="destructive" className="flex-1" disabled={deleting} onClick={handleDelete}>
-              {deleting ? "Deleting…" : "Delete"}
-            </Button>
-          </div>
+          {deleteBlockedError ? (
+            <div className="space-y-3">
+              <p className="text-sm text-amber-900 dark:text-amber-200">
+                {deleteBlockedError.message}
+              </p>
+              {deleteBlockedError.blockingIds.length > 0 && (
+                <div className="rounded-md border border-amber-300/60 bg-amber-50 dark:bg-amber-950/40 dark:border-amber-800/60 p-3 text-xs">
+                  <p className="font-medium text-amber-900 dark:text-amber-200 mb-1.5">
+                    Dependent rows:
+                  </p>
+                  <ul className="space-y-1">
+                    {deleteBlockedError.blockingIds.map((id) => (
+                      <li key={id}>
+                        <Link
+                          href={`/transactions?search=%23${id}`}
+                          className="text-amber-700 dark:text-amber-300 underline hover:no-underline"
+                          onClick={() => {
+                            setDeleteConfirmId(null);
+                            setDeleteBlockedError(null);
+                          }}
+                        >
+                          Transaction #{id}
+                        </Link>
+                      </li>
+                    ))}
+                  </ul>
+                </div>
+              )}
+              <div className="flex gap-2 mt-2">
+                <Button
+                  variant="outline"
+                  className="flex-1"
+                  onClick={() => {
+                    setDeleteConfirmId(null);
+                    setDeleteBlockedError(null);
+                  }}
+                >
+                  Close
+                </Button>
+              </div>
+            </div>
+          ) : (
+            <>
+              <p className="text-sm text-muted-foreground">
+                Are you sure you want to delete <strong>{deleteConfirmPayee}</strong>? This cannot be undone.
+              </p>
+              <div className="flex gap-2 mt-2">
+                <Button variant="outline" className="flex-1" onClick={() => setDeleteConfirmId(null)}>Cancel</Button>
+                <Button variant="destructive" className="flex-1" disabled={deleting} onClick={handleDelete}>
+                  {deleting ? "Deleting…" : "Delete"}
+                </Button>
+              </div>
+            </>
+          )}
         </DialogContent>
       </Dialog>
 

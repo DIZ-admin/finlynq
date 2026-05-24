@@ -29,10 +29,28 @@ type QuoteResult = {
   change: number;
   changePct: number;
   marketCap?: number;
+  // FINLYNQ-92: Yahoo's `meta.previousClose`. Persisted in price_cache so the
+  // change/changePct fields can be computed from a cached row on the next read
+  // instead of being hardcoded to 0. Null on historical bars (no prior-day
+  // reference) and on rows written before the 20260522 migration.
+  previousClose?: number | null;
 };
 
 function todayISO(): string {
   return new Date().toISOString().split("T")[0];
+}
+
+// FINLYNQ-92: derive change + changePct from price + previousClose. Returns
+// 0/0 when previousClose is null OR zero (back-compat for pre-migration rows
+// + safety against divide-by-zero on bad data).
+function deriveDayChange(price: number, previousClose: number | null | undefined): { change: number; changePct: number } {
+  if (previousClose == null || previousClose === 0) {
+    return { change: 0, changePct: 0 };
+  }
+  return {
+    change: price - previousClose,
+    changePct: ((price - previousClose) / previousClose) * 100,
+  };
 }
 
 // Single-row cache lookup. Returns null on miss.
@@ -43,13 +61,15 @@ async function readPriceCache(symbol: string, date: string): Promise<QuoteResult
     .where(and(eq(schema.priceCache.symbol, symbol), eq(schema.priceCache.date, date)))
     .get();
   if (!row) return null;
+  const { change, changePct } = deriveDayChange(row.price, row.previousClose);
   return {
     symbol,
     price: row.price,
     currency: row.currency ?? "USD",
     name: symbol,
-    change: 0,
-    changePct: 0,
+    change,
+    changePct,
+    previousClose: row.previousClose ?? null,
   };
 }
 
@@ -65,23 +85,32 @@ async function readPriceCacheBulk(symbols: string[], date: string): Promise<Map<
     ));
   const out = new Map<string, QuoteResult>();
   for (const r of rows) {
+    const { change, changePct } = deriveDayChange(r.price, r.previousClose);
     out.set(r.symbol, {
       symbol: r.symbol,
       price: r.price,
       currency: r.currency ?? "USD",
       name: r.symbol,
-      change: 0,
-      changePct: 0,
+      change,
+      changePct,
+      previousClose: r.previousClose ?? null,
     });
   }
   return out;
 }
 
 // Idempotent insert; ignores duplicate-key errors so concurrent callers
-// don't race-fail.
-async function writePriceCache(symbol: string, date: string, price: number, currency: string) {
+// don't race-fail. FINLYNQ-92: writes previousClose alongside price so the
+// next cache-hit read can compute live day-change.
+async function writePriceCache(
+  symbol: string,
+  date: string,
+  price: number,
+  currency: string,
+  previousClose: number | null = null,
+) {
   try {
-    await db.insert(schema.priceCache).values({ symbol, date, price, currency });
+    await db.insert(schema.priceCache).values({ symbol, date, price, currency, previousClose });
   } catch { /* duplicate-key is fine */ }
 }
 
@@ -100,15 +129,17 @@ async function fetchQuoteLive(symbol: string): Promise<QuoteResult | null> {
     const meta = data.chart?.result?.[0]?.meta;
     if (!meta) return null;
 
+    const price = meta.regularMarketPrice ?? 0;
+    const previousClose: number | null = meta.previousClose ?? null;
+    const { change, changePct } = deriveDayChange(price, previousClose);
     return {
       symbol,
-      price: meta.regularMarketPrice ?? 0,
+      price,
       currency: meta.currency ?? "USD",
       name: meta.shortName ?? symbol,
-      change: (meta.regularMarketPrice ?? 0) - (meta.previousClose ?? 0),
-      changePct: meta.previousClose
-        ? (((meta.regularMarketPrice ?? 0) - meta.previousClose) / meta.previousClose) * 100
-        : 0,
+      change,
+      changePct,
+      previousClose,
     };
   } catch {
     return null;
@@ -128,7 +159,7 @@ export async function fetchQuote(symbol: string): Promise<QuoteResult | null> {
   if (cached) return cached;
   const live = await fetchQuoteLive(symbol);
   if (!live) return null;
-  await writePriceCache(symbol, today, live.price, live.currency);
+  await writePriceCache(symbol, today, live.price, live.currency, live.previousClose ?? null);
   return live;
 }
 
@@ -153,7 +184,7 @@ export async function fetchMultipleQuotes(symbols: string[]): Promise<Map<string
     for (const q of quotes) {
       if (!q) continue;
       results.set(q.symbol, q);
-      await writePriceCache(q.symbol, today, q.price, q.currency);
+      await writePriceCache(q.symbol, today, q.price, q.currency, q.previousClose ?? null);
     }
   }
   return results;
@@ -204,7 +235,11 @@ export async function fetchQuoteAtDate(symbol: string, date: string): Promise<Qu
     }
     if (!chosen) return null;
     const currency = meta.currency ?? "USD";
-    await writePriceCache(symbol, date, chosen.close, currency);
+    // FINLYNQ-92: historical bars don't carry a meaningful "day change" — we'd
+    // need the bar BEFORE `chosen` for that and we don't currently fetch it.
+    // Writing null keeps the column honest; the day-change badge already
+    // doesn't render for historical date queries.
+    await writePriceCache(symbol, date, chosen.close, currency, null);
     return {
       symbol,
       price: chosen.close,
@@ -212,6 +247,7 @@ export async function fetchQuoteAtDate(symbol: string, date: string): Promise<Qu
       name: meta.shortName ?? symbol,
       change: 0,
       changePct: 0,
+      previousClose: null,
     };
   } catch {
     return null;

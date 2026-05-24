@@ -49,6 +49,12 @@ import {
   getUserTransactions,
 } from "../src/lib/mcp/user-tx-cache";
 import {
+  applyLotEffectsForTx,
+  buildLotContext,
+  reverseLotsForDeleteHook,
+} from "../src/lib/portfolio/lots/write-hooks";
+import type { TxRowForLots } from "../src/lib/portfolio/lots/types";
+import {
   scanForPossibleDuplicates,
   dateBoundsForScan,
   type CommittedInsert,
@@ -91,14 +97,11 @@ import {
   type InvestmentCategoryHint,
 } from "../src/lib/auto-categorize";
 import { decryptStaged, encryptStaged } from "../src/lib/crypto/staging-envelope";
+import { calculateFinancialHealth } from "../src/lib/financial-health";
 import { getHoldingsValueByAccount } from "../src/lib/holdings-value";
 import { computeGoalProgress } from "../src/lib/goals-progress";
 import { sourceTagFor, isFormatTag, type FormatTag } from "../src/lib/tx-source";
-import {
-  validateSignVsCategory,
-  getCategoryTypeMap,
-  SignCategoryMismatchError,
-} from "../src/lib/transactions/sign-category-invariant";
+import { validateSignVsCategory } from "../src/lib/transactions/sign-category-invariant";
 import { ymdDate, ymPeriod, parseYmdSafe } from "./lib/date-validators";
 import {
   analyzeRecurringGroup,
@@ -1962,298 +1965,19 @@ export function registerPgTools(
   // ── get_financial_health_score ─────────────────────────────────────────────
   server.tool(
     "get_financial_health_score",
-    `Calculate a financial health score 0-100 with breakdown by component. Component scores are currency-independent ratios; the underlying totals (income, expenses, liabilities, liquid assets) are converted to reportingCurrency (defaults to user's display currency). Issue #235 changes: (a) final score is summed from un-rounded sub-components and rounded once at the end (no off-by-one); (b) liquid assets exclude illiquid asset accounts (uses \`accounts.is_investment\` + a cash-group whitelist); (c) Net Worth Trend is a real 3M delta with \`{ direction, magnitudePct, descriptor }\` payload; (d) when there are no budgets the Budget Adherence component is EXCLUDED (not penalized at 50/100) and the remaining weights renormalize — \`excludedComponents\` lists what was dropped; (e) DTI uses trailing-12-month debt payments / trailing-12-month income (no 3m × 4 extrapolation).`,
+    `Calculate a financial health score 0-100 with breakdown by 6 weighted components (Savings Rate 0.25 / Debt-to-Income 0.20 / Emergency Fund 0.15 / Net Worth Trend 0.15 / Budget Adherence 0.15 / Age of Money 0.10). Component scores are currency-independent ratios; the underlying totals (income, expenses, liabilities, liquid assets) are converted to reportingCurrency (defaults to user's display currency). FINLYNQ-94 (2026-05-23): Age of Money restored as the 6th component (was dropped from issue #235); calculator promoted to shared \`src/lib/financial-health.ts\`. Issue #235 features preserved: (a) final score summed from un-rounded sub-components and rounded once at the end; (b) liquid assets exclude illiquid asset accounts (uses \`accounts.is_investment\` + a cash-group whitelist); (c) Net Worth Trend is a real 3M delta with \`{ direction, magnitudePct, descriptor }\` payload surfaced under \`detailRich\`; (d) components with insufficient data are EXCLUDED (not penalized at a neutral score) and the remaining weights renormalize — \`excludedComponents\` lists what was dropped; (e) DTI uses trailing-12-month debt payments / trailing-12-month income.`,
     {
       reportingCurrency: z.string().optional().describe("ISO code; defaults to user's display currency. Affects the underlying totals surfaced alongside the score."),
     },
     async ({ reportingCurrency }) => {
       const reporting = await resolveReportingCurrency(db, userId, reportingCurrency);
-      const today = new Date().toISOString().split("T")[0];
-      const fxCache = new Map<string, number>();
-      const fxFor = async (ccy: string): Promise<number> => {
-        const k = (ccy || reporting).toUpperCase();
-        if (fxCache.has(k)) return fxCache.get(k)!;
-        const r = await getRate(k, reporting, today, userId);
-        fxCache.set(k, r);
-        return r;
-      };
-
-      // Cash-group whitelist for the liquid-assets filter (issue #235). Not
-      // an exhaustive list of "user-defined cash groups" — a starting point
-      // mirroring the load-bearing branching shape used by /api/goals
-      // currentAmount and the account-balance rule. If validation surfaces
-      // accounts that should be liquid but aren't, extend this list rather
-      // than reverting to substring matching on `group`.
-      const CASH_GROUPS = new Set([
-        "Banks",
-        "Cash Accounts",
-        "Cash",
-        "Savings",
-        "Chequing",
-        "Checking",
-      ]);
-
-      const now = new Date();
-      const currentMonth = `${now.getFullYear()}-${String(now.getMonth() + 1).padStart(2, "0")}`;
-      const threeAgo = new Date(now); threeAgo.setMonth(threeAgo.getMonth() - 3);
-      const threeStart = `${threeAgo.getFullYear()}-${String(threeAgo.getMonth() + 1).padStart(2, "0")}-01`;
-      const twelveAgo = new Date(now); twelveAgo.setFullYear(twelveAgo.getFullYear() - 1);
-      const twelveStart = twelveAgo.toISOString().split("T")[0];
-
-      // 3-month window for savings-rate (existing semantics).
-      const incomeExpenses = await q(db, sql`
-        SELECT TO_CHAR(t.date::date, 'YYYY-MM') AS month, c.type AS cat_type,
-               COALESCE(t.currency, a.currency) AS currency,
-               SUM(t.amount) AS total
-        FROM transactions t
-        LEFT JOIN categories c ON t.category_id = c.id
-        LEFT JOIN accounts a ON a.id = t.account_id
-        WHERE t.user_id = ${userId} AND t.date >= ${threeStart} AND c.type IN ('E','I')
-        GROUP BY TO_CHAR(t.date::date, 'YYYY-MM'), c.type, COALESCE(t.currency, a.currency)
-      `) as { month: string; cat_type: string; currency: string | null; total: number }[];
-
-      let totalIncome = 0, totalExpenses = 0;
-      for (const r of incomeExpenses) {
-        const fx = await fxFor(String(r.currency ?? reporting));
-        const converted = Number(r.total) * fx;
-        if (r.cat_type === "I") totalIncome += converted;
-        if (r.cat_type === "E") totalExpenses += Math.abs(converted);
-      }
-
-      const savingsRateScore = totalIncome > 0 ? Math.min(100, Math.max(0, ((totalIncome - totalExpenses) / totalIncome) * 500)) : 0;
-
-      // 12-month window for DTI (issue #235). Annualizing income from a 3m
-      // window distorts in months with skewed payment timing — Q1 lump sums
-      // get multiplied by 4. Compute trailing-12m on both sides directly.
-      const incomeDebt12m = await q(db, sql`
-        SELECT c.type AS cat_type,
-               COALESCE(t.currency, a.currency) AS currency,
-               SUM(t.amount) AS total
-        FROM transactions t
-        LEFT JOIN categories c ON t.category_id = c.id
-        LEFT JOIN accounts a ON a.id = t.account_id
-        WHERE t.user_id = ${userId} AND t.date >= ${twelveStart}
-          AND (c.type = 'I' OR (a.type = 'L' AND t.amount < 0))
-        GROUP BY c.type, COALESCE(t.currency, a.currency), a.type
-      `) as { cat_type: string | null; currency: string | null; total: number }[];
-
-      let income12m = 0;
-      let debtPayments12m = 0;
-      for (const r of incomeDebt12m) {
-        const fx = await fxFor(String(r.currency ?? reporting));
-        const converted = Number(r.total) * fx;
-        if (r.cat_type === "I") {
-          income12m += converted;
-        } else {
-          // a.type = 'L' AND amount < 0 = payment INTO the liability (paying
-          // down the loan / paying the credit card). Flip sign so positive.
-          debtPayments12m += Math.abs(converted);
-        }
-      }
-
-      // Liquid-assets filter (issue #235). is_investment branching mirrors
-      // the load-bearing rule documented in CLAUDE.md (goals currentAmount,
-      // account-balance). Real estate / vehicles / locked-in retirement
-      // plans no longer slip through the substring filter.
-      const balances = await q(db, sql`
-        SELECT a.type, a."group", a.currency, a.is_investment,
-               COALESCE(SUM(t.amount), 0) AS balance
-        FROM accounts a LEFT JOIN transactions t ON a.id = t.account_id AND t.user_id = ${userId}
-        WHERE a.user_id = ${userId}
-        GROUP BY a.id, a.type, a."group", a.currency, a.is_investment
-      `) as { type: string; group: string; currency: string | null; is_investment: boolean | null; balance: number }[];
-
-      let totalLiabilities = 0;
-      let liquidAssets = 0;
-      for (const b of balances) {
-        const fx = await fxFor(String(b.currency ?? reporting));
-        const converted = Number(b.balance) * fx;
-        if (b.type === "L") totalLiabilities += Math.abs(converted);
-        if (b.type === "A") {
-          const groupTrim = (b.group ?? "").trim();
-          if (b.is_investment !== true && CASH_GROUPS.has(groupTrim)) {
-            liquidAssets += converted;
-          }
-        }
-      }
-      const dtiRatio = income12m > 0 ? debtPayments12m / income12m : null;
-      const dtiScore = dtiRatio !== null
-        ? Math.min(100, Math.max(0, (1 - dtiRatio) * 100))
-        : (debtPayments12m === 0 ? 100 : 0);
-
-      const avgMonthlyExpenses = totalExpenses / 3;
-      const emergencyScore = avgMonthlyExpenses > 0 ? Math.min(100, Math.max(0, (liquidAssets / avgMonthlyExpenses / 6) * 100)) : (liquidAssets > 0 ? 50 : 0);
-
-      // Net Worth Trend (issue #235). Compute net worth today vs. ~90 days
-      // ago using the same balance roll-up shape as the balances query, but
-      // gated by t.date <= cutoff. Score the 3m delta on a centered scale:
-      // -10% magnitude => 0, +10% => 100, flat => 50.
-      const ninetyDaysAgo = new Date(now.getTime() - 90 * 86400000);
-      const ninetyDaysAgoStr = ninetyDaysAgo.toISOString().split("T")[0];
-      const balancesPast = await q(db, sql`
-        SELECT a.currency, COALESCE(SUM(t.amount), 0) AS balance
-        FROM accounts a LEFT JOIN transactions t ON a.id = t.account_id AND t.user_id = ${userId} AND t.date <= ${ninetyDaysAgoStr}
-        WHERE a.user_id = ${userId}
-        GROUP BY a.id, a.currency
-      `) as { currency: string | null; balance: number }[];
-
-      let nwToday = 0;
-      let nwPast = 0;
-      for (const b of balances) {
-        const fx = await fxFor(String(b.currency ?? reporting));
-        nwToday += Number(b.balance) * fx;
-      }
-      for (const b of balancesPast) {
-        const fx = await fxFor(String(b.currency ?? reporting));
-        nwPast += Number(b.balance) * fx;
-      }
-
-      // Detect "not enough history" by checking how far back the user has
-      // any transaction at all. If the oldest tx is < 60d old, the trend
-      // signal is unreliable.
-      const oldestRow = await q(db, sql`
-        SELECT MIN(t.date) AS oldest FROM transactions t WHERE t.user_id = ${userId}
-      `) as { oldest: string | null }[];
-      const oldestStr = oldestRow[0]?.oldest ?? null;
-      const oldestAgeDays = oldestStr
-        ? Math.round((now.getTime() - new Date(oldestStr + "T00:00:00").getTime()) / 86400000)
-        : 0;
-      const insufficientHistory = !oldestStr || oldestAgeDays < 60;
-
-      const nwAbsBase = Math.max(Math.abs(nwToday), Math.abs(nwPast), 1);
-      const nwDelta = nwToday - nwPast;
-      const nwMagnitudePct = insufficientHistory ? 0 : Math.round((nwDelta / nwAbsBase) * 1000) / 10;
-      const nwDirection: "up" | "down" | "flat" = insufficientHistory
-        ? "flat"
-        : Math.abs(nwMagnitudePct) < 0.5
-          ? "flat"
-          : nwMagnitudePct > 0
-            ? "up"
-            : "down";
-      const nwDescriptor = insufficientHistory
-        ? "Not enough history"
-        : nwDirection === "flat"
-          ? "Flat over the last 3 months"
-          : `${nwDirection === "up" ? "Up" : "Down"} ${Math.abs(nwMagnitudePct).toFixed(1)}% over the last 3 months`;
-      // Score: 0 = -10% or worse, 50 = flat, 100 = +10% or better.
-      const nwScore = insufficientHistory
-        ? 0
-        : Math.min(100, Math.max(0, 50 + nwMagnitudePct * 5));
-
-      const budgetsData = await q(db, sql`
-        SELECT b.id, b.amount AS budget,
-               COALESCE(ABS(SUM(CASE WHEN t.date >= ${currentMonth + "-01"} AND t.date <= ${currentMonth + "-31"} THEN t.amount ELSE 0 END)), 0) AS spent
-        FROM budgets b
-        JOIN categories c ON b.category_id = c.id AND c.user_id = ${userId}
-        LEFT JOIN transactions t ON t.category_id = c.id AND t.user_id = ${userId}
-        WHERE b.month = ${currentMonth} AND b.user_id = ${userId}
-        GROUP BY b.id, b.amount
-      `) as { budget: number; spent: number }[];
-
-      const budgetOnTrackCount = budgetsData.filter(b => Number(b.spent) <= Math.abs(Number(b.budget))).length;
-      const budgetScore = budgetsData.length > 0
-        ? (budgetOnTrackCount / budgetsData.length) * 100
-        : 0;
-
-      // Build the candidate component list (un-rounded internally — we
-      // round ONCE at the end). Components with `excluded: true` are
-      // dropped from the weighted average and their weight is
-      // renormalized across the remaining ones.
-      const candidates: Array<{
-        name: string;
-        scoreRaw: number;
-        weightCanonical: number;
-        detail: unknown;
-        excluded: boolean;
-        excludeReason?: string;
-      }> = [
-        {
-          name: "Savings Rate",
-          scoreRaw: savingsRateScore,
-          weightCanonical: 0.3,
-          detail: totalIncome > 0 ? `${Math.round(((totalIncome - totalExpenses) / totalIncome) * 100)}% savings rate` : "No income data",
-          excluded: false,
-        },
-        {
-          name: "Debt-to-Income",
-          scoreRaw: dtiScore,
-          weightCanonical: 0.2,
-          detail: dtiRatio !== null ? `${Math.round(dtiRatio * 100)}% debt-to-income (12m)` : (debtPayments12m === 0 ? "No debt payments (12m)" : "No income data (12m)"),
-          excluded: false,
-        },
-        {
-          name: "Emergency Fund",
-          scoreRaw: emergencyScore,
-          weightCanonical: 0.2,
-          detail: avgMonthlyExpenses > 0 ? `${(liquidAssets / avgMonthlyExpenses).toFixed(1)} months covered` : "No expense data",
-          excluded: false,
-        },
-        {
-          name: "Net Worth Trend",
-          scoreRaw: nwScore,
-          weightCanonical: 0.15,
-          detail: { direction: nwDirection, magnitudePct: nwMagnitudePct, descriptor: nwDescriptor },
-          excluded: insufficientHistory,
-          excludeReason: insufficientHistory ? "insufficient_history" : undefined,
-        },
-        {
-          name: "Budget Adherence",
-          scoreRaw: budgetScore,
-          weightCanonical: 0.15,
-          detail: budgetsData.length > 0 ? `${budgetOnTrackCount}/${budgetsData.length} on track` : "No budgets set",
-          excluded: budgetsData.length === 0,
-          excludeReason: budgetsData.length === 0 ? "no_budgets" : undefined,
-        },
-      ];
-
-      // Renormalize the kept components' weights so they sum to 1.0.
-      const keptWeightSum = candidates.filter(c => !c.excluded).reduce((s, c) => s + c.weightCanonical, 0);
-      const components = candidates
-        .filter(c => !c.excluded)
-        .map(c => {
-          const weight = keptWeightSum > 0 ? c.weightCanonical / keptWeightSum : 0;
-          const weightedRaw = c.scoreRaw * weight;
-          return {
-            name: c.name,
-            score: Math.round(c.scoreRaw),
-            weight: Math.round(weight * 1000) / 1000,
-            weighted: Math.round(weightedRaw),
-            weightedRaw,
-            detail: c.detail,
-          };
-        });
-
-      const totalScoreRaw = components.reduce((s, c) => s + c.weightedRaw, 0);
-      const totalScore = Math.round(Math.min(100, Math.max(0, totalScoreRaw)));
-      const grade = totalScore >= 80 ? "Excellent" : totalScore >= 60 ? "Good" : totalScore >= 40 ? "Fair" : "Needs Work";
-
-      const excludedComponents = candidates
-        .filter(c => c.excluded)
-        .map(c => ({
-          name: c.name,
-          reason: c.excludeReason ?? "excluded",
-          detail: c.detail,
-        }));
-
-      return dataResponse({
-        score: totalScore,
-        grade,
-        // Strip the internal `weightedRaw` from the surface response (it's
-        // a computational helper, not user-facing).
-        components: components.map(({ weightedRaw: _wr, ...rest }) => rest),
-        excludedComponents,
+      const payload = await calculateFinancialHealth({
+        db,
+        userId,
+        dek: null,
         reportingCurrency: reporting,
-        totals: {
-          totalIncome3m: tagAmount(totalIncome, reporting, "reporting"),
-          totalExpenses3m: tagAmount(totalExpenses, reporting, "reporting"),
-          totalIncome12m: tagAmount(income12m, reporting, "reporting"),
-          totalDebtPayments12m: tagAmount(debtPayments12m, reporting, "reporting"),
-          totalLiabilities: tagAmount(totalLiabilities, reporting, "reporting"),
-          liquidAssets: tagAmount(liquidAssets, reporting, "reporting"),
-          netWorthToday: tagAmount(nwToday, reporting, "reporting"),
-          netWorth90DaysAgo: tagAmount(nwPast, reporting, "reporting"),
-        },
       });
+      return dataResponse(payload);
     }
   );
 
@@ -3110,18 +2834,15 @@ export function registerPgTools(
         catName = (ct && dek ? decryptField(dek, String(ct)) : ct ?? "") || "uncategorized";
         catType = row?.type != null ? String(row.type) : null;
       }
-      // Issue #212 — sign-vs-category invariant (HARD REJECT). 'E' must be
+      // FINLYNQ-97 — sign-vs-category check is advisory. 'E' must be
       // ≤ 0; 'I' must be ≥ 0; 'R'/'T' exempt. Runs on resolved.amount AFTER
-      // FX so the rule is evaluated on the value that lands in the DB. dryRun
-      // returns a structured 400-equivalent envelope; non-dryRun never inserts.
+      // FX so the rule is evaluated on the value that lands in the DB.
+      // Non-null result lands in the `warnings` array below; row inserts.
       const sErr = validateSignVsCategory({
         amount: resolved.amount,
         categoryType: catType,
         categoryName: catName,
       });
-      if (sErr) {
-        return err(sErr.message);
-      }
       // Issue #211 Bug h: when both `amount` and `enteredAmount` are
       // passed, surface a structured warning so the caller knows the
       // resolved value diverged from their literal `amount` arg.
@@ -3134,6 +2855,8 @@ export function registerPgTools(
         resolvedAmount: enteredAmount != null && amount != null ? resolved.amount : null,
         enteredCurrency: enteredCurrency ?? null,
       });
+      // FINLYNQ-97 — append the sign-vs-category advisory message (if any).
+      if (sErr) warnings.push(sErr.message);
       const resolvedAccountInfo = { id: Number(acct.id), name: String(acct.name ?? "") };
       const resolvedCategory = catId ? { id: catId, name: String(catName ?? "") } : null;
       const resolvedHolding = resolvedHoldingId != null ? { id: resolvedHoldingId } : null;
@@ -3191,6 +2914,29 @@ export function registerPgTools(
       `);
 
       invalidateUserTxCache(userId);
+
+      // Portfolio lot tracking — open/close a lot for any row touching a
+      // holding with non-zero quantity. Soft-fails internally; never
+      // blocks the MCP response on lot-side errors.
+      if (resolvedHoldingId != null && quantity != null && quantity !== 0) {
+        const lotCtx = await buildLotContext(userId, dek);
+        const lotTx: TxRowForLots = {
+          id: result[0]?.id,
+          userId,
+          date: txDate,
+          amount: persistedAmount,
+          currency: resolved.currency,
+          enteredAmount: persistedEnteredAmount,
+          enteredCurrency: resolved.enteredCurrency,
+          quantity,
+          accountId: acct.id,
+          categoryId: catId ?? null,
+          portfolioHoldingId: resolvedHoldingId,
+          tradeLinkId: tradeLinkId ?? null,
+          source: "mcp_http",
+        };
+        await applyLotEffectsForTx(lotTx, lotCtx);
+      }
       return text({
         success: true,
         data: {
@@ -3560,29 +3306,19 @@ export function registerPgTools(
             continue;
           }
 
-          // Issue #212 — sign-vs-category invariant per row. Fail this row
-          // only (matches the #203 unknown-category envelope: results[i]
-          // gets `success: false` + `code: 'sign_category_mismatch'`); the
-          // batch keeps going. The check runs on `resolved.amount` (after
-          // FX) so the rule is evaluated against the value the DB will see.
-          if (catId != null) {
-            const sErr = validateSignVsCategory({
-              amount: resolved.amount,
-              categoryType: catTypeById.get(catId) ?? null,
-              categoryName: catNameById.get(catId) ?? `category #${catId}`,
-            });
-            if (sErr) {
-              results.push({
-                index: i,
-                success: false,
-                message: sErr.message,
-                code: sErr.code,
-                resolvedAccount: resolvedAccountInfo,
-                resolvedCategory: { id: catId, name: catNameById.get(catId) ?? "" },
-              });
-              continue;
-            }
-          }
+          // FINLYNQ-97 — sign-vs-category check is advisory. The check
+          // runs on `resolved.amount` (after FX) so the rule is evaluated
+          // against the value the DB will see; a non-null result is
+          // appended to the per-row `warnings[]` below and the row still
+          // inserts.
+          const signWarn =
+            catId != null
+              ? validateSignVsCategory({
+                  amount: resolved.amount,
+                  categoryType: catTypeById.get(catId) ?? null,
+                  categoryName: catNameById.get(catId) ?? `category #${catId}`,
+                })
+              : null;
 
           // Issue #211 Bug h: amount-vs-enteredAmount override warning.
           const rowWarnings = deriveTxWriteWarnings({
@@ -3594,6 +3330,8 @@ export function registerPgTools(
             resolvedAmount: t.enteredAmount != null && t.amount != null ? resolved.amount : null,
             enteredCurrency: t.enteredCurrency ?? null,
           });
+          // FINLYNQ-97 — append the sign-vs-category advisory (if any).
+          if (signWarn) rowWarnings.push(signWarn.message);
           const rowCategory = catId != null ? { id: catId, name: catNameById.get(catId) ?? "" } : null;
           const rowHolding = rowHoldingId != null ? { id: rowHoldingId } : null;
 
@@ -3933,11 +3671,12 @@ export function registerPgTools(
       } else if (amount !== undefined) {
         postMergeAmount = amount;
       }
-      // Issue #212 — sign-vs-category invariant on the post-merge state.
-      // Resolve type + name from the post-merge category. When the patch
-      // doesn't touch category, fall back to the existing row's category.
-      // Runs BEFORE every UPDATE so a violation aborts the whole patch
-      // cleanly — no partial application.
+      // FINLYNQ-97 — sign-vs-category check on the post-merge state is
+      // advisory. Resolve type + name from the post-merge category; when
+      // the patch doesn't touch category, fall back to the existing row's
+      // category. A non-null result lands in the `warnings[]` array on
+      // the success response below; the UPDATE still applies.
+      let signWarnUpdate: string | null = null;
       if (postMergeAmount != null) {
         const postMergeCategoryId = catId !== undefined ? catId : existingCategoryId;
         if (postMergeCategoryId != null) {
@@ -3952,7 +3691,7 @@ export function registerPgTools(
               categoryType: cat.type as string | null | undefined,
               categoryName: catName,
             });
-            if (sErr) return err(sErr.message);
+            if (sErr) signWarnUpdate = sErr.message;
           }
         }
       }
@@ -4024,6 +3763,8 @@ export function registerPgTools(
             quantity: null,
           })
         : [];
+      // FINLYNQ-97 — surface the post-merge sign-vs-category advisory.
+      if (signWarnUpdate) warnings.push(signWarnUpdate);
       // Issue #60: response shape — explicit `fieldsUpdated[]` replaces the
       // ambiguous "(N field(s))" count, and `resolvedCategory` mirrors the
       // per-row shape `bulk_record_transactions` already returns.
@@ -4052,6 +3793,10 @@ export function registerPgTools(
       if (!existing.length) return err(`Transaction #${id} not found`);
       const t = existing[0];
       const plainPayee = dek ? (decryptField(dek, String(t.payee ?? "")) ?? "") : t.payee;
+      // Portfolio lot tracking — reverse BEFORE the DELETE so closure rows
+      // are still in place for the lookup. CASCADE on holding_lots.open_tx_id
+      // catches anything reverseLotsForDeleteHook missed.
+      await reverseLotsForDeleteHook(userId, id);
       await db.execute(sql`DELETE FROM transactions WHERE id = ${id} AND user_id = ${userId}`);
       invalidateUserTxCache(userId);
       return text({ success: true, data: { message: `Deleted transaction #${id}: "${plainPayee}" ${t.amount} on ${t.date}` } });
@@ -5727,6 +5472,180 @@ export function registerPgTools(
         },
       });
     }
+  );
+
+  // ── get_portfolio_performance_v2 ───────────────────────────────────────────
+  // Phase 3 of plan/portfolio-lots-and-performance.md — TWRR + MWRR + daily
+  // value series from portfolio_snapshots. Distinct from get_portfolio_performance
+  // (which is the avg-cost legacy aggregate); v2 reads pre-built snapshots
+  // populated by the nightly cron + backfill script.
+  server.tool(
+    "get_portfolio_performance_v2",
+    "Time-series performance for the portfolio: daily market_value + cost_basis series, period TWRR (Modified Dietz chained daily), annualized TWRR, and MWRR / XIRR. Reads `portfolio_snapshots` populated by the nightly cron + admin backfill script. `gapsFilledDays` count flags any range where price_cache or fx_rates fell back to last-known values.",
+    {
+      period: z.enum(["1m", "3m", "6m", "ytd", "1y", "all"]).optional().describe("Lookback period; defaults to '1y'"),
+      accountId: z.number().int().optional().describe("Scope to one accounts.id; omit for whole-portfolio aggregate"),
+    },
+    async ({ period, accountId }) => {
+      const PERIOD_DAYS: Record<string, number | null> = {
+        "1m": 30, "3m": 90, "6m": 180, ytd: -1, "1y": 365, all: null,
+      };
+      const asOfDate = new Date().toISOString().slice(0, 10);
+      const p = period ?? "1y";
+      let from: string;
+      if (p === "ytd") from = `${asOfDate.slice(0, 4)}-01-01`;
+      else {
+        const days = PERIOD_DAYS[p];
+        if (days == null) from = "1900-01-01";
+        else {
+          const d = new Date(`${asOfDate}T00:00:00Z`);
+          d.setUTCDate(d.getUTCDate() - days);
+          from = d.toISOString().slice(0, 10);
+        }
+      }
+
+      const rowsRaw = await q(db, sql`
+        SELECT
+          snap_date AS date,
+          market_value,
+          cost_basis,
+          net_contribution AS contribution,
+          currency,
+          gaps_filled
+        FROM portfolio_snapshots
+        WHERE user_id = ${userId}
+          AND snap_date >= ${from}
+          AND snap_date <= ${asOfDate}
+          AND ${accountId != null ? sql`account_id = ${accountId}` : sql`account_id IS NULL`}
+        ORDER BY snap_date
+      `);
+      const series = (rowsRaw as Array<{
+        date: string;
+        market_value: number;
+        cost_basis: number;
+        contribution: number;
+        currency: string;
+        gaps_filled: boolean;
+      }>).map((r) => ({
+        date: r.date,
+        marketValue: Number(r.market_value),
+        costBasis: Number(r.cost_basis),
+        contribution: Number(r.contribution),
+        gapsFilled: r.gaps_filled,
+      }));
+
+      const { computeTwrr, annualizeReturn } = await import(
+        "../src/lib/portfolio/performance/twrr"
+      );
+      const { computeMwrr } = await import(
+        "../src/lib/portfolio/performance/mwrr"
+      );
+      const { computeNetContributions } = await import(
+        "../src/lib/portfolio/performance/contributions"
+      );
+
+      const twrr = computeTwrr(
+        series.map((p) => ({
+          date: p.date,
+          marketValue: p.marketValue,
+          contribution: p.contribution,
+        })),
+      );
+      let mwrr: { irr: number; converged: boolean } = { irr: 0, converged: false };
+      if (series.length > 0) {
+        const flows = await computeNetContributions({
+          userId,
+          accountId: accountId ?? null,
+          fromDate: from,
+          toDate: asOfDate,
+        });
+        const startMv = series[0]?.marketValue ?? 0;
+        if (startMv > 0) flows.unshift({ date: from, amount: -startMv });
+        const finalMv = series[series.length - 1]?.marketValue ?? 0;
+        const result = computeMwrr(flows, finalMv, asOfDate);
+        mwrr = { irr: result.irr, converged: result.converged };
+      }
+
+      const periodDays = series.length >= 2
+        ? Math.max(1, Math.round((Date.parse(series[series.length - 1].date) - Date.parse(series[0].date)) / 86400000))
+        : 0;
+      const twrrAnnualized = annualizeReturn(twrr.periodReturn, periodDays);
+
+      return text({
+        success: true,
+        data: {
+          period: p,
+          accountId: accountId ?? null,
+          from,
+          to: asOfDate,
+          currency: (rowsRaw as Array<{ currency?: string }>)[0]?.currency ?? "USD",
+          series,
+          twrr: {
+            period: twrr.periodReturn,
+            annualized: twrrAnnualized,
+            hadContributions: twrr.hadContributions,
+          },
+          mwrr,
+          gapsFilledDays: series.filter((p) => p.gapsFilled).length,
+        },
+      });
+    },
+  );
+
+  // ── get_realized_gains ─────────────────────────────────────────────────────
+  // Phase 2 of plan/portfolio-lots-and-performance.md — reads
+  // `holding_lot_closures` populated by Phase 1's lot engine.
+  server.tool(
+    "get_realized_gains",
+    "Lot-level realized gains for the user, sourced from the FIFO lot engine. One row per closure (a sell that consumed a buy lot). Filter by tax year, date range, holding/account, or term (short ≤365d / long >365d / all). Each row carries pre-computed `realizedGain` in the holding's own currency (post issue #96 paired-cash-leg substitution). Pre-Phase-1 history requires running the lot-backfill admin script.",
+    {
+      from: z.string().optional().describe("Inclusive close_date lower bound, YYYY-MM-DD"),
+      to: z.string().optional().describe("Inclusive close_date upper bound, YYYY-MM-DD"),
+      taxYear: z.number().int().optional().describe("Convenience: sets from=YYYY-01-01, to=YYYY-12-31"),
+      holdingId: z.number().int().optional().describe("Scope to one portfolio_holdings.id"),
+      accountId: z.number().int().optional().describe("Scope to one accounts.id"),
+      term: z.enum(["short", "long", "all"]).optional().describe("Holding-period term (US tax convention; days_held threshold = 365)"),
+    },
+    async ({ from, to, taxYear, holdingId, accountId, term }) => {
+      const { listRealizedGainClosures } = await import("../src/lib/portfolio/realized-gains");
+      const result = await listRealizedGainClosures(userId, dek, {
+        from,
+        to,
+        taxYear,
+        holdingId,
+        accountId,
+        term: term ?? "all",
+      });
+      return text({ success: true, data: result });
+    },
+  );
+
+  // ── get_dividend_income ────────────────────────────────────────────────────
+  // Phase 2 of plan/portfolio-lots-and-performance.md — reads transactions
+  // by category_id (Dividends), respecting the issue #84 category-id rule.
+  server.tool(
+    "get_dividend_income",
+    "Dividend income from the transactions table, classified by the user's Dividends category (issue #84). Includes cash dividends (qty=0), reinvested dividends (qty>0), and withholding-tax entries (amount<0, surfaced as separate `withholdingCount` per group, not netted). Group by year / quarter / holding, or omit `groupBy` to return raw rows.",
+    {
+      from: z.string().optional().describe("Inclusive lower bound on transactions.date, YYYY-MM-DD"),
+      to: z.string().optional().describe("Inclusive upper bound on transactions.date, YYYY-MM-DD"),
+      taxYear: z.number().int().optional().describe("Convenience: sets from=YYYY-01-01, to=YYYY-12-31"),
+      holdingId: z.number().int().optional().describe("Scope to one portfolio_holdings.id"),
+      accountId: z.number().int().optional().describe("Scope to one accounts.id"),
+      groupBy: z.enum(["quarter", "year", "holding"]).optional().describe("Aggregation mode; omit for raw rows"),
+    },
+    async ({ from, to, taxYear, holdingId, accountId, groupBy }) => {
+      const { listDividendIncome } = await import("../src/lib/portfolio/dividends");
+      const result = await listDividendIncome(userId, dek, {
+        from,
+        to,
+        taxYear,
+        holdingId,
+        accountId,
+        groupBy,
+      });
+      return text({ success: true, data: result });
+    },
   );
 
   // ── get_portfolio_analysis ─────────────────────────────────────────────────

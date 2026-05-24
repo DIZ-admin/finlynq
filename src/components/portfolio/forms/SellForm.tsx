@@ -1,0 +1,645 @@
+"use client";
+
+/**
+ * SellForm — Phase 2 of plan/portfolio-lots-and-performance.md.
+ *
+ * POST /api/portfolio/operations/sell:
+ *   pick investment account → pick non-cash holding → enter qty + totalProceeds
+ *   optional: "Choose specific lots" → LotPicker (FIFO when empty/omitted).
+ *
+ * Cash leg is inferred from the (account, holding.currency) sleeve;
+ * missing sleeve surfaces with the same "create one first" message as Buy.
+ */
+
+import { useEffect, useMemo, useState } from "react";
+import { useRouter, useSearchParams } from "next/navigation";
+import Link from "next/link";
+import {
+  Card,
+  CardContent,
+  CardDescription,
+  CardHeader,
+  CardTitle,
+} from "@/components/ui/card";
+import { Button } from "@/components/ui/button";
+import { Input } from "@/components/ui/input";
+import { Label } from "@/components/ui/label";
+import {
+  Select,
+  SelectContent,
+  SelectItem,
+  SelectTrigger,
+  SelectValue,
+} from "@/components/ui/select";
+import { formatCurrency } from "@/lib/currency";
+import LotPicker from "./LotPicker";
+
+interface AccountRow {
+  id: number;
+  name: string | null;
+  currency: string;
+  alias?: string | null;
+  type?: string | null;
+  isInvestment?: boolean;
+}
+
+interface HoldingRow {
+  id: number;
+  accountId: number;
+  name: string | null;
+  symbol: string | null;
+  currency: string;
+  isCrypto: boolean | number;
+  isCash: boolean | number;
+  currentShares: number;
+  accountName: string | null;
+}
+
+function todayISO(): string {
+  return new Date().toISOString().slice(0, 10);
+}
+
+export default function SellForm() {
+  const router = useRouter();
+  const searchParams = useSearchParams();
+  const editIdParam = searchParams.get("editId");
+  const editId = editIdParam ? Number(editIdParam) : null;
+  const isEdit =
+    editId != null && Number.isFinite(editId) && editId > 0;
+
+  const [accounts, setAccounts] = useState<AccountRow[]>([]);
+  const [holdings, setHoldings] = useState<HoldingRow[]>([]);
+  const [loading, setLoading] = useState(true);
+  const [loadError, setLoadError] = useState<string | null>(null);
+
+  const [accountId, setAccountId] = useState<string>("");
+  const [holdingId, setHoldingId] = useState<string>("");
+  const [qty, setQty] = useState<string>("");
+  const [totalProceeds, setTotalProceeds] = useState<string>("");
+  const [date, setDate] = useState<string>(todayISO());
+  const [payee, setPayee] = useState<string>("");
+  const [note, setNote] = useState<string>("");
+  const [tags, setTags] = useState<string>("");
+
+  const [useLotPicker, setUseLotPicker] = useState(false);
+  const [lotSelection, setLotSelection] = useState<
+    { lotId: number; qty: number }[]
+  >([]);
+  // When the lot picker is active, the qty field is auto-computed from the
+  // sum of per-lot inputs (read-only display).
+  const lotSelectionTotal = lotSelection.reduce((s, l) => s + l.qty, 0);
+  const effectiveSellQty = useLotPicker
+    ? lotSelectionTotal
+    : parseFloat(qty);
+
+  const [submitting, setSubmitting] = useState(false);
+  const [errors, setErrors] = useState<Record<string, string>>({});
+  const [submitError, setSubmitError] = useState<string | null>(null);
+  const [blockingClosureTxIds, setBlockingClosureTxIds] = useState<number[]>(
+    [],
+  );
+
+  useEffect(() => {
+    let cancelled = false;
+    Promise.all([
+      fetch("/api/accounts").then((r) => r.json()),
+      fetch("/api/portfolio").then((r) => r.json()),
+    ])
+      .then(([acc, holds]) => {
+        if (cancelled) return;
+        setAccounts(Array.isArray(acc) ? acc : []);
+        setHoldings(Array.isArray(holds) ? holds : []);
+      })
+      .catch((e: unknown) => {
+        if (cancelled) return;
+        setLoadError(e instanceof Error ? e.message : "Failed to load data");
+      })
+      .finally(() => {
+        if (!cancelled) setLoading(false);
+      });
+    return () => {
+      cancelled = true;
+    };
+  }, []);
+
+  // Load existing operation data on mount when editId is present.
+  useEffect(() => {
+    if (!isEdit) return;
+    let cancelled = false;
+    fetch(`/api/portfolio/operations/load?id=${editId}`)
+      .then(async (r) => {
+        if (cancelled) return;
+        const json: {
+          error?: string;
+          data?: {
+            op?: string;
+            accountId?: number;
+            holdingId?: number;
+            qty?: number;
+            totalProceeds?: number;
+            date?: string;
+            payee?: string | null;
+            note?: string | null;
+            tags?: string | null;
+          };
+        } = await r.json().catch(() => ({}));
+        if (cancelled) return;
+        if (!r.ok) {
+          setLoadError(
+            json.error ?? `Failed to load edit data (${r.status})`,
+          );
+          return;
+        }
+        const d = json.data;
+        if (!d) {
+          setLoadError("Failed to load edit data (empty response)");
+          return;
+        }
+        if (d.op !== "sell") {
+          setLoadError(
+            `This edit link is for "${d.op}" — use that form instead.`,
+          );
+          return;
+        }
+        if (d.accountId != null) setAccountId(String(d.accountId));
+        if (d.holdingId != null) setHoldingId(String(d.holdingId));
+        if (d.qty != null) setQty(String(d.qty));
+        if (d.totalProceeds != null)
+          setTotalProceeds(String(d.totalProceeds));
+        if (d.date) setDate(d.date);
+        setPayee(d.payee ?? "");
+        setNote(d.note ?? "");
+        setTags(d.tags ?? "");
+      })
+      .catch((e: unknown) => {
+        if (cancelled) return;
+        setLoadError(
+          e instanceof Error ? e.message : "Failed to load edit data",
+        );
+      });
+    return () => {
+      cancelled = true;
+    };
+  }, [editId, isEdit]);
+
+  const investmentAccounts = useMemo(
+    () => accounts.filter((a) => a.isInvestment === true),
+    [accounts],
+  );
+
+  const selectedAccount = useMemo(
+    () =>
+      accountId
+        ? investmentAccounts.find((a) => String(a.id) === accountId) ?? null
+        : null,
+    [accountId, investmentAccounts],
+  );
+
+  const accountHoldings = useMemo(
+    () =>
+      selectedAccount
+        ? holdings.filter(
+            (h) => h.accountId === selectedAccount.id && !h.isCash,
+          )
+        : [],
+    [holdings, selectedAccount],
+  );
+
+  const selectedHolding = useMemo(
+    () =>
+      holdingId
+        ? accountHoldings.find((h) => String(h.id) === holdingId) ?? null
+        : null,
+    [holdingId, accountHoldings],
+  );
+
+  const cashSleeve = useMemo(() => {
+    if (!selectedAccount || !selectedHolding) return null;
+    return (
+      holdings.find(
+        (h) =>
+          h.accountId === selectedAccount.id &&
+          !!h.isCash &&
+          h.currency === selectedHolding.currency,
+      ) ?? null
+    );
+  }, [holdings, selectedAccount, selectedHolding]);
+
+  const cashSleeveMissing = !!selectedHolding && !cashSleeve;
+
+  function validate(): boolean {
+    const e: Record<string, string> = {};
+    if (!accountId) e.accountId = "Pick an account";
+    if (!holdingId) e.holdingId = "Pick a holding";
+    const qtyNum = useLotPicker ? lotSelectionTotal : parseFloat(qty);
+    if (useLotPicker) {
+      if (!(qtyNum > 0)) e.qty = "Pick at least one lot with qty > 0";
+    } else {
+      if (!qty || Number.isNaN(qtyNum) || qtyNum <= 0)
+        e.qty = "Quantity must be > 0";
+    }
+    const proceedsNum = parseFloat(totalProceeds);
+    if (!totalProceeds || Number.isNaN(proceedsNum) || proceedsNum <= 0)
+      e.totalProceeds = "Total proceeds must be > 0";
+    if (!date) e.date = "Pick a date";
+    setErrors(e);
+    return Object.keys(e).length === 0;
+  }
+
+  async function handleSubmit(e: React.FormEvent) {
+    e.preventDefault();
+    setSubmitError(null);
+    setBlockingClosureTxIds([]);
+    if (!validate()) return;
+    if (cashSleeveMissing) {
+      setSubmitError(
+        `No ${selectedHolding?.currency} cash sleeve exists in this account.`,
+      );
+      return;
+    }
+    setSubmitting(true);
+    try {
+      // Phase 3 — when the lot picker is active the qty is the sum of per-lot
+      // inputs. Otherwise the user types qty manually (FIFO closes).
+      const submitQty = useLotPicker ? lotSelectionTotal : parseFloat(qty);
+      const body: Record<string, unknown> = {
+        accountId: Number(accountId),
+        holdingId: Number(holdingId),
+        qty: submitQty,
+        totalProceeds: parseFloat(totalProceeds),
+        date,
+      };
+      if (payee.trim()) body.payee = payee.trim();
+      if (note.trim()) body.note = note.trim();
+      if (tags.trim()) body.tags = tags.trim();
+      // Phase 3 lotSelection shape — array of {lotId, qty} per the picker.
+      // Empty selection with picker on = same as FIFO (server default), so skip.
+      if (useLotPicker && lotSelection.length > 0) {
+        body.lotSelection = {
+          method: "SPECIFIC",
+          lots: lotSelection,
+          // Legacy fallback for any reader that still expects lotIds.
+          lotIds: lotSelection.map((l) => l.lotId),
+        };
+      }
+      if (isEdit) body.editId = editId;
+      const res = await fetch("/api/portfolio/operations/sell", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify(body),
+      });
+      if (!res.ok) {
+        const data: {
+          error?: string;
+          code?: string;
+          currency?: string;
+          blockingClosureTxIds?: unknown;
+        } = await res.json().catch(() => ({}));
+        if (data.code === "cash_sleeve_not_found") {
+          setSubmitError(
+            `No ${data.currency ?? selectedHolding?.currency ?? ""} cash sleeve exists in this account. Create one via the account's Cash sleeves panel first.`,
+          );
+        } else if (data.code === "portfolio_edit_blocked") {
+          setBlockingClosureTxIds(
+            Array.isArray(data.blockingClosureTxIds)
+              ? (data.blockingClosureTxIds.filter(
+                  (n) => typeof n === "number",
+                ) as number[])
+              : [],
+          );
+          setSubmitError(
+            data.error ?? "Edit blocked — dependent transactions exist",
+          );
+        } else {
+          setSubmitError(data.error ?? `Save failed (${res.status})`);
+        }
+        return;
+      }
+      router.push("/transactions");
+    } catch (err: unknown) {
+      setSubmitError(err instanceof Error ? err.message : "Save failed");
+    } finally {
+      setSubmitting(false);
+    }
+  }
+
+  if (loading) {
+    return (
+      <Card>
+        <CardContent className="py-8 text-sm text-muted-foreground">
+          Loading…
+        </CardContent>
+      </Card>
+    );
+  }
+  if (loadError) {
+    return (
+      <Card>
+        <CardContent className="py-8 text-sm text-destructive">
+          {loadError}
+        </CardContent>
+      </Card>
+    );
+  }
+  if (investmentAccounts.length === 0) {
+    return (
+      <Card>
+        <CardHeader>
+          <CardTitle>No investment accounts</CardTitle>
+          <CardDescription>
+            Sell operations require an investment account. Mark one of your
+            accounts as an investment account first.
+          </CardDescription>
+        </CardHeader>
+        <CardContent>
+          <Link href="/accounts" className="text-sm text-primary underline">
+            Go to Accounts →
+          </Link>
+        </CardContent>
+      </Card>
+    );
+  }
+
+  const proceedsNum = parseFloat(totalProceeds);
+  const showPreview =
+    selectedHolding &&
+    !Number.isNaN(proceedsNum) &&
+    proceedsNum > 0 &&
+    !!cashSleeve;
+
+  return (
+    <Card>
+      <CardHeader>
+        <CardTitle>{isEdit ? "Edit Sell" : "Sell"}</CardTitle>
+        <CardDescription>
+          Realize gains on a holding. Proceeds land in the matching{" "}
+          {selectedHolding?.currency ?? "<currency>"} cash sleeve. FIFO by default
+          — toggle the lot picker to choose specific lots.
+        </CardDescription>
+      </CardHeader>
+      <CardContent>
+        <form onSubmit={handleSubmit} className="space-y-4">
+          <div className="space-y-1.5">
+            <Label>Account</Label>
+            <Select
+              value={accountId}
+              onValueChange={(v) => {
+                setAccountId(v ?? "");
+                setHoldingId("");
+                setUseLotPicker(false);
+                setLotSelection([]);
+              }}
+            >
+              <SelectTrigger className="w-full">
+                <SelectValue placeholder="Pick an investment account" />
+              </SelectTrigger>
+              <SelectContent>
+                {investmentAccounts.map((a) => (
+                  <SelectItem key={a.id} value={String(a.id)}>
+                    {a.name ?? `#${a.id}`} ({a.currency})
+                  </SelectItem>
+                ))}
+              </SelectContent>
+            </Select>
+            {errors.accountId && (
+              <p className="text-xs text-destructive">{errors.accountId}</p>
+            )}
+          </div>
+
+          <div className="space-y-1.5">
+            <Label>Holding</Label>
+            <Select
+              value={holdingId}
+              onValueChange={(v) => {
+                setHoldingId(v ?? "");
+                setLotSelection([]);
+              }}
+              disabled={!selectedAccount}
+            >
+              <SelectTrigger className="w-full">
+                <SelectValue
+                  placeholder={
+                    selectedAccount
+                      ? accountHoldings.length === 0
+                        ? "No non-cash holdings in this account"
+                        : "Pick a holding"
+                      : "Pick an account first"
+                  }
+                />
+              </SelectTrigger>
+              <SelectContent>
+                {accountHoldings.map((h) => (
+                  <SelectItem key={h.id} value={String(h.id)}>
+                    {h.symbol ? `${h.symbol} — ` : ""}
+                    {h.name ?? `#${h.id}`} ({h.currency})
+                  </SelectItem>
+                ))}
+              </SelectContent>
+            </Select>
+            {errors.holdingId && (
+              <p className="text-xs text-destructive">{errors.holdingId}</p>
+            )}
+            {selectedHolding && (
+              <p className="text-xs text-muted-foreground">
+                Currently holding {Number(selectedHolding.currentShares ?? 0).toLocaleString()} shares.
+              </p>
+            )}
+          </div>
+
+          {cashSleeveMissing && (
+            <div className="rounded-md border border-destructive/50 bg-destructive/5 px-3 py-2 text-xs text-destructive">
+              No {selectedHolding?.currency} cash sleeve exists in this account.
+              Create one in the{" "}
+              <Link
+                href={`/accounts/${selectedAccount?.id ?? ""}`}
+                className="underline"
+              >
+                account page
+              </Link>{" "}
+              first.
+            </div>
+          )}
+
+          <div className="grid grid-cols-2 gap-3">
+            <div className="space-y-1.5">
+              <Label>
+                Quantity to sell
+                {useLotPicker && (
+                  <span className="text-muted-foreground text-xs ml-1.5">
+                    (sum of selected lots)
+                  </span>
+                )}
+              </Label>
+              <Input
+                type="number"
+                step="any"
+                inputMode="decimal"
+                value={useLotPicker ? String(lotSelectionTotal || "") : qty}
+                onChange={(e) => setQty(e.target.value)}
+                placeholder="100"
+                readOnly={useLotPicker}
+                className={useLotPicker ? "bg-muted/40" : undefined}
+              />
+              {errors.qty && (
+                <p className="text-xs text-destructive">{errors.qty}</p>
+              )}
+            </div>
+            <div className="space-y-1.5">
+              <Label>
+                Total proceeds{" "}
+                {selectedHolding ? (
+                  <span className="text-muted-foreground text-xs">
+                    ({selectedHolding.currency})
+                  </span>
+                ) : null}
+              </Label>
+              <Input
+                type="number"
+                step="any"
+                inputMode="decimal"
+                value={totalProceeds}
+                onChange={(e) => setTotalProceeds(e.target.value)}
+                placeholder="1100.00"
+              />
+              {errors.totalProceeds && (
+                <p className="text-xs text-destructive">{errors.totalProceeds}</p>
+              )}
+            </div>
+          </div>
+
+          <div className="space-y-1.5">
+            <Label>Date</Label>
+            <Input
+              type="date"
+              value={date}
+              onChange={(e) => setDate(e.target.value)}
+            />
+            {errors.date && (
+              <p className="text-xs text-destructive">{errors.date}</p>
+            )}
+          </div>
+
+          {showPreview && selectedHolding && (
+            <div className="rounded-md border border-border/60 bg-muted/30 px-3 py-2 text-xs text-muted-foreground">
+              Will credit the {selectedHolding.currency} cash sleeve by{" "}
+              <span className="font-mono text-foreground">
+                {formatCurrency(proceedsNum, selectedHolding.currency)}
+              </span>
+              .
+            </div>
+          )}
+
+          {selectedHolding && (
+            <div className="space-y-2 rounded-md border border-border/60 px-3 py-2">
+              <label className="flex items-center gap-2 text-xs">
+                <input
+                  type="checkbox"
+                  checked={useLotPicker}
+                  onChange={(e) => {
+                    setUseLotPicker(e.target.checked);
+                    if (!e.target.checked) setLotSelection([]);
+                  }}
+                  className="h-3.5 w-3.5"
+                />
+                <span>Choose specific lots (advanced)</span>
+              </label>
+              {useLotPicker && (
+                <LotPicker
+                  holdingId={selectedHolding.id}
+                  currency={selectedHolding.currency}
+                  selection={lotSelection}
+                  onChange={setLotSelection}
+                />
+              )}
+            </div>
+          )}
+
+          <div className="space-y-1.5">
+            <Label>
+              Payee{" "}
+              <span className="text-muted-foreground text-xs">(optional)</span>
+            </Label>
+            <Input
+              value={payee}
+              onChange={(e) => setPayee(e.target.value)}
+              placeholder="Broker name"
+            />
+          </div>
+
+          <div className="space-y-1.5">
+            <Label>
+              Note{" "}
+              <span className="text-muted-foreground text-xs">(optional)</span>
+            </Label>
+            <Input
+              value={note}
+              onChange={(e) => setNote(e.target.value)}
+              placeholder=""
+            />
+          </div>
+
+          <div className="space-y-1.5">
+            <Label>
+              Tags{" "}
+              <span className="text-muted-foreground text-xs">(optional)</span>
+            </Label>
+            <Input
+              value={tags}
+              onChange={(e) => setTags(e.target.value)}
+              placeholder="tag1, tag2"
+            />
+          </div>
+
+          {submitError && (
+            <p className="text-sm text-destructive">{submitError}</p>
+          )}
+
+          {blockingClosureTxIds.length > 0 && (
+            <div className="rounded-md border border-amber-300/60 bg-amber-50 dark:bg-amber-950/40 dark:border-amber-800/60 p-3 text-xs">
+              <p className="font-medium text-amber-900 dark:text-amber-200 mb-1.5">
+                Delete these dependent transactions first:
+              </p>
+              <ul className="space-y-1">
+                {blockingClosureTxIds.map((id) => (
+                  <li key={id}>
+                    <Link
+                      href={`/transactions?search=%23${id}`}
+                      className="text-amber-700 dark:text-amber-300 underline hover:no-underline"
+                    >
+                      Transaction #{id}
+                    </Link>
+                  </li>
+                ))}
+              </ul>
+            </div>
+          )}
+
+          <div className="flex gap-2 pt-1">
+            <Button
+              type="button"
+              variant="outline"
+              className="flex-1"
+              onClick={() => router.push("/portfolio/new")}
+              disabled={submitting}
+            >
+              Cancel
+            </Button>
+            <Button
+              type="submit"
+              className="flex-1"
+              disabled={submitting || cashSleeveMissing || !!loadError}
+            >
+              {submitting
+                ? isEdit
+                  ? "Saving…"
+                  : "Recording…"
+                : isEdit
+                  ? "Save edit"
+                  : "Record sell"}
+            </Button>
+          </div>
+        </form>
+      </CardContent>
+    </Card>
+  );
+}

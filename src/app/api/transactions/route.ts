@@ -9,7 +9,14 @@ import { invalidateUser as invalidateUserTxCache } from "@/lib/mcp/user-tx-cache
 import { buildHoldingResolver } from "@/lib/external-import/portfolio-holding-resolver";
 import { convertToAccountCurrency } from "@/lib/currency-conversion";
 import { InvestmentHoldingRequiredError } from "@/lib/investment-account";
-import { SignCategoryMismatchError } from "@/lib/transactions/sign-category-invariant";
+import { validateSignVsCategoryById } from "@/lib/transactions/sign-category-invariant";
+import {
+  applyLotEffectsForTx,
+  buildLotContext,
+  reverseLotsForDeleteHook,
+} from "@/lib/portfolio/lots/write-hooks";
+import { canEditPortfolioRow } from "@/lib/portfolio/operations";
+import type { TxRowForLots } from "@/lib/portfolio/lots/types";
 import { db, schema } from "@/db";
 import { and, eq } from "drizzle-orm";
 import { z } from "zod";
@@ -473,29 +480,40 @@ export async function POST(request: NextRequest) {
     // Phase 5: never persist the legacy text column. The FK is the source
     // of truth and the column is being dropped in a follow-up release.
     delete data.portfolioHolding;
+    // FINLYNQ-97 — sign-vs-category check is advisory. Compute the message
+    // BEFORE encryption / INSERT so it sees the post-resolve amount; row
+    // lands regardless. A returned non-null error surfaces as `warning`
+    // on the 201 body.
+    const signWarn =
+      data.amount != null
+        ? await validateSignVsCategoryById(
+            auth.userId,
+            auth.dek,
+            data.categoryId,
+            Number(data.amount),
+          )
+        : null;
     const encrypted = encryptTxWrite(auth.dek, data);
     // Issue #28: hard-code the writer surface at the route boundary rather
     // than relying on the schema default. Defensive against a future writer
     // path that forgets to set it — every entry point is grep-discoverable.
     const tx = await createTransaction(auth.userId, { ...encrypted, source: "manual" }, auth.dek);
     invalidateUserTxCache(auth.userId);
-    return NextResponse.json(tx, { status: 201 });
+    // Portfolio lot tracking — open/close a lot when the row touches a
+    // portfolio holding. Soft-fails internally; never blocks the REST
+    // response on lot-side errors.
+    if (tx && tx.portfolioHoldingId != null && tx.quantity != null && tx.quantity !== 0) {
+      const ctx = await buildLotContext(auth.userId, auth.dek);
+      await applyLotEffectsForTx(tx as TxRowForLots, ctx);
+    }
+    return NextResponse.json(
+      signWarn ? { ...tx, warning: signWarn.message } : tx,
+      { status: 201 },
+    );
   } catch (error: unknown) {
     if (error instanceof InvestmentHoldingRequiredError) {
       return NextResponse.json(
         { error: error.message, code: error.code, accountId: error.accountId },
-        { status: 400 },
-      );
-    }
-    if (error instanceof SignCategoryMismatchError) {
-      return NextResponse.json(
-        {
-          error: error.message,
-          code: error.code,
-          amount: error.amount,
-          categoryName: error.categoryName,
-          categoryType: error.categoryType,
-        },
         { status: 400 },
       );
     }
@@ -526,6 +544,22 @@ export async function PUT(request: NextRequest) {
     const parsed = validateBody(body, putSchema);
     if (parsed.error) return parsed.error;
     const { id, ...data } = parsed.data;
+
+    // Portfolio edit-guard (Phase 2 of the operations refactor) — refuse
+    // edits to a buy/transfer-in tx whose opened lot has been sold or
+    // transferred out. Returns the dependent closure tx ids so the UI can
+    // render a modal listing the rows the user must delete first.
+    const guard = await canEditPortfolioRow(auth.userId, id);
+    if (!guard.allowed) {
+      return NextResponse.json(
+        {
+          error: guard.reason,
+          code: "portfolio_edit_blocked",
+          blockingClosureTxIds: guard.blockingClosureTxIds ?? [],
+        },
+        { status: 409 },
+      );
+    }
 
     const resolved = await resolveTxAmounts(data, auth.userId, true);
     if (!resolved.ok) return resolved.response;
@@ -558,26 +592,61 @@ export async function PUT(request: NextRequest) {
     }
     // Phase 5: never persist the legacy text column.
     delete data.portfolioHolding;
+    // FINLYNQ-97 — sign-vs-category check is advisory on PUT too. Compute
+    // the post-merge amount + category by falling back to the existing
+    // row's values when the patch doesn't touch them, then validate.
+    // The row is updated either way; a non-null result is attached as
+    // `warning` on the 200 body.
+    let signWarn: { message: string } | null = null;
+    if (data.amount !== undefined || data.categoryId !== undefined) {
+      const current = await db
+        .select({
+          amount: schema.transactions.amount,
+          categoryId: schema.transactions.categoryId,
+        })
+        .from(schema.transactions)
+        .where(
+          and(
+            eq(schema.transactions.id, id),
+            eq(schema.transactions.userId, auth.userId),
+          ),
+        )
+        .get();
+      if (current) {
+        const postAmount =
+          data.amount !== undefined ? data.amount : current.amount;
+        const postCategoryId =
+          data.categoryId !== undefined ? data.categoryId : current.categoryId;
+        if (postAmount != null) {
+          signWarn = await validateSignVsCategoryById(
+            auth.userId,
+            auth.dek,
+            postCategoryId,
+            Number(postAmount),
+          );
+        }
+      }
+    }
     const encrypted = encryptTxWrite(auth.dek, data);
     const tx = await updateTransaction(id, auth.userId, encrypted, auth.dek);
     invalidateUserTxCache(auth.userId);
-    return NextResponse.json(tx);
+    // Portfolio lot tracking — UPDATE may have changed quantity / amount /
+    // category / holding, so the conservative move is reverse + redo.
+    // Pure-metadata edits (note / payee / tags / date) still spend the
+    // reverse cycle, but reverseLotsForDeleteHook is a no-op when there
+    // are no lots tied to this tx.
+    await reverseLotsForDeleteHook(auth.userId, id);
+    if (tx && tx.portfolioHoldingId != null && tx.quantity != null && tx.quantity !== 0) {
+      const ctx = await buildLotContext(auth.userId, auth.dek);
+      await applyLotEffectsForTx(tx as TxRowForLots, ctx);
+    }
+    return NextResponse.json(
+      signWarn ? { ...tx, warning: signWarn.message } : tx,
+    );
   } catch (error: unknown) {
     if (error instanceof InvestmentHoldingRequiredError) {
       return NextResponse.json(
         { error: error.message, code: error.code, accountId: error.accountId },
-        { status: 400 },
-      );
-    }
-    if (error instanceof SignCategoryMismatchError) {
-      return NextResponse.json(
-        {
-          error: error.message,
-          code: error.code,
-          amount: error.amount,
-          categoryName: error.categoryName,
-          categoryType: error.categoryType,
-        },
         { status: 400 },
       );
     }
@@ -599,10 +668,140 @@ export async function DELETE(request: NextRequest) {
   // DELETE doesn't need the DEK — IDs and user-scope only.
   const auth = await requireAuth(request);
   if (!auth.authenticated) return auth.response;
+  const { userId } = auth.context;
   const params = request.nextUrl.searchParams;
   const id = parseInt(params.get("id") ?? "0");
   if (!id) return NextResponse.json({ error: "Missing id" }, { status: 400 });
-  await deleteTransaction(id, auth.context.userId);
-  invalidateUserTxCache(auth.context.userId);
-  return NextResponse.json({ success: true });
+
+  // Phase 2 portfolio-ops refactor (2026-05-25): paired rows from
+  // operations.ts share a `trade_link_id` (buy/sell cash leg pairs) or
+  // `link_id` (in-kind transfers, FX conversions). Deleting one leg without
+  // the sibling leaves an orphan that breaks account-level invariants
+  // (cash sleeve sum drifts, lot bookkeeping desyncs). Compute the full
+  // "delete set" up front — the target + every sibling sharing either
+  // link — then run the edit-guard + delete loop over the entire set.
+  const target = await db
+    .select({
+      id: schema.transactions.id,
+      tradeLinkId: schema.transactions.tradeLinkId,
+      linkId: schema.transactions.linkId,
+      swapLinkId: schema.transactions.swapLinkId,
+    })
+    .from(schema.transactions)
+    .where(
+      and(
+        eq(schema.transactions.id, id),
+        eq(schema.transactions.userId, userId),
+      ),
+    )
+    .get();
+  if (!target) {
+    return NextResponse.json({ error: "Transaction not found" }, { status: 404 });
+  }
+  const idSet = new Set<number>([id]);
+  if (target.tradeLinkId) {
+    const siblings = await db
+      .select({ id: schema.transactions.id })
+      .from(schema.transactions)
+      .where(
+        and(
+          eq(schema.transactions.userId, userId),
+          eq(schema.transactions.tradeLinkId, target.tradeLinkId),
+        ),
+      );
+    for (const r of siblings) idSet.add(r.id);
+  }
+  if (target.linkId) {
+    const siblings = await db
+      .select({ id: schema.transactions.id })
+      .from(schema.transactions)
+      .where(
+        and(
+          eq(schema.transactions.userId, userId),
+          eq(schema.transactions.linkId, target.linkId),
+        ),
+      );
+    for (const r of siblings) idSet.add(r.id);
+  }
+  // Phase 4 — swaps share a swap_link_id across all 4 rows (sell pair +
+  // buy pair). Deleting one row cascades to the full bundle.
+  if (target.swapLinkId) {
+    const siblings = await db
+      .select({
+        id: schema.transactions.id,
+        tradeLinkId: schema.transactions.tradeLinkId,
+      })
+      .from(schema.transactions)
+      .where(
+        and(
+          eq(schema.transactions.userId, userId),
+          eq(schema.transactions.swapLinkId, target.swapLinkId),
+        ),
+      );
+    for (const r of siblings) idSet.add(r.id);
+    // Each swap row carries its own tradeLinkId (the inner sell+buy pair
+    // links). Pull those siblings too so all 4 stock+cash rows land in
+    // the delete set.
+    const tradeLinks = new Set(
+      siblings.map((r) => r.tradeLinkId).filter((v): v is string => !!v),
+    );
+    for (const tl of tradeLinks) {
+      const more = await db
+        .select({ id: schema.transactions.id })
+        .from(schema.transactions)
+        .where(
+          and(
+            eq(schema.transactions.userId, userId),
+            eq(schema.transactions.tradeLinkId, tl),
+          ),
+        );
+      for (const r of more) idSet.add(r.id);
+    }
+  }
+  const allIds = Array.from(idSet);
+
+  // Portfolio edit-guard — applies to EVERY id in the delete set. The user
+  // can't delete a buy that has been sold (the sell's closures lock the buy
+  // in place); they have to delete the sell first. We check each row in the
+  // set and aggregate any blocking ids so the UI can surface a single
+  // actionable list.
+  const blockingClosureTxIds: number[] = [];
+  for (const txId of allIds) {
+    const guard = await canEditPortfolioRow(userId, txId);
+    if (!guard.allowed && guard.blockingClosureTxIds) {
+      for (const b of guard.blockingClosureTxIds) {
+        // Exclude ids already in the delete set — the user is deleting
+        // them, so they're not "blocking" the operation.
+        if (!idSet.has(b)) blockingClosureTxIds.push(b);
+      }
+    }
+  }
+  if (blockingClosureTxIds.length > 0) {
+    return NextResponse.json(
+      {
+        error:
+          `This transaction opens one or more lots that have been sold or transferred out. ` +
+          `Delete the ${blockingClosureTxIds.length} dependent transaction(s) first, then retry.`,
+        code: "portfolio_edit_blocked",
+        blockingClosureTxIds,
+      },
+      { status: 409 },
+    );
+  }
+
+  // Reverse lots BEFORE deleting tx rows so reverseLotsForDeleteHook can
+  // see them. ON DELETE CASCADE on holding_lots.open_tx_id catches any
+  // strays as defense-in-depth.
+  for (const txId of allIds) {
+    await reverseLotsForDeleteHook(userId, txId);
+  }
+  for (const txId of allIds) {
+    await deleteTransaction(txId, userId);
+  }
+  invalidateUserTxCache(userId);
+  return NextResponse.json({
+    success: true,
+    deletedIds: allIds,
+    cascaded: allIds.length > 1,
+  });
 }

@@ -8,7 +8,7 @@
  * one" class of regression (issues #214, #211, #230, #205 cohort) before it
  * ships, not to prove soundness.
  *
- * Six invariants today (see CLAUDE.md "Load-bearing gotchas"):
+ * Seven invariants today (see CLAUDE.md "Load-bearing gotchas"):
  *
  *   1. sign-vs-category          — every transactions INSERT must call
  *                                  `validateSignVsCategory` or use
@@ -39,6 +39,26 @@
  *                                  or `SET name_ct = ...`) — schema defs,
  *                                  SELECT lists, comments, blog posts, etc.
  *                                  are excluded.
+ *   7. lots-write-hook           — every transactions write-site that
+ *                                  touches `portfolio_holding_id` must
+ *                                  apply lot effects via
+ *                                  `applyLotEffectsForTx` /
+ *                                  `*LotHook` / `reverseLotsForDeleteHook`
+ *                                  (plan/portfolio-lots-and-performance.md
+ *                                  Phase 1).
+ *   8. portfolio-ops-kind-via-operations
+ *                                — any file that literally writes
+ *                                  `kind: "buy"` / `kind: "sell"` /
+ *                                  `kind: "buy_cash_leg"` /
+ *                                  `kind: "sell_cash_leg"` /
+ *                                  `kind: "fx_*"` /
+ *                                  `kind: "in_kind_transfer_*"` must
+ *                                  import the matching helper from
+ *                                  `@/lib/portfolio/operations` — the
+ *                                  only writer that knows how to pair
+ *                                  legs correctly + invoke the lot
+ *                                  engine + share the trade_link_id
+ *                                  (portfolio ops Phase 1, 2026-05-25).
  *
  * Output:
  *   ALL INVARIANTS PASS                  (exit 0)
@@ -111,6 +131,51 @@ const BASELINE_EXCEPTIONS: Record<string, string> = {
   // helper.
   "src/lib/external-import/reconciliation.ts:sign-vs-category":
     "predates issue #212; followup to wire validateSignVsCategoryById into the reconciliation helper",
+  // FINLYNQ-97 — sign-vs-category check is advisory and lives at the route
+  // boundary (`/api/transactions` POST/PUT) instead of the inner helper.
+  // The validator still runs for every REST write, but the result becomes
+  // a `warning` on the success body rather than a thrown error in the
+  // helper. Calling the validator inside `createTransaction` would be a
+  // redundant DB round-trip with no behavioral effect.
+  "src/lib/queries.ts:sign-vs-category":
+    "FINLYNQ-97 — validator moved to /api/transactions route boundary; advisory warning on success body",
+  // Lot-tracking wiring TODOs (Phase 1, 2026-05-25). The big-three MCP HTTP
+  // write tools below need lot hooks wired before portfolio_lots_status.enabled
+  // can flip TRUE for any user. Tracked as Phase 1 follow-up; backfill catches
+  // the gap in the meantime. Each baseline exception is a known wiring
+  // task, NOT a permanent "doesn't need lots" carve-out. Remove the
+  // exception line as each tool gets wired.
+  //
+  // bulk_record_transactions — needs per-row applyLotEffectsForTx loop after the batch INSERT.
+  // record_trade — buy-pair tool, needs openLotForBuyHook on the stock leg + paired-cash-leg substitution.
+  // update_transaction — needs reverseLotsForDeleteHook + redo via applyLotEffectsForTx.
+  // (record_transaction + delete_transaction are already wired as of 2026-05-25.)
+  "mcp-server/register-tools-pg.ts:lots-write-hook":
+    "Phase 1 follow-up — bulk_record_transactions / record_trade / update_transaction need lot wiring; record_transaction + delete_transaction already wired; backfill covers the gap until flag-flip",
+  // operations.ts is the canonical writer of the multi-leg portfolio op
+  // kinds; it can't very well "import from @/lib/portfolio/operations" of
+  // itself. Accepted as a baseline exception for invariant #8.
+  "src/lib/portfolio/operations.ts:portfolio-ops-kind-via-operations":
+    "operations.ts is the canonical writer; cannot self-import",
+  // seed-demo.ts uses raw-SQL INSERTs to populate the demo's investment
+  // history (legacy pattern — predates operations.ts). Each row's `kind`
+  // is set by the qty-sign rule that matches the schema-migration backfill,
+  // and the lots-backfill at the end of seed-demo (buildLotsForUser) wires
+  // the cost-basis side. Phase 2 follow-up: route through operations.ts
+  // so the seed itself produces paired cash-leg rows (today the demo's
+  // cash sleeve qty is derived from the backfill, not literal rows).
+  "scripts/seed-demo.ts:portfolio-ops-kind-via-operations":
+    "Phase 2 follow-up — seed uses legacy raw-SQL with `kind` tagged by qty sign; lots-backfill at end wires cost basis",
+  // The Phase 2 one-off backfill script INSERTs cash-leg rows for legacy
+  // single-row buys/sells. It uses raw `pg.Pool` SQL (not Drizzle, not the
+  // app helpers) so it can run against any environment without pulling the
+  // PostgresAdapter bootstrap chain. The TypeScript `kind: "buy" | "sell"`
+  // type annotation at line 130 is what trips the regex — there are no
+  // actual `kind: "buy"` value writes; the script writes `kind: 'buy_cash_leg'`
+  // / `'sell_cash_leg'` literals which are correctly paired with the source
+  // rows. Accepted as a one-off-script exception (file is delete-after-use).
+  "scripts/backfill-buy-sell-cash-legs.ts:portfolio-ops-kind-via-operations":
+    "One-off raw-SQL backfill script; regex false-positive on a TypeScript union type annotation. Writes only `*_cash_leg` literals.",
 };
 
 interface InvariantConfig {
@@ -220,6 +285,54 @@ const INVARIANTS: InvariantConfig[] = [
     requiredHelper:
       /updated_at\s*=\s*NOW\(\)|updatedAt\s*:\s*sql`NOW\(\)`|updatedAt\s*:\s*sql\.raw\(['"`]NOW\(\)['"`]\)|updates\.push\(\s*["'`]updated_at\s*=\s*NOW\(\)/,
     helperName: "updated_at = NOW() (Drizzle: updatedAt: sql`NOW()`)",
+  },
+  {
+    id: "lots-write-hook",
+    description:
+      "every write-site touching transactions.portfolio_holding_id must apply lot effects (plan/portfolio-lots-and-performance.md Phase 1)",
+    // Narrow file globs — only the canonical writer surfaces. Other paths
+    // route through these (e.g. /api/import/staged/[id]/approve calls into
+    // executeImport + createTransferPair, both already wired).
+    fileGlobs: [
+      "src/app/api/transactions/route.ts",
+      "src/lib/transfer.ts",
+      "src/lib/import-pipeline.ts",
+      "mcp-server/register-tools-pg.ts",
+    ],
+    // Trigger fires only on writes that ACTUALLY touch portfolio_holding_id
+    // (raw SQL column reference) or portfolioHoldingId (Drizzle camelCase).
+    // A bare `db.delete(transactions)` doesn't flip the lot state on its
+    // own; the matching write-side INSERT/UPDATE flagged for the same file
+    // gets the hook.
+    writeSite:
+      /(?:INSERT\s+INTO\s+transactions[\s\S]{0,2000}?portfolio_holding_id|UPDATE\s+transactions\b[\s\S]{0,1000}?portfolio_holding_id|portfolioHoldingId\s*:)/i,
+    // Any of the lot hooks (or the dispatcher) satisfies the invariant.
+    requiredHelper:
+      /\b(?:applyLotEffectsForTx|openLotForBuyHook|closeLotsForSellHook|transferLotHook|reverseLotsForDeleteHook|openLotForBuy|closeLotsForSell|transferLot)\b/,
+    helperName: "applyLotEffectsForTx / *LotHook (Phase 1 lot tracking)",
+  },
+  {
+    id: "portfolio-ops-kind-via-operations",
+    description:
+      "any file that writes one of the portfolio-op kind discriminators (buy/sell/buy_cash_leg/sell_cash_leg/fx_*/in_kind_transfer_*) must import the matching helper from @/lib/portfolio/operations — otherwise the cash-leg pairing + lot wiring is incomplete (portfolio ops Phase 1, 2026-05-25)",
+    fileGlobs: [
+      "src/",
+      "mcp-server/",
+      "scripts/",
+    ],
+    // Trigger on a literal `kind: "<op>"` or `kind: '<op>'` for any
+    // operation kind that requires multi-row pairing. portfolio_income /
+    // portfolio_expense are intentionally NOT in this list — they're
+    // single-row writes and can be written directly without the helper.
+    writeSite:
+      /kind\s*:\s*['"](?:buy|sell|buy_cash_leg|sell_cash_leg|fx_from|fx_to|fx_fee|in_kind_transfer_in|in_kind_transfer_out|brokerage_deposit_in|brokerage_deposit_out|brokerage_withdrawal_in|brokerage_withdrawal_out)['"]/,
+    // Any import from the operations module satisfies the invariant.
+    // operations.ts itself is the canonical writer; its own writes don't
+    // need to import it (and won't match this import regex), so we add a
+    // baseline exception for operations.ts below.
+    requiredHelper:
+      /from\s+["']@\/lib\/portfolio\/operations["']|from\s+["']\.{1,2}\/(?:[^"']*\/)?operations["']/,
+    helperName: "import from @/lib/portfolio/operations",
   },
   {
     id: "buildNameFields-on-stream-d-tables",

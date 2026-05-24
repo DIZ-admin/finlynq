@@ -26,6 +26,8 @@ import {
   type HoldingEditFormHolding,
 } from "@/components/holdings/holding-edit-form";
 import { ColorDot, CspSafeColorBar } from "@/components/csp-safe-bar";
+import { PerformanceChart } from "@/components/portfolio/PerformanceChart";
+import { buttonVariants } from "@/components/ui/button";
 
 // Mirror of /api/portfolio/overview's `canonicalKey()`. Keep in sync with
 // the server-side function — both must produce the same key for a given
@@ -571,10 +573,40 @@ export default function PortfolioPage() {
             in create mode. The same form lives at /settings/investments;
             both are driven by src/components/holdings/holding-edit-form.tsx
             so the field set never drifts between surfaces (issue #100). */}
-        <Button onClick={() => setCreatingHolding({})} size="sm">
-          <Plus className="h-4 w-4 mr-1.5" /> Add holding
-        </Button>
+        <div className="flex items-center gap-2">
+          {/* Phase 2 nav — realized gains + dividends dashboards. Each
+              dashboard reads its own data; they're not modal extensions
+              of this page, just deeper drills into the same portfolio.
+              `buttonVariants` styles a plain Link as a button — Button
+              itself uses base-ui ButtonPrimitive which doesn't accept
+              asChild per shadcn v4 (uses `render` prop instead, but
+              that's not wired here yet). */}
+          <Link
+            href="/portfolio/realized-gains"
+            className={buttonVariants({ variant: "outline", size: "sm" })}
+          >
+            Realized gains
+          </Link>
+          <Link
+            href="/portfolio/dividends"
+            className={buttonVariants({ variant: "outline", size: "sm" })}
+          >
+            Dividends
+          </Link>
+          {/* Add holding entry point — opens the shared <HoldingEditForm>
+              in create mode. The same form lives at /settings/investments;
+              both are driven by src/components/holdings/holding-edit-form.tsx
+              so the field set never drifts between surfaces (issue #100). */}
+          <Button onClick={() => setCreatingHolding({})} size="sm">
+            <Plus className="h-4 w-4 mr-1.5" /> Add holding
+          </Button>
+        </div>
       </div>
+
+      {/* Phase 3 performance chart — TWRR/MWRR + daily value series.
+          Empty-state copy in the component explains how to populate
+          /portfolio_snapshots via the nightly cron + admin backfill. */}
+      <PerformanceChart accountId={null} />
 
       {/* Re-login prompt — surfaces when the server couldn't decrypt
           tx.portfolio_holding (cold DEK cache after a server restart).
