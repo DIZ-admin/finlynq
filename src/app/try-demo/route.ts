@@ -46,10 +46,13 @@ import { enqueueUpgradeStagingEncryption } from "@/lib/email-import/upgrade-stag
 const DEMO_IDENTIFIER = "demo@finlynq.com";
 const DEMO_PASSWORD = "finlynq-demo";
 
-/** Default landing screen when no ?next= is supplied. Picks /import/pending
- *  because the demo's pre-staged batch (scripts/seed-demo-pending-import.ts)
- *  is the marquee surface this route exists to showcase. */
-const DEFAULT_NEXT = "/import/pending";
+/** Default landing screen when no ?next= is supplied. Picks /dashboard so
+ *  first-time visitors see the at-a-glance net-worth + spending overview
+ *  that anchors the app, rather than dropping straight into a workflow
+ *  surface. Marketing links that want to showcase a specific feature
+ *  (e.g. the pre-staged batch from scripts/seed-demo-pending-import.ts)
+ *  should pass ?next=/import/pending explicitly. */
+const DEFAULT_NEXT = "/dashboard";
 
 /**
  * Validate that `next` is a safe same-origin redirect target.

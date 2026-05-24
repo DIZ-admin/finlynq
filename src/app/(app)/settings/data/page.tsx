@@ -380,6 +380,29 @@ export default function DataSettingsPage() {
         </CardContent>
       </Card>
 
+      {/* Backfill transactions — canonicalization pipeline */}
+      <Card>
+        <CardHeader>
+          <div className="flex items-center gap-3">
+            <div className="flex h-10 w-10 items-center justify-center rounded-xl bg-amber-100 text-amber-600">
+              <ArrowLeftRight className="h-5 w-5" />
+            </div>
+            <div>
+              <CardTitle className="text-base">Backfill transactions</CardTitle>
+              <CardDescription>Canonicalize legacy or imported transactions so realized gains and lot tracking work</CardDescription>
+            </div>
+          </div>
+        </CardHeader>
+        <CardContent>
+          <Button variant="outline" onClick={() => { window.location.href = "/settings/backfill"; }}>
+            Open backfill wizard
+          </Button>
+          <p className="text-xs text-muted-foreground mt-2">
+            Reviews proposals before applying. Won&apos;t change account balances. <a href="/settings/backfill" className="underline">Learn more</a>.
+          </p>
+        </CardContent>
+      </Card>
+
       {/* Data Management — danger zone */}
       <Card>
         <CardHeader>

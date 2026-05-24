@@ -21,6 +21,15 @@ export const SOURCES = [
   // inserted as link_type='primary'. The bank row keeps its original
   // ingest source (BANK_LEDGER_SOURCES); this label is system-side only.
   "reconcile_link",
+  // Backfill-pipeline synthesized rows (2026-06-02). The
+  // /settings/backfill apply path UPDATE-in-places existing rows
+  // (preserving their original `source`), but synthesize mode (S8) and
+  // drift variant A (S4) fabricate net-new rows — paired cash legs for
+  // orphan stock legs and separate fee rows for drift cases. Those
+  // synthesized rows carry this label so they're visually distinguishable
+  // in /transactions and can be filtered out of bank-reconcile flows.
+  // See pf-app/docs/architecture/backfill.md.
+  "backfill_synth",
 ] as const;
 
 export type TransactionSource = (typeof SOURCES)[number];
@@ -61,6 +70,8 @@ export function labelForSource(s: TransactionSource): string {
       return "Backup restore";
     case "reconcile_link":
       return "Reconcile";
+    case "backfill_synth":
+      return "Backfill (synthesized)";
   }
 }
 

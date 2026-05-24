@@ -1396,3 +1396,123 @@ export const portfolioLegacyRealizedGainSnapshot = pgTable(
     primaryKey({ columns: [table.userId, table.holdingId, table.accountId] }),
   ],
 );
+
+// ─── backfill_runs — transaction-canonicalization pipeline (2026-06-02)
+//
+// One row per "compute proposals" invocation on /settings/backfill. Carries
+// the preflight mode choice (refuse_orphans vs synthesize_orphans, see
+// pf-app/docs/architecture/backfill.md S8) + the scope filter.
+// CASCADE on user_id so wipe-account cleans up automatically.
+//
+// Migration: scripts/migrations/20260602_backfill_pipeline.sql.
+export const backfillRuns = pgTable("backfill_runs", {
+  id: uuid("id").primaryKey().default(sql`gen_random_uuid()`),
+  userId: text("user_id")
+    .notNull()
+    .references(() => users.id, { onDelete: "cascade" }),
+  // 'refuse_orphans' | 'synthesize_orphans' — CHECK enforced in SQL.
+  mode: text("mode").notNull(),
+  // { accountIds?: number[], stagedImportId?: string,
+  //   dateFrom?: 'YYYY-MM-DD', dateTo?: 'YYYY-MM-DD' }. Empty = all.
+  scopeFilter: jsonb("scope_filter").notNull().default(sql`'{}'::jsonb`),
+  // 'planning' | 'ready' | 'applied' | 'partially_applied' | 'cancelled' | 'undone'
+  status: text("status").notNull().default("planning"),
+  createdAt: timestamp("created_at", { withTimezone: true })
+    .notNull()
+    .defaultNow(),
+  appliedAt: timestamp("applied_at", { withTimezone: true }),
+});
+
+// ─── backfill_proposals — proposed canonical reshapes for review
+//
+// One row per proposed canonical reshape. `replacementRowsJson` is the
+// payload the apply path UPDATEs the existing rows into; for drift
+// proposals (S4) it carries BOTH variant payloads keyed by
+// 'separate_fee_row' and 'absorb_into_cost' — the user's `variantChoice`
+// picks one.
+//
+// `synthesizedRowsJson` carries net-new rows for synthesize-mode orphans
+// and for drift variant A (separate fee row).
+//
+// `dependsOnProposalIds` (S7) — a Sell proposal depends on every Buy
+// proposal in the same (holding, account) whose lots the Sell FIFO-closes
+// from. Enforced in the UI selector AND server-side at apply.
+export const backfillProposals = pgTable("backfill_proposals", {
+  id: serial("id").primaryKey(),
+  runId: uuid("run_id")
+    .notNull()
+    .references(() => backfillRuns.id, { onDelete: "cascade" }),
+  userId: text("user_id")
+    .notNull()
+    .references(() => users.id, { onDelete: "cascade" }),
+  // 'buy_pair' | 'sell_pair' | 'dividend' | 'fx_pair' |
+  // 'brokerage_deposit_pair' | 'brokerage_withdrawal_pair' |
+  // 'classify_only' | 'drift' | 'orphan_stock_leg'
+  proposalKind: text("proposal_kind").notNull(),
+  // 'high' | 'medium' | 'low' | 'refused' — CHECK enforced in SQL.
+  confidence: text("confidence").notNull(),
+  refusalReason: text("refusal_reason"),
+  summary: text("summary").notNull(),
+  // transactions.id values being displaced/updated by this proposal.
+  existingRowIds: integer("existing_row_ids")
+    .array()
+    .notNull()
+    .default(sql`ARRAY[]::INTEGER[]`),
+  replacementRowsJson: jsonb("replacement_rows_json").notNull(),
+  synthesizedRowsJson: jsonb("synthesized_rows_json"),
+  // { balance, lots: [{ holdingId, qtyDelta }], realizedGainBase }
+  deltasJson: jsonb("deltas_json").notNull(),
+  dependsOnProposalIds: integer("depends_on_proposal_ids")
+    .array()
+    .notNull()
+    .default(sql`ARRAY[]::INTEGER[]`),
+  // NULL until the user picks. Drift proposals refuse to apply with NULL.
+  // 'separate_fee_row' | 'absorb_into_cost' — CHECK enforced in SQL.
+  variantChoice: text("variant_choice"),
+  // NULL until the user picks. dividend_reinvestment proposals refuse to
+  // apply with NULL — mirror of variantChoice for the holding-picker
+  // flow. Apply route reads this when proposal_kind='dividend_reinvestment'.
+  chosenHoldingId: integer("chosen_holding_id"),
+  // Pre-suggested holding ids for the picker UI. Set by the planner
+  // (Pass 1.6) to every non-cash holding in the row's account. UI
+  // pre-selects the top one and offers the rest as alternatives.
+  candidateHoldingIds: integer("candidate_holding_ids")
+    .array()
+    .notNull()
+    .default(sql`ARRAY[]::INTEGER[]`),
+  // Phase 3 — `missing_lot` proposals carry which lot op to run.
+  // CHECK enforced in SQL: NULL OR 'open' | 'close' | 'transfer'.
+  lotAction: text("lot_action"),
+  // Phase 4b — `dividend_reinvestment` proposals require the user to
+  // pick between treating the row as a cash dividend (zero out qty,
+  // no lot opens) or a share reinvestment (qty interpreted as shares,
+  // lot opens). CHECK in SQL: NULL OR 'cash_dividend' | 'drip'.
+  dividendVariant: text("dividend_variant"),
+  // 'pending' | 'approved' | 'rejected' | 'applied' | 'undone' | 'refused_with_reason'
+  status: text("status").notNull().default("pending"),
+  appliedAt: timestamp("applied_at", { withTimezone: true }),
+  createdAt: timestamp("created_at", { withTimezone: true })
+    .notNull()
+    .defaultNow(),
+});
+
+// ─── backfill_audit — snapshot of pre-apply row state for undo
+//
+// Snapshot of the row state BEFORE the apply UPDATE/INSERT. The undo
+// endpoint reads this to restore the pre-apply state. Kept indefinitely
+// (no TTL) so the audit trail survives — the 7-day UX limit on the Undo
+// button is enforced application-side.
+//
+// `txId` is INTEGER (not REFERENCES) intentionally: the row may have been
+// deleted by an unrelated flow, and the snapshot is what we restore from.
+export const backfillAudit = pgTable("backfill_audit", {
+  id: serial("id").primaryKey(),
+  proposalId: integer("proposal_id")
+    .notNull()
+    .references(() => backfillProposals.id, { onDelete: "cascade" }),
+  txId: integer("tx_id").notNull(),
+  beforeJson: jsonb("before_json").notNull(),
+  createdAt: timestamp("created_at", { withTimezone: true })
+    .notNull()
+    .defaultNow(),
+});

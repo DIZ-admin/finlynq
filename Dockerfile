@@ -6,7 +6,10 @@ RUN apk add --no-cache libc6-compat python3 make g++
 WORKDIR /app
 
 COPY package.json package-lock.json ./
-RUN npm ci --omit=dev
+# --ignore-scripts: the `postinstall` hook runs scripts/generate-mcp-tool-catalog.mjs
+# which needs files we haven't COPY'd yet. The builder stage regenerates the
+# catalog via the `prebuild` script before `npm run build` once the source is in.
+RUN npm ci --omit=dev --ignore-scripts
 
 # ── Stage 2: Build the application ───────────────────────────────────────────
 # TODO(security): pin node:22-alpine to a digest — see deps stage.
@@ -15,7 +18,7 @@ RUN apk add --no-cache libc6-compat python3 make g++
 WORKDIR /app
 
 COPY package.json package-lock.json ./
-RUN npm ci
+RUN npm ci --ignore-scripts
 
 # `.dockerignore` (added in the Docker hardening pass) keeps `.env*`, `.git`,
 # `node_modules`, `.next`, tests, agent state, etc. out of the image. If you
