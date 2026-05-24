@@ -1,16 +1,25 @@
 # Transaction-canonicalization backfill pipeline
 
-**Status:** Shipped to dev 2026-06-02. Schema + planner + apply/undo + UI + CLI. **Three bugs surfaced from review — see "Known issues — pending fix" below before extending this code.**
-**Migration:** [scripts/migrations/20260602_backfill_pipeline.sql](../../scripts/migrations/20260602_backfill_pipeline.sql)
+**Status:** Shipped to dev across commits `e3487de` → `15ac794` (2026-06-02 through 2026-05-24). Four rounds of iteration are live on `dev` (V1 + review fixes + Phases 0–4 + cash_dividend correction). See "Iteration history" below for the chronological version.
+
+**Migrations** (run in deploy.sh order):
+- [20260602_backfill_pipeline.sql](../../scripts/migrations/20260602_backfill_pipeline.sql) — V1 schema (runs, proposals, audit)
+- [20260603_opening_balance_kind.sql](../../scripts/migrations/20260603_opening_balance_kind.sql) — extends `transactions_kind_check` with `dividend`, `interest`, `opening_balance`; re-tags earliest-per-holding rows
+- [20260604_backfill_dividend_reinvest.sql](../../scripts/migrations/20260604_backfill_dividend_reinvest.sql) — `chosen_holding_id` + `candidate_holding_ids` on `backfill_proposals`
+- [20260605_backfill_missing_lot.sql](../../scripts/migrations/20260605_backfill_missing_lot.sql) — `lot_action` on `backfill_proposals`
+- [20260607_dividend_variant.sql](../../scripts/migrations/20260607_dividend_variant.sql) — `dividend_variant` on `backfill_proposals`
+
 **Key modules:**
-- Pure planner: [src/lib/portfolio/backfill/planner.ts](../../src/lib/portfolio/backfill/planner.ts)
-- Types:        [src/lib/portfolio/backfill/types.ts](../../src/lib/portfolio/backfill/types.ts)
+- Pure planner: [src/lib/portfolio/backfill/planner.ts](../../src/lib/portfolio/backfill/planner.ts) (Passes 0, 1, 1.5, 1.6, 2, 3)
+- Types:        [src/lib/portfolio/backfill/types.ts](../../src/lib/portfolio/backfill/types.ts) (`PAIRLESS_CANONICAL_KINDS`, `isAlreadyCanonical`, `ProposalKind`)
 - Synthesize:   [src/lib/portfolio/backfill/synthesize.ts](../../src/lib/portfolio/backfill/synthesize.ts)
 - Dependencies: [src/lib/portfolio/backfill/dependencies.ts](../../src/lib/portfolio/backfill/dependencies.ts)
-- Apply + Undo: [src/lib/portfolio/backfill/apply.ts](../../src/lib/portfolio/backfill/apply.ts)
-- UI:           [src/app/(app)/settings/backfill/page.tsx](../../src/app/(app)/settings/backfill/page.tsx) (wizard) + [[runId]/page.tsx](../../src/app/(app)/settings/backfill/[runId]/page.tsx) (review)
+- Apply + Undo + Snapshot loader: [src/lib/portfolio/backfill/apply.ts](../../src/lib/portfolio/backfill/apply.ts)
+- UI:           [src/app/(app)/settings/backfill/page.tsx](../../src/app/(app)/settings/backfill/page.tsx) (wizard + symbol fix card) + [[runId]/page.tsx](../../src/app/(app)/settings/backfill/[runId]/page.tsx) (review with variant + holding pickers)
 - CLI:          [scripts/backfill-cli.ts](../../scripts/backfill-cli.ts)
-- Tests:        [tests/backfill-planner.test.ts](../../tests/backfill-planner.test.ts)
+- Coverage:     [src/app/api/settings/backfill/coverage/route.ts](../../src/app/api/settings/backfill/coverage/route.ts) (canonical + missing-lots metrics)
+- Symbol fix:   [src/app/api/settings/backfill/fix-cash-sleeve-symbols/route.ts](../../src/app/api/settings/backfill/fix-cash-sleeve-symbols/route.ts)
+- Tests:        [tests/backfill-planner.test.ts](../../tests/backfill-planner.test.ts) (24 scenarios)
 
 ## Why
 
@@ -31,16 +40,18 @@ UNDO (≤7d UX) → restore from backfill_audit, refuses with 409 if downstream 
 
 ## Stitching engine — per-row detectors
 
-The planner walks `transactions` ordered by `(account, date, id)`. For each row, in order (first match wins):
+The planner walks `transactions` in scope, then runs six ordered passes (first match per row wins):
 
-| Shape | Detection | Canonical kind | Confidence |
+| Pass | Predicate | Proposal kind | Confidence |
 |---|---|---|---|
-| Stock holding + qty>0 + cash sleeve row same date/exact-magnitude amount | Pair | `buy` + `buy_cash_leg` | HIGH |
-| Stock holding + qty<0 + cash sleeve row same date/exact-magnitude amount | Pair | `sell` + `sell_cash_leg` | HIGH |
-| Stock holding + qty=0 + amount>0 + category=Dividends | Single-row | `dividend` | HIGH |
-| Two cash sleeves same account different currency, opposite signs | Pair | `fx_from` + `fx_to` | MEDIUM (planned for V2) |
-| Cash sleeve + non-investment sibling same date/amount | Pair | `brokerage_deposit_{in,out}` | HIGH (planned for V2) |
-| Stock holding + qty>0 + NO exact cash candidate | Orphan | depends on run mode | varies |
+| **0** missing-lot | canonical row + qty≠0 + non-cash holding + no `holding_lots.open_tx_id` (or `closures.close_tx_id`) | `missing_lot` w/ `lotAction='open'` or `'close'` | HIGH |
+| **1** dividend (qty=0) | stock holding + qty=0 + amount>0 + category=Dividends | `dividend` | HIGH |
+| **1.5** combined cash leg | one cash row matches the sum of ≥2 same-date stock legs | `orphan_stock_leg` (refused: combined_cash_leg) | REFUSED |
+| **1.6** DRIP / cash-div on stock | category=Dividends + qty>0 + amount>0 + qty≈amount | `dividend_reinvestment` w/ holding picker + variant radio | MEDIUM |
+| **2** buy / sell / drift | stock holding + qty≠0; matches cash leg by magnitude → buy_pair / sell_pair | `buy_pair` / `sell_pair` / `drift` / `orphan_stock_leg` / `opening_balance` | varies |
+| **3** safety net | every remaining unconsumed candidate | `orphan_stock_leg` (refused: unmatched_candidate) | REFUSED |
+
+Pass 0 operates on **already-canonical** rows (the rest operate on non-canonical candidates). Pass 3 is a hard symmetry guard: coverage-pending count and planner-proposal count cannot diverge silently.
 
 **Refusal cases** (`proposal.confidence='refused'`, not auto-applyable):
 - **S1 cross-currency** — stock-leg currency != cash-leg currency. The user must record an FX Conversion first; V1 doesn't synthesize FX rates.
@@ -52,6 +63,35 @@ The planner walks `transactions` ordered by `(account, date, id)`. For each row,
   The user picks per proposal; `variant_choice=NULL` means "still needs user input" and the apply route refuses.
 - **Ambiguous candidates** — multiple cash-sleeve rows match exact magnitude. User must pick the right pair manually.
 - **No cash sleeve to synthesize into** (synthesize mode + missing sleeve) — the account doesn't have a cash sleeve in the target currency; user must create one first.
+- **`unmatched_candidate`** — Pass 3 fallback for any non-canonical row that none of Passes 1/1.5/2 handled (e.g., qty=0 with categoryId ≠ user's Dividends id, or cash-holding row with kind set but no pair). Surfaces to the user instead of being silently dropped.
+
+## Proposal kinds with user choice (V1 + Phase 4)
+
+Two proposal classes require user input on the right pane before they can be applied. Both follow the same pattern as drift's `variant_choice`: a nullable column on `backfill_proposals`, planner pre-fills a sensible default, apply route refuses with a code if NULL.
+
+### `opening_balance` (V1 + Phase 0 fix)
+First transaction for a (holding, account) with qty>0 and no cash pair — almost certainly a carry-in from another platform. The apply records the row as a lot at the entered cost basis with NO cash-side impact and stamps the distinct `kind='opening_balance'` literal so the strict canonicalization predicate counts it as pair-less canonical.
+
+### `dividend_reinvestment` (Phase 2 + Phase 4b)
+Pattern: `category=Dividends`, `qty>0`, `amount>0`, `|qty - amount| / max(qty, amount) < 0.05`. The qty=$amount shape can mean either a cash dividend (qty stored quirkily) or a true share reinvestment at $1/share. The proposal carries two pickers:
+
+**Holding picker** (`chosen_holding_id`): which underlying stock did this dividend come from? Candidates = every non-cash holding in the row's account. Defaults to the planner's first suggestion. Refusal code: `holding_choice_missing`.
+
+**Variant radio** (`dividend_variant`): how should it apply?
+
+| Variant | Apply behavior |
+|---|---|
+| `cash_dividend` | Move row to the matching cash sleeve `(accountId, currency)`; set `related_holding_id` = chosen stock; `kind='portfolio_income'`; **preserve** qty (it represents cash units on the sleeve). The dividend lands where the cash actually went; reports attribute it to the picked stock. If no cash sleeve exists → apply throws and surfaces "create one first". |
+| `drip` | Set `portfolio_holding_id` = chosen stock; `kind='dividend'`; preserve qty (interpreted as share count). Lot replay opens at `costPerShare=amount/qty`. |
+
+Planner default:
+- Row already on a non-cash stock holding → suggests `cash_dividend` (typical VUN.TO-style case)
+- Row on a cash sleeve or no holding → suggests `drip` (typical crypto/sub-dollar case)
+
+Refusal code: `dividend_variant_missing`.
+
+### `missing_lot` (Phase 3)
+Canonical buy/sell row on a non-cash stock holding with no matching `holding_lots.open_tx_id` (qty>0) or `holding_lot_closures.close_tx_id` (qty<0). Apply runs `applyLotEffectsForTx` directly on the row — no UPDATE-in-place, just retroactive lot creation. Confidence HIGH (mechanical fix). Stale guard: refuses with `lot_already_exists` if a lot/closure has been created since planning. `lot_action` carries `'open' | 'close' | 'transfer'`.
 
 **Orphan handling** is gated by the per-run preflight mode (S8):
 - `refuse_orphans`: orphan stock legs surface as `orphan_stock_leg` proposals at confidence `low`. The user fixes them manually.
@@ -89,9 +129,32 @@ Enforcement:
 
 ## Idempotency (S5)
 
-Re-running the planner after apply returns `[]` — the `isAlreadyCanonical(tx)` filter in [types.ts](../../src/lib/portfolio/backfill/types.ts) skips rows where `kind IS NOT NULL AND (kind IN pair-less-set OR tradeLinkId IS NOT NULL OR linkId IS NOT NULL)`.
+Re-running the planner after apply returns `[]` — the `isAlreadyCanonical(tx)` filter in [types.ts](../../src/lib/portfolio/backfill/types.ts) skips rows where `kind IS NOT NULL AND (kind IN PAIRLESS_CANONICAL_KINDS OR tradeLinkId IS NOT NULL OR linkId IS NOT NULL)`. The `PAIRLESS_CANONICAL_KINDS` set (`dividend`, `interest`, `portfolio_income`, `portfolio_expense`, `opening_balance`) is **shared** between this predicate and the coverage endpoint's SQL — importing one constant from the other so the two surfaces cannot drift.
 
 Partial-applied runs work too — only proposals with `status='approved'` get applied, leaving the rest in `pending` for a future review pass.
+
+## Coverage dashboard
+
+`GET /api/settings/backfill/coverage` returns per-investment-account:
+- `total` — count of transactions in the account
+- `canonical` — count matching the strict predicate above
+- `pending` — `total - canonical`
+- `pendingPct` — rounded percentage
+- `missingLots` — count of canonical buy/sell rows whose lot/closure is missing (Phase 3 metric)
+
+Plus top-level aggregates: `totalTxs`, `canonicalTxs`, `nonCanonicalTxs`, `canonicalPct`, `missingLots`. The wizard at `/settings/backfill` reads this on load.
+
+## Cash-sleeve symbol hygiene (Phase 4a)
+
+`POST /api/settings/backfill/fix-cash-sleeve-symbols` (Step 0 in the wizard). Finds every `portfolio_holdings` row where `is_cash=true` AND `symbol_ct IS NULL`, sets `symbol_ct = encryptName(dek, currency).ct` + `symbol_lookup = encryptName(dek, currency).lookup`. Idempotent. Returns `{ fixed, total }`. Used to populate Symbol = currency code (e.g., `CAD` for a CAD cash sleeve) before any backfill run so the holdings list isn't visually ambiguous.
+
+## Kind column on `/transactions` (Phase 0)
+
+The Kind column in [transactions/page.tsx](../../src/app/(app)/transactions/page.tsx) renders the row's `kind` as a colored pill. Border style mirrors the coverage SQL predicate:
+- **Solid border** = row is coverage-canonical (PAIRLESS kind OR `trade_link_id` OR `link_id`)
+- **Dashed border** = `kind` set but row is still coverage-pending (broken pair, manual fix needed)
+
+Hover title surfaces the explanation. This lets users see at a glance which rows the backfill dashboard still counts as pending without leaving the transactions page.
 
 ## Schema invariants for future contributors
 
@@ -103,44 +166,67 @@ When extending the backfill pipeline:
 - **Adding a new proposal kind** requires: (1) the planner detector in planner.ts, (2) test fixtures in tests/backfill-planner.test.ts, (3) any new replacement-payload shape documented in this file.
 - **Adding a new refusal reason** requires: only updating the planner; the apply route reads `confidence='refused'` and refuses without case-by-case logic.
 
-## Known issues — pending fix
+## Iteration history (resolved)
 
-Surfaced by a manual review session on the demo user (1,280 investment-account transactions) on 2026-06-02. Full hand-off: [HANDOVER_2026-06-02_BACKFILL_REVIEW_BUGS.md](../../../HANDOVER_2026-06-02_BACKFILL_REVIEW_BUGS.md).
+The pipeline shipped across four rounds. Earlier round's "Known issues" are all resolved — kept here as a record of what each round addressed.
 
-1. **Wizard "Specific accounts" picker reads the wrong field name.** `/api/accounts` returns rows with `id` (from `db.select().from(accounts)` in [queries.ts:22-26](../../src/lib/queries.ts)), but the wizard at [src/app/(app)/settings/backfill/page.tsx](../../src/app/(app)/settings/backfill/page.tsx) reads `a.accountId` which is undefined. Symptom: empty picker, or (pre-strict-filter) clicking one checkbox marks them all. **Fix:** read `a.id`, alias locally as `accountId`.
-2. **Coverage and planner predicates have diverged.** The planner's `isAlreadyCanonical` (commit `92ed3a6`) treats any non-null `kind` as canonical; the coverage endpoint at [coverage/route.ts](../../src/app/api/settings/backfill/coverage/route.ts) requires kind AND (pair-less kind OR pair link). Effect: dashboard reports N pending, planner returns 0 proposals. Root cause: `kind='buy'` without `trade_link_id` is ambiguous — could be an intentional opening balance OR a broken pair.
-3. **Kind column tags vs. coverage count mismatch** (same root cause as #2). User sees all 4 Gold Coins rows tagged `buy` in the `/transactions` Kind column but coverage says 3/4 canonical.
+### Round 1 — V1 pipeline (`e3487de` → `92ed3a6`, 2026-06-02)
+Planner + apply/undo + UI + 13 stress scenarios. Three bugs surfaced from manual review on the demo user (1,280 investment transactions across 10 accounts):
+1. Wizard "Specific accounts" picker showed "No investment accounts found" — read `a.accountId` while `/api/accounts` returns `a.id`.
+2. Coverage said 312 pending but planner returned 0 proposals — `isAlreadyCanonical` (loose: "any non-null kind") and the coverage SQL (strict: "kind + pair-less OR pair link") had diverged.
+3. Kind column tagged all 4 Gold Coins rows as `buy` but coverage said only 76% canonical — same root cause as #2.
 
-**Recommended fix** (in the hand-off): introduce `kind='opening_balance'` as a distinct literal so the planner can stamp it on carry-in rows. Then both predicates count `'opening_balance'` as pair-less canonical; a row with `kind='buy'` + no pair is unambiguously a bug. Requires a small data migration on dev to re-tag existing `kind='buy'` + no-pair rows that came from the broken first-pass opening_balance flow.
+### Round 2 — Resolution commits (`e1c37a9` → `bb066c9`, 2026-05-24)
+- `e1c37a9` — Bug 1 fix (read `a.id`); Bug 2/3 fix (introduce `kind='opening_balance'` literal so the strict predicate can return; planner emits the new literal; coverage's `PAIRLESS_CANONICAL_KINDS` imported from `types.ts` so SQL and TS predicates share one source of truth).
+- `bb066c9` — Deploy failure recovery: extend `transactions_kind_check` enum with `dividend`, `interest`, `opening_balance` (all three were in `PAIRLESS_CANONICAL_KINDS` but only `portfolio_income`/`portfolio_expense` were in the SQL CHECK constraint — applying any dividend/interest/opening_balance proposal would have failed the check).
+- One-off data migration (`20260603_opening_balance_kind.sql`): re-tag earliest-per-(holding, account) rows that the first-pass flow stamped `kind='buy'` to `kind='opening_balance'`. Guarded by the same `isFirstTxForHolding` heuristic so genuinely broken pairs (non-earliest `kind='buy'` + no `trade_link_id`) stay flagged.
 
-**Known damage on dev:** one VWRD.L lot (32 shares, opened 2022-12-31 on IBKR Joint) is duplicated because the pre-fix opening_balance path re-applied the same proposal twice. The fix prevents new duplicates; the existing duplicate must be cleaned up manually by deleting one of the two `2022-12-31` VWRD.L buy rows from `/transactions` (the `reverseLotsForDeleteHook` handles lot cleanup).
+### Round 3 — Coverage and planner converge (`e1a184a` → `86fa4c7`, 2026-05-24)
+- **Phase 0** (`e1a184a`) — Kind column on `/transactions` renders dashed-border pill when `kind` is set but the row is still coverage-pending. Solid border = canonical. Mirrors the coverage predicate client-side.
+- **Phase 1** (`1853dc9`) — Planner Pass 3 safety net: any candidate that falls through Passes 1/1.5/2 silently now emits an `unmatched_candidate` refused proposal. Guarantees `count(coverage_pending) === count(planner_proposals)` by construction. Catches cash-holding rows with kind set but no pair, qty=0 rows with non-Dividends categories, etc.
+- **Phase 2** (`7743ce4`) — DRIP detection: Pass 1.6 emits `dividend_reinvestment` proposals when `category=Dividends, qty>0, qty≈amount`. Right-pane holding picker with candidates pre-filtered to non-cash holdings in the row's account. Apply switches `portfolio_holding_id` + stamps `kind='dividend'`. (Variant chooser added in Phase 4b — see below.)
+- **Phase 3** (`86fa4c7`) — Pass 0 missing-lot detection. Already-canonical rows on non-cash holdings whose lot/closure is missing surface as `missing_lot` proposals. Coverage gets a new `missingLots` metric. Apply runs `applyLotEffectsForTx` directly without UPDATEing the row.
+
+### Round 4 — Cash dividends + symbol hygiene (`77794e7` → `15ac794`, 2026-05-24)
+- **Phase 4a** (`77794e7`) — Cash-sleeve symbol auto-fix. Server-side endpoint sets `symbol = currency` for cash sleeves missing a symbol. Surfaces as Step 0 in the wizard.
+- **Phase 4b** (`30a1459`) — Two-variant `dividend_reinvestment`: `cash_dividend` vs `drip`. Variant radio above the holding picker.
+- **Cash-dividend correction** (`15ac794`) — The initial Phase 4b apply for `cash_dividend` zeroed qty and kept `portfolio_holding_id` = the picked stock. User flagged that's the wrong direction — cash dividends LAND on the cash sleeve (where the money goes), not on the stock. Fixed: `cash_dividend` apply now sets `portfolio_holding_id` = matching cash sleeve, `related_holding_id` = picked stock (for reporting), `kind='portfolio_income'`, preserves qty as cash units. Mirrors the shape produced by `recordIncomeExpense` in `operations.ts`.
+
+### Known dev-side cleanup
+- One duplicate VWRD.L lot (32 shares, opened 2022-12-31 on IBKR Joint) from the pre-Phase-0 opening_balance double-apply. Delete one of the two `2022-12-31` VWRD.L buy rows from `/transactions`; `reverseLotsForDeleteHook` drops the orphan lot.
+- One Mimi TFSA VUN.TO dividend row (Apr 6) was applied with the buggy first version of `cash_dividend` (kind=dividend, qty=0, holding=VUN.TO instead of cash sleeve). Either undo the proposal on `/settings/backfill/[runId]` and re-apply with the new code, or edit manually via `/transactions`.
 
 ## V2 work surfaced by stress testing (not yet shipped)
 
 - **S1 cross-currency synthesis** — fabricate FX Conversion pair when the user supplies a known rate or accepts a historical lookup.
 - **S2 N-row trade families** — generalize `operations.ts` to support combined-cash-leg structures so the user doesn't have to manually split.
-- **DRIP normalization** — detect "dividend + same-day buy at dividend amount" as a single reinvestment proposal.
 - **Stock split / corporate-action backfill** — separate concern; integrate with existing `add_split` MCP tool.
 - **Direct CSV ingest from competitor exports** — new connector under `@finlynq/import-connectors` that lands rows into `transactions`, then the backfill pipeline canonicalizes them.
+- **`missing_symbol` proposal kind** for holdings (not transactions) — surface non-cash holdings missing a ticker as proposals the user reviews. Currently only the cash-sleeve case auto-fixes.
+- **Lot cleanup on holding switch** — when `dividend_reinvestment`'s `cash_dividend` apply moves a row from a stock holding to a cash sleeve, the old lot opened on the stock during a prior wrong apply remains. Manual cleanup needed for now.
 
 ## Verification
 
 ```bash
 cd pf-app
-npx vitest run tests/backfill-planner.test.ts   # 10/10 PASS — all 8 stress scenarios + worked example
-npx tsc --noEmit
+npx vitest run tests/backfill-planner.test.ts   # 24/24 PASS — all 6 passes + Phase 0-4 scenarios
+npx tsc --noEmit                                  # clean
 npm run audit:invariants                         # 8/8 PASS — backfill imports applyLotEffectsForTx so invariant #8 holds
 ```
 
 Integration (dev env):
 
 1. Visit `dev.finlynq.com/settings/backfill`
-2. Pick `synthesize_orphans` mode if Wealthfolio-style data lacks cash sleeve activity; otherwise `refuse_orphans`
-3. Pick scope, click "Compute proposals"
-4. Right-pane each proposal; confirm displaced→replacement rows + lot impact
-5. For drift proposals, pick variant A or B
-6. Click "Apply N approved" → 200 OK
-7. Verify `/portfolio/realized-gains` now populates for historical sells
-8. Verify `/portfolio` shows unchanged qty + balance
-9. Click "Undo" on one proposal; verify restore
-10. Re-run planner → empty proposal set (idempotency)
+2. **Step 0:** Click "Fix cash-sleeve symbols" if any cash sleeves show blank Symbol in the holdings list
+3. Pick `synthesize_orphans` mode if Wealthfolio-style data lacks cash sleeve activity; otherwise `refuse_orphans`
+4. Pick scope, click "Compute proposals"
+5. Right-pane each proposal; confirm displaced→replacement rows + lot impact
+6. For drift proposals, pick variant A or B
+7. For `dividend_reinvestment` proposals, pick variant (cash_dividend vs drip) + the underlying stock
+8. For `missing_lot` proposals, no input needed — just approve
+9. Click "Apply N approved" → 200 OK
+10. Verify `/portfolio/realized-gains` populates for historical sells
+11. Verify `/portfolio` shows unchanged qty + balance
+12. Click "Undo" on one proposal; verify restore
+13. Re-run planner → empty proposal set (idempotency)
+14. Verify `/transactions` Kind column shows solid pills on every row (no dashed = no coverage-pending)
