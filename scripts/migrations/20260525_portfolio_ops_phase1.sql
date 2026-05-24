@@ -114,17 +114,17 @@ ALTER TABLE portfolio_holdings
   ADD COLUMN IF NOT EXISTS is_cash BOOLEAN NOT NULL DEFAULT FALSE;
 
 -- Uniqueness invariant per user: at most one cash sleeve per (account,
--- currency). Enforced via partial unique index — non-cash holdings (the
--- vast majority) are unaffected. The migration's consolidation step below
--- merges existing duplicates before this index lands.
+-- currency). The CREATE UNIQUE INDEX is at the BOTTOM of this migration,
+-- intentionally AFTER the backfill + consolidation steps below — prod
+-- has pre-existing duplicate cash holdings from the pre-Stream-D era
+-- that the consolidation merges before the constraint becomes enforceable.
+-- Creating the index here (before the backfill) caused prod deploy
+-- 26349930535 to fail with `duplicate key value violates unique constraint`.
 --
 -- Note: account_id can be NULL on portfolio_holdings (legacy column;
 -- holding_accounts is the M:N join). The partial index treats NULL
 -- account_ids as distinct per Postgres semantics, which is acceptable —
 -- unaccounted cash sleeves are an edge case.
-CREATE UNIQUE INDEX IF NOT EXISTS portfolio_holdings_one_cash_per_account_currency
-  ON portfolio_holdings (user_id, account_id, currency)
-  WHERE is_cash = TRUE;
 
 -- ─── Backfill: tag existing cash sleeves with is_cash = TRUE ─────────────
 --
@@ -281,6 +281,14 @@ WITH ranked_cash AS (
 )
 DELETE FROM portfolio_holdings
  WHERE id IN (SELECT id FROM ranked_cash WHERE rn > 1);
+
+-- Duplicates now consolidated — safe to add the partial unique index.
+-- Moved from the top of the file (where it caused prod deploy 26349930535
+-- to fail with "duplicate key value violates unique constraint" before the
+-- consolidation could run).
+CREATE UNIQUE INDEX IF NOT EXISTS portfolio_holdings_one_cash_per_account_currency
+  ON portfolio_holdings (user_id, account_id, currency)
+  WHERE is_cash = TRUE;
 
 -- ─── Backfill: tag existing portfolio rows with kind by qty sign ─────────
 --
