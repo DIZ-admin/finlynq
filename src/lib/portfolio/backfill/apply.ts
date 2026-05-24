@@ -277,23 +277,59 @@ export async function applyProposal(
       if (r.tradeLinkId !== undefined) patch.tradeLinkId = r.tradeLinkId;
       if (r.linkId !== undefined) patch.linkId = r.linkId;
       // dividend_reinvestment fills its patch from the user's choice — the
-      // proposal's `replacement[0]` only carries the txId; the
-      // portfolio_holding_id and kind come from the apply path so the
-      // user cannot bypass the picker by manipulating the JSON.
+      // proposal's `replacement[0]` only carries the txId; the holding
+      // identifiers and kind come from the apply path so the user cannot
+      // bypass the picker by manipulating the JSON.
+      //
+      // Phase 4b — variant branching:
+      // - 'drip' (share reinvestment): the row IS shares acquired. Set
+      //   portfolio_holding_id = chosen stock so the lot opens on that
+      //   stock at costPerShare=amount/qty. qty preserved as share count.
+      // - 'cash_dividend' (the typical stock case): the row is CASH that
+      //   landed in the cash sleeve, attributed to the picked stock for
+      //   reporting. Set portfolio_holding_id = matching cash sleeve in
+      //   (account, currency), related_holding_id = chosen stock,
+      //   kind='portfolio_income'. qty preserved as cash-units. Mirrors
+      //   the shape produced by the IncomeExpenseForm + recordIncomeExpense
+      //   path (see operations.ts).
       if (
         proposal.proposalKind === "dividend_reinvestment" &&
         proposal.chosenHoldingId != null
       ) {
-        patch.portfolioHoldingId = proposal.chosenHoldingId;
-        patch.kind = "dividend";
-        // Phase 4b — variant branching:
-        // - 'cash_dividend' zeroes the qty so the lot replay won't open
-        //   a phantom share lot. The dollar `amount` stays as-is and
-        //   surfaces as a normal cash dividend payout.
-        // - 'drip' keeps qty as a share count so the replay opens a lot
-        //   at costPerShare=amount/qty. No change to the qty field.
-        if (proposal.dividendVariant === "cash_dividend") {
-          patch.quantity = 0;
+        if (proposal.dividendVariant === "drip") {
+          patch.portfolioHoldingId = proposal.chosenHoldingId;
+          patch.kind = "dividend";
+        } else {
+          // cash_dividend — find the matching cash sleeve for this row's
+          // (account, currency). Pulled inside the loop because we need
+          // the displaced row's accountId + currency from `before`.
+          const beforeRow = before.find((b) => b.id === r.txId);
+          if (!beforeRow || beforeRow.accountId == null) {
+            throw new Error(`cash_dividend apply: cannot locate displaced row ${r.txId} (account/currency unknown)`);
+          }
+          const sleeve = await tx
+            .select({ id: schema.portfolioHoldings.id })
+            .from(schema.portfolioHoldings)
+            .where(
+              and(
+                eq(schema.portfolioHoldings.userId, userId),
+                eq(schema.portfolioHoldings.accountId, beforeRow.accountId),
+                eq(schema.portfolioHoldings.currency, beforeRow.currency),
+                eq(schema.portfolioHoldings.isCash, true),
+              ),
+            )
+            .limit(1);
+          const sleeveId = sleeve[0]?.id;
+          if (sleeveId == null) {
+            // Surface as an unrecoverable apply failure — the caller
+            // route catches it and surfaces in the UI.
+            throw new Error(
+              `cash_dividend apply: no cash sleeve in account ${beforeRow.accountId} for currency ${beforeRow.currency}. Create one in the account-detail page first.`,
+            );
+          }
+          patch.portfolioHoldingId = sleeveId;
+          patch.relatedHoldingId = proposal.chosenHoldingId;
+          patch.kind = "portfolio_income";
         }
       }
       await tx

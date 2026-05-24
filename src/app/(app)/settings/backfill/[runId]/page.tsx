@@ -649,14 +649,14 @@ function DividendVariantPicker({
   return (
     <div className="space-y-2">
       <VariantOption
-        label="Cash dividend (no lot)"
-        explanation="The dividend was paid in cash and credited to the cash sleeve. Apply zeroes out the qty (the dollar amount stored there was an import quirk) and stamps kind='dividend'. No share lot opens. Pick this for normal stock dividends like VUN.TO."
+        label="Cash dividend (lands on cash sleeve)"
+        explanation="The dividend was paid in cash and credited to the cash sleeve. Apply moves the row to the matching cash sleeve (same account + currency), sets related_holding_id to your picked stock for reporting, and stamps kind='portfolio_income'. Qty preserved as the cash amount. Pick this for normal stock dividends like VUN.TO."
         selected={selected === "cash_dividend"}
         onSelect={() => onChange("cash_dividend")}
       />
       <VariantOption
         label="Share reinvestment (opens lot)"
-        explanation="The dividend bought additional units of the underlying. Apply keeps qty as a share count and opens a lot at costPerShare=amount/qty. Pick this for crypto staking rewards or other sub-dollar reinvestments where the qty really is a share count."
+        explanation="The dividend bought additional units of the underlying. Apply moves the row to the picked stock holding, keeps qty as a share count, and opens a lot at costPerShare=amount/qty. Pick this for crypto staking rewards or other sub-dollar reinvestments where qty really is a share count."
         selected={selected === "drip"}
         onSelect={() => onChange("drip")}
       />
