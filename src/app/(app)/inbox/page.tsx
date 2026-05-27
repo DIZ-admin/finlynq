@@ -53,7 +53,7 @@ import {
 } from "@/components/inbox/inbox-reconcile-tab";
 import { InboxReconciledTab } from "@/components/inbox/inbox-reconciled-tab";
 import { InboxToApproveTab } from "@/components/inbox/inbox-to-approve-tab";
-import { AvailableNextPhase } from "@/components/inbox/available-next-phase";
+import { InboxToCategorizeTab } from "@/components/inbox/inbox-to-categorize-tab";
 
 interface Account {
   id: number;
@@ -388,9 +388,9 @@ function InboxPageInner() {
 
         {visibleTabs.includes("to-categorize") && (
           <TabsContent value="to-categorize">
-            <AvailableNextPhase
-              phase="Phase 4"
-              feature="Auto-pilot rule-firing-at-upload — rules categorize at upload, the unmatched land here"
+            <InboxToCategorizeTab
+              accountId={account.id}
+              accounts={accounts}
             />
           </TabsContent>
         )}
@@ -404,9 +404,12 @@ function InboxPageInner() {
             // snapshot to share.
             <InboxReconciledTab accountId={account.id} />
           ) : (
-            <AvailableNextPhase
-              phase="Phase 4"
-              feature="The reconciled view for the Auto-pilot lens shows the rule / auto / manual provenance pills landing alongside the card content."
+            // Auto-pilot lens: same snapshot fetch as Approve-each, plus
+            // the "X rows auto-applied by rules" banner so the user can
+            // audit what the upload-time rule firing did.
+            <InboxReconciledTab
+              accountId={account.id}
+              showAutoRuleBanner
             />
           )}
         </TabsContent>

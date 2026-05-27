@@ -70,6 +70,7 @@ import { parseQfxToCanonical } from "@/lib/external-import/parsers/qfx";
 import type { RawTransaction } from "@/lib/import-pipeline";
 import { safeErrorMessage } from "@/lib/validate";
 import { simplifiedUpload } from "@/lib/import/simplified-upload";
+import { applyRulesToBankRows } from "@/lib/reconcile/match-engine";
 
 export const dynamic = "force-dynamic";
 
@@ -505,15 +506,19 @@ export async function POST(request: NextRequest) {
     // where the account is Manual and the template is Detailed (or no
     // template is selected).
     let useSimplifiedPath = false;
-    if (boundAccountMode === "approve") {
-      // Account-policy override: Approve-each accounts always use the
-      // simplified path regardless of the per-template import_mode setting.
+    if (boundAccountMode === "approve" || boundAccountMode === "auto") {
+      // Account-policy override: Approve-each + Auto-pilot accounts always
+      // use the simplified path regardless of the per-template import_mode
+      // setting. Inbox v4 Phase 3 covers Approve-each; Phase 4 extends to
+      // Auto-pilot — both lenses skip the staged-review gate, but the
+      // post-bank-write step differs (Auto-pilot fires rules; Approve-each
+      // just waits for a click).
       if (accountId === null) {
         // boundAccountMode is only set when accountId is non-null, so this
         // is unreachable — kept as a defensive guard so the TS narrowing
         // below stays unambiguous.
         return NextResponse.json(
-          { error: "Approve-each accounts require accountId." },
+          { error: "Auto-pilot / Approve-each accounts require accountId." },
           { status: 400 },
         );
       }
@@ -568,6 +573,56 @@ export async function POST(request: NextRequest) {
           filename: file.name,
           source: "upload",
         });
+
+        // ─── Inbox v4 Phase 4 (2026-05-27) — Auto-pilot rule firing ─────
+        //
+        // For Auto-pilot accounts, fire user-configured transaction-rules
+        // against the bank rows we just upserted. Rule-matched rows are
+        // materialized to `transactions` with `source='auto_rule'` inside
+        // the helper; unmatched rows stay in `bank_transactions` and show
+        // up in /inbox's "To categorize" tab.
+        //
+        // Idempotent: re-running on the same batch (re-upload of the same
+        // file) silently skips rows whose `transaction_bank_links` row
+        // already exists, so the helper never duplicates ledger entries.
+        //
+        // Fired AFTER simplifiedUpload returns rather than threaded into
+        // its transaction because: (1) the helper opens its own
+        // per-bank-row tx so a single bad row doesn't roll back the
+        // entire batch ingest; (2) simplifiedUpload doesn't return the
+        // inserted ids today and threading them out would couple the two
+        // module surfaces unnecessarily. Bank-row ids are looked up by
+        // `upload_batch_id` instead — cheap single-account-scoped SELECT.
+        let autoRuleStats: { matched: number; unmatched: number; total: number } | null = null;
+        if (boundAccountMode === "auto") {
+          const insertedBankRows = await db
+            .select({ id: schema.bankTransactions.id })
+            .from(schema.bankTransactions)
+            .where(
+              and(
+                eq(schema.bankTransactions.userId, userId),
+                eq(schema.bankTransactions.uploadBatchId, result.batchId),
+              ),
+            )
+            .all();
+          const bankRowIds = insertedBankRows.map((r) => r.id);
+          if (bankRowIds.length > 0) {
+            const ruleResult = await applyRulesToBankRows(
+              userId,
+              bankRowIds,
+              dek,
+              { autoMaterialize: true },
+            );
+            autoRuleStats = {
+              matched: ruleResult.materialized,
+              unmatched: bankRowIds.length - ruleResult.materialized,
+              total: bankRowIds.length,
+            };
+          } else {
+            autoRuleStats = { matched: 0, unmatched: 0, total: 0 };
+          }
+        }
+
         return NextResponse.json({
           mode: result.mode,
           batchId: result.batchId,
@@ -577,6 +632,10 @@ export async function POST(request: NextRequest) {
             created: result.created,
             skippedDuplicates: result.skippedDuplicates,
             anchorsUpserted: result.anchorsUpserted,
+            // Phase 4 — populated only on Auto-pilot accounts. Surfaces
+            // the rule-fire results so the UploadDrawer's after-toast can
+            // say "5 of 12 rows auto-categorized."
+            ...(autoRuleStats ? { autoRule: autoRuleStats } : {}),
           },
           rowErrors,
         });

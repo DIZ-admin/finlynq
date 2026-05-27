@@ -19,19 +19,26 @@
  */
 
 import { useEffect, useState } from "react";
+import { useRouter } from "next/navigation";
 import { Badge } from "@/components/ui/badge";
 import { Card, CardContent } from "@/components/ui/card";
 import { Check, Inbox } from "lucide-react";
 import { formatCurrency } from "@/lib/currency";
 import type { ReconcileData } from "./inbox-reconcile-tab";
+import { AutoRuleBanner } from "./auto-rule-banner";
 
 export function InboxReconciledTab({
   data,
   accountId,
+  showAutoRuleBanner = false,
 }: {
   data?: ReconcileData | null;
   accountId?: number;
+  /** Phase 4 — render the "X rows auto-applied" banner on top of the
+   *  reconciled list. Lit up by the Inbox page when lens === 'auto'. */
+  showAutoRuleBanner?: boolean;
 }) {
+  const router = useRouter();
   const [fetched, setFetched] = useState<ReconcileData | null>(null);
   const [loading, setLoading] = useState(false);
 
@@ -92,27 +99,49 @@ export function InboxReconciledTab({
     )
     .sort((a, b) => b.bank.date.localeCompare(a.bank.date));
 
+  const handleAutoRuleRowClick = (transactionId: number) => {
+    // Navigate to /transactions filtered to this account so the user can
+    // find + edit the rule-fired row. Hard navigation keeps the existing
+    // edit flow intact; the inbox surface doesn't itself own a
+    // TransactionDialog open-by-id path.
+    router.push(`/transactions?focusId=${transactionId}`);
+  };
+
   if (rows.length === 0) {
     return (
-      <Card>
-        <CardContent className="py-12 text-center space-y-3">
-          <Inbox className="h-10 w-10 text-muted-foreground mx-auto" />
-          <div>
-            <p className="text-sm font-medium">
-              Nothing reconciled yet on this account
-            </p>
-            <p className="text-xs text-muted-foreground mt-1">
-              Once you accept a suggestion or bulk-link rows on the Reconcile
-              tab, they&apos;ll show up here.
-            </p>
-          </div>
-        </CardContent>
-      </Card>
+      <div className="space-y-3">
+        {showAutoRuleBanner && accountId != null && (
+          <AutoRuleBanner
+            accountId={accountId}
+            onRowClick={handleAutoRuleRowClick}
+          />
+        )}
+        <Card>
+          <CardContent className="py-12 text-center space-y-3">
+            <Inbox className="h-10 w-10 text-muted-foreground mx-auto" />
+            <div>
+              <p className="text-sm font-medium">
+                Nothing reconciled yet on this account
+              </p>
+              <p className="text-xs text-muted-foreground mt-1">
+                Once you accept a suggestion or bulk-link rows on the Reconcile
+                tab, they&apos;ll show up here.
+              </p>
+            </div>
+          </CardContent>
+        </Card>
+      </div>
     );
   }
 
   return (
-    <div className="space-y-2">
+    <div className="space-y-3">
+      {showAutoRuleBanner && accountId != null && (
+        <AutoRuleBanner
+          accountId={accountId}
+          onRowClick={handleAutoRuleRowClick}
+        />
+      )}
       <p className="text-xs text-muted-foreground">
         Fully reconciled rows — in your bank ledger AND in your transaction
         history. {rows.length} link{rows.length === 1 ? "" : "s"}.
