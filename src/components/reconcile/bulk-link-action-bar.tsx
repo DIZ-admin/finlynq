@@ -34,7 +34,7 @@ export function BulkLinkActionBar({
   const canReconcile = txCount > 0 && bankCount > 0 && total > 0;
 
   return (
-    <div className="sticky bottom-3 z-30 mx-auto w-fit max-w-full">
+    <div className="fixed bottom-4 left-1/2 -translate-x-1/2 z-40 w-fit max-w-[calc(100%-2rem)]">
       <div className="flex items-center gap-3 rounded-full border bg-card px-4 py-2 shadow-lg">
         <span className="text-sm">
           <strong>{txCount}</strong> transaction{txCount === 1 ? "" : "s"}
