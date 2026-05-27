@@ -55,14 +55,26 @@ export async function DELETE(
   const { userId } = auth.context;
   const { batchId } = await params;
 
-  let deleteLinkedTransactions = false;
+  // Tri-state: null = "no opinion" (initial fetch, triggers 409 if linked),
+  // true  = "delete the linked transactions too",
+  // false = "keep them; just orphan the lineage".
+  // Distinguishing null from false is load-bearing — the modal's
+  // "Keep transactions" branch sends `false` and the route MUST treat
+  // that as explicit consent to proceed without cascading. Pre-2026-05-27
+  // this code conflated null with false and the "Keep" branch couldn't
+  // complete; fixed alongside the same bug in the per-row delete route.
+  let deleteLinkedTransactions: boolean | null = null;
   try {
     const body = await request.json();
-    if (body && typeof body === "object" && body.deleteLinkedTransactions === true) {
-      deleteLinkedTransactions = true;
+    if (
+      body &&
+      typeof body === "object" &&
+      typeof body.deleteLinkedTransactions === "boolean"
+    ) {
+      deleteLinkedTransactions = body.deleteLinkedTransactions;
     }
   } catch {
-    // No body / invalid JSON — default to false.
+    // No body / invalid JSON — stays null (will trigger 409 when linked).
   }
 
   // Verify ownership.
@@ -119,8 +131,11 @@ export async function DELETE(
 
     if (
       linkedTransactionIds.length > 0 &&
-      !deleteLinkedTransactions
+      deleteLinkedTransactions === null
     ) {
+      // `=== null` (not `!deleteLinkedTransactions`) so that an explicit
+      // `false` from the modal's "Keep transactions" branch falls through
+      // to the cascade below with `cascade=false`.
       return NextResponse.json(
         {
           requiresConfirmation: true,
@@ -133,10 +148,12 @@ export async function DELETE(
       );
     }
 
+    const cascadeLinkedTx = deleteLinkedTransactions === true;
+
     // ─── Cascade delete in a single transaction ─────────────────────────
     await db.transaction(async (tx) => {
       // 1. Optional: delete linked transactions when the user opts in.
-      if (deleteLinkedTransactions && linkedTransactionIds.length > 0) {
+      if (cascadeLinkedTx && linkedTransactionIds.length > 0) {
         await tx
           .delete(schema.transactions)
           .where(and(
@@ -181,7 +198,7 @@ export async function DELETE(
       deleted: {
         bankRows: bankIds.length,
         anchors: anchorRows.length,
-        linkedTransactions: deleteLinkedTransactions ? linkedTransactionIds.length : 0,
+        linkedTransactions: cascadeLinkedTx ? linkedTransactionIds.length : 0,
       },
     });
   } catch (err) {
