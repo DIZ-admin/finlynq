@@ -908,6 +908,21 @@ export async function applyRulesToBankRows(
   let rulesFired = 0;
   let materialized = 0;
 
+  // Diagnostic — single-line summary at INFO level, scoped to the
+  // autoMaterialize path so /reconcile's per-snapshot calls don't spam
+  // the journal. The Phase-4 dev-launch repro chased a "0 of N matched"
+  // outcome that turned out to be a CSV parser short-circuit dropping
+  // payees before they reached the matcher; keeping this trace makes a
+  // future similar issue debuggable without rebuilding the helper.
+  if (autoMaterialize) {
+    // eslint-disable-next-line no-console
+    console.log("[applyRulesToBankRows] start", {
+      userId,
+      bankRowCount: bankRows.length,
+      activeRuleCount: activeRules.length,
+    });
+  }
+
   for (const bank of bankRows) {
     if (alreadyLinked.has(bank.id)) {
       perRow.push({
@@ -929,6 +944,17 @@ export async function applyRulesToBankRows(
       activeRules,
     );
     if (!match) {
+      if (autoMaterialize && activeRules.length > 0 && (!payeePlain || payeePlain === "")) {
+        // Surface the most common cause: payee fell through as empty
+        // string (the 2026-05-27 CSV-parser bug). Bounded — only when
+        // payee is actually empty, so the journal stays readable for
+        // healthy uploads.
+        // eslint-disable-next-line no-console
+        console.warn("[applyRulesToBankRows] empty-payee skip", {
+          bankRowId: bank.id,
+          amount: bank.amount,
+        });
+      }
       perRow.push({ bankRowId: bank.id, matched: false });
       continue;
     }
