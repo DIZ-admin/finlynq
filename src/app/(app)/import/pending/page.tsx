@@ -71,7 +71,8 @@ import {
   SuggestionsGroup,
   type SuggestionDisplay,
 } from "@/components/import/reconcile/suggestions-group";
-import { Link as LinkIcon, Flag, X as XIcon } from "lucide-react";
+import { ConfirmDeleteBankRow } from "@/components/reconcile/confirm-delete-bank-row";
+import { Link as LinkIcon, Flag, X as XIcon, Trash2 } from "lucide-react";
 
 interface StagedRow {
   id: string;
@@ -192,6 +193,19 @@ function PendingImportsPageInner() {
   /** Anchor encoded as `staged:<id>` or `bank:<uuid>`. Null = no
    *  active highlight; second click on the same row clears it. */
   const [highlightAnchor, setHighlightAnchor] = useState<string | null>(null);
+
+  /** Per-row bank-transaction delete (2026-05-27). Mirrors /reconcile's
+   *  flow: first fetch sends empty body; server returns 409 +
+   *  requiresConfirmation when the row has linked transactions, and the
+   *  modal lets the user pick "Delete all" vs "Keep tx". */
+  const [bankDeleteConfirm, setBankDeleteConfirm] = useState<{
+    bankId: string;
+    date: string;
+    amount: number;
+    currency: string;
+    payee: string | null;
+    linkedTransactionCount: number;
+  } | null>(null);
 
   const loadList = useCallback(async () => {
     setLoading(true);
@@ -891,6 +905,60 @@ function PendingImportsPageInner() {
     [updateDbRowFlag],
   );
 
+  // Per-row bank-transaction delete on /import/pending (2026-05-27).
+  // Same two-phase contract as /reconcile: first POST sends an empty
+  // body and the server replies 409 when the row has linked txs; the
+  // modal lets the user pick "Delete all" / "Keep tx" / "Cancel".
+  const deleteBankRow = useCallback(
+    async (bankId: string, deleteLinkedTransactions: boolean | null) => {
+      setBusyKey(`bank-delete:${bankId}`);
+      try {
+        const body: Record<string, unknown> = {};
+        if (deleteLinkedTransactions != null) {
+          body.deleteLinkedTransactions = deleteLinkedTransactions;
+        }
+        const res = await fetch(
+          `/api/bank-transactions/${encodeURIComponent(bankId)}`,
+          {
+            method: "DELETE",
+            headers: { "Content-Type": "application/json" },
+            body: JSON.stringify(body),
+          },
+        );
+        if (res.status === 409) {
+          const payload = await res.json();
+          const snap = dbRows.find((r) => r.id === bankId);
+          setBankDeleteConfirm({
+            bankId,
+            date: payload.bankDate ?? snap?.date ?? "",
+            amount: payload.bankAmount ?? snap?.amount ?? 0,
+            currency: payload.bankCurrency ?? snap?.currency ?? "CAD",
+            payee: snap?.payee ?? null,
+            linkedTransactionCount: payload.linkedTransactionCount ?? 0,
+          });
+          return;
+        }
+        if (!res.ok) {
+          const errBody = await res.json().catch(() => ({}));
+          throw new Error(errBody.error ?? `HTTP ${res.status}`);
+        }
+        // Optimistic removal — drop the row from local state. The next
+        // full bank-ledger reload (account change or page open) will
+        // fetch fresh.
+        setDbRows((rows) => rows.filter((r) => r.id !== bankId));
+        setBankDeleteConfirm(null);
+      } catch (e) {
+        setToast({
+          type: "error",
+          msg: e instanceof Error ? e.message : "Failed to delete bank row",
+        });
+      } finally {
+        setBusyKey(null);
+      }
+    },
+    [dbRows],
+  );
+
   // FINLYNQ-56 Phase 4 — live "After approval" balance. The projection
   // sums selected rows that will actually materialize into `transactions`
   // on approve:
@@ -1463,66 +1531,102 @@ function PendingImportsPageInner() {
                   // — they're historical bank entries without a current
                   // system-side row.
                   const txId = r.linkedTransactionId;
+                  const deleteBusy = busyKey === `bank-delete:${r.id}`;
+                  // Per-row bank delete (2026-05-27) — always available
+                  // alongside the link/flag affordances.
+                  const deleteBtn = (
+                    <Button
+                      size="sm"
+                      variant="ghost"
+                      onClick={() => void deleteBankRow(r.id, null)}
+                      disabled={deleteBusy}
+                      title="Delete this bank-ledger row"
+                      aria-label="Delete bank row"
+                      className="h-7 w-7 p-0 text-muted-foreground hover:text-rose-700"
+                    >
+                      <Trash2 className="h-3.5 w-3.5" />
+                    </Button>
+                  );
                   if (linkMode) {
                     if (!eligibleForLink) {
                       return (
-                        <span className="text-[10px] text-muted-foreground italic">
-                          already linked
-                        </span>
+                        <div className="flex items-center justify-end gap-1">
+                          <span className="text-[10px] text-muted-foreground italic">
+                            already linked
+                          </span>
+                          {deleteBtn}
+                        </div>
                       );
                     }
                     if (txId == null) {
                       return (
-                        <span className="text-[10px] text-muted-foreground italic">
-                          bank-only
-                        </span>
+                        <div className="flex items-center justify-end gap-1">
+                          <span className="text-[10px] text-muted-foreground italic">
+                            bank-only
+                          </span>
+                          {deleteBtn}
+                        </div>
                       );
                     }
                     return (
-                      <Button
-                        size="sm"
-                        variant="outline"
-                        onClick={() => completeLink(txId)}
-                        disabled={linkBusy}
-                        className="h-7 px-2"
-                      >
-                        <Check className="h-3.5 w-3.5 mr-1" />
-                        Pick
-                      </Button>
+                      <div className="flex items-center justify-end gap-1">
+                        <Button
+                          size="sm"
+                          variant="outline"
+                          onClick={() => completeLink(txId)}
+                          disabled={linkBusy}
+                          className="h-7 px-2"
+                        >
+                          <Check className="h-3.5 w-3.5 mr-1" />
+                          Pick
+                        </Button>
+                        {deleteBtn}
+                      </div>
                     );
                   }
                   if (txId == null) {
-                    // Bank-only history row — flag actions don't apply.
-                    return null;
+                    // Bank-only history row — flag actions don't apply,
+                    // but delete still does.
+                    return (
+                      <div className="flex items-center justify-end gap-1">
+                        {deleteBtn}
+                      </div>
+                    );
                   }
-                  // Default mode: flag / unflag toggle.
+                  // Default mode: flag / unflag toggle + delete.
                   const flagBusy =
                     busyKey === `flag:${txId}` || busyKey === `unflag:${txId}`;
                   if (r.reconciliationFlag) {
                     return (
-                      <Button
-                        size="sm"
-                        variant="ghost"
-                        onClick={() => unflagDbRow(txId)}
-                        disabled={flagBusy}
-                        className="h-7 px-2 text-rose-700"
-                        title="Remove 'missing from statement' flag"
-                      >
-                        <XIcon className="h-3.5 w-3.5" />
-                      </Button>
+                      <div className="flex items-center justify-end gap-1">
+                        <Button
+                          size="sm"
+                          variant="ghost"
+                          onClick={() => unflagDbRow(txId)}
+                          disabled={flagBusy}
+                          className="h-7 px-2 text-rose-700"
+                          title="Remove 'missing from statement' flag"
+                        >
+                          <XIcon className="h-3.5 w-3.5" />
+                        </Button>
+                        {deleteBtn}
+                      </div>
                     );
                   }
                   return (
-                    <Button
-                      size="sm"
-                      variant="ghost"
-                      onClick={() => flagDbRow(txId)}
-                      disabled={flagBusy}
-                      className="h-7 px-2 text-muted-foreground hover:text-rose-700"
-                      title="Mark as missing from this statement"
-                    >
-                      <Flag className="h-3.5 w-3.5" />
-                    </Button>
+                    <div className="flex items-center justify-end gap-1">
+                      <Button
+                        size="sm"
+                        variant="ghost"
+                        onClick={() => flagDbRow(txId)}
+                        disabled={flagBusy}
+                        className="h-7 px-2 text-muted-foreground hover:text-rose-700"
+                        title="Mark as missing from this statement"
+                      >
+                        <Flag className="h-3.5 w-3.5" />
+                      </Button>
+                      {deleteBtn}
+                    </div>
                   );
                 }}
               />
@@ -1620,6 +1724,23 @@ function PendingImportsPageInner() {
           />
         ) : null}
       </div>
+
+      {/* Confirmation modal for per-row bank-transaction delete (2026-05-27). */}
+      {bankDeleteConfirm && (
+        <ConfirmDeleteBankRow
+          open
+          linkedTransactionCount={bankDeleteConfirm.linkedTransactionCount}
+          bankDate={bankDeleteConfirm.date}
+          bankAmount={bankDeleteConfirm.amount}
+          bankCurrency={bankDeleteConfirm.currency}
+          bankPayee={bankDeleteConfirm.payee}
+          busy={busyKey === `bank-delete:${bankDeleteConfirm.bankId}`}
+          onConfirm={(deleteLinked) => {
+            void deleteBankRow(bankDeleteConfirm.bankId, deleteLinked);
+          }}
+          onCancel={() => setBankDeleteConfirm(null)}
+        />
+      )}
     </div>
   );
 }

@@ -56,6 +56,8 @@ import {
   type BalanceSummary,
 } from "@/components/reconcile/balance-summary-card";
 import { RecentUploadsPanel } from "@/components/reconcile/recent-uploads-panel";
+import { ConfirmDeleteBankRow } from "@/components/reconcile/confirm-delete-bank-row";
+import { BulkLinkActionBar } from "@/components/reconcile/bulk-link-action-bar";
 import { safeAccountName } from "@/lib/safe-name";
 
 interface Account {
@@ -250,6 +252,28 @@ export default function ReconcilePage() {
    *  same row toggles the highlight off. Encoded as `tx:<id>` or
    *  `bank:<uuid>`. Null = no active highlight. */
   const [highlightAnchor, setHighlightAnchor] = useState<string | null>(null);
+
+  /** Per-row bank-transaction delete (2026-05-27). When a linked bank row
+   *  is clicked, the page shows the ConfirmDeleteBankRow modal first and
+   *  stashes the snapshot here; bank-only rows skip the modal and call
+   *  the delete fetch directly. */
+  const [deleteConfirm, setDeleteConfirm] = useState<{
+    bankId: string;
+    date: string;
+    amount: number;
+    currency: string;
+    payee: string | null;
+    linkedTransactionCount: number;
+  } | null>(null);
+
+  /** Bulk-link selection state (2026-05-27). Independent on each pane. */
+  const [selectedTxIds, setSelectedTxIds] = useState<ReadonlySet<number>>(
+    () => new Set(),
+  );
+  const [selectedBankIds, setSelectedBankIds] = useState<ReadonlySet<string>>(
+    () => new Set(),
+  );
+  const [bulkLinking, setBulkLinking] = useState(false);
 
   /** Build the neighborhood for a clicked tx. Pair siblings are computed
    *  from the tx snapshots in `data` — linkId for transfers, tradeLinkId
@@ -738,6 +762,151 @@ export default function ReconcilePage() {
     [refresh],
   );
 
+  // Per-row bank-transaction delete (2026-05-27).
+  // Two-phase:
+  //   1. POST with empty body → server may return 409 + requiresConfirmation
+  //      if the row has linked transactions. Surface the modal.
+  //   2. Modal "Delete all" → POST { deleteLinkedTransactions: true }
+  //      Modal "Keep tx"   → POST { deleteLinkedTransactions: false }
+  // Bank-only rows skip the modal entirely (server doesn't 409).
+  const deleteBankRow = useCallback(
+    async (bankId: string, deleteLinkedTransactions: boolean | null) => {
+      setBusyBankId(bankId);
+      try {
+        const body: Record<string, unknown> = {};
+        if (deleteLinkedTransactions != null) {
+          body.deleteLinkedTransactions = deleteLinkedTransactions;
+        }
+        const res = await fetch(
+          `/api/bank-transactions/${encodeURIComponent(bankId)}`,
+          {
+            method: "DELETE",
+            headers: { "Content-Type": "application/json" },
+            body: JSON.stringify(body),
+          },
+        );
+        if (res.status === 409) {
+          const payload = await res.json();
+          const snap = data?.bankTransactions[bankId];
+          setDeleteConfirm({
+            bankId,
+            date: payload.bankDate ?? snap?.date ?? "",
+            amount: payload.bankAmount ?? snap?.amount ?? 0,
+            currency: payload.bankCurrency ?? snap?.currency ?? "CAD",
+            payee: snap?.payee ?? null,
+            linkedTransactionCount: payload.linkedTransactionCount ?? 0,
+          });
+          return;
+        }
+        if (!res.ok) {
+          const errBody = await res.json().catch(() => ({}));
+          throw new Error(errBody.error ?? `HTTP ${res.status}`);
+        }
+        // Drop the row from selection state if it was checked.
+        setSelectedBankIds((prev) => {
+          if (!prev.has(bankId)) return prev;
+          const next = new Set(prev);
+          next.delete(bankId);
+          return next;
+        });
+        setDeleteConfirm(null);
+        await refresh();
+      } catch (e) {
+        setError(e instanceof Error ? e.message : String(e));
+      } finally {
+        setBusyBankId(null);
+      }
+    },
+    [data, refresh],
+  );
+
+  const onBankDelete = useCallback(
+    (bankId: string) => {
+      // First call sends no body — server will 409 if linked, otherwise
+      // deletes immediately.
+      void deleteBankRow(bankId, null);
+    },
+    [deleteBankRow],
+  );
+
+  // Bulk-link selection handlers (2026-05-27).
+  const onToggleBankSelect = useCallback((bankId: string) => {
+    setSelectedBankIds((prev) => {
+      const next = new Set(prev);
+      if (next.has(bankId)) next.delete(bankId);
+      else next.add(bankId);
+      return next;
+    });
+  }, []);
+
+  const onToggleTxSelect = useCallback((txId: number) => {
+    setSelectedTxIds((prev) => {
+      const next = new Set(prev);
+      if (next.has(txId)) next.delete(txId);
+      else next.add(txId);
+      return next;
+    });
+  }, []);
+
+  const onToggleAllBank = useCallback(
+    (checked: boolean) => {
+      if (!checked) {
+        setSelectedBankIds(new Set());
+        return;
+      }
+      // Select every visible bank row id from the current data snapshot.
+      setSelectedBankIds(
+        new Set(Object.keys(data?.bankTransactions ?? {})),
+      );
+    },
+    [data],
+  );
+
+  const onToggleAllTx = useCallback(
+    (checked: boolean) => {
+      if (!checked) {
+        setSelectedTxIds(new Set());
+        return;
+      }
+      setSelectedTxIds(
+        new Set(
+          Object.keys(data?.transactions ?? {}).map((s) => parseInt(s, 10)),
+        ),
+      );
+    },
+    [data],
+  );
+
+  const clearSelection = useCallback(() => {
+    setSelectedTxIds(new Set());
+    setSelectedBankIds(new Set());
+  }, []);
+
+  const onBulkReconcile = useCallback(async () => {
+    if (selectedTxIds.size === 0 || selectedBankIds.size === 0) return;
+    setBulkLinking(true);
+    try {
+      const res = await fetch("/api/reconcile/links/bulk", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          transactionIds: [...selectedTxIds],
+          bankTransactionIds: [...selectedBankIds],
+        }),
+      });
+      if (!res.ok) {
+        const body = await res.json().catch(() => ({}));
+        throw new Error(body.error ?? `HTTP ${res.status}`);
+      }
+      clearSelection();
+      await refresh();
+    } catch (e) {
+      setError(e instanceof Error ? e.message : String(e));
+    } finally {
+      setBulkLinking(false);
+    }
+  }, [selectedTxIds, selectedBankIds, clearSelection, refresh]);
+
   // Open the canonical TransactionDialog prefilled from the bank row.
   // Replaces the old MaterializeDialog (2026-05-25, plan/reuse-add-
   // transaction-dialog.md) so users get the full Add Transaction surface
@@ -955,6 +1124,9 @@ export default function ReconcilePage() {
               onRowClick={onTxRowClick}
               highlightedTxIds={highlightedTxIds}
               busySuggestionKey={busySuggestionKey}
+              selectedTxIds={selectedTxIds}
+              onToggleSelect={onToggleTxSelect}
+              onToggleSelectAll={onToggleAllTx}
             />
           }
           rightLabel="Bank ledger"
@@ -964,9 +1136,13 @@ export default function ReconcilePage() {
               loading={dataLoading}
               onMaterialize={onMaterialize}
               onUnlink={onUnlink}
+              onDelete={onBankDelete}
               onRowClick={onBankRowClick}
               highlightedBankIds={highlightedBankIds}
               busyBankId={busyBankId}
+              selectedBankIds={selectedBankIds}
+              onToggleSelect={onToggleBankSelect}
+              onToggleSelectAll={onToggleAllBank}
             />
           }
         />
@@ -1000,6 +1176,32 @@ export default function ReconcilePage() {
           </span>
         )}
       </div>
+
+      {/* Confirmation modal for per-row bank-transaction delete (2026-05-27). */}
+      {deleteConfirm && (
+        <ConfirmDeleteBankRow
+          open
+          linkedTransactionCount={deleteConfirm.linkedTransactionCount}
+          bankDate={deleteConfirm.date}
+          bankAmount={deleteConfirm.amount}
+          bankCurrency={deleteConfirm.currency}
+          bankPayee={deleteConfirm.payee}
+          busy={busyBankId === deleteConfirm.bankId}
+          onConfirm={(deleteLinked) => {
+            void deleteBankRow(deleteConfirm.bankId, deleteLinked);
+          }}
+          onCancel={() => setDeleteConfirm(null)}
+        />
+      )}
+
+      {/* Sticky action bar for bulk M:N reconcile (2026-05-27). */}
+      <BulkLinkActionBar
+        txCount={selectedTxIds.size}
+        bankCount={selectedBankIds.size}
+        busy={bulkLinking}
+        onReconcile={() => void onBulkReconcile()}
+        onClear={clearSelection}
+      />
 
       <TransactionDialog
         open={dialogOpen}
