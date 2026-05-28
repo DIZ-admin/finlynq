@@ -388,13 +388,22 @@ export async function GET(
   }
 
   // ─── 2026-05-28 — manual template/account picker payload ──────────────
-  // For email-import batches that didn't template-match at parse time, the
-  // detail page renders a "Pick template or bind to account" panel BEFORE
-  // the per-account split view. Surface the user's accounts (decrypted
-  // names) + import templates so the UI can render dropdowns without
-  // separate round-trips. Only attached when the staged_imports row
-  // carries fallback metadata (headers != null) — small payload, but no
-  // reason to send for already-bound batches.
+  // For email-import batches that didn't bind to an account at parse time
+  // (no template match, OR template matched but had an empty
+  // defaultAccount — the smoke-template case), the detail page renders a
+  // "Pick template or bind to account" panel BEFORE the per-account split
+  // view. Surface the user's accounts (decrypted names) + import templates
+  // so the UI can render dropdowns without separate round-trips.
+  //
+  // Gate: the staged row has fallback metadata (headers != null) AND no
+  // row has a usable account_name. We check rows rather than just
+  // staged.boundAccountId because template-matched-with-empty-
+  // defaultAccount produces rows with empty account_name yet leaves
+  // boundAccountId null, so the bound_account_id check alone misses
+  // that case.
+  const hasAnyBoundRow = decryptedRows.some(
+    (r) => r.accountName != null && r.accountName.trim() !== "",
+  );
   let pickerCandidates: {
     accounts: Array<{ id: number; name: string; currency: string; isInvestment: boolean }>;
     templates: Array<{
@@ -405,7 +414,7 @@ export async function GET(
       matchesHeaders: boolean;
     }>;
   } | null = null;
-  if (staged.headers != null && staged.boundAccountId == null) {
+  if (staged.headers != null && staged.boundAccountId == null && !hasAnyBoundRow) {
     const headersForMatch = Array.isArray(staged.headers)
       ? (staged.headers as unknown[]).filter((h): h is string => typeof h === "string")
       : [];

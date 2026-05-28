@@ -34,19 +34,24 @@ export interface ResendAttachment {
  *
  * `rows` is the flat per-transaction list (input for stageEmailImport).
  *
- * `unmatchedCsvMeta` is populated when at least one CSV attachment didn't
- * template-match — it carries the headers + first ~3 data rows from the
- * FIRST such attachment so the /import/pending detail page can render a
- * "Pick template / Bind to account" picker post-hoc. We capture only the
- * first because the typical email-import case is one CSV per email; the
- * second+ unmatched CSV would overwrite the first in the staged_imports
- * row anyway, and showing a second metadata snapshot in the UI would be
- * confusing. Null when every attachment template-matched, or when none of
- * the attachments were CSVs.
+ * `csvFallbackMeta` carries the headers + first ~3 data rows from the
+ * FIRST CSV attachment, captured unconditionally for every CSV regardless
+ * of whether a template matched. The /import/pending detail page uses it
+ * to render a "Pick template / Bind to account" picker when the resulting
+ * staged_transactions rows lack a usable account_name (either no template
+ * matched, OR a template matched but its defaultAccount was empty — the
+ * smoke-template case that bit us on first ship). The route handler is
+ * what decides whether to surface the picker; the parser just snapshots
+ * the metadata so the data is there if needed. Null for non-CSV inputs.
+ *
+ * We capture only the first CSV because the typical email-import case is
+ * one CSV per email; the second-onwards would overwrite the first in the
+ * staged_imports row anyway, and showing a second metadata snapshot in
+ * the UI would be confusing.
  */
 export interface ParseResendAttachmentsResult {
   rows: RawTransaction[];
-  unmatchedCsvMeta: {
+  csvFallbackMeta: {
     headers: string[];
     sampleRows: Array<Record<string, string>>;
   } | null;
@@ -71,7 +76,7 @@ export async function parseResendAttachments(
   const templates = templateRows.map(deserializeTemplate);
 
   const allRows: RawTransaction[] = [];
-  let unmatchedCsvMeta: ParseResendAttachmentsResult["unmatchedCsvMeta"] = null;
+  let csvFallbackMeta: ParseResendAttachmentsResult["csvFallbackMeta"] = null;
 
   for (const att of attachments) {
     const ext = att.filename.split(".").pop()?.toLowerCase();
@@ -97,23 +102,27 @@ export async function parseResendAttachments(
         }
       } else {
         rows = csvToRawTransactions(text).rows;
-        // Capture only the FIRST unmatched CSV's metadata — see interface
-        // doc above. Snapshot headers + a few sample rows for the manual
-        // template picker on /import/pending.
-        if (unmatchedCsvMeta === null && headers.length > 0) {
-          const sampleRows: Array<Record<string, string>> = [];
-          const dataLines = text.split(/\r?\n/).slice(1, 1 + SAMPLE_ROW_COUNT);
-          for (const line of dataLines) {
-            if (!line.trim()) continue;
-            const cells = parseCsvLine(line);
-            const row: Record<string, string> = {};
-            headers.forEach((h, i) => {
-              row[h] = cells[i] ?? "";
-            });
-            sampleRows.push(row);
-          }
-          unmatchedCsvMeta = { headers, sampleRows };
+      }
+
+      // Capture metadata for the FIRST CSV attachment unconditionally —
+      // see interface doc. Picker visibility is decided downstream based
+      // on whether the resulting staged_transactions rows have a usable
+      // account_name (template-matched-with-empty-defaultAccount produces
+      // bound rows here but unbound rows downstream, so capture is the
+      // safe default).
+      if (csvFallbackMeta === null && headers.length > 0) {
+        const sampleRows: Array<Record<string, string>> = [];
+        const dataLines = text.split(/\r?\n/).slice(1, 1 + SAMPLE_ROW_COUNT);
+        for (const line of dataLines) {
+          if (!line.trim()) continue;
+          const cells = parseCsvLine(line);
+          const row: Record<string, string> = {};
+          headers.forEach((h, i) => {
+            row[h] = cells[i] ?? "";
+          });
+          sampleRows.push(row);
         }
+        csvFallbackMeta = { headers, sampleRows };
       }
     } else if (ext === "pdf" || att.contentType === "application/pdf") {
       // Dynamic import — PDF parser is heavy (~5 MB), lazy-load.
@@ -135,7 +144,7 @@ export async function parseResendAttachments(
     allRows.push(...rows);
   }
 
-  return { rows: allRows, unmatchedCsvMeta };
+  return { rows: allRows, csvFallbackMeta };
 }
 
 /**
