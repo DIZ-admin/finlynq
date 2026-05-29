@@ -8,7 +8,7 @@ import type { Transaction } from "../../../shared/types";
 export type TransactionsStackParamList = {
   TransactionsList: undefined;
   TransactionDetail: { transaction: Transaction };
-  AddTransaction: undefined;
+  AddTransaction: { mode?: "expense" | "income" | "transfer" } | undefined;
 };
 
 const Stack = createNativeStackNavigator<TransactionsStackParamList>();

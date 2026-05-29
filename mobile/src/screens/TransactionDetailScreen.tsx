@@ -14,6 +14,7 @@ import {
 import { SafeAreaView } from "react-native-safe-area-context";
 import { useTheme } from "../theme";
 import { endpoints } from "../api/client";
+import { logger } from "../lib/logger";
 import type { Transaction, Account, Category } from "../../../shared/types";
 import type { NativeStackScreenProps } from "@react-navigation/native-stack";
 import type { TransactionsStackParamList } from "../navigation/TransactionsStack";
@@ -48,12 +49,17 @@ export default function TransactionDetailScreen({ route, navigation }: Props) {
   const [selectedCategoryId, setSelectedCategoryId] = useState(transaction.categoryId);
 
   useEffect(() => {
-    Promise.all([endpoints.getAccounts(), endpoints.getCategories()]).then(
-      ([accRes, catRes]) => {
+    Promise.all([endpoints.getAccounts(), endpoints.getCategories()])
+      .then(([accRes, catRes]) => {
         if (accRes.success) setAccounts(accRes.data);
+        else logger.warn("tx-detail", "accounts fetch failed", { error: accRes.error });
         if (catRes.success) setCategories(catRes.data);
-      }
-    );
+        else logger.warn("tx-detail", "categories fetch failed", { error: catRes.error });
+      })
+      .catch((e) => {
+        const detail = e instanceof Error ? `${e.name}: ${e.message}` : String(e);
+        logger.error("tx-detail", "load threw", { detail });
+      });
   }, []);
 
   const accountName =
@@ -82,12 +88,16 @@ export default function TransactionDetailScreen({ route, navigation }: Props) {
         tags: tags || undefined,
       });
       if (res.success) {
+        logger.info("tx-detail", "transaction updated", { id: transaction.id });
         setEditing(false);
         navigation.goBack();
       } else {
+        logger.warn("tx-detail", "update rejected", { id: transaction.id, error: res.error });
         Alert.alert("Error", "error" in res ? res.error : "Failed to save");
       }
-    } catch {
+    } catch (e) {
+      const detail = e instanceof Error ? `${e.name}: ${e.message}` : String(e);
+      logger.error("tx-detail", "update threw", { detail });
       Alert.alert("Error", "Cannot connect to server");
     } finally {
       setSaving(false);
@@ -104,11 +114,15 @@ export default function TransactionDetailScreen({ route, navigation }: Props) {
           try {
             const res = await endpoints.deleteTransaction(transaction.id);
             if (res.success) {
+              logger.info("tx-detail", "transaction deleted", { id: transaction.id });
               navigation.goBack();
             } else {
+              logger.warn("tx-detail", "delete rejected", { id: transaction.id, error: res.error });
               Alert.alert("Error", "error" in res ? res.error : "Failed to delete");
             }
-          } catch {
+          } catch (e) {
+            const detail = e instanceof Error ? `${e.name}: ${e.message}` : String(e);
+            logger.error("tx-detail", "delete threw", { detail });
             Alert.alert("Error", "Cannot connect to server");
           }
         },
@@ -254,7 +268,7 @@ export default function TransactionDetailScreen({ route, navigation }: Props) {
               <Text
                 style={[
                   styles.amountText,
-                  { color: transaction.amount >= 0 ? colors.chart3 : colors.foreground },
+                  { color: transaction.amount >= 0 ? colors.pos : colors.foreground },
                 ]}
               >
                 {formatCurrency(transaction.amount, transaction.currency)}

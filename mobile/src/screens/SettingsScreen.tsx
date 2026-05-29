@@ -13,6 +13,7 @@ import { SafeAreaView } from "react-native-safe-area-context";
 import { useTheme } from "../theme";
 import { useAuth } from "../hooks/useAuth";
 import { getServerUrl } from "../api/client";
+import { getLogs, clearLogs, type LogEntry, type LogLevel } from "../lib/logger";
 
 const AUTO_LOCK_OPTIONS = [
   { label: "Disabled", value: 0 },
@@ -35,8 +36,33 @@ export default function SettingsScreen() {
   } = useAuth();
   const [url, setUrl] = useState(getServerUrl());
   const [saved, setSaved] = useState(false);
+  const [logs, setLogs] = useState<LogEntry[]>([]);
+  const [showLogs, setShowLogs] = useState(false);
 
   const colors = theme.colors;
+
+  const logColor = (level: LogLevel): string =>
+    level === "error"
+      ? colors.destructive
+      : level === "warn"
+        ? colors.primary
+        : colors.mutedForeground;
+
+  const refreshLogs = () => setLogs(getLogs().slice(-80).reverse());
+  const toggleLogs = () => {
+    if (!showLogs) refreshLogs();
+    setShowLogs((v) => !v);
+  };
+  const handleClearLogs = () => {
+    clearLogs();
+    setLogs([]);
+  };
+
+  function logTime(ts: number): string {
+    const d = new Date(ts);
+    const p = (n: number) => String(n).padStart(2, "0");
+    return `${p(d.getHours())}:${p(d.getMinutes())}:${p(d.getSeconds())}`;
+  }
 
   const handleSaveUrl = async () => {
     await saveServerUrl(url);
@@ -163,6 +189,57 @@ export default function SettingsScreen() {
           </TouchableOpacity>
         </View>
 
+        {/* Diagnostics — on-device view of the app log (no adb needed). */}
+        <Text style={[styles.sectionTitle, { color: colors.mutedForeground }]}>DIAGNOSTICS</Text>
+        <View style={[styles.card, { backgroundColor: colors.card, borderColor: colors.border }]}>
+          <Text style={[styles.settingDesc, { color: colors.mutedForeground, marginBottom: 10 }]}>
+            Recent app log (API calls, auth, errors). Useful for diagnosing
+            connection or data issues.
+          </Text>
+          <View style={styles.diagBtnRow}>
+            <TouchableOpacity
+              style={[styles.diagBtn, { backgroundColor: colors.secondary, borderColor: colors.border }]}
+              onPress={toggleLogs}
+            >
+              <Text style={[styles.diagBtnText, { color: colors.foreground }]}>
+                {showLogs ? "Hide log" : "Show recent log"}
+              </Text>
+            </TouchableOpacity>
+            {showLogs && (
+              <>
+                <TouchableOpacity
+                  style={[styles.diagBtn, { backgroundColor: colors.secondary, borderColor: colors.border }]}
+                  onPress={refreshLogs}
+                >
+                  <Text style={[styles.diagBtnText, { color: colors.foreground }]}>Refresh</Text>
+                </TouchableOpacity>
+                <TouchableOpacity
+                  style={[styles.diagBtn, { backgroundColor: colors.secondary, borderColor: colors.border }]}
+                  onPress={handleClearLogs}
+                >
+                  <Text style={[styles.diagBtnText, { color: colors.destructive }]}>Clear</Text>
+                </TouchableOpacity>
+              </>
+            )}
+          </View>
+
+          {showLogs && (
+            <View style={[styles.logBox, { backgroundColor: colors.background, borderColor: colors.border }]}>
+              {logs.length === 0 ? (
+                <Text style={[styles.logEmpty, { color: colors.mutedForeground }]}>
+                  No log entries yet.
+                </Text>
+              ) : (
+                logs.map((e, i) => (
+                  <Text key={i} style={[styles.logLine, { color: logColor(e.level) }]}>
+                    {logTime(e.ts)} {e.level.toUpperCase()} {e.tag}: {e.msg}
+                  </Text>
+                ))
+              )}
+            </View>
+          )}
+        </View>
+
         {/* About */}
         <Text style={[styles.sectionTitle, { color: colors.mutedForeground }]}>ABOUT</Text>
         <View style={[styles.card, { backgroundColor: colors.card, borderColor: colors.border }]}>
@@ -250,6 +327,22 @@ const styles = StyleSheet.create({
     borderWidth: StyleSheet.hairlineWidth,
   },
   chipText: { fontSize: 13, fontWeight: "500" },
+  diagBtnRow: { flexDirection: "row", flexWrap: "wrap", gap: 8 },
+  diagBtn: {
+    paddingHorizontal: 14,
+    paddingVertical: 8,
+    borderRadius: 8,
+    borderWidth: StyleSheet.hairlineWidth,
+  },
+  diagBtnText: { fontSize: 13, fontWeight: "600" },
+  logBox: {
+    marginTop: 12,
+    borderRadius: 8,
+    borderWidth: StyleSheet.hairlineWidth,
+    padding: 10,
+  },
+  logEmpty: { fontSize: 12 },
+  logLine: { fontSize: 11, fontFamily: "monospace", marginBottom: 3, lineHeight: 15 },
   aboutRow: {
     flexDirection: "row",
     justifyContent: "space-between",

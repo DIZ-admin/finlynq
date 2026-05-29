@@ -12,29 +12,37 @@ import {
   Platform,
 } from "react-native";
 import { SafeAreaView } from "react-native-safe-area-context";
+import { useNavigation, useRoute, type RouteProp } from "@react-navigation/native";
 import { useTheme } from "../theme";
 import { endpoints } from "../api/client";
+import { logger } from "../lib/logger";
+import { safeName } from "../lib/format";
 import type { Account, Category } from "../../../shared/types";
-import type { NativeStackScreenProps } from "@react-navigation/native-stack";
-import type { TransactionsStackParamList } from "../navigation/TransactionsStack";
 
-type Props = NativeStackScreenProps<TransactionsStackParamList, "AddTransaction">;
+type Mode = "expense" | "income" | "transfer";
 
 function todayStr(): string {
   const d = new Date();
   return `${d.getFullYear()}-${String(d.getMonth() + 1).padStart(2, "0")}-${String(d.getDate()).padStart(2, "0")}`;
 }
 
-export default function AddTransactionScreen({ navigation }: Props) {
-  const theme = useTheme();
-  const colors = theme.colors;
+// Read-only nav surface this screen needs — keeps it usable from any stack
+// (Transactions and More both register it).
+type AddRoute = RouteProp<{ AddTransaction?: { mode?: Mode } }, "AddTransaction">;
+
+export default function AddTransactionScreen() {
+  const { colors } = useTheme();
+  const navigation = useNavigation<{ goBack: () => void }>();
+  const route = useRoute<AddRoute>();
 
   const [accounts, setAccounts] = useState<Account[]>([]);
   const [categories, setCategories] = useState<Category[]>([]);
   const [loading, setLoading] = useState(true);
   const [saving, setSaving] = useState(false);
 
-  // Form state
+  const [mode, setMode] = useState<Mode>(route.params?.mode ?? "expense");
+
+  // Shared form state
   const [date, setDate] = useState(todayStr());
   const [amount, setAmount] = useState("");
   const [payee, setPayee] = useState("");
@@ -42,24 +50,46 @@ export default function AddTransactionScreen({ navigation }: Props) {
   const [tags, setTags] = useState("");
   const [selectedAccountId, setSelectedAccountId] = useState<number | null>(null);
   const [selectedCategoryId, setSelectedCategoryId] = useState<number | null>(null);
-  const [isExpense, setIsExpense] = useState(true);
+
+  // Transfer-only state
+  const [fromAccountId, setFromAccountId] = useState<number | null>(null);
+  const [toAccountId, setToAccountId] = useState<number | null>(null);
 
   useEffect(() => {
-    Promise.all([endpoints.getAccounts(), endpoints.getCategories()]).then(([accRes, catRes]) => {
-      if (accRes.success) {
-        setAccounts(accRes.data);
-        if (accRes.data.length > 0) setSelectedAccountId(accRes.data[0].id);
-      }
-      if (catRes.success) setCategories(catRes.data);
-      setLoading(false);
-    });
+    Promise.all([endpoints.getAccounts(), endpoints.getCategories()])
+      .then(([accRes, catRes]) => {
+        if (accRes.success) {
+          setAccounts(accRes.data);
+          if (accRes.data.length > 0) {
+            setSelectedAccountId(accRes.data[0].id);
+            setFromAccountId(accRes.data[0].id);
+            if (accRes.data.length > 1) setToAccountId(accRes.data[1].id);
+          }
+        } else {
+          logger.warn("add-tx", "accounts fetch failed", { error: accRes.error });
+        }
+        if (catRes.success) setCategories(catRes.data);
+        else logger.warn("add-tx", "categories fetch failed", { error: catRes.error });
+        setLoading(false);
+      })
+      .catch((e) => {
+        const detail = e instanceof Error ? `${e.name}: ${e.message}` : String(e);
+        logger.error("add-tx", "load threw", { detail });
+        setLoading(false);
+      });
   }, []);
 
+  const isExpense = mode === "expense";
+  const isTransfer = mode === "transfer";
   const filteredCategories = categories.filter((c) =>
     isExpense ? c.type === "E" : c.type === "I"
   );
+  const fromAccount = accounts.find((a) => a.id === fromAccountId);
+  const toAccount = accounts.find((a) => a.id === toAccountId);
+  const currencyMismatch =
+    isTransfer && !!fromAccount && !!toAccount && fromAccount.currency !== toAccount.currency;
 
-  const handleSave = async () => {
+  const handleSaveEntry = async () => {
     const parsedAmount = parseFloat(amount);
     if (isNaN(parsedAmount) || parsedAmount === 0) {
       Alert.alert("Error", "Please enter a valid amount");
@@ -73,7 +103,6 @@ export default function AddTransactionScreen({ navigation }: Props) {
       Alert.alert("Error", "Please select a category");
       return;
     }
-
     const finalAmount = isExpense ? -Math.abs(parsedAmount) : Math.abs(parsedAmount);
     const currency = accounts.find((a) => a.id === selectedAccountId)?.currency ?? "CAD";
 
@@ -90,11 +119,62 @@ export default function AddTransactionScreen({ navigation }: Props) {
         tags: tags || undefined,
       });
       if (res.success) {
+        logger.info("add-tx", "transaction created", { mode });
         navigation.goBack();
       } else {
+        logger.warn("add-tx", "create rejected", { error: res.error });
         Alert.alert("Error", "error" in res ? res.error : "Failed to create transaction");
       }
-    } catch {
+    } catch (e) {
+      const detail = e instanceof Error ? `${e.name}: ${e.message}` : String(e);
+      logger.error("add-tx", "create threw", { detail });
+      Alert.alert("Error", "Cannot connect to server");
+    } finally {
+      setSaving(false);
+    }
+  };
+
+  const handleSaveTransfer = async () => {
+    const parsedAmount = parseFloat(amount);
+    if (isNaN(parsedAmount) || parsedAmount <= 0) {
+      Alert.alert("Error", "Please enter a valid amount");
+      return;
+    }
+    if (!fromAccountId || !toAccountId) {
+      Alert.alert("Error", "Pick both a From and a To account");
+      return;
+    }
+    if (fromAccountId === toAccountId) {
+      Alert.alert("Error", "From and To must be different accounts");
+      return;
+    }
+    if (currencyMismatch) {
+      Alert.alert(
+        "Use the web app",
+        "Cross-currency (FX) transfers must be done on the web app where you can lock the exchange rate."
+      );
+      return;
+    }
+
+    setSaving(true);
+    try {
+      const res = await endpoints.recordTransfer({
+        fromAccountId,
+        toAccountId,
+        enteredAmount: Math.abs(parsedAmount),
+        date,
+        note: note || undefined,
+      });
+      if (res.success) {
+        logger.info("add-tx", "transfer created");
+        navigation.goBack();
+      } else {
+        logger.warn("add-tx", "transfer rejected", { error: res.error });
+        Alert.alert("Error", "error" in res ? res.error : "Failed to create transfer");
+      }
+    } catch (e) {
+      const detail = e instanceof Error ? `${e.name}: ${e.message}` : String(e);
+      logger.error("add-tx", "transfer threw", { detail });
       Alert.alert("Error", "Cannot connect to server");
     } finally {
       setSaving(false);
@@ -109,19 +189,60 @@ export default function AddTransactionScreen({ navigation }: Props) {
     );
   }
 
+  const segments: { key: Mode; label: string; activeBg: string; activeFg: string }[] = [
+    { key: "expense", label: "Expense", activeBg: colors.neg, activeFg: "#ffffff" },
+    { key: "income", label: "Income", activeBg: colors.pos, activeFg: "#ffffff" },
+    { key: "transfer", label: "Transfer", activeBg: colors.primary, activeFg: colors.primaryForeground },
+  ];
+
+  const renderAccountChips = (
+    selectedId: number | null,
+    onSelect: (id: number) => void
+  ) => (
+    <ScrollView horizontal showsHorizontalScrollIndicator={false}>
+      {accounts.map((acc) => (
+        <TouchableOpacity
+          key={acc.id}
+          onPress={() => onSelect(acc.id)}
+          style={[
+            fieldStyles.chip,
+            {
+              backgroundColor: acc.id === selectedId ? colors.primary : colors.secondary,
+              borderColor: colors.border,
+            },
+          ]}
+        >
+          <Text
+            style={[
+              fieldStyles.chipText,
+              { color: acc.id === selectedId ? colors.primaryForeground : colors.foreground },
+            ]}
+            numberOfLines={1}
+          >
+            {safeName(acc.name)}
+          </Text>
+        </TouchableOpacity>
+      ))}
+    </ScrollView>
+  );
+
   return (
     <SafeAreaView style={[styles.safe, { backgroundColor: colors.background }]} edges={["top"]}>
       <KeyboardAvoidingView
         style={styles.flex}
         behavior={Platform.OS === "ios" ? "padding" : undefined}
       >
-        {/* Header */}
         <View style={[styles.topBar, { borderBottomColor: colors.border }]}>
           <TouchableOpacity onPress={() => navigation.goBack()}>
-            <Text style={[styles.backBtn, { color: colors.primary }]}>← Cancel</Text>
+            <Text style={[styles.backBtn, { color: colors.primary }]}>Cancel</Text>
           </TouchableOpacity>
-          <Text style={[styles.title, { color: colors.foreground }]}>Add Transaction</Text>
-          <TouchableOpacity onPress={handleSave} disabled={saving}>
+          <Text style={[styles.title, { color: colors.foreground }]}>
+            {isTransfer ? "Transfer" : "Add Transaction"}
+          </Text>
+          <TouchableOpacity
+            onPress={isTransfer ? handleSaveTransfer : handleSaveEntry}
+            disabled={saving}
+          >
             {saving ? (
               <ActivityIndicator size="small" color={colors.primary} />
             ) : (
@@ -131,43 +252,30 @@ export default function AddTransactionScreen({ navigation }: Props) {
         </View>
 
         <ScrollView contentContainerStyle={styles.scroll}>
-          {/* Type Toggle */}
-          <View style={[styles.toggleRow, { backgroundColor: colors.secondary, borderRadius: 10 }]}>
-            <TouchableOpacity
-              style={[
-                styles.toggleBtn,
-                isExpense && { backgroundColor: colors.destructive },
-              ]}
-              onPress={() => setIsExpense(true)}
-            >
-              <Text
-                style={[
-                  styles.toggleText,
-                  { color: isExpense ? colors.destructiveForeground : colors.mutedForeground },
-                ]}
-              >
-                Expense
-              </Text>
-            </TouchableOpacity>
-            <TouchableOpacity
-              style={[
-                styles.toggleBtn,
-                !isExpense && { backgroundColor: colors.chart3 },
-              ]}
-              onPress={() => setIsExpense(false)}
-            >
-              <Text
-                style={[
-                  styles.toggleText,
-                  { color: !isExpense ? "#fff" : colors.mutedForeground },
-                ]}
-              >
-                Income
-              </Text>
-            </TouchableOpacity>
+          {/* Segmented control: Expense / Income / Transfer */}
+          <View style={[styles.toggleRow, { backgroundColor: colors.secondary }]}>
+            {segments.map((seg) => {
+              const active = mode === seg.key;
+              return (
+                <TouchableOpacity
+                  key={seg.key}
+                  style={[styles.toggleBtn, active && { backgroundColor: seg.activeBg }]}
+                  onPress={() => setMode(seg.key)}
+                >
+                  <Text
+                    style={[
+                      styles.toggleText,
+                      { color: active ? seg.activeFg : colors.mutedForeground },
+                    ]}
+                  >
+                    {seg.label}
+                  </Text>
+                </TouchableOpacity>
+              );
+            })}
           </View>
 
-          {/* Amount Input */}
+          {/* Amount */}
           <View style={[styles.amountCard, { backgroundColor: colors.card, borderColor: colors.border }]}>
             <Text style={[styles.amountPrefix, { color: colors.mutedForeground }]}>$</Text>
             <TextInput
@@ -181,9 +289,8 @@ export default function AddTransactionScreen({ navigation }: Props) {
             />
           </View>
 
-          {/* Form Fields */}
           <View style={[styles.card, { backgroundColor: colors.card, borderColor: colors.border }]}>
-            {/* Date */}
+            {/* Date — shared */}
             <View style={fieldStyles.container}>
               <Text style={[fieldStyles.label, { color: colors.mutedForeground }]}>DATE</Text>
               <TextInput
@@ -195,79 +302,89 @@ export default function AddTransactionScreen({ navigation }: Props) {
               />
             </View>
 
-            {/* Payee */}
-            <View style={fieldStyles.container}>
-              <Text style={[fieldStyles.label, { color: colors.mutedForeground }]}>PAYEE</Text>
-              <TextInput
-                style={[fieldStyles.input, { color: colors.foreground, backgroundColor: colors.secondary, borderColor: colors.border }]}
-                value={payee}
-                onChangeText={setPayee}
-                placeholder="Merchant or payee name"
-                placeholderTextColor={colors.mutedForeground}
-              />
-            </View>
+            {isTransfer ? (
+              <>
+                {/* From account */}
+                <View style={fieldStyles.container}>
+                  <Text style={[fieldStyles.label, { color: colors.mutedForeground }]}>FROM</Text>
+                  {renderAccountChips(fromAccountId, setFromAccountId)}
+                </View>
+                {/* To account */}
+                <View style={fieldStyles.container}>
+                  <Text style={[fieldStyles.label, { color: colors.mutedForeground }]}>TO</Text>
+                  {renderAccountChips(toAccountId, setToAccountId)}
+                </View>
+                {currencyMismatch && (
+                  <Text style={[styles.warning, { color: colors.neg }]}>
+                    Cross-currency transfer — do this on the web app to lock the FX rate.
+                  </Text>
+                )}
+              </>
+            ) : (
+              <>
+                {/* Payee */}
+                <View style={fieldStyles.container}>
+                  <Text style={[fieldStyles.label, { color: colors.mutedForeground }]}>PAYEE</Text>
+                  <TextInput
+                    style={[fieldStyles.input, { color: colors.foreground, backgroundColor: colors.secondary, borderColor: colors.border }]}
+                    value={payee}
+                    onChangeText={setPayee}
+                    placeholder="Merchant or payee name"
+                    placeholderTextColor={colors.mutedForeground}
+                  />
+                </View>
 
-            {/* Account Picker */}
-            <View style={fieldStyles.container}>
-              <Text style={[fieldStyles.label, { color: colors.mutedForeground }]}>ACCOUNT</Text>
-              <ScrollView horizontal showsHorizontalScrollIndicator={false}>
-                {accounts.map((acc) => (
-                  <TouchableOpacity
-                    key={acc.id}
-                    onPress={() => setSelectedAccountId(acc.id)}
-                    style={[
-                      fieldStyles.chip,
-                      {
-                        backgroundColor: acc.id === selectedAccountId ? colors.primary : colors.secondary,
-                        borderColor: colors.border,
-                      },
-                    ]}
-                  >
-                    <Text
-                      style={[
-                        fieldStyles.chipText,
-                        { color: acc.id === selectedAccountId ? colors.primaryForeground : colors.foreground },
-                      ]}
-                      numberOfLines={1}
-                    >
-                      {acc.name}
-                    </Text>
-                  </TouchableOpacity>
-                ))}
-              </ScrollView>
-            </View>
+                {/* Account */}
+                <View style={fieldStyles.container}>
+                  <Text style={[fieldStyles.label, { color: colors.mutedForeground }]}>ACCOUNT</Text>
+                  {renderAccountChips(selectedAccountId, setSelectedAccountId)}
+                </View>
 
-            {/* Category Picker */}
-            <View style={fieldStyles.container}>
-              <Text style={[fieldStyles.label, { color: colors.mutedForeground }]}>CATEGORY</Text>
-              <ScrollView horizontal showsHorizontalScrollIndicator={false}>
-                {filteredCategories.map((cat) => (
-                  <TouchableOpacity
-                    key={cat.id}
-                    onPress={() => setSelectedCategoryId(cat.id)}
-                    style={[
-                      fieldStyles.chip,
-                      {
-                        backgroundColor: cat.id === selectedCategoryId ? colors.primary : colors.secondary,
-                        borderColor: colors.border,
-                      },
-                    ]}
-                  >
-                    <Text
-                      style={[
-                        fieldStyles.chipText,
-                        { color: cat.id === selectedCategoryId ? colors.primaryForeground : colors.foreground },
-                      ]}
-                      numberOfLines={1}
-                    >
-                      {cat.name}
-                    </Text>
-                  </TouchableOpacity>
-                ))}
-              </ScrollView>
-            </View>
+                {/* Category */}
+                <View style={fieldStyles.container}>
+                  <Text style={[fieldStyles.label, { color: colors.mutedForeground }]}>CATEGORY</Text>
+                  <ScrollView horizontal showsHorizontalScrollIndicator={false}>
+                    {filteredCategories.map((cat) => (
+                      <TouchableOpacity
+                        key={cat.id}
+                        onPress={() => setSelectedCategoryId(cat.id)}
+                        style={[
+                          fieldStyles.chip,
+                          {
+                            backgroundColor: cat.id === selectedCategoryId ? colors.primary : colors.secondary,
+                            borderColor: colors.border,
+                          },
+                        ]}
+                      >
+                        <Text
+                          style={[
+                            fieldStyles.chipText,
+                            { color: cat.id === selectedCategoryId ? colors.primaryForeground : colors.foreground },
+                          ]}
+                          numberOfLines={1}
+                        >
+                          {safeName(cat.name)}
+                        </Text>
+                      </TouchableOpacity>
+                    ))}
+                  </ScrollView>
+                </View>
 
-            {/* Note */}
+                {/* Tags */}
+                <View style={fieldStyles.container}>
+                  <Text style={[fieldStyles.label, { color: colors.mutedForeground }]}>TAGS</Text>
+                  <TextInput
+                    style={[fieldStyles.input, { color: colors.foreground, backgroundColor: colors.secondary, borderColor: colors.border }]}
+                    value={tags}
+                    onChangeText={setTags}
+                    placeholder="Comma-separated tags"
+                    placeholderTextColor={colors.mutedForeground}
+                  />
+                </View>
+              </>
+            )}
+
+            {/* Note — shared */}
             <View style={fieldStyles.container}>
               <Text style={[fieldStyles.label, { color: colors.mutedForeground }]}>NOTE</Text>
               <TextInput
@@ -280,18 +397,6 @@ export default function AddTransactionScreen({ navigation }: Props) {
                 placeholder="Optional note"
                 placeholderTextColor={colors.mutedForeground}
                 multiline
-              />
-            </View>
-
-            {/* Tags */}
-            <View style={fieldStyles.container}>
-              <Text style={[fieldStyles.label, { color: colors.mutedForeground }]}>TAGS</Text>
-              <TextInput
-                style={[fieldStyles.input, { color: colors.foreground, backgroundColor: colors.secondary, borderColor: colors.border }]}
-                value={tags}
-                onChangeText={setTags}
-                placeholder="Comma-separated tags"
-                placeholderTextColor={colors.mutedForeground}
               />
             </View>
           </View>
@@ -321,13 +426,9 @@ const styles = StyleSheet.create({
     flexDirection: "row",
     marginBottom: 16,
     padding: 3,
+    borderRadius: 10,
   },
-  toggleBtn: {
-    flex: 1,
-    paddingVertical: 8,
-    borderRadius: 8,
-    alignItems: "center",
-  },
+  toggleBtn: { flex: 1, paddingVertical: 8, borderRadius: 8, alignItems: "center" },
   toggleText: { fontSize: 14, fontWeight: "600" },
   amountCard: {
     borderRadius: 12,
@@ -339,13 +440,20 @@ const styles = StyleSheet.create({
     justifyContent: "center",
   },
   amountPrefix: { fontSize: 32, fontWeight: "700", marginRight: 4 },
-  amountInput: { fontSize: 36, fontWeight: "800", minWidth: 150, textAlign: "center" },
+  amountInput: {
+    fontSize: 36,
+    fontWeight: "800",
+    minWidth: 150,
+    textAlign: "center",
+    fontVariant: ["tabular-nums"],
+  },
   card: {
     borderRadius: 12,
     borderWidth: StyleSheet.hairlineWidth,
     padding: 16,
     marginBottom: 12,
   },
+  warning: { fontSize: 13, marginTop: 4, marginBottom: 8 },
 });
 
 const fieldStyles = StyleSheet.create({

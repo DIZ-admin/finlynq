@@ -16,9 +16,11 @@ import type { RegisterPayload } from "../../../shared/types";
 import {
   endpoints,
   getSession,
+  getServerUrl,
   setAuthToken,
   setServerUrl,
 } from "../api/client";
+import { logger } from "../lib/logger";
 
 const BIOMETRIC_KEY = "pf_biometric_enabled";
 const AUTO_LOCK_KEY = "pf_auto_lock_minutes";
@@ -70,6 +72,14 @@ function useAuthEngine() {
       const autoLock = autoLockStr ? parseInt(autoLockStr, 10) : 5;
       const biometricEnabled = bioEnabled === "true";
 
+      logger.info("auth", "bootstrap", {
+        serverUrl: getServerUrl(),
+        hasStoredToken: !!token,
+        biometricHw,
+        biometricEnabled,
+        autoLock,
+      });
+
       let isUnlocked = false;
       let hasSession = false;
 
@@ -83,13 +93,16 @@ function useAuthEngine() {
             isUnlocked = !(biometricHw && biometricEnabled);
           } else {
             // Token rejected (expired / deploy-rotated) — drop it.
+            logger.warn("auth", "stored token rejected by /api/auth/session — dropping");
             setAuthToken(null);
             await SecureStore.deleteItemAsync(SESSION_TOKEN_KEY);
           }
-        } catch {
+        } catch (e) {
           // Couldn't reach the server. Keep the stored token (it may still be
           // valid once the URL/network is fixed) but fall through to the login
           // screen so the user can retry or correct the server URL.
+          const detail = e instanceof Error ? `${e.name}: ${e.message}` : String(e);
+          logger.error("auth", "session validation threw during bootstrap", { detail });
         }
       }
 
@@ -158,6 +171,7 @@ function useAuthEngine() {
           setAuthToken(res.token);
           await SecureStore.setItemAsync(SESSION_TOKEN_KEY, res.token);
         }
+        logger.info("auth", "sign-in succeeded", { bearerStored: !!res.token });
         setState((s) => ({
           ...s,
           isUnlocked: true,
@@ -167,6 +181,7 @@ function useAuthEngine() {
         return true;
       }
       if (res.data?.mfaRequired) {
+        logger.warn("auth", "sign-in blocked: MFA required (unsupported on mobile)");
         setState((s) => ({
           ...s,
           isLoading: false,
@@ -176,15 +191,20 @@ function useAuthEngine() {
         return false;
       }
       const errorMsg = (res.data?.error as string) || "Sign in failed";
+      logger.warn("auth", "sign-in rejected", { status: res.status, error: errorMsg });
       setState((s) => ({ ...s, isLoading: false, error: errorMsg }));
       return false;
     } catch (e) {
-      // Surface the real error so we can diagnose device-only failures.
+      // Log the real exception; show the user a clean message.
       const detail = e instanceof Error ? `${e.name}: ${e.message}` : String(e);
+      logger.error("auth", "sign-in threw (network/JS error)", {
+        detail,
+        serverUrl: getServerUrl(),
+      });
       setState((s) => ({
         ...s,
         isLoading: false,
-        error: `Cannot connect — ${detail}`,
+        error: "Can't reach the server. Check your connection and server URL.",
       }));
       return false;
     }
@@ -204,6 +224,7 @@ function useAuthEngine() {
           setAuthToken(res.token);
           await SecureStore.setItemAsync(SESSION_TOKEN_KEY, res.token);
         }
+        logger.info("auth", "register succeeded", { bearerStored: !!res.token });
         setState((s) => ({
           ...s,
           isUnlocked: true,
@@ -213,15 +234,20 @@ function useAuthEngine() {
         return true;
       }
       const errorMsg = (res.data?.error as string) || "Registration failed";
+      logger.warn("auth", "register rejected", { status: res.status, error: errorMsg });
       setState((s) => ({ ...s, isLoading: false, error: errorMsg }));
       return false;
     } catch (e) {
-      // Surface the real error so we can diagnose device-only failures.
+      // Log the real exception; show the user a clean message.
       const detail = e instanceof Error ? `${e.name}: ${e.message}` : String(e);
+      logger.error("auth", "register threw (network/JS error)", {
+        detail,
+        serverUrl: getServerUrl(),
+      });
       setState((s) => ({
         ...s,
         isLoading: false,
-        error: `Cannot connect — ${detail}`,
+        error: "Can't reach the server. Check your connection and server URL.",
       }));
       return false;
     }
@@ -229,6 +255,7 @@ function useAuthEngine() {
 
   /** Clear the session token and return to the login screen. */
   const signOut = useCallback(async () => {
+    logger.info("auth", "sign-out");
     setAuthToken(null);
     await SecureStore.deleteItemAsync(SESSION_TOKEN_KEY);
     setState((s) => ({

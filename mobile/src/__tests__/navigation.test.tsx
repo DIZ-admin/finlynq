@@ -44,6 +44,36 @@ jest.mock("../screens/BudgetsScreen", () => {
   return () => React.createElement(Text, null, "BudgetsScreen");
 });
 
+jest.mock("../screens/AccountsScreen", () => {
+  const React = require("react");
+  const { Text } = require("react-native");
+  return () => React.createElement(Text, null, "AccountsScreen");
+});
+
+jest.mock("../screens/AccountDetailScreen", () => {
+  const React = require("react");
+  const { Text } = require("react-native");
+  return () => React.createElement(Text, null, "AccountDetailScreen");
+});
+
+jest.mock("../screens/PortfolioScreen", () => {
+  const React = require("react");
+  const { Text } = require("react-native");
+  return () => React.createElement(Text, null, "PortfolioScreen");
+});
+
+jest.mock("../screens/GoalsScreen", () => {
+  const React = require("react");
+  const { Text } = require("react-native");
+  return () => React.createElement(Text, null, "GoalsScreen");
+});
+
+jest.mock("../screens/MoreScreen", () => {
+  const React = require("react");
+  const { Text } = require("react-native");
+  return () => React.createElement(Text, null, "MoreScreen");
+});
+
 jest.mock("../screens/SettingsScreen", () => {
   const React = require("react");
   const { Text } = require("react-native");
@@ -69,7 +99,11 @@ jest.mock("../api/client", () => ({
     getBudgets: jest.fn(),
     getTransactions: jest.fn(),
     getAccounts: jest.fn(),
+    getAccountBalances: jest.fn(),
     getCategories: jest.fn(),
+    getGoals: jest.fn(),
+    getPortfolioOverview: jest.fn(),
+    recordTransfer: jest.fn(),
   },
   getSession: jest.fn(),
 }));
@@ -117,14 +151,14 @@ describe("TabNavigator", () => {
     expect(toJSON()).toBeTruthy();
   });
 
-  it("defines all five tab screens", () => {
+  it("defines all five Option B tab screens", () => {
     const { toJSON } = renderWithTheme(<TabNavigator />);
     const tree = JSON.stringify(toJSON());
-    expect(tree).toContain("Dashboard");
+    expect(tree).toContain("Home");
+    expect(tree).toContain("Accounts");
+    expect(tree).toContain("Portfolio");
     expect(tree).toContain("Transactions");
-    expect(tree).toContain("Import");
-    expect(tree).toContain("Budgets");
-    expect(tree).toContain("Settings");
+    expect(tree).toContain("More");
   });
 });
 
@@ -176,8 +210,8 @@ describe("RootNavigator", () => {
     mockAuthReturn.isUnlocked = true;
     const { toJSON } = renderWithTheme(<RootNavigator />);
     const tree = JSON.stringify(toJSON());
-    // When unlocked, should show tab navigator with screen names
-    expect(tree).toContain("Dashboard");
+    // When unlocked, should show tab navigator with the Home tab.
+    expect(tree).toContain("Home");
   });
 
   it("shows LoginScreen when there is no session", () => {

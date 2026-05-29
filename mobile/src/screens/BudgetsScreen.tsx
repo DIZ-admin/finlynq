@@ -14,6 +14,7 @@ import { SafeAreaView } from "react-native-safe-area-context";
 import { useTheme } from "../theme";
 import { endpoints } from "../api/client";
 import { api } from "../api/client";
+import { logger } from "../lib/logger";
 import type { BudgetWithSpending, Category } from "../../../shared/types";
 
 function getMonth(offset: number): string {
@@ -68,10 +69,14 @@ export default function BudgetsScreen() {
           setBudgets(budgetRes.data);
           setError(null);
         } else {
+          logger.warn("budgets", "budgets fetch failed", { error: budgetRes.error });
           setError(budgetRes.error);
         }
         if (catRes.success) setCategories(catRes.data);
-      } catch {
+        else logger.warn("budgets", "categories fetch failed", { error: catRes.error });
+      } catch (e) {
+        const detail = e instanceof Error ? `${e.name}: ${e.message}` : String(e);
+        logger.error("budgets", "fetch threw", { detail });
         setError("Cannot connect to server");
       } finally {
         setLoading(false);
@@ -84,6 +89,13 @@ export default function BudgetsScreen() {
   useEffect(() => {
     fetchBudgets();
   }, [fetchBudgets]);
+
+  // `/api/budgets` returns `categoryNameCt` (ciphertext) un-decrypted — it never
+  // calls decryptName, unlike /api/accounts and /api/transactions. So `b.categoryName`
+  // is undefined on the wire. Resolve the display name from the separately-fetched
+  // (already-decrypted) categories list by id instead.
+  const categoryLabel = (catId: number) =>
+    categories.find((c) => c.id === catId)?.name || `Category #${catId}`;
 
   const totalBudgeted = budgets.reduce((s, b) => s + (b.convertedAmount ?? b.amount), 0);
   const totalSpent = budgets.reduce((s, b) => s + (b.convertedSpent ?? 0), 0);
@@ -113,7 +125,7 @@ export default function BudgetsScreen() {
   };
 
   const handleDelete = (budget: BudgetWithSpending) => {
-    Alert.alert("Delete Budget", `Remove budget for ${budget.categoryName || "this category"}?`, [
+    Alert.alert("Delete Budget", `Remove budget for ${categoryLabel(budget.categoryId)}?`, [
       { text: "Cancel", style: "cancel" },
       {
         text: "Delete",
@@ -342,7 +354,7 @@ export default function BudgetsScreen() {
               key={b.id}
               activeOpacity={0.7}
               onLongPress={() => {
-                Alert.alert(b.categoryName || `Category #${b.categoryId}`, undefined, [
+                Alert.alert(categoryLabel(b.categoryId), undefined, [
                   {
                     text: "Edit Amount",
                     onPress: () => {
@@ -363,7 +375,7 @@ export default function BudgetsScreen() {
               >
                 <View style={styles.budgetHeader}>
                   <Text style={[styles.catName, { color: colors.foreground }]} numberOfLines={1}>
-                    {b.categoryName || `Category #${b.categoryId}`}
+                    {categoryLabel(b.categoryId)}
                   </Text>
                   {b.categoryGroup && (
                     <Text style={[styles.catGroup, { color: colors.mutedForeground }]}>

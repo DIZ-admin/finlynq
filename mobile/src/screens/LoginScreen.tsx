@@ -12,6 +12,7 @@ import {
 } from "react-native";
 import { useTheme } from "../theme";
 import { getServerUrl } from "../api/client";
+import { FinlynqLogo } from "../components/FinlynqLogo";
 import type { RegisterPayload } from "../../../shared/types";
 
 interface Props {
@@ -81,11 +82,9 @@ export default function LoginScreen({
         keyboardShouldPersistTaps="handled"
       >
         <View style={styles.content}>
-          {/* Logo */}
-          <View style={[styles.logoBadge, { backgroundColor: colors.primary }]}>
-            <Text style={[styles.logoText, { color: colors.primaryForeground }]}>
-              F
-            </Text>
+          {/* Logo — mirrors the launcher icon (amber mark on the dark brand tile) */}
+          <View style={[styles.logoBadge, { backgroundColor: colors.sidebar }]}>
+            <FinlynqLogo size={38} color={colors.primary} />
           </View>
 
           <Text style={[styles.title, { color: colors.foreground }]}>
@@ -135,6 +134,9 @@ export default function LoginScreen({
                 placeholderTextColor={colors.mutedForeground}
                 value={username}
                 onChangeText={setUsername}
+                autoComplete="username-new"
+                textContentType="username"
+                importantForAutofill="yes"
                 autoCapitalize="none"
                 autoCorrect={false}
                 returnKeyType="next"
@@ -158,6 +160,9 @@ export default function LoginScreen({
                 placeholderTextColor={colors.mutedForeground}
                 value={identifier}
                 onChangeText={setIdentifier}
+                autoComplete="username"
+                textContentType="username"
+                importantForAutofill="yes"
                 autoCapitalize="none"
                 autoCorrect={false}
                 returnKeyType="next"
@@ -181,6 +186,8 @@ export default function LoginScreen({
                 placeholderTextColor={colors.mutedForeground}
                 value={email}
                 onChangeText={setEmail}
+                autoComplete="email"
+                textContentType="emailAddress"
                 autoCapitalize="none"
                 autoCorrect={false}
                 keyboardType="email-address"
@@ -207,6 +214,9 @@ export default function LoginScreen({
               secureTextEntry={!showPass}
               value={password}
               onChangeText={setPassword}
+              autoComplete={isRegisterMode ? "new-password" : "current-password"}
+              textContentType={isRegisterMode ? "newPassword" : "password"}
+              importantForAutofill="yes"
               onSubmitEditing={handleSubmit}
               returnKeyType="go"
             />
@@ -355,10 +365,6 @@ const styles = StyleSheet.create({
     alignItems: "center",
     justifyContent: "center",
     marginBottom: 24,
-  },
-  logoText: {
-    fontSize: 30,
-    fontWeight: "800",
   },
   title: {
     fontSize: 24,

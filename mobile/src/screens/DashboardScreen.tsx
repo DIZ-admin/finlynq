@@ -10,6 +10,7 @@ import {
 import { SafeAreaView } from "react-native-safe-area-context";
 import { useTheme } from "../theme";
 import { endpoints } from "../api/client";
+import { logger } from "../lib/logger";
 import type { DashboardData, HealthScoreData, BudgetWithSpending } from "../../../shared/types";
 
 function formatCurrency(amount: number, currency = "CAD"): string {
@@ -27,9 +28,10 @@ function getCurrentMonth(): string {
 }
 
 function getHealthColor(score: number): string {
-  if (score >= 70) return "#10b981";
-  if (score >= 40) return "#f59e0b";
-  return "#ef4444";
+  // Palette-aligned: teal (good) / amber (fair) / coral (needs work).
+  if (score >= 70) return "#1fb393";
+  if (score >= 40) return "#f5a623";
+  return "#db4f3f";
 }
 
 function HealthScoreRing({ score, grade, color }: { score: number; grade: string; color: string }) {
@@ -142,12 +144,17 @@ export default function DashboardScreen() {
         setData(dashRes.data);
         setError(null);
       } else {
+        logger.warn("dashboard", "dashboard fetch failed", { error: dashRes.error });
         setError(dashRes.error);
       }
 
       if (healthRes.success) setHealth(healthRes.data);
+      else logger.warn("dashboard", "health-score fetch failed", { error: healthRes.error });
       if (budgetRes.success) setBudgets(budgetRes.data);
-    } catch {
+      else logger.warn("dashboard", "budgets fetch failed", { error: budgetRes.error });
+    } catch (e) {
+      const detail = e instanceof Error ? `${e.name}: ${e.message}` : String(e);
+      logger.error("dashboard", "fetchAll threw", { detail });
       setError("Cannot connect to server");
     } finally {
       setLoading(false);
@@ -206,7 +213,7 @@ export default function DashboardScreen() {
             <View style={styles.row}>
               <View style={styles.halfCol}>
                 <Text style={[styles.smallLabel, { color: colors.mutedForeground }]}>Assets</Text>
-                <Text style={[styles.smallValue, { color: colors.chart3 }]}>
+                <Text style={[styles.smallValue, { color: colors.pos }]}>
                   {data ? formatCurrency(data.totalAssets) : "--"}
                 </Text>
               </View>
@@ -244,7 +251,7 @@ export default function DashboardScreen() {
           <View style={styles.row}>
             <View style={styles.halfCol}>
               <Text style={[styles.smallLabel, { color: colors.mutedForeground }]}>Income</Text>
-              <Text style={[styles.smallValue, { color: colors.chart3 }]}>
+              <Text style={[styles.smallValue, { color: colors.pos }]}>
                 {data ? formatCurrency(data.monthlyIncome) : "--"}
               </Text>
             </View>
@@ -314,7 +321,7 @@ export default function DashboardScreen() {
               <Text
                 style={[
                   styles.txAmount,
-                  { color: tx.amount >= 0 ? colors.chart3 : colors.foreground },
+                  { color: tx.amount >= 0 ? colors.pos : colors.foreground },
                 ]}
               >
                 {formatCurrency(tx.amount)}

@@ -1,88 +1,63 @@
 import React from "react";
 import { createBottomTabNavigator } from "@react-navigation/bottom-tabs";
-import { View, Text, StyleSheet } from "react-native";
+import { StyleSheet } from "react-native";
 import { useTheme } from "../theme";
+import { Icon, type IconName } from "../components/icon";
 import DashboardScreen from "../screens/DashboardScreen";
+import AccountsStack from "./AccountsStack";
+import PortfolioScreen from "../screens/PortfolioScreen";
 import TransactionsStack from "./TransactionsStack";
-import ImportScreen from "../screens/ImportScreen";
-import BudgetsScreen from "../screens/BudgetsScreen";
-import SettingsScreen from "../screens/SettingsScreen";
+import MoreStack from "./MoreStack";
 
+// Option B — "Wealth-led" IA: Home · Accounts · Portfolio · Transactions · More.
 export type TabParamList = {
-  Dashboard: undefined;
+  Home: undefined;
+  Accounts: undefined;
+  Portfolio: undefined;
   Transactions: undefined;
-  Import: undefined;
-  Budgets: undefined;
-  Settings: undefined;
+  More: undefined;
+};
+
+const ICON_BY_ROUTE: Record<keyof TabParamList, IconName> = {
+  Home: "dashboard",
+  Accounts: "accounts",
+  Portfolio: "portfolio",
+  Transactions: "transactions",
+  More: "more",
 };
 
 const Tab = createBottomTabNavigator<TabParamList>();
 
-function TabIcon({ name, focused, color }: { name: string; focused: boolean; color: string }) {
-  const icons: Record<string, string> = {
-    Dashboard: "⊞",
-    Transactions: "⇄",
-    Import: "↓",
-    Budgets: "◎",
-    Settings: "⚙",
-  };
-  return (
-    <View style={styles.iconContainer}>
-      <Text style={[styles.icon, { color }]}>{icons[name] ?? "•"}</Text>
-      {focused && <View style={[styles.dot, { backgroundColor: color }]} />}
-    </View>
-  );
-}
-
 export default function TabNavigator() {
-  const theme = useTheme();
+  const { colors } = useTheme();
 
   return (
     <Tab.Navigator
       screenOptions={({ route }) => ({
         headerShown: false,
+        // The tab bar is always dark in both light and dark mode (mirrors the
+        // web sidebar) — uses the sidebar* token set.
         tabBarStyle: {
-          backgroundColor: theme.colors.card,
-          borderTopColor: theme.colors.border,
+          backgroundColor: colors.sidebar,
+          borderTopColor: colors.sidebarBorder,
           borderTopWidth: StyleSheet.hairlineWidth,
-          height: 56,
-          paddingBottom: 4,
+          height: 60,
+          paddingBottom: 6,
+          paddingTop: 6,
         },
-        tabBarActiveTintColor: theme.colors.primary,
-        tabBarInactiveTintColor: theme.colors.mutedForeground,
-        tabBarLabelStyle: {
-          fontSize: 11,
-          fontWeight: "600",
-        },
-        tabBarIcon: ({ focused, color }) => (
-          <TabIcon name={route.name} focused={focused} color={color} />
+        tabBarActiveTintColor: colors.sidebarPrimary,
+        tabBarInactiveTintColor: colors.sidebarMutedForeground,
+        tabBarLabelStyle: { fontSize: 11, fontWeight: "600" },
+        tabBarIcon: ({ color }) => (
+          <Icon name={ICON_BY_ROUTE[route.name]} size={22} color={color} />
         ),
       })}
     >
-      <Tab.Screen name="Dashboard" component={DashboardScreen} />
+      <Tab.Screen name="Home" component={DashboardScreen} />
+      <Tab.Screen name="Accounts" component={AccountsStack} />
+      <Tab.Screen name="Portfolio" component={PortfolioScreen} />
       <Tab.Screen name="Transactions" component={TransactionsStack} />
-      <Tab.Screen name="Import" component={ImportScreen} />
-      <Tab.Screen name="Budgets" component={BudgetsScreen} />
-      <Tab.Screen name="Settings" component={SettingsScreen} />
+      <Tab.Screen name="More" component={MoreStack} />
     </Tab.Navigator>
   );
 }
-
-const styles = StyleSheet.create({
-  iconContainer: {
-    alignItems: "center",
-    justifyContent: "center",
-    width: 28,
-    height: 28,
-  },
-  icon: {
-    fontSize: 20,
-    lineHeight: 24,
-  },
-  dot: {
-    width: 4,
-    height: 4,
-    borderRadius: 2,
-    marginTop: 2,
-  },
-});

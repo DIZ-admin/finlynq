@@ -36,7 +36,9 @@ describe("API Client", () => {
   describe("api.get", () => {
     it("makes GET request to correct URL", async () => {
       mockFetch.mockResolvedValue({
-        json: () => Promise.resolve({ success: true, data: [] }),
+        ok: true,
+        status: 200,
+        json: () => Promise.resolve([]),
       });
 
       await api.get("/api/accounts");
@@ -46,19 +48,66 @@ describe("API Client", () => {
       });
     });
 
-    it("returns parsed JSON response", async () => {
+    // The REST API returns BARE JSON; request() synthesizes the { success, data }
+    // envelope from the HTTP status. This is the load-bearing empty-data fix.
+    it("wraps a bare REST array in the success envelope", async () => {
       mockFetch.mockResolvedValue({
-        json: () => Promise.resolve({ success: true, data: [{ id: 1 }] }),
+        ok: true,
+        status: 200,
+        json: () => Promise.resolve([{ id: 1 }]),
       });
 
       const result = await api.get("/api/accounts");
       expect(result).toEqual({ success: true, data: [{ id: 1 }] });
+    });
+
+    it("wraps a bare REST object in the success envelope", async () => {
+      mockFetch.mockResolvedValue({
+        ok: true,
+        status: 200,
+        json: () => Promise.resolve({ netWorth: 5 }),
+      });
+
+      const result = await api.get("/api/dashboard");
+      expect(result).toEqual({ success: true, data: { netWorth: 5 } });
+    });
+
+    it("maps a non-OK response to an error envelope", async () => {
+      mockFetch.mockResolvedValue({
+        ok: false,
+        status: 401,
+        json: () => Promise.resolve({ error: "Unauthorized" }),
+      });
+
+      const result = await api.get("/api/accounts");
+      expect(result).toEqual({ success: false, error: "Unauthorized" });
+    });
+
+    it("falls back to HTTP <status> when an error body has no message", async () => {
+      mockFetch.mockResolvedValue({
+        ok: false,
+        status: 500,
+        json: () => Promise.resolve(null),
+      });
+
+      const result = await api.get("/api/accounts");
+      expect(result).toEqual({ success: false, error: "HTTP 500" });
+    });
+
+    it("maps a thrown fetch to an error envelope (no throw)", async () => {
+      mockFetch.mockRejectedValue(new TypeError("Network request failed"));
+
+      const result = await api.get("/api/accounts");
+      expect(result.success).toBe(false);
+      expect("error" in result && result.error).toContain("Network request failed");
     });
   });
 
   describe("api.post", () => {
     it("makes POST request with body", async () => {
       mockFetch.mockResolvedValue({
+        ok: true,
+        status: 200,
         json: () => Promise.resolve({ success: true, data: {} }),
       });
 
@@ -73,6 +122,8 @@ describe("API Client", () => {
 
     it("makes POST request without body", async () => {
       mockFetch.mockResolvedValue({
+        ok: true,
+        status: 200,
         json: () => Promise.resolve({ success: true, data: {} }),
       });
 
@@ -89,6 +140,8 @@ describe("API Client", () => {
   describe("api.put", () => {
     it("makes PUT request with body", async () => {
       mockFetch.mockResolvedValue({
+        ok: true,
+        status: 200,
         json: () => Promise.resolve({ success: true, data: {} }),
       });
 
@@ -105,6 +158,8 @@ describe("API Client", () => {
   describe("api.patch", () => {
     it("makes PATCH request with body", async () => {
       mockFetch.mockResolvedValue({
+        ok: true,
+        status: 200,
         json: () => Promise.resolve({ success: true, data: {} }),
       });
 
@@ -121,6 +176,8 @@ describe("API Client", () => {
   describe("api.delete", () => {
     it("makes DELETE request", async () => {
       mockFetch.mockResolvedValue({
+        ok: true,
+        status: 200,
         json: () => Promise.resolve({ success: true, data: {} }),
       });
 
@@ -136,6 +193,8 @@ describe("API Client", () => {
   describe("endpoints", () => {
     beforeEach(() => {
       mockFetch.mockResolvedValue({
+        ok: true,
+        status: 200,
         json: () => Promise.resolve({ success: true, data: {} }),
       });
     });

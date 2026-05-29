@@ -1,0 +1,110 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>Finlynq Mobile · More menu</title>
+  <link rel="stylesheet" href="../tokens.css" />
+  <style>
+    .more-row { display: flex; align-items: center; gap: 14px; padding: 13px 2px; border-bottom: 1px solid var(--border); }
+    .more-row:last-child { border-bottom: 0; }
+    .more-row .lbl { flex: 1; font-weight: 500; font-size: var(--fs-base); }
+    .more-row .licon.lead { color: var(--fg); }
+    .grabber { width: 36px; height: 4px; border-radius: 2px; background: var(--muted-fg); opacity: .4; margin: 10px auto 14px; }
+  </style>
+</head>
+<body>
+  <div class="stage">
+    <div class="stage-title">More menu <span style="opacity:.6;font-weight:600">· NEW</span></div>
+    <div class="stage-sub">Slide-up sheet behind the "More" tab — Add/Transfer + everything outside the 5 tabs, grouped like the web nav</div>
+
+    <!-- LIGHT -->
+    <div class="device-wrap">
+      <div class="device-label">Light</div>
+      <div class="device">
+        <div class="screen light">
+          <div class="dynamic-island"></div>
+          <div class="statusbar"><span class="time">9:41</span><span class="sb-icons">▮▮▮ ⏶ 100﹪</span></div>
+          <div class="content fill" style="padding:0;background:rgba(0,0,0,.45)">
+            <div class="spacer" style="flex:0 0 56px"></div>
+            <div style="flex:1;background:var(--card);border-top-left-radius:var(--r-2xl);border-top-right-radius:var(--r-2xl);padding:0 var(--sp-lg) var(--sp-md);overflow-y:auto">
+              <div class="grabber"></div>
+              <div class="row between" style="margin-bottom:6px">
+                <span style="font-size:var(--fs-lg);font-weight:800">More</span>
+                <span class="badge info">Theme: System</span>
+              </div>
+
+              <p class="section-label">Add</p>
+              <div class="more-row"><svg class="licon lead"><use href="../icons.svg#i-plus"/></svg><span class="lbl">Add transaction</span><svg class="licon sm" style="color:var(--muted-fg)"><use href="../icons.svg#i-chevron-right"/></svg></div>
+              <div class="more-row"><svg class="licon lead"><use href="../icons.svg#i-txns"/></svg><span class="lbl">Transfer</span><svg class="licon sm" style="color:var(--muted-fg)"><use href="../icons.svg#i-chevron-right"/></svg></div>
+
+              <p class="section-label">Tracking</p>
+              <div class="more-row"><svg class="licon lead"><use href="../icons.svg#i-budgets"/></svg><span class="lbl">Budgets</span><svg class="licon sm" style="color:var(--muted-fg)"><use href="../icons.svg#i-chevron-right"/></svg></div>
+              <div class="more-row"><svg class="licon lead"><use href="../icons.svg#i-goals"/></svg><span class="lbl">Goals</span><svg class="licon sm" style="color:var(--muted-fg)"><use href="../icons.svg#i-chevron-right"/></svg></div>
+              <div class="more-row"><svg class="licon lead"><use href="../icons.svg#i-subscriptions"/></svg><span class="lbl">Subscriptions</span><svg class="licon sm" style="color:var(--muted-fg)"><use href="../icons.svg#i-chevron-right"/></svg></div>
+
+              <p class="section-label">Tools</p>
+              <div class="more-row"><svg class="licon lead"><use href="../icons.svg#i-import"/></svg><span class="lbl">Import</span><svg class="licon sm" style="color:var(--muted-fg)"><use href="../icons.svg#i-chevron-right"/></svg></div>
+              <div class="more-row"><svg class="licon lead"><use href="../icons.svg#i-file"/></svg><span class="lbl">Reports</span><svg class="licon sm" style="color:var(--muted-fg)"><use href="../icons.svg#i-chevron-right"/></svg></div>
+              <div class="more-row"><svg class="licon lead"><use href="../icons.svg#i-settings"/></svg><span class="lbl">Settings</span><svg class="licon sm" style="color:var(--muted-fg)"><use href="../icons.svg#i-chevron-right"/></svg></div>
+              <div class="more-row"><svg class="licon lead" style="color:var(--neg)"><use href="../icons.svg#i-logout"/></svg><span class="lbl" style="color:var(--neg)">Sign out</span></div>
+            </div>
+          </div>
+          <div class="tabbar">
+            <div class="tab"><svg class="licon"><use href="../icons.svg#i-home"/></svg>Home</div>
+            <div class="tab"><svg class="licon"><use href="../icons.svg#i-accounts"/></svg>Accounts</div>
+            <div class="tab"><svg class="licon"><use href="../icons.svg#i-portfolio"/></svg>Portfolio</div>
+            <div class="tab"><svg class="licon"><use href="../icons.svg#i-txns"/></svg>Txns</div>
+            <div class="tab active"><svg class="licon"><use href="../icons.svg#i-more"/></svg>More</div>
+          </div>
+          <div class="home-indicator"></div>
+        </div>
+      </div>
+    </div>
+
+    <!-- DARK -->
+    <div class="device-wrap">
+      <div class="device-label">Dark</div>
+      <div class="device">
+        <div class="screen dark">
+          <div class="dynamic-island"></div>
+          <div class="statusbar"><span class="time">9:41</span><span class="sb-icons">▮▮▮ ⏶ 100﹪</span></div>
+          <div class="content fill" style="padding:0;background:rgba(0,0,0,.55)">
+            <div class="spacer" style="flex:0 0 56px"></div>
+            <div style="flex:1;background:var(--card);border-top-left-radius:var(--r-2xl);border-top-right-radius:var(--r-2xl);padding:0 var(--sp-lg) var(--sp-md);overflow-y:auto">
+              <div class="grabber"></div>
+              <div class="row between" style="margin-bottom:6px">
+                <span style="font-size:var(--fs-lg);font-weight:800">More</span>
+                <span class="badge info">Theme: System</span>
+              </div>
+
+              <p class="section-label">Add</p>
+              <div class="more-row"><svg class="licon lead"><use href="../icons.svg#i-plus"/></svg><span class="lbl">Add transaction</span><svg class="licon sm" style="color:var(--muted-fg)"><use href="../icons.svg#i-chevron-right"/></svg></div>
+              <div class="more-row"><svg class="licon lead"><use href="../icons.svg#i-txns"/></svg><span class="lbl">Transfer</span><svg class="licon sm" style="color:var(--muted-fg)"><use href="../icons.svg#i-chevron-right"/></svg></div>
+
+              <p class="section-label">Tracking</p>
+              <div class="more-row"><svg class="licon lead"><use href="../icons.svg#i-budgets"/></svg><span class="lbl">Budgets</span><svg class="licon sm" style="color:var(--muted-fg)"><use href="../icons.svg#i-chevron-right"/></svg></div>
+              <div class="more-row"><svg class="licon lead"><use href="../icons.svg#i-goals"/></svg><span class="lbl">Goals</span><svg class="licon sm" style="color:var(--muted-fg)"><use href="../icons.svg#i-chevron-right"/></svg></div>
+              <div class="more-row"><svg class="licon lead"><use href="../icons.svg#i-subscriptions"/></svg><span class="lbl">Subscriptions</span><svg class="licon sm" style="color:var(--muted-fg)"><use href="../icons.svg#i-chevron-right"/></svg></div>
+
+              <p class="section-label">Tools</p>
+              <div class="more-row"><svg class="licon lead"><use href="../icons.svg#i-import"/></svg><span class="lbl">Import</span><svg class="licon sm" style="color:var(--muted-fg)"><use href="../icons.svg#i-chevron-right"/></svg></div>
+              <div class="more-row"><svg class="licon lead"><use href="../icons.svg#i-file"/></svg><span class="lbl">Reports</span><svg class="licon sm" style="color:var(--muted-fg)"><use href="../icons.svg#i-chevron-right"/></svg></div>
+              <div class="more-row"><svg class="licon lead"><use href="../icons.svg#i-settings"/></svg><span class="lbl">Settings</span><svg class="licon sm" style="color:var(--muted-fg)"><use href="../icons.svg#i-chevron-right"/></svg></div>
+              <div class="more-row"><svg class="licon lead" style="color:var(--neg)"><use href="../icons.svg#i-logout"/></svg><span class="lbl" style="color:var(--neg)">Sign out</span></div>
+            </div>
+          </div>
+          <div class="tabbar">
+            <div class="tab"><svg class="licon"><use href="../icons.svg#i-home"/></svg>Home</div>
+            <div class="tab"><svg class="licon"><use href="../icons.svg#i-accounts"/></svg>Accounts</div>
+            <div class="tab"><svg class="licon"><use href="../icons.svg#i-portfolio"/></svg>Portfolio</div>
+            <div class="tab"><svg class="licon"><use href="../icons.svg#i-txns"/></svg>Txns</div>
+            <div class="tab active"><svg class="licon"><use href="../icons.svg#i-more"/></svg>More</div>
+          </div>
+          <div class="home-indicator"></div>
+        </div>
+      </div>
+    </div>
+  </div>
+</body>
+</html>

@@ -1,0 +1,36 @@
+import React from "react";
+import { createNativeStackNavigator } from "@react-navigation/native-stack";
+import MoreScreen from "../screens/MoreScreen";
+import BudgetsScreen from "../screens/BudgetsScreen";
+import GoalsScreen from "../screens/GoalsScreen";
+import ImportScreen from "../screens/ImportScreen";
+import SettingsScreen from "../screens/SettingsScreen";
+import AddTransactionScreen from "../screens/AddTransactionScreen";
+
+export type MoreStackParamList = {
+  MoreHome: undefined;
+  Budgets: undefined;
+  Goals: undefined;
+  Import: undefined;
+  Settings: undefined;
+  AddTransaction: { mode?: "expense" | "income" | "transfer" } | undefined;
+};
+
+const Stack = createNativeStackNavigator<MoreStackParamList>();
+
+export default function MoreStack() {
+  return (
+    <Stack.Navigator screenOptions={{ headerShown: false }}>
+      <Stack.Screen name="MoreHome" component={MoreScreen} />
+      <Stack.Screen name="Budgets" component={BudgetsScreen} />
+      <Stack.Screen name="Goals" component={GoalsScreen} />
+      <Stack.Screen name="Import" component={ImportScreen} />
+      <Stack.Screen name="Settings" component={SettingsScreen} />
+      <Stack.Screen
+        name="AddTransaction"
+        component={AddTransactionScreen}
+        options={{ presentation: "modal" }}
+      />
+    </Stack.Navigator>
+  );
+}
