@@ -828,6 +828,7 @@ export function LandingClient() {
                 <li><a href="#flow">How it works</a></li>
                 <li><Link href="/mcp-guide">MCP guide</Link></li>
                 <li><Link href="/api-docs">API docs</Link></li>
+                <li><Link href="/glossary">Glossary</Link></li>
                 <li><Link href="/blog">Blog</Link></li>
                 <li>
                   <a href="https://github.com/finlynq/finlynq" target="_blank" rel="noreferrer">
@@ -853,8 +854,12 @@ export function LandingClient() {
               <ul>
                 <li><Link href="/vs">All comparisons</Link></li>
                 <li><Link href="/vs/monarch">Finlynq vs Monarch Money</Link></li>
+                <li><Link href="/vs/ynab">Finlynq vs YNAB</Link></li>
                 <li><Link href="/vs/era">Finlynq vs Era</Link></li>
                 <li><Link href="/vs/firefly-iii">Finlynq vs Firefly III</Link></li>
+                <li><Link href="/vs/actual">Finlynq vs Actual Budget</Link></li>
+                <li><Link href="/vs/ghostfolio">Finlynq vs Ghostfolio</Link></li>
+                <li><Link href="/vs/maybe">Finlynq vs Maybe / Sure</Link></li>
                 <li><Link href="/vs/alderfi">Finlynq vs Alderfi</Link></li>
               </ul>
             </div>

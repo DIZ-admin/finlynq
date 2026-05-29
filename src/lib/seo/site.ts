@@ -14,7 +14,16 @@ export const SITE_URL =
  * Comparison pages under `/vs/<slug>`. Add a slug here when you ship a new
  * comparison page — it flows into the sitemap, the `/vs` index, and llms.txt.
  */
-export const VS_SLUGS = ["monarch", "era", "firefly-iii", "alderfi"] as const;
+export const VS_SLUGS = [
+  "monarch",
+  "ynab",
+  "era",
+  "firefly-iii",
+  "actual",
+  "ghostfolio",
+  "maybe",
+  "alderfi",
+] as const;
 export type VsSlug = (typeof VS_SLUGS)[number];
 
 /** One-line positioning per comparison, rendered on the `/vs` index. */
@@ -23,6 +32,11 @@ export const VS_META: Record<VsSlug, { name: string; blurb: string }> = {
     name: "Monarch Money",
     blurb:
       "Open-source self-hostable vs a polished closed-source SaaS with mature US bank sync.",
+  },
+  ynab: {
+    name: "YNAB",
+    blurb:
+      "Open-source with investments, multi-currency, and a first-party MCP vs closed zero-based budgeting SaaS.",
   },
   era: {
     name: "Era",
@@ -33,6 +47,21 @@ export const VS_META: Record<VsSlug, { name: string; blurb: string }> = {
     name: "Firefly III",
     blurb:
       "Two open-source self-hostable PFMs — first-party MCP + name encryption vs mature double-entry.",
+  },
+  actual: {
+    name: "Actual Budget",
+    blurb:
+      "Two open-source PFMs — Actual's local-first budgeting vs Finlynq's investments + multi-currency + MCP.",
+  },
+  ghostfolio: {
+    name: "Ghostfolio",
+    blurb:
+      "Full personal-finance app with a first-party MCP vs a dedicated open-source portfolio tracker.",
+  },
+  maybe: {
+    name: "Maybe / Sure",
+    blurb:
+      "Actively-built, encrypted, MCP-first vs the open-sourced-after-shutdown Maybe and its Sure fork.",
   },
   alderfi: {
     name: "Alderfi",
