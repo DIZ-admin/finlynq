@@ -1,7 +1,9 @@
 # SEO architecture
 
 How Finlynq's public marketing surface is optimized for search engines and
-AI-assistant citation. Phase 1 (technical foundations) shipped 2026-05-29.
+AI-assistant citation. Phases 0–4 shipped to **production** 2026-05-29
+(commits `133c785` → `35c6ada` on `main`), fact-checked, with IndexNow submitted.
+Remaining items are external (GSC/Bing, awesome lists) — see the bottom section.
 
 ## Single source of truth
 
@@ -49,9 +51,11 @@ AI-assistant citation. Phase 1 (technical foundations) shipped 2026-05-29.
   anchored (`/mcp$`, `/mcp/`) so it doesn't deindex the public `/mcp-guide`.
 - **[public/llms.txt](../public/llms.txt)** — curated map for AI crawlers
   (llms.txt convention). Hand-maintained; static so it hardcodes finlynq.com.
-  `llms-full.txt` (long-form concat of docs) ships with the Phase 2 docs route.
+- **`/llms-full.txt`** ([route](../src/app/llms-full.txt/route.ts)) — long-form
+  companion, generated at build from the glossary + page pointers (shipped).
 - **GA / CSP `isWebsite` gate** in middleware now covers `/about`, `/blog`,
-  `/mcp-guide`, `/vs`, `/docs` so analytics beacons aren't CSP-blocked there.
+  `/mcp-guide`, `/vs`, `/glossary`, `/docs` so analytics beacons aren't
+  CSP-blocked there.
 
 ## Target keyword map (Phase 0)
 
@@ -95,8 +99,12 @@ The comparison cluster grew from 4 to 8 pages: added `/vs/ynab`, `/vs/actual`,
 `/vs/ghostfolio`, `/vs/maybe`. All use the shared `VsPage` template, carry
 BreadcrumbList JSON-LD (via the component), and are registered in `site.ts`
 (`VS_SLUGS` + `VS_META`) so they flow into the sitemap, the `/vs` index, the
-footer, and llms-full.txt. Content is sourced + dated; re-fact-check competitor
-claims before any prod promotion.
+footer, and llms-full.txt. Content is sourced + dated. A post-launch fact-check
+pass (commit `e1e166f`, 2026-05-29) corrected four competitor claims: YNAB bank
+sync (TrueLayer is legacy → Plaid now covers UK/EU), Actual multi-user (has
+shipped, not "roadmap") + Pluggy.ai/GoCardless caveat, and the Maybe 2023
+product-shutdown vs July-2025 B2B-pivot archival distinction. Re-verify before
+adding more competitors.
 
 ## Phase 4 — OG images, IndexNow, repo SEO (shipped 2026-05-29)
 
@@ -105,8 +113,10 @@ claims before any prod promotion.
   every route's OG/Twitter metadata automatically. Per-page dynamic images
   (e.g. "Finlynq vs X") remain a future enhancement.
 - **IndexNow** — ownership key at `public/7e2c9a4f1b6d83e05a9c2f47b1d6e803.txt`.
-  After a deploy, ping Bing to index new/changed URLs:
-  `curl "https://api.indexnow.org/indexnow?url=https://finlynq.com/&key=7e2c9a4f1b6d83e05a9c2f47b1d6e803"`
+  All 25 public URLs were submitted via the bulk API on 2026-05-29 (HTTP 202).
+  To re-ping after future changes, POST `{host, key, keyLocation, urlList}` to
+  `https://api.indexnow.org/indexnow`, or single-URL:
+  `curl "https://api.indexnow.org/indexnow?url=<URL>&key=7e2c9a4f1b6d83e05a9c2f47b1d6e803"`
 - **GitHub repo SEO** — repo description + topics set via `gh repo edit`
   (personal-finance, mcp, model-context-protocol, self-hosted, budgeting,
   nextjs, postgresql, agpl, …). The social-preview IMAGE must still be uploaded
@@ -114,11 +124,14 @@ claims before any prod promotion.
 
 ## Deferred / needs user action
 
+- **Google Search Console / Bing Webmaster** — verify `finlynq.com` (DNS TXT or
+  HTML-file method) and submit `https://finlynq.com/sitemap.xml`. Requires the
+  owner's Google/Bing login; cannot be automated.
 - **Awesome-list PRs** (awesome-selfhosted, awesome-mcp-servers ×N,
-  awesome-personal-finance) and **Google Search Console / Bing Webmaster**
-  verification + sitemap submission — external accounts / third-party repos,
-  out of scope for an automated push. Submit `${SITE_URL}/sitemap.xml`.
-- **GitHub social-preview image upload** (manual, see above).
+  awesome-personal-finance) — PRs to third-party repos; prepare + submit manually.
+- **GitHub social-preview image upload** (manual, no API — use the OG image).
 - **`/docs/*` route** — pending the stale-doc rewrite (see Phase 2 note).
 - **FAQPage JSON-LD on `/vs/*`** — blocked on the `faq` answers being JSX
   (`ReactNode`); needs a plain-text `aText` field on `FaqItem` to serialize.
+- **Per-page dynamic OG images** ("Finlynq vs X") — enhancement over the
+  sitewide default.
