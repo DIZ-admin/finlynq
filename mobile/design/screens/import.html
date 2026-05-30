@@ -1,0 +1,128 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>Finlynq Mobile · Import</title>
+  <link rel="stylesheet" href="../tokens.css" />
+</head>
+<body>
+  <div class="stage">
+    <div class="stage-title">Import</div>
+    <div class="stage-sub">Pick a file → preview parsed rows (with duplicate flags) → confirm import</div>
+
+    <!-- LIGHT -->
+    <div class="device-wrap">
+      <div class="device-label">Light</div>
+      <div class="device">
+        <div class="screen light">
+          <div class="dynamic-island"></div>
+          <div class="statusbar"><span class="time">9:41</span><span class="sb-icons">▮▮▮ ⏶ 100﹪</span></div>
+          <div class="content">
+            <h1 class="h1 sm">Import</h1>
+
+            <!-- chosen file -->
+            <div class="card tight">
+              <div class="filebox">
+                <div class="fb-ico">CSV</div>
+                <div class="fb-main">
+                  <div class="fb-name">td-chequing-may.csv</div>
+                  <div class="fb-sub">42 rows · 8.4 KB</div>
+                </div>
+                <span class="link">Change</span>
+              </div>
+            </div>
+
+            <!-- column mapping -->
+            <div class="card">
+              <p class="label">Column mapping</p>
+              <div class="kv-row"><span class="kv-key">Date</span><span class="kv-val">Column 1</span></div>
+              <div class="kv-row"><span class="kv-key">Description</span><span class="kv-val">Column 2</span></div>
+              <div class="kv-row"><span class="kv-key">Amount</span><span class="kv-val">Column 3</span></div>
+              <div class="kv-row"><span class="kv-key">Account</span><span class="kv-val">TD Chequing</span></div>
+            </div>
+
+            <!-- preview -->
+            <div class="card">
+              <div class="row between" style="margin-bottom:var(--sp-sm)">
+                <span class="label" style="margin:0">Preview</span>
+                <span class="badge neg">3 duplicates</span>
+              </div>
+              <div class="preview-row"><span class="pr-date">05-28</span><span class="pr-desc">Loblaws</span><span class="pr-amt neg">−$84.32</span></div>
+              <div class="preview-row"><span class="pr-date">05-27</span><span class="pr-desc">Acme Payroll</span><span class="pr-amt pos">+$3,100.00</span></div>
+              <div class="preview-row"><span class="pr-date">05-26</span><span class="pr-desc">Hydro One <span class="badge neg" style="margin-left:6px">dup</span></span><span class="pr-amt neg">−$112.00</span></div>
+              <div class="preview-row"><span class="pr-date">05-25</span><span class="pr-desc">Amazon</span><span class="pr-amt neg">−$43.19</span></div>
+              <p class="hint" style="text-align:left;margin-top:8px">+ 38 more rows</p>
+            </div>
+
+            <button class="btn primary block">Import 39 new rows</button>
+          </div>
+          <div class="tabbar">
+            <div class="tab"><svg class="licon"><use href="../icons.svg#i-home"/></svg>Home</div>
+            <div class="tab"><svg class="licon"><use href="../icons.svg#i-accounts"/></svg>Accounts</div>
+            <div class="tab"><svg class="licon"><use href="../icons.svg#i-portfolio"/></svg>Portfolio</div>
+            <div class="tab"><svg class="licon"><use href="../icons.svg#i-txns"/></svg>Txns</div>
+            <div class="tab active"><svg class="licon"><use href="../icons.svg#i-more"/></svg>More</div>
+          </div>
+          <div class="home-indicator"></div>
+        </div>
+      </div>
+    </div>
+
+    <!-- DARK -->
+    <div class="device-wrap">
+      <div class="device-label">Dark</div>
+      <div class="device">
+        <div class="screen dark">
+          <div class="dynamic-island"></div>
+          <div class="statusbar"><span class="time">9:41</span><span class="sb-icons">▮▮▮ ⏶ 100﹪</span></div>
+          <div class="content">
+            <h1 class="h1 sm">Import</h1>
+
+            <div class="card tight">
+              <div class="filebox">
+                <div class="fb-ico">CSV</div>
+                <div class="fb-main">
+                  <div class="fb-name">td-chequing-may.csv</div>
+                  <div class="fb-sub">42 rows · 8.4 KB</div>
+                </div>
+                <span class="link">Change</span>
+              </div>
+            </div>
+
+            <div class="card">
+              <p class="label">Column mapping</p>
+              <div class="kv-row"><span class="kv-key">Date</span><span class="kv-val">Column 1</span></div>
+              <div class="kv-row"><span class="kv-key">Description</span><span class="kv-val">Column 2</span></div>
+              <div class="kv-row"><span class="kv-key">Amount</span><span class="kv-val">Column 3</span></div>
+              <div class="kv-row"><span class="kv-key">Account</span><span class="kv-val">TD Chequing</span></div>
+            </div>
+
+            <div class="card">
+              <div class="row between" style="margin-bottom:var(--sp-sm)">
+                <span class="label" style="margin:0">Preview</span>
+                <span class="badge neg">3 duplicates</span>
+              </div>
+              <div class="preview-row"><span class="pr-date">05-28</span><span class="pr-desc">Loblaws</span><span class="pr-amt neg">−$84.32</span></div>
+              <div class="preview-row"><span class="pr-date">05-27</span><span class="pr-desc">Acme Payroll</span><span class="pr-amt pos">+$3,100.00</span></div>
+              <div class="preview-row"><span class="pr-date">05-26</span><span class="pr-desc">Hydro One <span class="badge neg" style="margin-left:6px">dup</span></span><span class="pr-amt neg">−$112.00</span></div>
+              <div class="preview-row"><span class="pr-date">05-25</span><span class="pr-desc">Amazon</span><span class="pr-amt neg">−$43.19</span></div>
+              <p class="hint" style="text-align:left;margin-top:8px">+ 38 more rows</p>
+            </div>
+
+            <button class="btn primary block">Import 39 new rows</button>
+          </div>
+          <div class="tabbar">
+            <div class="tab"><svg class="licon"><use href="../icons.svg#i-home"/></svg>Home</div>
+            <div class="tab"><svg class="licon"><use href="../icons.svg#i-accounts"/></svg>Accounts</div>
+            <div class="tab"><svg class="licon"><use href="../icons.svg#i-portfolio"/></svg>Portfolio</div>
+            <div class="tab"><svg class="licon"><use href="../icons.svg#i-txns"/></svg>Txns</div>
+            <div class="tab active"><svg class="licon"><use href="../icons.svg#i-more"/></svg>More</div>
+          </div>
+          <div class="home-indicator"></div>
+        </div>
+      </div>
+    </div>
+  </div>
+</body>
+</html>

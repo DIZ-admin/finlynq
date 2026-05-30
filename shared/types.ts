@@ -51,6 +51,9 @@ export interface Transaction {
   splitRatio: number | null;
   importHash: string | null;
   fitId: string | null;
+  /** Decrypted category name — GET /api/transactions resolves this per row
+   *  (route.ts decrypts categoryNameCt and strips the ciphertext companion). */
+  categoryName?: string | null;
 }
 
 export interface Budget {
@@ -68,9 +71,21 @@ export interface Goal {
   targetAmount: number;
   deadline: string | null;
   accountId: number | null;
+  currency?: string | null;
   priority: number;
   status: string;
   note: string;
+}
+
+/** GET /api/goals shape — base Goal plus the server-computed progress fields. */
+export interface GoalWithProgress extends Goal {
+  currentAmount: number;
+  /** 0–100 percentage toward the target. */
+  progress: number;
+  /** Alias of `progress` (mirrors the MCP get_goals output). */
+  percentComplete: number;
+  remaining: number;
+  monthlyNeeded: number;
 }
 
 export interface Loan {
@@ -131,11 +146,30 @@ export interface Notification {
 }
 
 // --- Auth ---
-export interface UnlockStatus {
-  unlocked: boolean;
-  needsSetup: boolean;
-  mode: string;
-  hasExistingData: boolean;
+/** Shape returned by GET /api/auth/session — the backend identity source. */
+export interface SessionInfo {
+  authenticated: boolean;
+  method: string | null;
+  authMethod?: string | null;
+  userId: string | null;
+  mfaVerified?: boolean;
+  onboardingComplete?: boolean;
+  isAdmin?: boolean;
+  username?: string | null;
+  email?: string | null;
+  displayName?: string | null;
+  displayCurrency?: string;
+}
+
+/** Payload for POST /api/auth/register. Username is the required identifier;
+ *  email is an optional recovery channel. When email is omitted the user must
+ *  set acknowledgeNoRecovery=true (no password-recovery path). */
+export interface RegisterPayload {
+  username: string;
+  email?: string;
+  password: string;
+  displayName?: string;
+  acknowledgeNoRecovery?: boolean;
 }
 
 // --- Dashboard ---
@@ -172,6 +206,77 @@ export interface BudgetWithSpending extends Budget {
   convertedAmount?: number;
   convertedSpent?: number;
   rolloverAmount?: number;
+}
+
+// --- Per-account balance (the `balances` rows from GET /api/dashboard) ---
+// /api/accounts returns accounts WITHOUT balances; the computed + currency-
+// converted per-account balance lives in the dashboard payload.
+export interface AccountBalance {
+  accountId: number;
+  accountName: string | null;
+  accountType: "A" | "L";
+  accountGroup: string;
+  currency: string;
+  balance: number;
+  convertedBalance: number;
+  displayCurrency: string;
+  isInvestment?: boolean;
+  holdingsValue?: number;
+}
+
+// --- Portfolio overview (GET /api/portfolio/overview) ---
+/** One consolidated position across accounts (the `byHolding` rollup row). */
+export interface PortfolioHoldingSummary {
+  key: string;
+  symbol: string | null;
+  name: string;
+  assetType: string | null;
+  totalQty: number;
+  avgCostDisplay: number | null;
+  costBasisDisplay: number;
+  marketValueDisplay: number;
+  unrealizedGainDisplay: number;
+  unrealizedGainPct: number | null;
+  realizedGainDisplay: number;
+  dividendsDisplay: number;
+  totalReturnDisplay: number;
+  totalReturnPct: number | null;
+  pctOfPortfolio: number | null;
+  accountCount: number;
+  image?: string | null;
+}
+
+export interface PortfolioSummary {
+  totalHoldings: number;
+  totalAccounts: number;
+  totalValueDisplay: number;
+  dayChangeDisplay: number;
+  dayChangePct: number;
+  hasQuantityData: boolean;
+  totalCostBasisDisplay: number;
+  totalUnrealizedGainDisplay: number;
+  totalUnrealizedGainPct: number;
+  totalRealizedGainDisplay: number;
+  totalDividendsDisplay: number;
+  totalReturnDisplay: number;
+  totalReturnPct: number;
+}
+
+export interface PortfolioOverview {
+  holdings: unknown[];
+  byHolding: PortfolioHoldingSummary[];
+  displayCurrency: string;
+  summary: PortfolioSummary;
+}
+
+/** POST /api/transactions/transfer body — same-currency transfers only on mobile. */
+export interface TransferPayload {
+  fromAccountId: number;
+  toAccountId: number;
+  enteredAmount: number;
+  date?: string;
+  note?: string;
+  tags?: string;
 }
 
 // --- Transaction form ---

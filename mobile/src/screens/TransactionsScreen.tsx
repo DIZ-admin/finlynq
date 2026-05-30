@@ -1,4 +1,4 @@
-import React, { useEffect, useState, useCallback, useRef } from "react";
+import React, { useEffect, useState, useCallback } from "react";
 import {
   View,
   Text,
@@ -8,12 +8,13 @@ import {
   RefreshControl,
   ActivityIndicator,
   TouchableOpacity,
-  Animated,
   Alert,
 } from "react-native";
 import { SafeAreaView } from "react-native-safe-area-context";
 import { useTheme } from "../theme";
 import { endpoints } from "../api/client";
+import { logger } from "../lib/logger";
+import { formatCurrency, safeName, formatShortDate } from "../lib/format";
 import type { Transaction } from "../../../shared/types";
 import type { NativeStackScreenProps } from "@react-navigation/native-stack";
 import type { TransactionsStackParamList } from "../navigation/TransactionsStack";
@@ -21,71 +22,41 @@ import { useIsFocused } from "@react-navigation/native";
 
 type Props = NativeStackScreenProps<TransactionsStackParamList, "TransactionsList">;
 
-function formatCurrency(amount: number): string {
-  return new Intl.NumberFormat("en-CA", {
-    style: "currency",
-    currency: "CAD",
-    minimumFractionDigits: 2,
-  }).format(amount);
-}
-
-function formatDate(dateStr: string): string {
-  const d = new Date(dateStr + "T00:00:00");
-  return d.toLocaleDateString("en-CA", { month: "short", day: "numeric" });
-}
-
-function SwipeableRow({
-  children,
-  onEdit,
-  onDelete,
-  colors,
-}: {
-  children: React.ReactNode;
-  onEdit: () => void;
-  onDelete: () => void;
-  colors: ReturnType<typeof useTheme>["colors"];
-}) {
-  const translateX = useRef(new Animated.Value(0)).current;
-  const lastDx = useRef(0);
-
-  const onMoveShouldSetResponder = () => true;
-  const onResponderMove = (e: { nativeEvent: { pageX: number } }) => {
-    // Simple horizontal swipe tracking - we use a simpler approach
-    // since we don't have gesture handler installed
-  };
-
-  // For simplicity without full gesture handler, use tap-based actions
-  // The swipe concept is replaced with a long-press menu
-  return <View>{children}</View>;
-}
-
 export default function TransactionsScreen({ navigation }: Props) {
-  const theme = useTheme();
+  const { colors } = useTheme();
   const isFocused = useIsFocused();
   const [transactions, setTransactions] = useState<Transaction[]>([]);
   const [loading, setLoading] = useState(true);
   const [refreshing, setRefreshing] = useState(false);
   const [error, setError] = useState<string | null>(null);
   const [search, setSearch] = useState("");
-  const [searchActive, setSearchActive] = useState(false);
 
   const fetchTransactions = useCallback(
     async (isRefresh = false) => {
       if (isRefresh) setRefreshing(true);
       else setLoading(true);
       try {
+        // Mirror AccountDetailScreen's recognized sort params (the backend reads
+        // `sort`/`sortDir`, not `order`). No accountId → all of the user's rows.
         const params = new URLSearchParams();
         params.set("limit", "50");
-        params.set("order", "desc");
+        params.set("sort", "date");
+        params.set("sortDir", "desc");
         if (search.trim()) params.set("search", search.trim());
         const res = await endpoints.getTransactions(params.toString());
         if (res.success) {
           setTransactions(res.data);
           setError(null);
+          // Count in the message string (the Diagnostics panel truncates the
+          // data object) so an empty result is unambiguous on device.
+          logger.info("transactions", `loaded ${res.data.length} rows`);
         } else {
+          logger.warn("transactions", "fetch failed", { error: res.error });
           setError(res.error);
         }
-      } catch {
+      } catch (e) {
+        const detail = e instanceof Error ? `${e.name}: ${e.message}` : String(e);
+        logger.error("transactions", "fetch threw", { detail });
         setError("Cannot connect to server");
       } finally {
         setLoading(false);
@@ -100,87 +71,78 @@ export default function TransactionsScreen({ navigation }: Props) {
   }, [isFocused, fetchTransactions]);
 
   const handleDelete = (tx: Transaction) => {
-    Alert.alert("Delete Transaction", `Delete "${tx.payee || tx.note || "this transaction"}"?`, [
-      { text: "Cancel", style: "cancel" },
-      {
-        text: "Delete",
-        style: "destructive",
-        onPress: async () => {
-          try {
-            const res = await endpoints.deleteTransaction(tx.id);
-            if (res.success) {
-              setTransactions((prev) => prev.filter((t) => t.id !== tx.id));
+    Alert.alert(
+      "Delete Transaction",
+      `Delete "${safeName(tx.payee || tx.note, "this transaction")}"?`,
+      [
+        { text: "Cancel", style: "cancel" },
+        {
+          text: "Delete",
+          style: "destructive",
+          onPress: async () => {
+            try {
+              const res = await endpoints.deleteTransaction(tx.id);
+              if (res.success) {
+                setTransactions((prev) => prev.filter((t) => t.id !== tx.id));
+              }
+            } catch {
+              Alert.alert("Error", "Cannot connect to server");
             }
-          } catch {
-            Alert.alert("Error", "Cannot connect to server");
-          }
+          },
         },
-      },
-    ]);
+      ]
+    );
   };
 
-  const colors = theme.colors;
-
-  const renderItem = ({ item }: { item: Transaction }) => (
-    <TouchableOpacity
-      activeOpacity={0.7}
-      onPress={() => navigation.navigate("TransactionDetail", { transaction: item })}
-      onLongPress={() => {
-        Alert.alert(
-          item.payee || item.note || "Transaction",
-          formatCurrency(item.amount),
-          [
+  const renderItem = ({ item }: { item: Transaction }) => {
+    const positive = item.amount >= 0;
+    const subtitle = item.categoryName
+      ? `${formatShortDate(item.date)} · ${item.categoryName}`
+      : formatShortDate(item.date);
+    return (
+      <TouchableOpacity
+        activeOpacity={0.7}
+        onPress={() => navigation.navigate("TransactionDetail", { transaction: item })}
+        onLongPress={() => {
+          Alert.alert(safeName(item.payee || item.note, "Transaction"), formatCurrency(item.amount, item.currency), [
             {
               text: "Edit",
-              onPress: () =>
-                navigation.navigate("TransactionDetail", { transaction: item }),
+              onPress: () => navigation.navigate("TransactionDetail", { transaction: item }),
             },
-            {
-              text: "Delete",
-              style: "destructive",
-              onPress: () => handleDelete(item),
-            },
+            { text: "Delete", style: "destructive", onPress: () => handleDelete(item) },
             { text: "Cancel", style: "cancel" },
-          ]
-        );
-      }}
-    >
-      <View style={[styles.row, { borderBottomColor: colors.border }]}>
-        {/* Category type indicator */}
-        <View
-          style={[
-            styles.indicator,
-            {
-              backgroundColor: item.amount >= 0 ? colors.chart3 + "22" : colors.destructive + "22",
-            },
-          ]}
-        >
-          <Text style={{ fontSize: 14, color: item.amount >= 0 ? colors.chart3 : colors.destructive }}>
-            {item.amount >= 0 ? "↑" : "↓"}
-          </Text>
-        </View>
-        <View style={styles.left}>
-          <Text style={[styles.payee, { color: colors.foreground }]} numberOfLines={1}>
-            {item.payee || item.note || "Transaction"}
-          </Text>
-          <Text style={[styles.date, { color: colors.mutedForeground }]}>
-            {formatDate(item.date)}
-          </Text>
-        </View>
-        <View style={styles.right}>
-          <Text
+          ]);
+        }}
+      >
+        <View style={[styles.row, { borderBottomColor: colors.border }]}>
+          <View
             style={[
-              styles.amount,
-              { color: item.amount >= 0 ? colors.chart3 : colors.foreground },
+              styles.indicator,
+              { backgroundColor: (positive ? colors.pos : colors.destructive) + "22" },
             ]}
           >
-            {formatCurrency(item.amount)}
-          </Text>
-          <Text style={[styles.chevron, { color: colors.mutedForeground }]}>›</Text>
+            <Text style={{ fontSize: 14, color: positive ? colors.pos : colors.destructive }}>
+              {positive ? "↑" : "↓"}
+            </Text>
+          </View>
+          <View style={styles.left}>
+            <Text style={[styles.payee, { color: colors.foreground }]} numberOfLines={1}>
+              {safeName(item.payee || item.note, "Transaction")}
+            </Text>
+            <Text style={[styles.date, { color: colors.mutedForeground }]} numberOfLines={1}>
+              {subtitle}
+            </Text>
+          </View>
+          <View style={styles.right}>
+            <Text style={[styles.amount, { color: positive ? colors.pos : colors.foreground }]}>
+              {formatCurrency(item.amount, item.currency)}
+            </Text>
+            <Text style={[styles.chevron, { color: colors.mutedForeground }]}>›</Text>
+          </View>
         </View>
-      </View>
-    </TouchableOpacity>
-  );
+      </TouchableOpacity>
+    );
+  };
 
   return (
     <SafeAreaView style={[styles.safe, { backgroundColor: colors.background }]} edges={["top"]}>
@@ -206,16 +168,11 @@ export default function TransactionsScreen({ navigation }: Props) {
           placeholderTextColor={colors.mutedForeground}
           returnKeyType="search"
           onSubmitEditing={() => fetchTransactions()}
-          onFocus={() => setSearchActive(true)}
-          onBlur={() => setSearchActive(false)}
+          autoCapitalize="none"
+          autoCorrect={false}
         />
         {search.length > 0 && (
-          <TouchableOpacity
-            onPress={() => {
-              setSearch("");
-              // Will refetch on next effect cycle
-            }}
-          >
+          <TouchableOpacity onPress={() => setSearch("")}>
             <Text style={[styles.clearBtn, { color: colors.mutedForeground }]}>✕</Text>
           </TouchableOpacity>
         )}
@@ -226,37 +183,37 @@ export default function TransactionsScreen({ navigation }: Props) {
         Tap to view • Long press for actions
       </Text>
 
-      {loading ? (
-        <View style={styles.center}>
-          <ActivityIndicator size="large" color={colors.primary} />
-        </View>
-      ) : error ? (
-        <View style={styles.center}>
-          <Text style={{ color: colors.destructive }}>{error}</Text>
-        </View>
-      ) : (
-        <FlatList
-          data={transactions}
-          keyExtractor={(item) => String(item.id)}
-          renderItem={renderItem}
-          contentContainerStyle={styles.list}
-          refreshControl={
-            <RefreshControl refreshing={refreshing} onRefresh={() => fetchTransactions(true)} />
-          }
-          ListEmptyComponent={
+      {/* The list is ALWAYS rendered with flex:1 (mirrors AccountDetailScreen).
+          Loading/error/empty are handled by ListEmptyComponent so the FlatList
+          never collapses to zero height behind a conditional. */}
+      <FlatList
+        style={styles.flatList}
+        data={transactions}
+        keyExtractor={(item) => String(item.id)}
+        renderItem={renderItem}
+        contentContainerStyle={styles.list}
+        refreshControl={
+          <RefreshControl refreshing={refreshing} onRefresh={() => fetchTransactions(true)} />
+        }
+        ListEmptyComponent={
+          loading ? (
+            <ActivityIndicator style={{ marginTop: 32 }} size="large" color={colors.primary} />
+          ) : error ? (
+            <Text style={[styles.empty, { color: colors.destructive }]}>{error}</Text>
+          ) : (
             <Text style={[styles.empty, { color: colors.mutedForeground }]}>
               {search ? "No matching transactions" : "No transactions yet"}
             </Text>
-          }
-        />
-      )}
+          )
+        }
+      />
     </SafeAreaView>
   );
 }
 
 const styles = StyleSheet.create({
   safe: { flex: 1 },
-  center: { flex: 1, alignItems: "center", justifyContent: "center" },
+  flatList: { flex: 1 },
   headerRow: {
     flexDirection: "row",
     alignItems: "center",
@@ -305,7 +262,7 @@ const styles = StyleSheet.create({
   right: { flexDirection: "row", alignItems: "center", gap: 6 },
   payee: { fontSize: 15, fontWeight: "500" },
   date: { fontSize: 12, marginTop: 2 },
-  amount: { fontSize: 15, fontWeight: "600" },
+  amount: { fontSize: 15, fontWeight: "600", fontVariant: ["tabular-nums"] },
   chevron: { fontSize: 20, fontWeight: "300" },
   empty: { textAlign: "center", paddingVertical: 32, fontSize: 14 },
 });

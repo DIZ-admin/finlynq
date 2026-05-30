@@ -1,4 +1,10 @@
-import { api, getServerUrl, setServerUrl, endpoints } from "../api/client";
+import {
+  api,
+  getServerUrl,
+  setServerUrl,
+  endpoints,
+  getSession,
+} from "../api/client";
 
 // Mock global fetch
 const mockFetch = jest.fn();
@@ -30,7 +36,9 @@ describe("API Client", () => {
   describe("api.get", () => {
     it("makes GET request to correct URL", async () => {
       mockFetch.mockResolvedValue({
-        json: () => Promise.resolve({ success: true, data: [] }),
+        ok: true,
+        status: 200,
+        json: () => Promise.resolve([]),
       });
 
       await api.get("/api/accounts");
@@ -40,33 +48,82 @@ describe("API Client", () => {
       });
     });
 
-    it("returns parsed JSON response", async () => {
+    // The REST API returns BARE JSON; request() synthesizes the { success, data }
+    // envelope from the HTTP status. This is the load-bearing empty-data fix.
+    it("wraps a bare REST array in the success envelope", async () => {
       mockFetch.mockResolvedValue({
-        json: () => Promise.resolve({ success: true, data: [{ id: 1 }] }),
+        ok: true,
+        status: 200,
+        json: () => Promise.resolve([{ id: 1 }]),
       });
 
       const result = await api.get("/api/accounts");
       expect(result).toEqual({ success: true, data: [{ id: 1 }] });
+    });
+
+    it("wraps a bare REST object in the success envelope", async () => {
+      mockFetch.mockResolvedValue({
+        ok: true,
+        status: 200,
+        json: () => Promise.resolve({ netWorth: 5 }),
+      });
+
+      const result = await api.get("/api/dashboard");
+      expect(result).toEqual({ success: true, data: { netWorth: 5 } });
+    });
+
+    it("maps a non-OK response to an error envelope", async () => {
+      mockFetch.mockResolvedValue({
+        ok: false,
+        status: 401,
+        json: () => Promise.resolve({ error: "Unauthorized" }),
+      });
+
+      const result = await api.get("/api/accounts");
+      expect(result).toEqual({ success: false, error: "Unauthorized" });
+    });
+
+    it("falls back to HTTP <status> when an error body has no message", async () => {
+      mockFetch.mockResolvedValue({
+        ok: false,
+        status: 500,
+        json: () => Promise.resolve(null),
+      });
+
+      const result = await api.get("/api/accounts");
+      expect(result).toEqual({ success: false, error: "HTTP 500" });
+    });
+
+    it("maps a thrown fetch to an error envelope (no throw)", async () => {
+      mockFetch.mockRejectedValue(new TypeError("Network request failed"));
+
+      const result = await api.get("/api/accounts");
+      expect(result.success).toBe(false);
+      expect("error" in result && result.error).toContain("Network request failed");
     });
   });
 
   describe("api.post", () => {
     it("makes POST request with body", async () => {
       mockFetch.mockResolvedValue({
+        ok: true,
+        status: 200,
         json: () => Promise.resolve({ success: true, data: {} }),
       });
 
-      await api.post("/api/auth/unlock", { action: "unlock", passphrase: "test" });
+      await api.post("/api/transactions", { amount: 100 });
 
-      expect(mockFetch).toHaveBeenCalledWith("http://localhost:3000/api/auth/unlock", {
+      expect(mockFetch).toHaveBeenCalledWith("http://localhost:3000/api/transactions", {
         method: "POST",
         headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ action: "unlock", passphrase: "test" }),
+        body: JSON.stringify({ amount: 100 }),
       });
     });
 
     it("makes POST request without body", async () => {
       mockFetch.mockResolvedValue({
+        ok: true,
+        status: 200,
         json: () => Promise.resolve({ success: true, data: {} }),
       });
 
@@ -83,6 +140,8 @@ describe("API Client", () => {
   describe("api.put", () => {
     it("makes PUT request with body", async () => {
       mockFetch.mockResolvedValue({
+        ok: true,
+        status: 200,
         json: () => Promise.resolve({ success: true, data: {} }),
       });
 
@@ -99,6 +158,8 @@ describe("API Client", () => {
   describe("api.patch", () => {
     it("makes PATCH request with body", async () => {
       mockFetch.mockResolvedValue({
+        ok: true,
+        status: 200,
         json: () => Promise.resolve({ success: true, data: {} }),
       });
 
@@ -115,6 +176,8 @@ describe("API Client", () => {
   describe("api.delete", () => {
     it("makes DELETE request", async () => {
       mockFetch.mockResolvedValue({
+        ok: true,
+        status: 200,
         json: () => Promise.resolve({ success: true, data: {} }),
       });
 
@@ -130,38 +193,66 @@ describe("API Client", () => {
   describe("endpoints", () => {
     beforeEach(() => {
       mockFetch.mockResolvedValue({
+        ok: true,
+        status: 200,
         json: () => Promise.resolve({ success: true, data: {} }),
       });
     });
 
-    it("getUnlockStatus calls correct path", async () => {
-      await endpoints.getUnlockStatus();
+    it("login sends {identifier, password} to /api/auth/login", async () => {
+      mockFetch.mockResolvedValue({
+        ok: true,
+        status: 200,
+        json: () => Promise.resolve({ success: true }),
+        headers: { get: () => null },
+      });
+      await endpoints.login("alice", "hunter2hunter2");
       expect(mockFetch).toHaveBeenCalledWith(
-        "http://localhost:3000/api/auth/unlock",
+        "http://localhost:3000/api/auth/login",
+        expect.objectContaining({
+          method: "POST",
+          body: JSON.stringify({
+            identifier: "alice",
+            password: "hunter2hunter2",
+          }),
+        })
+      );
+    });
+
+    it("register forwards the full payload to /api/auth/register", async () => {
+      mockFetch.mockResolvedValue({
+        ok: true,
+        status: 201,
+        json: () => Promise.resolve({ success: true }),
+        headers: { get: () => null },
+      });
+      const payload = {
+        username: "alice",
+        email: undefined,
+        password: "correct horse battery",
+        displayName: "Alice",
+        acknowledgeNoRecovery: true,
+      };
+      await endpoints.register(payload);
+      expect(mockFetch).toHaveBeenCalledWith(
+        "http://localhost:3000/api/auth/register",
+        expect.objectContaining({
+          method: "POST",
+          body: JSON.stringify(payload),
+        })
+      );
+    });
+
+    it("getSession calls /api/auth/session", async () => {
+      mockFetch.mockResolvedValue({
+        json: () => Promise.resolve({ authenticated: true, userId: "u1" }),
+      });
+      const session = await getSession();
+      expect(mockFetch).toHaveBeenCalledWith(
+        "http://localhost:3000/api/auth/session",
         expect.any(Object)
       );
-    });
-
-    it("unlock sends correct payload", async () => {
-      await endpoints.unlock("mypass");
-      expect(mockFetch).toHaveBeenCalledWith(
-        "http://localhost:3000/api/auth/unlock",
-        expect.objectContaining({
-          method: "POST",
-          body: JSON.stringify({ action: "unlock", passphrase: "mypass" }),
-        })
-      );
-    });
-
-    it("lock sends correct payload", async () => {
-      await endpoints.lock();
-      expect(mockFetch).toHaveBeenCalledWith(
-        "http://localhost:3000/api/auth/unlock",
-        expect.objectContaining({
-          method: "POST",
-          body: JSON.stringify({ action: "lock" }),
-        })
-      );
+      expect(session).toEqual({ authenticated: true, userId: "u1" });
     });
 
     it("getDashboard calls correct path", async () => {

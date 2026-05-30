@@ -1,0 +1,87 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>Finlynq Mobile · Transactions</title>
+  <link rel="stylesheet" href="../tokens.css" />
+</head>
+<body>
+  <div class="stage">
+    <div class="stage-title">Transactions</div>
+    <div class="stage-sub">Rebuilt to mirror Account Detail — FlatList always rendered (flex:1), loading/error/empty via ListEmptyComponent · rows unwrap the /api/transactions {data,total} envelope · category subtitle per row · search · tap to view · long-press Edit / Delete · pull-to-refresh · "+ Add" · tab bar clears the OS gesture bar via safe-area inset</div>
+
+    <!-- LIGHT -->
+    <div class="device-wrap">
+      <div class="device-label">Light</div>
+      <div class="device">
+        <div class="screen light">
+          <div class="dynamic-island"></div>
+          <div class="statusbar"><span class="time">9:41</span><span class="sb-icons">▮▮▮ ⏶ 100﹪</span></div>
+          <div class="content">
+            <div class="header-row"><h1 class="h1 sm">Transactions</h1><button class="btn primary sm">+ Add</button></div>
+            <div class="searchbar"><span class="ico"><svg class="licon sm"><use href="../icons.svg#i-search"/></svg></span><span class="ph">Search transactions…</span></div>
+            <p class="hint" style="margin-bottom:var(--sp-sm)">Tap to view · long-press for actions</p>
+
+            <div class="list-row"><div class="indicator out"><svg class="licon"><use href="../icons.svg#i-out"/></svg></div><div class="lr-main"><div class="lr-title">Loblaws</div><div class="lr-sub">May 28 · Groceries</div></div><div class="lr-amt">−$84.32</div><span class="chev">›</span></div>
+            <div class="list-row"><div class="indicator in"><svg class="licon"><use href="../icons.svg#i-in"/></svg></div><div class="lr-main"><div class="lr-title">Acme Payroll</div><div class="lr-sub">May 27 · Salary</div></div><div class="lr-amt pos">+$3,100.00</div><span class="chev">›</span></div>
+            <div class="list-row"><div class="indicator out"><svg class="licon"><use href="../icons.svg#i-out"/></svg></div><div class="lr-main"><div class="lr-title">Tim Hortons</div><div class="lr-sub">May 27 · Dining</div></div><div class="lr-amt">−$6.45</div><span class="chev">›</span></div>
+            <div class="list-row"><div class="indicator out"><svg class="licon"><use href="../icons.svg#i-out"/></svg></div><div class="lr-main"><div class="lr-title">Hydro One</div><div class="lr-sub">May 26 · Utilities</div></div><div class="lr-amt">−$112.00</div><span class="chev">›</span></div>
+            <div class="list-row"><div class="indicator out"><svg class="licon"><use href="../icons.svg#i-out"/></svg></div><div class="lr-main"><div class="lr-title">Amazon</div><div class="lr-sub">May 25 · Shopping</div></div><div class="lr-amt">−$43.19</div><span class="chev">›</span></div>
+            <div class="list-row"><div class="indicator out"><svg class="licon"><use href="../icons.svg#i-out"/></svg></div><div class="lr-main"><div class="lr-title">Petro-Canada</div><div class="lr-sub">May 24 · Transport</div></div><div class="lr-amt">−$58.70</div><span class="chev">›</span></div>
+            <div class="list-row"><div class="indicator out"><svg class="licon"><use href="../icons.svg#i-out"/></svg></div><div class="lr-main"><div class="lr-title">Netflix</div><div class="lr-sub">May 23 · Subscriptions</div></div><div class="lr-amt">−$20.99</div><span class="chev">›</span></div>
+            <div class="list-row"><div class="indicator in"><svg class="licon"><use href="../icons.svg#i-in"/></svg></div><div class="lr-main"><div class="lr-title">Interac e-Transfer</div><div class="lr-sub">May 22 · Transfer</div></div><div class="lr-amt pos">+$250.00</div><span class="chev">›</span></div>
+            <div class="list-row"><div class="indicator out"><svg class="licon"><use href="../icons.svg#i-out"/></svg></div><div class="lr-main"><div class="lr-title">Shoppers Drug Mart</div><div class="lr-sub">May 21 · Health</div></div><div class="lr-amt">−$31.40</div><span class="chev">›</span></div>
+            <div class="list-row"><div class="indicator out"><svg class="licon"><use href="../icons.svg#i-out"/></svg></div><div class="lr-main"><div class="lr-title">Spotify</div><div class="lr-sub">May 20 · Subscriptions</div></div><div class="lr-amt">−$11.29</div><span class="chev">›</span></div>
+            <div class="list-row"><div class="indicator out"><svg class="licon"><use href="../icons.svg#i-out"/></svg></div><div class="lr-main"><div class="lr-title">Rent — May</div><div class="lr-sub">May 1 · Housing</div></div><div class="lr-amt">−$1,850.00</div><span class="chev">›</span></div>
+          </div>
+          <div class="tabbar">
+            <div class="tab"><svg class="licon"><use href="../icons.svg#i-home"/></svg>Home</div>
+            <div class="tab"><svg class="licon"><use href="../icons.svg#i-accounts"/></svg>Accounts</div>
+            <div class="tab"><svg class="licon"><use href="../icons.svg#i-portfolio"/></svg>Portfolio</div>
+            <div class="tab active"><svg class="licon"><use href="../icons.svg#i-txns"/></svg>Txns</div>
+            <div class="tab"><svg class="licon"><use href="../icons.svg#i-more"/></svg>More</div>
+          </div>
+          <div class="home-indicator"></div>
+        </div>
+      </div>
+    </div>
+
+    <!-- DARK -->
+    <div class="device-wrap">
+      <div class="device-label">Dark</div>
+      <div class="device">
+        <div class="screen dark">
+          <div class="dynamic-island"></div>
+          <div class="statusbar"><span class="time">9:41</span><span class="sb-icons">▮▮▮ ⏶ 100﹪</span></div>
+          <div class="content">
+            <div class="header-row"><h1 class="h1 sm">Transactions</h1><button class="btn primary sm">+ Add</button></div>
+            <div class="searchbar"><span class="ico"><svg class="licon sm"><use href="../icons.svg#i-search"/></svg></span><span class="ph">Search transactions…</span></div>
+            <p class="hint" style="margin-bottom:var(--sp-sm)">Tap to view · long-press for actions</p>
+
+            <div class="list-row"><div class="indicator out"><svg class="licon"><use href="../icons.svg#i-out"/></svg></div><div class="lr-main"><div class="lr-title">Loblaws</div><div class="lr-sub">May 28 · Groceries</div></div><div class="lr-amt">−$84.32</div><span class="chev">›</span></div>
+            <div class="list-row"><div class="indicator in"><svg class="licon"><use href="../icons.svg#i-in"/></svg></div><div class="lr-main"><div class="lr-title">Acme Payroll</div><div class="lr-sub">May 27 · Salary</div></div><div class="lr-amt pos">+$3,100.00</div><span class="chev">›</span></div>
+            <div class="list-row"><div class="indicator out"><svg class="licon"><use href="../icons.svg#i-out"/></svg></div><div class="lr-main"><div class="lr-title">Tim Hortons</div><div class="lr-sub">May 27 · Dining</div></div><div class="lr-amt">−$6.45</div><span class="chev">›</span></div>
+            <div class="list-row"><div class="indicator out"><svg class="licon"><use href="../icons.svg#i-out"/></svg></div><div class="lr-main"><div class="lr-title">Hydro One</div><div class="lr-sub">May 26 · Utilities</div></div><div class="lr-amt">−$112.00</div><span class="chev">›</span></div>
+            <div class="list-row"><div class="indicator out"><svg class="licon"><use href="../icons.svg#i-out"/></svg></div><div class="lr-main"><div class="lr-title">Amazon</div><div class="lr-sub">May 25 · Shopping</div></div><div class="lr-amt">−$43.19</div><span class="chev">›</span></div>
+            <div class="list-row"><div class="indicator out"><svg class="licon"><use href="../icons.svg#i-out"/></svg></div><div class="lr-main"><div class="lr-title">Petro-Canada</div><div class="lr-sub">May 24 · Transport</div></div><div class="lr-amt">−$58.70</div><span class="chev">›</span></div>
+            <div class="list-row"><div class="indicator out"><svg class="licon"><use href="../icons.svg#i-out"/></svg></div><div class="lr-main"><div class="lr-title">Netflix</div><div class="lr-sub">May 23 · Subscriptions</div></div><div class="lr-amt">−$20.99</div><span class="chev">›</span></div>
+            <div class="list-row"><div class="indicator in"><svg class="licon"><use href="../icons.svg#i-in"/></svg></div><div class="lr-main"><div class="lr-title">Interac e-Transfer</div><div class="lr-sub">May 22 · Transfer</div></div><div class="lr-amt pos">+$250.00</div><span class="chev">›</span></div>
+            <div class="list-row"><div class="indicator out"><svg class="licon"><use href="../icons.svg#i-out"/></svg></div><div class="lr-main"><div class="lr-title">Shoppers Drug Mart</div><div class="lr-sub">May 21 · Health</div></div><div class="lr-amt">−$31.40</div><span class="chev">›</span></div>
+            <div class="list-row"><div class="indicator out"><svg class="licon"><use href="../icons.svg#i-out"/></svg></div><div class="lr-main"><div class="lr-title">Spotify</div><div class="lr-sub">May 20 · Subscriptions</div></div><div class="lr-amt">−$11.29</div><span class="chev">›</span></div>
+            <div class="list-row"><div class="indicator out"><svg class="licon"><use href="../icons.svg#i-out"/></svg></div><div class="lr-main"><div class="lr-title">Rent — May</div><div class="lr-sub">May 1 · Housing</div></div><div class="lr-amt">−$1,850.00</div><span class="chev">›</span></div>
+          </div>
+          <div class="tabbar">
+            <div class="tab"><svg class="licon"><use href="../icons.svg#i-home"/></svg>Home</div>
+            <div class="tab"><svg class="licon"><use href="../icons.svg#i-accounts"/></svg>Accounts</div>
+            <div class="tab"><svg class="licon"><use href="../icons.svg#i-portfolio"/></svg>Portfolio</div>
+            <div class="tab active"><svg class="licon"><use href="../icons.svg#i-txns"/></svg>Txns</div>
+            <div class="tab"><svg class="licon"><use href="../icons.svg#i-more"/></svg>More</div>
+          </div>
+          <div class="home-indicator"></div>
+        </div>
+      </div>
+    </div>
+  </div>
+</body>
+</html>

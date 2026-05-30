@@ -114,5 +114,48 @@ jest.mock("react-native-reanimated", () => ({
   runOnJS: jest.fn((fn) => fn),
 }));
 
+// Mock react-native-svg — the real module references RN internals that aren't
+// present in this stubbed node test env (throws "reading 'Mixin'"). lucide
+// depends on it transitively.
+jest.mock("react-native-svg", () => {
+  const React = require("react");
+  const stub = (name) => (props) => React.createElement(name, props, props && props.children);
+  return {
+    __esModule: true,
+    default: stub("Svg"),
+    Svg: stub("Svg"),
+    Circle: stub("Circle"),
+    Ellipse: stub("Ellipse"),
+    G: stub("G"),
+    Path: stub("Path"),
+    Rect: stub("Rect"),
+    Line: stub("Line"),
+    Polyline: stub("Polyline"),
+    Polygon: stub("Polygon"),
+    Text: stub("SvgText"),
+    Defs: stub("Defs"),
+    LinearGradient: stub("LinearGradient"),
+    Stop: stub("Stop"),
+    ClipPath: stub("ClipPath"),
+  };
+});
+
+// Mock lucide-react-native so any icon import renders as a simple stub without
+// loading the native SVG renderer. Proxy covers every named icon export.
+jest.mock("lucide-react-native", () => {
+  const React = require("react");
+  const Stub = (props) => React.createElement("LucideIcon", props, props && props.children);
+  return new Proxy(
+    { __esModule: true },
+    {
+      get: (_target, prop) => {
+        if (prop === "__esModule") return true;
+        if (typeof prop === "symbol") return undefined;
+        return Stub;
+      },
+    }
+  );
+});
+
 // Silence warnings
 jest.spyOn(console, "warn").mockImplementation(() => {});

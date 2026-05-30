@@ -12,6 +12,7 @@ import { SafeAreaView } from "react-native-safe-area-context";
 import * as DocumentPicker from "expo-document-picker";
 import { useTheme } from "../theme";
 import { getServerUrl } from "../api/client";
+import { logger } from "../lib/logger";
 
 interface PreviewRow {
   date: string;
@@ -92,15 +93,21 @@ export default function ImportScreen() {
         method: "POST",
         body: formData,
       });
-      const data = await res.json();
+      // /api/import/preview returns BARE JSON (no { success, data } envelope) —
+      // success is the HTTP status, the body IS the PreviewResult.
+      const data = await res.json().catch(() => ({}));
 
-      if (data.success) {
-        setPreview(data.data);
+      if (res.ok) {
+        logger.info("import", "preview ok", { type: data?.type, status: res.status });
+        setPreview(data as PreviewResult);
         setStep("preview");
       } else {
-        Alert.alert("Preview Error", data.error || "Failed to preview file");
+        logger.warn("import", "preview rejected", { status: res.status, error: data?.error });
+        Alert.alert("Preview Error", data?.error || "Failed to preview file");
       }
     } catch (err) {
+      const detail = err instanceof Error ? `${err.name}: ${err.message}` : String(err);
+      logger.error("import", "preview threw", { detail });
       Alert.alert("Error", "Cannot connect to server or read file");
     } finally {
       setLoading(false);
@@ -135,15 +142,23 @@ export default function ImportScreen() {
           forceImportIndices: forceIndices,
         }),
       });
-      const data = await res.json();
+      // /api/import/execute returns BARE JSON — the body IS the ImportResult.
+      const data = await res.json().catch(() => ({}));
 
-      if (data.success) {
-        setImportResult(data.data);
+      if (res.ok) {
+        logger.info("import", "execute ok", {
+          imported: data?.imported,
+          total: data?.total,
+        });
+        setImportResult(data as ImportResult);
         setStep("result");
       } else {
-        Alert.alert("Import Error", data.error || "Failed to import");
+        logger.warn("import", "execute rejected", { status: res.status, error: data?.error });
+        Alert.alert("Import Error", data?.error || "Failed to import");
       }
-    } catch {
+    } catch (e) {
+      const detail = e instanceof Error ? `${e.name}: ${e.message}` : String(e);
+      logger.error("import", "execute threw", { detail });
       Alert.alert("Error", "Cannot connect to server");
     } finally {
       setLoading(false);
@@ -211,9 +226,9 @@ export default function ImportScreen() {
 
               {/* Stats */}
               <View style={styles.statsRow}>
-                <View style={[styles.stat, { backgroundColor: colors.chart3 + "15" }]}>
-                  <Text style={[styles.statNum, { color: colors.chart3 }]}>{validCount}</Text>
-                  <Text style={[styles.statLabel, { color: colors.chart3 }]}>Valid</Text>
+                <View style={[styles.stat, { backgroundColor: colors.pos + "15" }]}>
+                  <Text style={[styles.statNum, { color: colors.pos }]}>{validCount}</Text>
+                  <Text style={[styles.statLabel, { color: colors.pos }]}>Valid</Text>
                 </View>
                 {dupCount > 0 && (
                   <View style={[styles.stat, { backgroundColor: colors.chart4 + "15" }]}>
@@ -253,7 +268,7 @@ export default function ImportScreen() {
                   <Text
                     style={[
                       styles.previewAmount,
-                      { color: row.amount >= 0 ? colors.chart3 : colors.foreground },
+                      { color: row.amount >= 0 ? colors.pos : colors.foreground },
                     ]}
                   >
                     {formatCurrency(row.amount)}
@@ -334,7 +349,7 @@ export default function ImportScreen() {
             <View
               style={[styles.card, { backgroundColor: colors.card, borderColor: colors.border }]}
             >
-              <Text style={[styles.successIcon, { color: colors.chart3 }]}>✓</Text>
+              <Text style={[styles.successIcon, { color: colors.pos }]}>✓</Text>
               <Text style={[styles.successTitle, { color: colors.foreground }]}>
                 Import Complete
               </Text>

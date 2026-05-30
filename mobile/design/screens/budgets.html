@@ -1,0 +1,157 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>Finlynq Mobile · Budgets</title>
+  <link rel="stylesheet" href="../tokens.css" />
+</head>
+<body>
+  <div class="stage">
+    <div class="stage-title">Budgets</div>
+    <div class="stage-sub">Month nav · overall summary · per-category cards (over-budget in red) · long-press to edit/delete</div>
+
+    <!-- LIGHT -->
+    <div class="device-wrap">
+      <div class="device-label">Light</div>
+      <div class="device">
+        <div class="screen light">
+          <div class="dynamic-island"></div>
+          <div class="statusbar"><span class="time">9:41</span><span class="sb-icons">▮▮▮ ⏶ 100﹪</span></div>
+          <div class="content">
+            <div class="header-row"><h1 class="h1 sm">Budgets</h1><button class="btn primary sm">+ Add</button></div>
+
+            <div class="row between" style="padding:6px 0 var(--sp-md)">
+              <span class="link">← Prev</span>
+              <span style="font-size:var(--fs-lg);font-weight:700">May 2026</span>
+              <span class="link">Next →</span>
+            </div>
+
+            <!-- overall summary -->
+            <div class="card">
+              <div class="row between">
+                <div><p class="sub-label">Spent</p><p class="value lg tnum">$1,390</p></div>
+                <div style="text-align:right"><p class="sub-label">Budgeted</p><p class="value lg tnum" style="color:var(--primary)">$1,590</p></div>
+              </div>
+              <div class="progress tall" style="margin:var(--sp-md) 0 8px"><i style="width:87%"></i></div>
+              <p class="hint" style="text-align:center;margin:0">$200 remaining</p>
+            </div>
+
+            <!-- per-category -->
+            <div class="card tight">
+              <div class="row between" style="margin-bottom:6px"><span style="font-weight:600">Groceries</span><span class="muted" style="font-size:12px">Food</span></div>
+              <div style="margin-bottom:4px"><span style="font-weight:700" class="tnum">$520</span><span class="muted tnum"> of $600</span></div>
+              <div class="progress"><i style="width:87%"></i></div>
+              <p class="muted" style="font-size:12px;margin:6px 0 0">$80 remaining</p>
+            </div>
+            <div class="card tight">
+              <div class="row between" style="margin-bottom:6px"><span style="font-weight:600">Dining</span><span class="muted" style="font-size:12px">Food</span></div>
+              <div style="margin-bottom:4px"><span style="font-weight:700" class="tnum">$310</span><span class="muted tnum"> of $250</span></div>
+              <div class="progress"><i class="over" style="width:100%"></i></div>
+              <p class="neg" style="font-size:12px;margin:6px 0 0">$60 over budget</p>
+            </div>
+            <div class="card tight">
+              <div class="row between" style="margin-bottom:6px"><span style="font-weight:600">Transport</span><span class="muted" style="font-size:12px">Auto</span></div>
+              <div style="margin-bottom:4px"><span style="font-weight:700" class="tnum">$140</span><span class="muted tnum"> of $200</span></div>
+              <div class="progress"><i style="width:70%"></i></div>
+              <p class="muted" style="font-size:12px;margin:6px 0 0">$60 remaining</p>
+            </div>
+            <div class="card tight">
+              <div class="row between" style="margin-bottom:6px"><span style="font-weight:600">Shopping</span><span class="muted" style="font-size:12px">Lifestyle</span></div>
+              <div style="margin-bottom:4px"><span style="font-weight:700" class="tnum">$180</span><span class="muted tnum"> of $300</span></div>
+              <div class="progress"><i style="width:60%"></i></div>
+              <p class="muted" style="font-size:12px;margin:6px 0 0">$120 remaining</p>
+            </div>
+            <div class="card tight">
+              <div class="row between" style="margin-bottom:6px"><span style="font-weight:600">Utilities</span><span class="muted" style="font-size:12px">Home</span></div>
+              <div style="margin-bottom:4px"><span style="font-weight:700" class="tnum">$240</span><span class="muted tnum"> of $240</span></div>
+              <div class="progress"><i style="width:100%"></i></div>
+              <p class="muted" style="font-size:12px;margin:6px 0 0">$0 remaining</p>
+            </div>
+
+            <p class="hint">Long-press a budget to edit or delete</p>
+          </div>
+          <div class="tabbar">
+            <div class="tab"><svg class="licon"><use href="../icons.svg#i-home"/></svg>Home</div>
+            <div class="tab"><svg class="licon"><use href="../icons.svg#i-accounts"/></svg>Accounts</div>
+            <div class="tab"><svg class="licon"><use href="../icons.svg#i-portfolio"/></svg>Portfolio</div>
+            <div class="tab"><svg class="licon"><use href="../icons.svg#i-txns"/></svg>Txns</div>
+            <div class="tab active"><svg class="licon"><use href="../icons.svg#i-more"/></svg>More</div>
+          </div>
+          <div class="home-indicator"></div>
+        </div>
+      </div>
+    </div>
+
+    <!-- DARK -->
+    <div class="device-wrap">
+      <div class="device-label">Dark</div>
+      <div class="device">
+        <div class="screen dark">
+          <div class="dynamic-island"></div>
+          <div class="statusbar"><span class="time">9:41</span><span class="sb-icons">▮▮▮ ⏶ 100﹪</span></div>
+          <div class="content">
+            <div class="header-row"><h1 class="h1 sm">Budgets</h1><button class="btn primary sm">+ Add</button></div>
+
+            <div class="row between" style="padding:6px 0 var(--sp-md)">
+              <span class="link">← Prev</span>
+              <span style="font-size:var(--fs-lg);font-weight:700">May 2026</span>
+              <span class="link">Next →</span>
+            </div>
+
+            <div class="card">
+              <div class="row between">
+                <div><p class="sub-label">Spent</p><p class="value lg tnum">$1,390</p></div>
+                <div style="text-align:right"><p class="sub-label">Budgeted</p><p class="value lg tnum" style="color:var(--primary)">$1,590</p></div>
+              </div>
+              <div class="progress tall" style="margin:var(--sp-md) 0 8px"><i style="width:87%"></i></div>
+              <p class="hint" style="text-align:center;margin:0">$200 remaining</p>
+            </div>
+
+            <div class="card tight">
+              <div class="row between" style="margin-bottom:6px"><span style="font-weight:600">Groceries</span><span class="muted" style="font-size:12px">Food</span></div>
+              <div style="margin-bottom:4px"><span style="font-weight:700" class="tnum">$520</span><span class="muted tnum"> of $600</span></div>
+              <div class="progress"><i style="width:87%"></i></div>
+              <p class="muted" style="font-size:12px;margin:6px 0 0">$80 remaining</p>
+            </div>
+            <div class="card tight">
+              <div class="row between" style="margin-bottom:6px"><span style="font-weight:600">Dining</span><span class="muted" style="font-size:12px">Food</span></div>
+              <div style="margin-bottom:4px"><span style="font-weight:700" class="tnum">$310</span><span class="muted tnum"> of $250</span></div>
+              <div class="progress"><i class="over" style="width:100%"></i></div>
+              <p class="neg" style="font-size:12px;margin:6px 0 0">$60 over budget</p>
+            </div>
+            <div class="card tight">
+              <div class="row between" style="margin-bottom:6px"><span style="font-weight:600">Transport</span><span class="muted" style="font-size:12px">Auto</span></div>
+              <div style="margin-bottom:4px"><span style="font-weight:700" class="tnum">$140</span><span class="muted tnum"> of $200</span></div>
+              <div class="progress"><i style="width:70%"></i></div>
+              <p class="muted" style="font-size:12px;margin:6px 0 0">$60 remaining</p>
+            </div>
+            <div class="card tight">
+              <div class="row between" style="margin-bottom:6px"><span style="font-weight:600">Shopping</span><span class="muted" style="font-size:12px">Lifestyle</span></div>
+              <div style="margin-bottom:4px"><span style="font-weight:700" class="tnum">$180</span><span class="muted tnum"> of $300</span></div>
+              <div class="progress"><i style="width:60%"></i></div>
+              <p class="muted" style="font-size:12px;margin:6px 0 0">$120 remaining</p>
+            </div>
+            <div class="card tight">
+              <div class="row between" style="margin-bottom:6px"><span style="font-weight:600">Utilities</span><span class="muted" style="font-size:12px">Home</span></div>
+              <div style="margin-bottom:4px"><span style="font-weight:700" class="tnum">$240</span><span class="muted tnum"> of $240</span></div>
+              <div class="progress"><i style="width:100%"></i></div>
+              <p class="muted" style="font-size:12px;margin:6px 0 0">$0 remaining</p>
+            </div>
+
+            <p class="hint">Long-press a budget to edit or delete</p>
+          </div>
+          <div class="tabbar">
+            <div class="tab"><svg class="licon"><use href="../icons.svg#i-home"/></svg>Home</div>
+            <div class="tab"><svg class="licon"><use href="../icons.svg#i-accounts"/></svg>Accounts</div>
+            <div class="tab"><svg class="licon"><use href="../icons.svg#i-portfolio"/></svg>Portfolio</div>
+            <div class="tab"><svg class="licon"><use href="../icons.svg#i-txns"/></svg>Txns</div>
+            <div class="tab active"><svg class="licon"><use href="../icons.svg#i-more"/></svg>More</div>
+          </div>
+          <div class="home-indicator"></div>
+        </div>
+      </div>
+    </div>
+  </div>
+</body>
+</html>

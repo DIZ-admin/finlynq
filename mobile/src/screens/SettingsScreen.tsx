@@ -12,7 +12,8 @@ import {
 import { SafeAreaView } from "react-native-safe-area-context";
 import { useTheme } from "../theme";
 import { useAuth } from "../hooks/useAuth";
-import { getServerUrl, setServerUrl } from "../api/client";
+import { getServerUrl } from "../api/client";
+import { getLogs, clearLogs, type LogEntry, type LogLevel } from "../lib/logger";
 
 const AUTO_LOCK_OPTIONS = [
   { label: "Disabled", value: 0 },
@@ -25,48 +26,55 @@ const AUTO_LOCK_OPTIONS = [
 export default function SettingsScreen() {
   const theme = useTheme();
   const {
-    lock,
-    serverMode,
-    resetMode,
+    signOut,
+    saveServerUrl,
     biometricAvailable,
     biometricEnabled,
     setBiometricEnabled,
     autoLockMinutes,
     setAutoLockMinutes,
   } = useAuth();
-  const isCloud = serverMode === "cloud";
   const [url, setUrl] = useState(getServerUrl());
   const [saved, setSaved] = useState(false);
+  const [logs, setLogs] = useState<LogEntry[]>([]);
+  const [showLogs, setShowLogs] = useState(false);
 
   const colors = theme.colors;
 
-  const handleSaveUrl = () => {
-    setServerUrl(url);
+  const logColor = (level: LogLevel): string =>
+    level === "error"
+      ? colors.destructive
+      : level === "warn"
+        ? colors.primary
+        : colors.mutedForeground;
+
+  const refreshLogs = () => setLogs(getLogs().slice(-80).reverse());
+  const toggleLogs = () => {
+    if (!showLogs) refreshLogs();
+    setShowLogs((v) => !v);
+  };
+  const handleClearLogs = () => {
+    clearLogs();
+    setLogs([]);
+  };
+
+  function logTime(ts: number): string {
+    const d = new Date(ts);
+    const p = (n: number) => String(n).padStart(2, "0");
+    return `${p(d.getHours())}:${p(d.getMinutes())}:${p(d.getSeconds())}`;
+  }
+
+  const handleSaveUrl = async () => {
+    await saveServerUrl(url);
     setSaved(true);
     setTimeout(() => setSaved(false), 2000);
   };
 
-  const handleLock = () => {
-    const title = isCloud ? "Sign Out" : "Lock App";
-    const message = isCloud
-      ? "Are you sure you want to sign out?"
-      : "Are you sure you want to lock the app?";
-    const action = isCloud ? "Sign Out" : "Lock";
-    Alert.alert(title, message, [
+  const handleSignOut = () => {
+    Alert.alert("Sign Out", "Are you sure you want to sign out?", [
       { text: "Cancel", style: "cancel" },
-      { text: action, style: "destructive", onPress: lock },
+      { text: "Sign Out", style: "destructive", onPress: signOut },
     ]);
-  };
-
-  const handleSwitchMode = () => {
-    Alert.alert(
-      "Switch Mode",
-      "This will sign you out and return to the mode selection screen.",
-      [
-        { text: "Cancel", style: "cancel" },
-        { text: "Switch", style: "destructive", onPress: resetMode },
-      ]
-    );
   };
 
   return (
@@ -134,7 +142,9 @@ export default function SettingsScreen() {
               Auto-Lock After
             </Text>
             <Text style={[styles.settingDesc, { color: colors.mutedForeground }]}>
-              Automatically lock when app is in background
+              {biometricEnabled
+                ? "Automatically lock when app is in background"
+                : "Enable biometric unlock for auto-lock to take effect"}
             </Text>
             <View style={styles.chipRow}>
               {AUTO_LOCK_OPTIONS.map((opt) => (
@@ -168,15 +178,66 @@ export default function SettingsScreen() {
             </View>
           </View>
 
-          {/* Lock / Sign Out button */}
+          {/* Sign Out button */}
           <TouchableOpacity
             style={[styles.button, { backgroundColor: colors.destructive, marginTop: 12 }]}
-            onPress={handleLock}
+            onPress={handleSignOut}
           >
             <Text style={[styles.buttonText, { color: colors.destructiveForeground }]}>
-              {isCloud ? "Sign Out" : "Lock App Now"}
+              Sign Out
             </Text>
           </TouchableOpacity>
+        </View>
+
+        {/* Diagnostics — on-device view of the app log (no adb needed). */}
+        <Text style={[styles.sectionTitle, { color: colors.mutedForeground }]}>DIAGNOSTICS</Text>
+        <View style={[styles.card, { backgroundColor: colors.card, borderColor: colors.border }]}>
+          <Text style={[styles.settingDesc, { color: colors.mutedForeground, marginBottom: 10 }]}>
+            Recent app log (API calls, auth, errors). Useful for diagnosing
+            connection or data issues.
+          </Text>
+          <View style={styles.diagBtnRow}>
+            <TouchableOpacity
+              style={[styles.diagBtn, { backgroundColor: colors.secondary, borderColor: colors.border }]}
+              onPress={toggleLogs}
+            >
+              <Text style={[styles.diagBtnText, { color: colors.foreground }]}>
+                {showLogs ? "Hide log" : "Show recent log"}
+              </Text>
+            </TouchableOpacity>
+            {showLogs && (
+              <>
+                <TouchableOpacity
+                  style={[styles.diagBtn, { backgroundColor: colors.secondary, borderColor: colors.border }]}
+                  onPress={refreshLogs}
+                >
+                  <Text style={[styles.diagBtnText, { color: colors.foreground }]}>Refresh</Text>
+                </TouchableOpacity>
+                <TouchableOpacity
+                  style={[styles.diagBtn, { backgroundColor: colors.secondary, borderColor: colors.border }]}
+                  onPress={handleClearLogs}
+                >
+                  <Text style={[styles.diagBtnText, { color: colors.destructive }]}>Clear</Text>
+                </TouchableOpacity>
+              </>
+            )}
+          </View>
+
+          {showLogs && (
+            <View style={[styles.logBox, { backgroundColor: colors.background, borderColor: colors.border }]}>
+              {logs.length === 0 ? (
+                <Text style={[styles.logEmpty, { color: colors.mutedForeground }]}>
+                  No log entries yet.
+                </Text>
+              ) : (
+                logs.map((e, i) => (
+                  <Text key={i} style={[styles.logLine, { color: logColor(e.level) }]}>
+                    {logTime(e.ts)} {e.level.toUpperCase()} {e.tag}: {e.msg}
+                  </Text>
+                ))
+              )}
+            </View>
+          )}
         </View>
 
         {/* About */}
@@ -184,17 +245,11 @@ export default function SettingsScreen() {
         <View style={[styles.card, { backgroundColor: colors.card, borderColor: colors.border }]}>
           <View style={[styles.aboutRow, { borderBottomColor: colors.border }]}>
             <Text style={[styles.aboutLabel, { color: colors.mutedForeground }]}>App</Text>
-            <Text style={[styles.aboutValue, { color: colors.foreground }]}>PF Mobile</Text>
+            <Text style={[styles.aboutValue, { color: colors.foreground }]}>Finlynq</Text>
           </View>
           <View style={[styles.aboutRow, { borderBottomColor: colors.border }]}>
             <Text style={[styles.aboutLabel, { color: colors.mutedForeground }]}>Version</Text>
             <Text style={[styles.aboutValue, { color: colors.foreground }]}>1.0.0</Text>
-          </View>
-          <View style={[styles.aboutRow, { borderBottomColor: colors.border }]}>
-            <Text style={[styles.aboutLabel, { color: colors.mutedForeground }]}>Mode</Text>
-            <Text style={[styles.aboutValue, { color: colors.foreground }]}>
-              {isCloud ? "Cloud" : "Self-Hosted"}
-            </Text>
           </View>
           <View style={[styles.aboutRow, { borderBottomColor: colors.border }]}>
             <Text style={[styles.aboutLabel, { color: colors.mutedForeground }]}>Platform</Text>
@@ -209,14 +264,6 @@ export default function SettingsScreen() {
             </Text>
           </View>
         </View>
-
-        {/* Switch mode */}
-        <TouchableOpacity
-          style={[styles.card, { backgroundColor: colors.card, borderColor: colors.border, alignItems: "center" }]}
-          onPress={handleSwitchMode}
-        >
-          <Text style={[styles.switchModeText, { color: colors.primary }]}>Switch Mode</Text>
-        </TouchableOpacity>
 
         <View style={styles.footer}>
           <Text style={[styles.footerText, { color: colors.mutedForeground }]}>
@@ -280,6 +327,22 @@ const styles = StyleSheet.create({
     borderWidth: StyleSheet.hairlineWidth,
   },
   chipText: { fontSize: 13, fontWeight: "500" },
+  diagBtnRow: { flexDirection: "row", flexWrap: "wrap", gap: 8 },
+  diagBtn: {
+    paddingHorizontal: 14,
+    paddingVertical: 8,
+    borderRadius: 8,
+    borderWidth: StyleSheet.hairlineWidth,
+  },
+  diagBtnText: { fontSize: 13, fontWeight: "600" },
+  logBox: {
+    marginTop: 12,
+    borderRadius: 8,
+    borderWidth: StyleSheet.hairlineWidth,
+    padding: 10,
+  },
+  logEmpty: { fontSize: 12 },
+  logLine: { fontSize: 11, fontFamily: "monospace", marginBottom: 3, lineHeight: 15 },
   aboutRow: {
     flexDirection: "row",
     justifyContent: "space-between",
@@ -289,7 +352,6 @@ const styles = StyleSheet.create({
   },
   aboutLabel: { fontSize: 14 },
   aboutValue: { fontSize: 14, fontWeight: "500" },
-  switchModeText: { fontSize: 15, fontWeight: "600" },
   footer: { alignItems: "center", paddingVertical: 24 },
   footerText: { fontSize: 13 },
 });
