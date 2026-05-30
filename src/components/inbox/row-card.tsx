@@ -2,8 +2,8 @@
 
 /**
  * RowCard — single bank-row presentation for the Approve-each lens
- * (/inbox To-approve tab). Matches the reconcile-v4 preview spec at
- * pf-app/src/app/preview/reconcile-v4/page.tsx (RowCard).
+ * (/inbox To-approve tab). Originally prototyped in the reconcile-v4 preview
+ * page (since removed).
  *
  * Pure presentation — every action bubbles to the parent via callbacks.
  * The parent owns the fetch lifecycle and the busy state.
