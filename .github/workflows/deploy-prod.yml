@@ -3,6 +3,10 @@ name: Deploy Production
 on:
   push:
     branches: [main]
+    # A mobile-only commit must NOT trigger a web build + SSH redeploy of
+    # finlynq.com. Commits that touch any non-mobile path still deploy.
+    paths-ignore:
+      - 'mobile/**'
 
 concurrency:
   group: deploy-production

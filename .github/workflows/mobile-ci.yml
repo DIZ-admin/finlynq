@@ -1,0 +1,50 @@
+name: Mobile CI
+
+# Mobile gets its own lane, decoupled from the web build/deploy workflows.
+# Runs only when mobile (or the shared type contract) actually changes, so a
+# web-only commit never triggers it and a mobile-only commit never triggers
+# the web workflows (see paths-ignore in ci.yml / deploy-dev.yml / deploy-prod.yml).
+on:
+  push:
+    branches: [dev, main, mobile-dev]
+    paths:
+      - 'mobile/**'
+      - 'shared/**'
+      - '.github/workflows/mobile-ci.yml'
+  pull_request:
+    paths:
+      - 'mobile/**'
+      - 'shared/**'
+      - '.github/workflows/mobile-ci.yml'
+
+concurrency:
+  group: mobile-ci-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  test:
+    name: Typecheck & Test (mobile)
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: mobile
+    steps:
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4.3.1
+
+      - name: Setup Node.js
+        uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4.4.0
+        with:
+          node-version: '20'
+          cache: 'npm'
+          cache-dependency-path: mobile/package-lock.json
+
+      - name: Install dependencies
+        run: npm ci
+
+      - name: Type check
+        # Mobile tsconfig pulls in ../shared/** — the full repo is checked out,
+        # so the shared type contract is typechecked against the mobile app here.
+        run: npx tsc --noEmit
+
+      - name: Jest
+        run: npm test -- --ci
