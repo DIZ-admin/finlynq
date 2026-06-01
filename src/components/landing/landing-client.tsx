@@ -86,6 +86,28 @@ const PLAN_FEATS = [
   "REST API + MCP (HTTP & stdio · OAuth 2.1 + DCR)",
 ];
 
+const ROADMAP_POINTS = [
+  {
+    label: "Live now",
+    desc: "Encrypted finances, a built-in MCP server for any AI, multi-currency portfolios, budgets, and imports.",
+  },
+  {
+    label: "Building",
+    desc: "A native mobile app (Android first, then iOS) and automatic bank and brokerage connections.",
+  },
+  {
+    label: "Up next",
+    desc: "Receipt OCR, smarter categorization, deeper budgeting and investing, debt payoff, retirement planning, tax tools, and custom dashboards.",
+  },
+  {
+    label: "Exploring",
+    desc: "Full retirement planning, notifications, freelancer tools, and household sharing.",
+  },
+] as const;
+
+const ROADMAP_LEDE =
+  "What's live, what we're building, and what's next. Directional, not a contract: Finlynq is open source.";
+
 function LogoMark() {
   return (
     <span className="logo-mark" aria-hidden="true">
@@ -257,6 +279,7 @@ export function LandingClient() {
             <a href="#flow">How it works</a>
             <a href="#mcp">MCP</a>
             <a href="#privacy">Privacy</a>
+            <a href="#roadmap">Roadmap</a>
             <a href="#pricing">Pricing</a>
           </nav>
           <div className="nav-cta">
@@ -711,6 +734,38 @@ export function LandingClient() {
         </div>
       </section>
 
+      {/* ROADMAP */}
+      <section className="fl-section" id="roadmap">
+        <div className="fl-container">
+          <div className="section-head">
+            <div className="reveal">
+              <div className="tag">Roadmap</div>
+              <h2 className="display-l">
+                Where we&apos;re<br />
+                <em>headed</em> next.
+              </h2>
+            </div>
+            <p className="lede reveal d2">{ROADMAP_LEDE}</p>
+          </div>
+
+          <ol className="roadmap-timeline reveal">
+            {ROADMAP_POINTS.map((p) => (
+              <li key={p.label} className="rm-node">
+                <span className="rm-dot" aria-hidden="true" />
+                <div className="rm-label">{p.label}</div>
+                <p className="rm-desc">{p.desc}</p>
+              </li>
+            ))}
+          </ol>
+
+          <div className="roadmap-cta reveal">
+            <Link href="/roadmap" className="btn btn-ghost">
+              See the full roadmap <span aria-hidden="true">→</span>
+            </Link>
+          </div>
+        </div>
+      </section>
+
       {/* PRICING */}
       <section className="fl-section" id="pricing">
         <div className="fl-container">
@@ -833,6 +888,7 @@ export function LandingClient() {
                 <li><a href="#flow">How it works</a></li>
                 <li><Link href="/mcp-guide">MCP guide</Link></li>
                 <li><Link href="/api-docs">API docs</Link></li>
+                <li><Link href="/roadmap">Roadmap</Link></li>
                 <li><Link href="/glossary">Glossary</Link></li>
                 <li><Link href="/blog">Blog</Link></li>
                 <li>
