@@ -3,12 +3,17 @@ import { createNativeStackNavigator } from "@react-navigation/native-stack";
 import AccountsScreen from "../screens/AccountsScreen";
 import AccountDetailScreen from "../screens/AccountDetailScreen";
 import AddAccountScreen from "../screens/AddAccountScreen";
+import AddTransactionScreen from "../screens/AddTransactionScreen";
 import type { AccountBalance } from "../../../shared/types";
 
 export type AccountsStackParamList = {
   AccountsList: undefined;
   AccountDetail: { account: AccountBalance };
   AddAccount: undefined;
+  AddTransaction: {
+    mode?: "expense" | "income" | "transfer";
+    preselectedAccountId?: number;
+  };
 };
 
 const Stack = createNativeStackNavigator<AccountsStackParamList>();
@@ -21,6 +26,11 @@ export default function AccountsStack() {
       <Stack.Screen
         name="AddAccount"
         component={AddAccountScreen}
+        options={{ presentation: "modal" }}
+      />
+      <Stack.Screen
+        name="AddTransaction"
+        component={AddTransactionScreen}
         options={{ presentation: "modal" }}
       />
     </Stack.Navigator>

@@ -17,6 +17,8 @@ import { useTheme } from "../theme";
 import { endpoints } from "../api/client";
 import { logger } from "../lib/logger";
 import { safeName } from "../lib/format";
+import { Icon } from "../components/icon";
+import { PickerSheet, type PickerOption } from "../components/picker-sheet";
 import type { Account, Category } from "../../../shared/types";
 
 type Mode = "expense" | "income" | "transfer";
@@ -28,7 +30,10 @@ function todayStr(): string {
 
 // Read-only nav surface this screen needs — keeps it usable from any stack
 // (Transactions and More both register it).
-type AddRoute = RouteProp<{ AddTransaction?: { mode?: Mode } }, "AddTransaction">;
+type AddRoute = RouteProp<
+  { AddTransaction?: { mode?: Mode; preselectedAccountId?: number } },
+  "AddTransaction"
+>;
 
 export default function AddTransactionScreen() {
   const { colors } = useTheme();
@@ -55,15 +60,26 @@ export default function AddTransactionScreen() {
   const [fromAccountId, setFromAccountId] = useState<number | null>(null);
   const [toAccountId, setToAccountId] = useState<number | null>(null);
 
+  // Which picker sheet is open, if any.
+  const [openPicker, setOpenPicker] = useState<null | "account" | "category" | "from" | "to">(null);
+
   useEffect(() => {
     Promise.all([endpoints.getAccounts(), endpoints.getCategories()])
       .then(([accRes, catRes]) => {
         if (accRes.success) {
           setAccounts(accRes.data);
           if (accRes.data.length > 0) {
-            setSelectedAccountId(accRes.data[0].id);
-            setFromAccountId(accRes.data[0].id);
-            if (accRes.data.length > 1) setToAccountId(accRes.data[1].id);
+            // Honor a preselected account (e.g. when launched from an account
+            // detail screen); otherwise default to the first account.
+            const preId = route.params?.preselectedAccountId;
+            const defaultId =
+              preId != null && accRes.data.some((a) => a.id === preId)
+                ? preId
+                : accRes.data[0].id;
+            setSelectedAccountId(defaultId);
+            setFromAccountId(defaultId);
+            const other = accRes.data.find((a) => a.id !== defaultId);
+            if (other) setToAccountId(other.id);
           }
         } else {
           logger.warn("add-tx", "accounts fetch failed", { error: accRes.error });
@@ -88,6 +104,26 @@ export default function AddTransactionScreen() {
   const toAccount = accounts.find((a) => a.id === toAccountId);
   const currencyMismatch =
     isTransfer && !!fromAccount && !!toAccount && fromAccount.currency !== toAccount.currency;
+
+  // Picker option lists + id→label helpers for the summary fields.
+  const accountOptions: PickerOption[] = accounts.map((a) => ({
+    id: a.id,
+    label: safeName(a.name),
+    sublabel: a.currency,
+  }));
+  const categoryOptions: PickerOption[] = filteredCategories.map((c) => ({
+    id: c.id,
+    label: safeName(c.name),
+    sublabel: c.group || undefined,
+  }));
+  const accountLabel = (id: number | null) => {
+    const a = accounts.find((x) => x.id === id);
+    return a ? safeName(a.name) : null;
+  };
+  const categoryLabel = (id: number | null) => {
+    const c = categories.find((x) => x.id === id);
+    return c ? safeName(c.name) : null;
+  };
 
   const handleSaveEntry = async () => {
     const parsedAmount = parseFloat(amount);
@@ -235,35 +271,28 @@ export default function AddTransactionScreen() {
     { key: "transfer", label: "Transfer", activeBg: colors.primary, activeFg: colors.primaryForeground },
   ];
 
-  const renderAccountChips = (
-    selectedId: number | null,
-    onSelect: (id: number) => void
+  // Tappable summary field that opens a searchable picker sheet — replaces the
+  // horizontal chip rows that didn't scale with many accounts/categories.
+  const renderSelectField = (
+    valueText: string | null,
+    placeholder: string,
+    onPress: () => void
   ) => (
-    <ScrollView horizontal showsHorizontalScrollIndicator={false}>
-      {accounts.map((acc) => (
-        <TouchableOpacity
-          key={acc.id}
-          onPress={() => onSelect(acc.id)}
-          style={[
-            fieldStyles.chip,
-            {
-              backgroundColor: acc.id === selectedId ? colors.primary : colors.secondary,
-              borderColor: colors.border,
-            },
-          ]}
-        >
-          <Text
-            style={[
-              fieldStyles.chipText,
-              { color: acc.id === selectedId ? colors.primaryForeground : colors.foreground },
-            ]}
-            numberOfLines={1}
-          >
-            {safeName(acc.name)}
-          </Text>
-        </TouchableOpacity>
-      ))}
-    </ScrollView>
+    <TouchableOpacity
+      onPress={onPress}
+      style={[fieldStyles.selectField, { backgroundColor: colors.secondary, borderColor: colors.border }]}
+    >
+      <Text
+        style={[
+          fieldStyles.selectText,
+          { color: valueText ? colors.foreground : colors.mutedForeground },
+        ]}
+        numberOfLines={1}
+      >
+        {valueText ?? placeholder}
+      </Text>
+      <Icon name="chevronDown" size={16} color={colors.mutedForeground} />
+    </TouchableOpacity>
   );
 
   return (
@@ -347,12 +376,16 @@ export default function AddTransactionScreen() {
                 {/* From account */}
                 <View style={fieldStyles.container}>
                   <Text style={[fieldStyles.label, { color: colors.mutedForeground }]}>FROM</Text>
-                  {renderAccountChips(fromAccountId, setFromAccountId)}
+                  {renderSelectField(accountLabel(fromAccountId), "Select account", () =>
+                    setOpenPicker("from")
+                  )}
                 </View>
                 {/* To account */}
                 <View style={fieldStyles.container}>
                   <Text style={[fieldStyles.label, { color: colors.mutedForeground }]}>TO</Text>
-                  {renderAccountChips(toAccountId, setToAccountId)}
+                  {renderSelectField(accountLabel(toAccountId), "Select account", () =>
+                    setOpenPicker("to")
+                  )}
                 </View>
                 {currencyMismatch && (
                   <Text style={[styles.warning, { color: colors.neg }]}>
@@ -377,37 +410,17 @@ export default function AddTransactionScreen() {
                 {/* Account */}
                 <View style={fieldStyles.container}>
                   <Text style={[fieldStyles.label, { color: colors.mutedForeground }]}>ACCOUNT</Text>
-                  {renderAccountChips(selectedAccountId, setSelectedAccountId)}
+                  {renderSelectField(accountLabel(selectedAccountId), "Select account", () =>
+                    setOpenPicker("account")
+                  )}
                 </View>
 
                 {/* Category */}
                 <View style={fieldStyles.container}>
                   <Text style={[fieldStyles.label, { color: colors.mutedForeground }]}>CATEGORY</Text>
-                  <ScrollView horizontal showsHorizontalScrollIndicator={false}>
-                    {filteredCategories.map((cat) => (
-                      <TouchableOpacity
-                        key={cat.id}
-                        onPress={() => setSelectedCategoryId(cat.id)}
-                        style={[
-                          fieldStyles.chip,
-                          {
-                            backgroundColor: cat.id === selectedCategoryId ? colors.primary : colors.secondary,
-                            borderColor: colors.border,
-                          },
-                        ]}
-                      >
-                        <Text
-                          style={[
-                            fieldStyles.chipText,
-                            { color: cat.id === selectedCategoryId ? colors.primaryForeground : colors.foreground },
-                          ]}
-                          numberOfLines={1}
-                        >
-                          {safeName(cat.name)}
-                        </Text>
-                      </TouchableOpacity>
-                    ))}
-                  </ScrollView>
+                  {renderSelectField(categoryLabel(selectedCategoryId), "Select category", () =>
+                    setOpenPicker("category")
+                  )}
                 </View>
 
                 {/* Tags */}
@@ -441,6 +454,39 @@ export default function AddTransactionScreen() {
             </View>
           </View>
         </ScrollView>
+
+        <PickerSheet
+          visible={openPicker === "account"}
+          title="Select account"
+          options={accountOptions}
+          selectedId={selectedAccountId}
+          onSelect={setSelectedAccountId}
+          onClose={() => setOpenPicker(null)}
+        />
+        <PickerSheet
+          visible={openPicker === "category"}
+          title="Select category"
+          options={categoryOptions}
+          selectedId={selectedCategoryId}
+          onSelect={setSelectedCategoryId}
+          onClose={() => setOpenPicker(null)}
+        />
+        <PickerSheet
+          visible={openPicker === "from"}
+          title="From account"
+          options={accountOptions}
+          selectedId={fromAccountId}
+          onSelect={setFromAccountId}
+          onClose={() => setOpenPicker(null)}
+        />
+        <PickerSheet
+          visible={openPicker === "to"}
+          title="To account"
+          options={accountOptions}
+          selectedId={toAccountId}
+          onSelect={setToAccountId}
+          onClose={() => setOpenPicker(null)}
+        />
       </KeyboardAvoidingView>
     </SafeAreaView>
   );
@@ -519,4 +565,14 @@ const fieldStyles = StyleSheet.create({
     marginRight: 8,
   },
   chipText: { fontSize: 13, fontWeight: "500" },
+  selectField: {
+    flexDirection: "row",
+    alignItems: "center",
+    justifyContent: "space-between",
+    borderWidth: StyleSheet.hairlineWidth,
+    borderRadius: 8,
+    paddingHorizontal: 12,
+    paddingVertical: 12,
+  },
+  selectText: { fontSize: 15, flex: 1, marginRight: 8 },
 });

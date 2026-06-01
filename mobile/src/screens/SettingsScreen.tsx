@@ -9,11 +9,14 @@ import {
   Alert,
   Switch,
   Linking,
+  Modal,
+  ActivityIndicator,
 } from "react-native";
 import { SafeAreaView } from "react-native-safe-area-context";
 import { useTheme, type ThemePreference } from "../theme";
 import { useAuth } from "../hooks/useAuth";
-import { getServerUrl } from "../api/client";
+import { getServerUrl, endpoints } from "../api/client";
+import { logger } from "../lib/logger";
 import { getLogs, clearLogs, type LogEntry, type LogLevel } from "../lib/logger";
 
 const AUTO_LOCK_OPTIONS = [
@@ -46,6 +49,12 @@ export default function SettingsScreen() {
   const [saved, setSaved] = useState(false);
   const [logs, setLogs] = useState<LogEntry[]>([]);
   const [showLogs, setShowLogs] = useState(false);
+
+  // Destructive-data flow: which confirm is open ("wipe" = keep login, "delete"
+  // = remove account), the typed password, and an in-flight guard.
+  const [dataAction, setDataAction] = useState<null | "wipe" | "delete">(null);
+  const [password, setPassword] = useState("");
+  const [busy, setBusy] = useState(false);
 
   const colors = theme.colors;
 
@@ -83,6 +92,47 @@ export default function SettingsScreen() {
       { text: "Cancel", style: "cancel" },
       { text: "Sign Out", style: "destructive", onPress: signOut },
     ]);
+  };
+
+  const closeDataModal = () => {
+    setDataAction(null);
+    setPassword("");
+  };
+
+  const runDataAction = async () => {
+    if (!password) {
+      Alert.alert("Password required", "Enter your password to continue.");
+      return;
+    }
+    const isDelete = dataAction === "delete";
+    setBusy(true);
+    try {
+      const res = isDelete
+        ? await endpoints.deleteAccount(password)
+        : await endpoints.wipeData(password);
+      if (res.success) {
+        logger.info("settings", isDelete ? "account deleted" : "data wiped");
+        closeDataModal();
+        // The server evicts the session DEK (and drops the user on delete), so
+        // the only valid next state is signed-out.
+        Alert.alert(
+          isDelete ? "Account deleted" : "Data deleted",
+          isDelete
+            ? "Your account and all data have been permanently deleted."
+            : "All your data has been permanently deleted.",
+          [{ text: "OK", onPress: signOut }]
+        );
+      } else {
+        logger.warn("settings", "data action rejected", { error: res.error });
+        Alert.alert("Couldn't complete", res.error || "Please try again.");
+      }
+    } catch (e) {
+      const detail = e instanceof Error ? `${e.name}: ${e.message}` : String(e);
+      logger.error("settings", "data action threw", { detail });
+      Alert.alert("Error", "Cannot connect to server");
+    } finally {
+      setBusy(false);
+    }
   };
 
   return (
@@ -236,6 +286,42 @@ export default function SettingsScreen() {
           </TouchableOpacity>
         </View>
 
+        {/* Data — destructive. Mirrors web Settings → Data (password-gated). */}
+        <Text style={[styles.sectionTitle, { color: colors.mutedForeground }]}>DATA</Text>
+        <View style={[styles.card, { backgroundColor: colors.card, borderColor: colors.border }]}>
+          <Text style={[styles.settingDesc, { color: colors.mutedForeground, marginBottom: 12 }]}>
+            Deleting is permanent and cannot be undone.
+          </Text>
+          <TouchableOpacity
+            style={[styles.dangerOutlineBtn, { borderColor: colors.destructive }]}
+            onPress={() => {
+              setPassword("");
+              setDataAction("wipe");
+            }}
+          >
+            <Text style={[styles.dangerOutlineText, { color: colors.destructive }]}>
+              Delete all data
+            </Text>
+          </TouchableOpacity>
+          <Text style={[styles.settingDesc, { color: colors.mutedForeground, marginTop: 6 }]}>
+            Removes every record but keeps your login.
+          </Text>
+          <TouchableOpacity
+            style={[styles.button, { backgroundColor: colors.destructive, marginTop: 14 }]}
+            onPress={() => {
+              setPassword("");
+              setDataAction("delete");
+            }}
+          >
+            <Text style={[styles.buttonText, { color: colors.destructiveForeground }]}>
+              Delete account
+            </Text>
+          </TouchableOpacity>
+          <Text style={[styles.settingDesc, { color: colors.mutedForeground, marginTop: 6 }]}>
+            Deletes your account and all data.
+          </Text>
+        </View>
+
         {/* Diagnostics — on-device view of the app log (no adb needed).
             Admin-only: hidden for regular accounts (incl. the public demo). */}
         {isAdmin && (
@@ -342,6 +428,65 @@ export default function SettingsScreen() {
           </Text>
         </View>
       </ScrollView>
+
+      {/* Password-gated confirmation for delete-data / delete-account. */}
+      <Modal
+        visible={dataAction !== null}
+        transparent
+        animationType="fade"
+        onRequestClose={closeDataModal}
+      >
+        <View style={styles.modalBackdrop}>
+          <View style={[styles.modalCard, { backgroundColor: colors.card, borderColor: colors.border }]}>
+            <Text style={[styles.modalTitle, { color: colors.foreground }]}>
+              {dataAction === "delete" ? "Delete account?" : "Delete all data?"}
+            </Text>
+            <Text style={[styles.modalDesc, { color: colors.mutedForeground }]}>
+              {dataAction === "delete"
+                ? "This permanently deletes your account and every record. This cannot be undone."
+                : "This permanently deletes all your data but keeps your login. This cannot be undone."}
+            </Text>
+            <TextInput
+              style={[
+                styles.input,
+                { backgroundColor: colors.secondary, color: colors.foreground, borderColor: colors.border, marginTop: 4 },
+              ]}
+              value={password}
+              onChangeText={setPassword}
+              placeholder="Enter your password"
+              placeholderTextColor={colors.mutedForeground}
+              secureTextEntry
+              autoCapitalize="none"
+              autoCorrect={false}
+            />
+            <Text style={[styles.modalNote, { color: colors.mutedForeground }]}>
+              If you have two-factor enabled, delete from the web app instead.
+            </Text>
+            <View style={styles.modalBtnRow}>
+              <TouchableOpacity
+                style={[styles.modalBtn, { backgroundColor: colors.secondary }]}
+                onPress={closeDataModal}
+                disabled={busy}
+              >
+                <Text style={[styles.modalBtnText, { color: colors.foreground }]}>Cancel</Text>
+              </TouchableOpacity>
+              <TouchableOpacity
+                style={[styles.modalBtn, { backgroundColor: colors.destructive }]}
+                onPress={runDataAction}
+                disabled={busy}
+              >
+                {busy ? (
+                  <ActivityIndicator size="small" color={colors.destructiveForeground} />
+                ) : (
+                  <Text style={[styles.modalBtnText, { color: colors.destructiveForeground }]}>
+                    {dataAction === "delete" ? "Delete account" : "Delete data"}
+                  </Text>
+                )}
+              </TouchableOpacity>
+            </View>
+          </View>
+        </View>
+      </Modal>
     </SafeAreaView>
   );
 }
@@ -379,6 +524,39 @@ const styles = StyleSheet.create({
     justifyContent: "center",
   },
   buttonText: { fontSize: 15, fontWeight: "600" },
+  dangerOutlineBtn: {
+    height: 44,
+    borderRadius: 10,
+    borderWidth: 1,
+    alignItems: "center",
+    justifyContent: "center",
+  },
+  dangerOutlineText: { fontSize: 15, fontWeight: "600" },
+  modalBackdrop: {
+    flex: 1,
+    backgroundColor: "rgba(0,0,0,0.5)",
+    alignItems: "center",
+    justifyContent: "center",
+    padding: 24,
+  },
+  modalCard: {
+    width: "100%",
+    borderRadius: 14,
+    borderWidth: StyleSheet.hairlineWidth,
+    padding: 20,
+  },
+  modalTitle: { fontSize: 18, fontWeight: "700", marginBottom: 8 },
+  modalDesc: { fontSize: 14, lineHeight: 20, marginBottom: 12 },
+  modalNote: { fontSize: 12, marginTop: 8, marginBottom: 4 },
+  modalBtnRow: { flexDirection: "row", gap: 10, marginTop: 12 },
+  modalBtn: {
+    flex: 1,
+    height: 44,
+    borderRadius: 10,
+    alignItems: "center",
+    justifyContent: "center",
+  },
+  modalBtnText: { fontSize: 15, fontWeight: "700" },
   settingRow: {
     flexDirection: "row",
     alignItems: "center",

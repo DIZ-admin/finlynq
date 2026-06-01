@@ -407,4 +407,22 @@ export const endpoints = {
       ...payload,
       appVersion: payload.appVersion ?? "mobile",
     }),
+
+  // Destructive account actions. Both are account-session only (the backend
+  // rejects API-key auth) and require the same confirmation phrase the web UI
+  // sends. `wipeData` deletes all data but keeps the login (DEK re-wrapped);
+  // `deleteAccount` removes the user row too. Either way the server evicts the
+  // session DEK, so the caller must sign out afterwards. MFA-gated accounts
+  // can't reach here (mobile login already blocks them) — the server returns a
+  // 401 surfaced as the error string if it ever does.
+  wipeData: (password: string) =>
+    api.post<{ success?: boolean }>("/api/auth/wipe-account", {
+      password,
+      confirmation: "WIPE",
+    }),
+  deleteAccount: (password: string) =>
+    api.post<{ success?: boolean }>("/api/auth/delete-account", {
+      password,
+      confirmation: "DELETE",
+    }),
 };

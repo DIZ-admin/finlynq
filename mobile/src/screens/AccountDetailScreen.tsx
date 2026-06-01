@@ -60,6 +60,22 @@ export default function AccountDetailScreen({ route, navigation }: Props) {
           <Icon name="back" size={20} color={colors.primary} />
           <Text style={[styles.backText, { color: colors.primary }]}>Accounts</Text>
         </TouchableOpacity>
+        {/* Investment accounts use the web portfolio flow; hide quick-add there. */}
+        {!account.isInvestment && (
+          <TouchableOpacity
+            style={[styles.addBtn, { backgroundColor: colors.primary }]}
+            onPress={() =>
+              navigation.navigate("AddTransaction", {
+                mode: "expense",
+                preselectedAccountId: account.accountId,
+              })
+            }
+          >
+            <Text style={[styles.addBtnText, { color: colors.primaryForeground }]}>
+              + Add transaction
+            </Text>
+          </TouchableOpacity>
+        )}
       </View>
 
       <FlatList
@@ -134,12 +150,15 @@ const styles = StyleSheet.create({
   topBar: {
     flexDirection: "row",
     alignItems: "center",
+    justifyContent: "space-between",
     paddingHorizontal: 12,
     paddingVertical: 10,
     borderBottomWidth: StyleSheet.hairlineWidth,
   },
   backBtn: { flexDirection: "row", alignItems: "center", gap: 2 },
   backText: { fontSize: 15, fontWeight: "600" },
+  addBtn: { paddingHorizontal: 12, paddingVertical: 7, borderRadius: 8 },
+  addBtnText: { fontSize: 13, fontWeight: "700" },
   list: { padding: 16, paddingBottom: 32 },
   hero: {
     borderRadius: 12,

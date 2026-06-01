@@ -19,7 +19,9 @@ export type MoreStackParamList = {
   Categories: undefined;
   Import: undefined;
   Settings: undefined;
-  AddTransaction: { mode?: "expense" | "income" | "transfer" } | undefined;
+  AddTransaction:
+    | { mode?: "expense" | "income" | "transfer"; preselectedAccountId?: number }
+    | undefined;
   AddCategory: undefined;
   AddGoal: undefined;
   WhatsNew: undefined;
