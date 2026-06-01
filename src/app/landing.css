@@ -262,6 +262,21 @@ html:has(.fl-landing) body {
   border-radius: 999px;
   font-weight: 500;
 }
+/* Second hero pill ("mobile coming soon") — forced onto its own line below
+   the MCP pill, sized to content, and clickable through to the blog post. */
+.fl-landing .hero-bar-mobile {
+  display: flex;
+  width: fit-content;
+  margin-top: -14px;
+}
+.fl-landing .hero-bar-link {
+  text-decoration: none;
+  transition: border-color 0.18s ease, color 0.18s ease;
+}
+.fl-landing .hero-bar-link:hover {
+  border-color: var(--fl-amber);
+  color: var(--fl-fg);
+}
 .fl-landing .hero-cta {
   display: flex;
   gap: 12px;

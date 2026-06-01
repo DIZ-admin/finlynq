@@ -76,7 +76,7 @@ const PLAN_FEATS = [
   "91 MCP tools (HTTP) · 87 (stdio) — read & write",
   "Per-user AES-256-GCM envelope encryption · operator can't decrypt",
   "In-app AI chat — no MCP client setup required",
-  "Native mobile app (React Native, iOS + Android)",
+  "Native mobile app for iOS + Android (coming soon)",
   "RRSP, TFSA, RESP contribution-room tracking (CRA limits)",
   "Lot-tracked portfolio cost basis · dividends · FX-aware",
   "Cash-flow forecasting · spending anomaly detection",
@@ -276,6 +276,11 @@ export function LandingClient() {
               <span className="tag">MCP</span>
               <span>91 tools · Claude · ChatGPT · Cursor · Windsurf · Cline</span>
             </div>
+
+            <Link href="/blog/finlynq-mobile-app" className="hero-bar hero-bar-mobile hero-bar-link">
+              <span className="tag">MOBILE</span>
+              <span>iOS &amp; Android apps coming soon <span aria-hidden="true">→</span></span>
+            </Link>
 
             <h1 className="display-xl">
               Your money,<br />
