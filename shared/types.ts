@@ -54,7 +54,37 @@ export interface Transaction {
   /** Decrypted category name — GET /api/transactions resolves this per row
    *  (route.ts decrypts categoryNameCt and strips the ciphertext companion). */
   categoryName?: string | null;
+  /** True when the transaction carries split rows. NOTE: the REST list route
+   *  does NOT currently populate this — mobile fetches splits per-tx on the
+   *  detail screen. Kept optional for forward-compat with a future list field. */
+  hasSplits?: boolean;
 }
+
+/**
+ * A transaction split — view metadata that divides one already-saved parent
+ * transaction across multiple category/account rows. Splits do NOT change the
+ * parent's amount/category/account; saving them only bumps the parent's
+ * updated_at. The read shape returned by GET /api/transactions/splits (the
+ * server decrypts note/tags with the user DEK). `amount` is the
+ * account-currency value and carries the same sign as the parent.
+ */
+export interface Split {
+  id: number;
+  transactionId: number;
+  categoryId: number | null;
+  accountId: number | null;
+  amount: number;
+  note?: string | null;
+  tags?: string | null;
+}
+
+/**
+ * Per-split element of the POST /api/transactions/splits body. `transactionId`
+ * rides at the top level of the request and the server derives id + the
+ * entered_* currency trilogy from the parent — so the write shape drops both.
+ * Send note/tags as plaintext strings (or omit); the server owns encryption.
+ */
+export type SplitInput = Omit<Split, "id" | "transactionId">;
 
 export interface Budget {
   id: number;

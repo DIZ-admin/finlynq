@@ -283,6 +283,8 @@ import type {
   GoalFormData,
   Announcement,
   FeedbackFormData,
+  Split,
+  SplitInput,
 } from "../../../shared/types";
 
 // --- Raw shape of GET /api/dashboard (server-computed, pre-aggregation) ---
@@ -426,6 +428,21 @@ export const endpoints = {
     api.put<Transaction>("/api/transactions", data),
   deleteTransaction: (id: number) =>
     api.delete<void>(`/api/transactions?id=${id}`),
+
+  // Transaction splits — view metadata that divides a parent across rows. All
+  // three return bare JSON: GET → Split[] (decrypted), POST → Split[] (201,
+  // atomic delete-then-insert), DELETE → { success: true }. request() wraps the
+  // GET/POST arrays into the { success, data } shape; the DELETE body already
+  // looks enveloped so request() passes it through (res.success === true).
+  getSplits: (transactionId: number) =>
+    api.get<Split[]>(`/api/transactions/splits?transactionId=${transactionId}`),
+  // Atomic replace — always send the FULL array. Server encrypts note/tags +
+  // derives entered_* from the parent, so the client sends only plaintext +
+  // the account-currency amount.
+  saveSplits: (transactionId: number, splits: SplitInput[]) =>
+    api.post<Split[]>("/api/transactions/splits", { transactionId, splits }),
+  deleteSplits: (transactionId: number) =>
+    api.delete<{ success: boolean }>(`/api/transactions/splits?transactionId=${transactionId}`),
 
   // Categories
   getCategories: () => api.get<Category[]>("/api/categories"),

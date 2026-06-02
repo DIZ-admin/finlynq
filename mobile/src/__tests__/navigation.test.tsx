@@ -33,6 +33,12 @@ jest.mock("../screens/AddTransactionScreen", () => {
   return () => React.createElement(Text, null, "AddTransactionScreen");
 });
 
+jest.mock("../screens/SplitsEditorScreen", () => {
+  const React = require("react");
+  const { Text } = require("react-native");
+  return () => React.createElement(Text, null, "SplitsEditorScreen");
+});
+
 jest.mock("../screens/ImportScreen", () => {
   const React = require("react");
   const { Text } = require("react-native");
@@ -218,6 +224,7 @@ describe("TransactionsStack", () => {
     expect(tree).toContain("TransactionsList");
     expect(tree).toContain("TransactionDetail");
     expect(tree).toContain("AddTransaction");
+    expect(tree).toContain("SplitsEditor");
   });
 });
 

@@ -1,4 +1,4 @@
-import React, { useEffect, useState } from "react";
+import React, { useCallback, useEffect, useState } from "react";
 import {
   View,
   Text,
@@ -15,6 +15,7 @@ import { SafeAreaView } from "react-native-safe-area-context";
 import { useTheme } from "../theme";
 import { endpoints } from "../api/client";
 import { logger } from "../lib/logger";
+import { Icon } from "../components/icon";
 import type { Transaction, Account, Category } from "../../../shared/types";
 import type { NativeStackScreenProps } from "@react-navigation/native-stack";
 import type { TransactionsStackParamList } from "../navigation/TransactionsStack";
@@ -38,6 +39,7 @@ export default function TransactionDetailScreen({ route, navigation }: Props) {
   const [saving, setSaving] = useState(false);
   const [accounts, setAccounts] = useState<Account[]>([]);
   const [categories, setCategories] = useState<Category[]>([]);
+  const [splitCount, setSplitCount] = useState(0);
 
   // Editable fields
   const [date, setDate] = useState(transaction.date);
@@ -61,6 +63,31 @@ export default function TransactionDetailScreen({ route, navigation }: Props) {
         logger.error("tx-detail", "load threw", { detail });
       });
   }, []);
+
+  // Lazy-fetch the split count for the "Split · N" chip. Refresh on focus so
+  // it reflects edits made in the SplitsEditor screen after returning here.
+  const refreshSplitCount = useCallback(() => {
+    endpoints
+      .getSplits(transaction.id)
+      .then((res) => {
+        if (res.success && Array.isArray(res.data)) setSplitCount(res.data.length);
+      })
+      .catch(() => {});
+  }, [transaction.id]);
+
+  useEffect(() => {
+    refreshSplitCount();
+    const unsub = navigation.addListener("focus", refreshSplitCount);
+    return unsub;
+  }, [navigation, refreshSplitCount]);
+
+  const handleSplit = () => {
+    navigation.navigate("SplitsEditor", {
+      transactionId: transaction.id,
+      totalAmount: transaction.amount,
+      currency: transaction.currency,
+    });
+  };
 
   const accountName =
     accounts.find((a) => a.id === selectedAccountId)?.name ??
@@ -283,9 +310,14 @@ export default function TransactionDetailScreen({ route, navigation }: Props) {
                     <Text style={[styles.actionBtn, { color: colors.primary }]}>In Portfolio</Text>
                   </TouchableOpacity>
                 ) : (
-                  <TouchableOpacity onPress={() => setEditing(true)}>
-                    <Text style={[styles.actionBtn, { color: colors.primary }]}>Edit</Text>
-                  </TouchableOpacity>
+                  <>
+                    <TouchableOpacity onPress={handleSplit}>
+                      <Text style={[styles.actionBtn, { color: colors.primary }]}>Split</Text>
+                    </TouchableOpacity>
+                    <TouchableOpacity onPress={() => setEditing(true)}>
+                      <Text style={[styles.actionBtn, { color: colors.primary }]}>Edit</Text>
+                    </TouchableOpacity>
+                  </>
                 )}
                 <TouchableOpacity onPress={handleDelete}>
                   <Text style={[styles.actionBtn, { color: colors.destructive }]}>Delete</Text>
@@ -320,6 +352,19 @@ export default function TransactionDetailScreen({ route, navigation }: Props) {
               {transaction.currency}
             </Text>
           </View>
+
+          {/* Split summary chip — tap to open the editor (non-portfolio rows). */}
+          {splitCount > 0 && !isPortfolioRow && !editing && (
+            <TouchableOpacity
+              onPress={handleSplit}
+              style={[styles.splitChip, { backgroundColor: colors.secondary, borderColor: colors.border }]}
+            >
+              <Icon name="split" size={14} color={colors.primary} />
+              <Text style={[styles.splitChipText, { color: colors.foreground }]}>
+                Split · {splitCount}
+              </Text>
+            </TouchableOpacity>
+          )}
 
           {/* Fields */}
           <View
@@ -373,6 +418,18 @@ const styles = StyleSheet.create({
   amountText: { fontSize: 36, fontWeight: "800" },
   amountInput: { fontSize: 36, fontWeight: "800", textAlign: "center", minWidth: 200 },
   currencyLabel: { fontSize: 13, marginTop: 4 },
+  splitChip: {
+    flexDirection: "row",
+    alignItems: "center",
+    alignSelf: "flex-start",
+    gap: 6,
+    borderWidth: StyleSheet.hairlineWidth,
+    borderRadius: 999,
+    paddingHorizontal: 12,
+    paddingVertical: 6,
+    marginBottom: 12,
+  },
+  splitChipText: { fontSize: 13, fontWeight: "600" },
   card: {
     borderRadius: 12,
     borderWidth: StyleSheet.hairlineWidth,

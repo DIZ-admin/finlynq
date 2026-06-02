@@ -43,6 +43,7 @@ import {
   ArrowUpFromLine,
   LineChart,
   Coins,
+  Scissors,
   type LucideIcon,
 } from "lucide-react-native";
 
@@ -79,6 +80,7 @@ export const Icons = {
   sampleData: Sparkles,
   whatsNew: Megaphone,
   feedback: MessageCircle,
+  split: Scissors,
   // Portfolio operations
   minus: Minus,
   swap: Repeat,
