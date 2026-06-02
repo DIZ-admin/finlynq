@@ -71,7 +71,7 @@ describe("SettingsScreen", () => {
     const { getByText } = renderWithTheme(<SettingsScreen />);
     expect(getByText("ABOUT")).toBeTruthy();
     expect(getByText("Finlynq")).toBeTruthy();
-    expect(getByText("1.0.0")).toBeTruthy();
+    expect(getByText("1.0.1")).toBeTruthy();
     expect(getByText("React Native + Expo")).toBeTruthy();
   });
 

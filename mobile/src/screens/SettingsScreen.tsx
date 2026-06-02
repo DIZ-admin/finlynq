@@ -13,6 +13,7 @@ import {
   ActivityIndicator,
 } from "react-native";
 import { SafeAreaView } from "react-native-safe-area-context";
+import Constants from "expo-constants";
 import { useTheme, type ThemePreference } from "../theme";
 import { useAuth } from "../hooks/useAuth";
 import { getServerUrl, endpoints } from "../api/client";
@@ -387,7 +388,9 @@ export default function SettingsScreen() {
           </View>
           <View style={[styles.aboutRow, { borderBottomColor: colors.border }]}>
             <Text style={[styles.aboutLabel, { color: colors.mutedForeground }]}>Version</Text>
-            <Text style={[styles.aboutValue, { color: colors.foreground }]}>1.0.0</Text>
+            <Text style={[styles.aboutValue, { color: colors.foreground }]}>
+              {Constants.expoConfig?.version ?? "—"}
+            </Text>
           </View>
           <View style={[styles.aboutRow, { borderBottomColor: colors.border }]}>
             <Text style={[styles.aboutLabel, { color: colors.mutedForeground }]}>Platform</Text>
