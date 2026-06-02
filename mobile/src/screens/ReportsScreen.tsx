@@ -129,7 +129,13 @@ export default function ReportsScreen() {
       sub: "Income vs expenses over time",
       onPress: () => navigation.navigate("Trends", rangeParams),
     },
-    // Cash flow / Year over year links are added in later phases.
+    {
+      icon: "fx",
+      label: "Cash flow",
+      sub: "Sankey: where money flows",
+      onPress: () => navigation.navigate("CashFlowSankey", rangeParams),
+    },
+    // Year over year link is added in the next phase.
   ];
 
   return (
