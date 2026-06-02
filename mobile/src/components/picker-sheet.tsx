@@ -12,6 +12,7 @@ import {
   StyleSheet,
   Pressable,
 } from "react-native";
+import { useSafeAreaInsets } from "react-native-safe-area-context";
 import { useTheme } from "../theme";
 import { Icon } from "./icon";
 
@@ -39,6 +40,7 @@ export function PickerSheet({
   onClose,
 }: PickerSheetProps) {
   const { colors } = useTheme();
+  const insets = useSafeAreaInsets();
   const [query, setQuery] = useState("");
 
   // Reset the search each time the sheet opens so a stale filter doesn't hide
@@ -61,9 +63,15 @@ export function PickerSheet({
     >
       {/* Tap the dimmed backdrop to dismiss. */}
       <Pressable style={styles.backdrop} onPress={onClose}>
-        {/* Stop touches inside the sheet from bubbling to the backdrop. */}
+        {/* Stop touches inside the sheet from bubbling to the backdrop.
+            Anchored at the TOP so the search box + results sit above the
+            on-screen keyboard (which rises from the bottom) — otherwise the
+            filtered results render behind the keyboard. */}
         <Pressable
-          style={[styles.sheet, { backgroundColor: colors.card, borderColor: colors.border }]}
+          style={[
+            styles.sheet,
+            { backgroundColor: colors.card, borderColor: colors.border, paddingTop: insets.top + 12 },
+          ]}
           onPress={() => {}}
         >
           <View style={styles.headerRow}>
@@ -137,16 +145,15 @@ const styles = StyleSheet.create({
   backdrop: {
     flex: 1,
     backgroundColor: "rgba(0,0,0,0.5)",
-    justifyContent: "flex-end",
+    justifyContent: "flex-start",
   },
   sheet: {
-    borderTopLeftRadius: 16,
-    borderTopRightRadius: 16,
+    borderBottomLeftRadius: 16,
+    borderBottomRightRadius: 16,
     borderWidth: StyleSheet.hairlineWidth,
     paddingHorizontal: 16,
-    paddingTop: 16,
-    paddingBottom: 24,
-    maxHeight: "75%",
+    paddingBottom: 16,
+    maxHeight: "65%",
   },
   headerRow: {
     flexDirection: "row",
@@ -166,7 +173,9 @@ const styles = StyleSheet.create({
     marginBottom: 8,
   },
   searchInput: { flex: 1, fontSize: 15, paddingVertical: 0 },
-  list: { flexGrow: 0 },
+  // flexShrink lets the list scroll inside the capped sheet when results are
+  // long; flexGrow 0 keeps the sheet hugging its content when results are few.
+  list: { flexGrow: 0, flexShrink: 1 },
   row: {
     flexDirection: "row",
     alignItems: "center",
