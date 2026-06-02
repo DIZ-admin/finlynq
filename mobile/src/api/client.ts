@@ -285,7 +285,34 @@ import type {
   FeedbackFormData,
   Split,
   SplitInput,
+  IncomeStatement,
+  BalanceSheet,
+  ReportTrends,
+  YoYReport,
+  ReportPeriod,
+  ReportGroupBy,
 } from "../../../shared/types";
+
+// Shared report query params. The date range + business + display currency are
+// common to the income-statement, trends and sankey surfaces; trends adds
+// granularity + group-by.
+export interface ReportRangeParams {
+  startDate: string;
+  endDate: string;
+  isBusiness?: boolean;
+  currency?: string;
+}
+export interface ReportTrendsParams extends ReportRangeParams {
+  period: ReportPeriod;
+  groupBy: ReportGroupBy;
+}
+
+function reportRangeQuery(p: ReportRangeParams): string {
+  const parts = [`startDate=${p.startDate}`, `endDate=${p.endDate}`];
+  if (p.isBusiness) parts.push("business=true");
+  if (p.currency) parts.push(`currency=${encodeURIComponent(p.currency)}`);
+  return parts.join("&");
+}
 
 // --- Raw shape of GET /api/dashboard (server-computed, pre-aggregation) ---
 // The mobile DashboardScreen wants a flattened `DashboardData`; the backend
@@ -525,6 +552,33 @@ export const endpoints = {
   getBudgets: (month?: string, spending = true) =>
     api.get<BudgetWithSpending[]>(
       `/api/budgets?spending=1${month ? `&month=${month}` : ""}`
+    ),
+
+  // Reports — all bare JSON (request() wraps). The income-statement +
+  // balance-sheet routes FX-convert totals server-side and echo back the
+  // resolved `displayCurrency`; trends + yoy do NOT convert (they SUM raw
+  // amounts), matching the web /reports behavior. Detail screens read the
+  // display currency off the income-statement/balance-sheet response and pass
+  // it down as a route param (trends/sankey/yoy have no currency field).
+  getIncomeStatement: (p: ReportRangeParams) =>
+    api.get<IncomeStatement>(
+      `/api/reports?type=income-statement&${reportRangeQuery(p)}`
+    ),
+  getBalanceSheet: (p: { endDate: string; currency?: string }) =>
+    api.get<BalanceSheet>(
+      `/api/reports?type=balance-sheet&endDate=${p.endDate}${
+        p.currency ? `&currency=${encodeURIComponent(p.currency)}` : ""
+      }`
+    ),
+  getReportTrends: (p: ReportTrendsParams) =>
+    api.get<ReportTrends>(
+      `/api/reports/trends?${reportRangeQuery(p)}&period=${p.period}&groupBy=${p.groupBy}`
+    ),
+  getYoY: (p: { year1: number; year2: number; currency?: string }) =>
+    api.get<YoYReport>(
+      `/api/reports/yoy?year1=${p.year1}&year2=${p.year2}${
+        p.currency ? `&currency=${encodeURIComponent(p.currency)}` : ""
+      }`
     ),
 
   // Announcements — active broadcast items + per-user read flag (bare array).

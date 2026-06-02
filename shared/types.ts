@@ -766,3 +766,136 @@ export interface TransactionFormData {
   quantity?: number;
   portfolioHolding?: string;
 }
+
+// --- Reports ---
+// Mirror the bare-JSON shapes returned by GET /api/reports (income-statement +
+// balance-sheet), /api/reports/trends and /api/reports/yoy. Category/account
+// names are decrypted server-side and can be "" under a cold DEK — route every
+// label through safeName(). Totals are FX-converted server-side on the
+// income-statement + balance-sheet routes; the trends + yoy routes do NOT
+// convert (they SUM raw amounts), matching the web /reports behavior exactly.
+
+export type ReportPeriod = "daily" | "weekly" | "monthly" | "quarterly";
+export type ReportGroupBy = "category" | "group";
+
+export interface IncomeStatementRow {
+  categoryId: number | null;
+  categoryType: string;
+  categoryGroup: string;
+  categoryName: string;
+  total: number;
+  count: number;
+}
+
+export interface UnrealizedReportTotals {
+  costBasis: number;
+  marketValue: number;
+  valuationGL: number;
+  fxGL: number;
+  totalGL: number;
+}
+
+export interface UnrealizedReportAccount {
+  accountId: number;
+  accountName: string;
+  accountCurrency: string;
+  costBasis: number;
+  marketValue: number;
+  valuationGL: number;
+  fxGL: number;
+  totalGL: number;
+  startMarketValue: number;
+  endMarketValue: number;
+  hasHoldings: boolean;
+  costBasisMissing: boolean;
+}
+
+export interface IncomeStatement {
+  type: "income-statement";
+  displayCurrency: string;
+  period: { startDate: string; endDate: string };
+  income: IncomeStatementRow[];
+  expenses: IncomeStatementRow[];
+  totalIncome: number;
+  totalExpenses: number;
+  netSavings: number;
+  savingsRate: number;
+  unrealized: {
+    totals: UnrealizedReportTotals;
+    accounts: UnrealizedReportAccount[];
+  };
+}
+
+export interface BalanceSheetRow {
+  accountId: number;
+  accountType: string;
+  accountGroup: string;
+  accountName: string;
+  currency: string;
+  balance: number;
+  convertedBalance: number;
+  displayCurrency: string;
+}
+
+export interface BalanceSheet {
+  type: "balance-sheet";
+  displayCurrency: string;
+  date: string;
+  assets: BalanceSheetRow[];
+  liabilities: BalanceSheetRow[];
+  totalAssets: number;
+  totalLiabilities: number;
+  netWorth: number;
+}
+
+export interface TrendsPoint {
+  period: string;
+  label: string;
+  income: number;
+  expenses: number;
+  net: number;
+}
+
+export interface TrendsBreakdownItem {
+  name: string;
+  group: string;
+  total: number;
+  count: number;
+  periods: Record<string, number>;
+}
+
+export interface ReportTrends {
+  period: ReportPeriod;
+  groupBy: ReportGroupBy;
+  startDate: string;
+  endDate: string;
+  timeseries: TrendsPoint[];
+  income: TrendsBreakdownItem[];
+  expenses: TrendsBreakdownItem[];
+  totalIncome: number;
+  totalExpenses: number;
+  netSavings: number;
+  savingsRate: number;
+}
+
+export interface YoYCategoryRow {
+  name: string;
+  year1Amount: number;
+  year2Amount: number;
+  change: number;
+}
+
+export interface YoYMonthlyRow {
+  month: string;
+  year1Income: number;
+  year1Expenses: number;
+  year2Income: number;
+  year2Expenses: number;
+}
+
+export interface YoYReport {
+  year1: number;
+  year2: number;
+  categories: YoYCategoryRow[];
+  monthly: YoYMonthlyRow[];
+}
