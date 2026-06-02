@@ -63,13 +63,13 @@ const databaseUrl: string = (() => {
 
 // Account type uses single-letter codes in this app: "A" = asset, "L" = liability.
 // Category type uses "I" = income, "E" = expense.
-type AccountSeed = { type: "A" | "L"; group: string; name: string };
+type AccountSeed = { type: "A" | "L"; group: string; name: string; isInvestment?: boolean };
 type CategorySeed = { type: "I" | "E"; group: string; name: string };
 
 const ACCOUNTS: AccountSeed[] = [
   { type: "A", group: "Banks", name: "Chequing" },
   { type: "A", group: "Banks", name: "Savings" },
-  { type: "A", group: "Investments", name: "Brokerage" },
+  { type: "A", group: "Investments", name: "Brokerage", isInvestment: true },
   { type: "L", group: "Credit Cards", name: "Visa Rewards" },
 ];
 
@@ -441,9 +441,9 @@ async function main() {
     for (const a of ACCOUNTS) {
       const enc = encryptName(demoDek, a.name);
       const { rows } = await client.query(
-        `INSERT INTO accounts (user_id, type, "group", name_ct, name_lookup, currency, note)
-         VALUES ($1, $2, $3, $4, $5, 'CAD', '') RETURNING id`,
-        [userId, a.type, a.group, enc.ct, enc.lookup]
+        `INSERT INTO accounts (user_id, type, "group", name_ct, name_lookup, currency, note, is_investment)
+         VALUES ($1, $2, $3, $4, $5, 'CAD', '', $6) RETURNING id`,
+        [userId, a.type, a.group, enc.ct, enc.lookup, a.isInvestment ?? false]
       );
       accountIds[a.name] = rows[0].id;
     }
