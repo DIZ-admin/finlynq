@@ -28,6 +28,50 @@ import {
   type NetWorthPeriod,
   type LiveInvestmentValue,
 } from "@/lib/net-worth-history";
+import {
+  rebuildPortfolioSnapshots,
+  tryBeginRebuild,
+  endRebuild,
+} from "@/lib/portfolio/snapshots/rebuild";
+import { listDirtySnapshotUsers, clearDirtyIfUnchanged } from "@/lib/portfolio/snapshots/dirty";
+
+/**
+ * DEK-bearing self-heal. Background jobs have no DEK (Stream D encrypts holding
+ * symbols), so a cron CANNOT correctly value investment holdings — it would
+ * write $1/unit garbage. This request DOES have the session DEK, and the chart
+ * is exactly where stale investment history surfaces, so we rebuild here:
+ *   - when a back-dated investment edit left a dirty marker, OR
+ *   - on first view for a user who has live investments but no snapshots yet.
+ * Fire-and-forget (the standalone Node server persists the work); the current
+ * response uses existing snapshots and the NEXT load reflects the rebuild.
+ */
+function kickSelfHeal(
+  userId: string,
+  dek: Buffer,
+  today: string,
+  dirtyFrom: string | null,
+  dirtyMarkedAt: string | null,
+  needsInitialBackfill: boolean,
+): void {
+  if (!dirtyFrom && !needsInitialBackfill) return;
+  if (!tryBeginRebuild(userId)) return; // a rebuild is already running
+  // dirtyFrom drives back-dated-edit refresh; null → full history (initial backfill).
+  const from = dirtyFrom;
+  void (async () => {
+    try {
+      await rebuildPortfolioSnapshots(userId, from, today, dek);
+      if (dirtyMarkedAt) await clearDirtyIfUnchanged(userId, dirtyMarkedAt);
+    } catch (err) {
+      // eslint-disable-next-line no-console
+      console.warn(
+        "[net-worth-history] self-heal rebuild failed:",
+        err instanceof Error ? err.message : err,
+      );
+    } finally {
+      endRebuild(userId);
+    }
+  })();
+}
 
 function parsePeriod(raw: string | null): NetWorthPeriod {
   return raw === "6m" || raw === "1y" || raw === "all" ? raw : "6m";
@@ -93,6 +137,26 @@ export async function GET(request: NextRequest) {
       liveInvestmentByAccount,
       today,
     });
+
+    // Auto-rebuild stale investment history with the request DEK (a cron can't
+    // — see kickSelfHeal). Only when we actually have a DEK to price correctly.
+    if (dek) {
+      const needsInitialBackfill =
+        liveInvestmentByAccount.size > 0 && snapshots.length === 0;
+      let dirtyFrom: string | null = null;
+      let dirtyMarkedAt: string | null = null;
+      try {
+        const dirty = await listDirtySnapshotUsers();
+        const mine = dirty.find((d) => d.userId === userId);
+        if (mine) {
+          dirtyFrom = mine.fromDate;
+          dirtyMarkedAt = mine.markedAt;
+        }
+      } catch {
+        /* dirty lookup is best-effort */
+      }
+      kickSelfHeal(userId, dek, today, dirtyFrom, dirtyMarkedAt, needsInitialBackfill);
+    }
 
     return NextResponse.json({
       displayCurrency,

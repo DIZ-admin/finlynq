@@ -6,36 +6,34 @@
  * "Rebuild investment history" button (Settings → Investments + the net-worth
  * chart empty-state). Idempotent on the snapshot unique index.
  *
- * Uses requireAuth + getDEK (NOT requireEncryption) — market value needs no
- * decrypted names, so a cold DEK still rebuilds (matches the dashboard's
- * nullable-DEK posture).
+ * Requires a real session DEK (`requireEncryption` → 423 if absent). Post
+ * Stream D Phase 4 holding symbols are ENCRYPTED, so pricing a holding needs
+ * the DEK to decrypt the symbol — without it `getHoldingsValueByAccount`
+ * mis-values stock holdings (treats share counts as $1/unit). A DEK-less
+ * rebuild would write garbage, so we refuse rather than corrupt history. This
+ * is also why the auto-rebuild is a DEK-bearing self-heal on chart load
+ * (see /api/net-worth-history) rather than a blind background cron.
  *
- * Guards against an overlapping per-user run (409) so a double-click doesn't
- * spawn two long walks. plan/net-worth-over-time.md Part B.
+ * Guards against an overlapping per-user run (409). plan/net-worth-over-time.md
+ * Part B.
  */
 
 import { NextRequest, NextResponse } from "next/server";
-import { requireAuth } from "@/lib/auth/require-auth";
-import { getDEK } from "@/lib/crypto/dek-cache";
+import { requireEncryption } from "@/lib/auth/require-encryption";
 import { logApiError } from "@/lib/validate";
-import { rebuildPortfolioSnapshots } from "@/lib/portfolio/snapshots/rebuild";
+import {
+  rebuildPortfolioSnapshots,
+  tryBeginRebuild,
+  endRebuild,
+} from "@/lib/portfolio/snapshots/rebuild";
 import { clearDirtyIfUnchanged, listDirtySnapshotUsers } from "@/lib/portfolio/snapshots/dirty";
 
-// HMR-safe in-flight guard (same pattern as the tx cache + DB adapter).
-const g = globalThis as typeof globalThis & { __pfRebuildInFlight?: Set<string> };
-function inFlight(): Set<string> {
-  if (!g.__pfRebuildInFlight) g.__pfRebuildInFlight = new Set();
-  return g.__pfRebuildInFlight;
-}
-
 export async function POST(request: NextRequest) {
-  const auth = await requireAuth(request);
-  if (!auth.authenticated) return auth.response;
-  const { userId, sessionId } = auth.context;
-  const dek = sessionId ? getDEK(sessionId, userId) : null;
+  const auth = await requireEncryption(request);
+  if (!auth.ok) return auth.response;
+  const { userId, dek } = auth;
 
-  const running = inFlight();
-  if (running.has(userId)) {
+  if (!tryBeginRebuild(userId)) {
     return NextResponse.json(
       { error: "A rebuild is already running for your account. Please wait.", code: "rebuild_in_progress" },
       { status: 409 },
@@ -51,7 +49,6 @@ export async function POST(request: NextRequest) {
       /* empty body is fine */
     }
 
-    running.add(userId);
     const summary = await rebuildPortfolioSnapshots(userId, fromDate ?? null, null, dek);
 
     // The manual rebuild covers whatever the auto-drain would have — clear any
@@ -70,6 +67,6 @@ export async function POST(request: NextRequest) {
     const message = error instanceof Error ? error.message : "Rebuild failed";
     return NextResponse.json({ error: message }, { status: 500 });
   } finally {
-    running.delete(userId);
+    endRebuild(userId);
   }
 }

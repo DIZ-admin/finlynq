@@ -21,6 +21,31 @@ export interface RebuildResult {
   gapsFilledDays: number;
 }
 
+// HMR-safe per-user in-flight guard. Shared by the manual rebuild endpoint and
+// the chart-load self-heal so a double-click / concurrent chart loads don't
+// spawn overlapping walks for the same user.
+const g = globalThis as typeof globalThis & { __pfRebuildInFlight?: Set<string> };
+function inFlightSet(): Set<string> {
+  if (!g.__pfRebuildInFlight) g.__pfRebuildInFlight = new Set();
+  return g.__pfRebuildInFlight;
+}
+
+/** Returns true and marks the user in-flight, or false if a rebuild is already running. */
+export function tryBeginRebuild(userId: string): boolean {
+  const s = inFlightSet();
+  if (s.has(userId)) return false;
+  s.add(userId);
+  return true;
+}
+
+export function endRebuild(userId: string): void {
+  inFlightSet().delete(userId);
+}
+
+export function isRebuildInFlight(userId: string): boolean {
+  return inFlightSet().has(userId);
+}
+
 function addDayUTC(iso: string): string {
   const d = new Date(`${iso}T00:00:00Z`);
   d.setUTCDate(d.getUTCDate() + 1);

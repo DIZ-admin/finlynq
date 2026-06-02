@@ -863,10 +863,20 @@ export async function getCashDailyDeltas(userId: string, accountId?: number) {
 }
 
 /**
- * Per-account portfolio snapshot rows in [from, to]. Pass `from="1900-01-01"`
- * so the first grid day always has a nearest-at-or-before value to carry
- * forward. NEVER returns the whole-portfolio NULL aggregate row (that would
- * double-count against the per-account sum the chart builds).
+ * Per-account portfolio snapshot rows in [from, to], for INVESTMENT accounts
+ * only. Pass `from="1900-01-01"` so the first grid day always has a
+ * nearest-at-or-before value to carry forward. NEVER returns the
+ * whole-portfolio NULL aggregate row (that would double-count against the
+ * per-account sum the chart builds).
+ *
+ * The `accounts.is_investment = true` join is load-bearing: `buildDailySnapshot`
+ * writes a per-account snapshot for ANY account with holdings — including a
+ * misconfigured `is_investment=false` account that still has holdings (e.g. the
+ * demo's Brokerage). Such an account is summed by `getCashDailyDeltas`
+ * (`is_investment=false`), so without this filter its snapshots would ALSO land
+ * in the investment pass → double-counting. Partitioning both passes on the
+ * same `is_investment` flag the dashboard hero uses keeps them disjoint and the
+ * latest point equal to the hero.
  */
 export async function getInvestmentSnapshotsInRange(
   userId: string,
@@ -878,6 +888,7 @@ export async function getInvestmentSnapshotsInRange(
     eq(schema.portfolioSnapshots.userId, userId),
     gte(schema.portfolioSnapshots.snapDate, from),
     lte(schema.portfolioSnapshots.snapDate, to),
+    eq(accounts.isInvestment, true),
   ];
   if (accountId != null) {
     conditions.push(eq(schema.portfolioSnapshots.accountId, accountId));
@@ -892,6 +903,7 @@ export async function getInvestmentSnapshotsInRange(
       currency: schema.portfolioSnapshots.currency,
     })
     .from(schema.portfolioSnapshots)
+    .innerJoin(accounts, eq(schema.portfolioSnapshots.accountId, accounts.id))
     .where(and(...conditions))
     .orderBy(asc(schema.portfolioSnapshots.snapDate))
     .all();
