@@ -5,24 +5,12 @@ import { alias } from "drizzle-orm/pg-core";
 import { fetchMultipleQuotes, aggregatePortfolioExposure, getEtfRegionBreakdown, getEtfSectorBreakdown, getEtfTopHoldings, getAvailableEtfSymbols, autoSeedEtfIfMissing } from "@/lib/price-service";
 import { getCryptoPrices, symbolToCoinGeckoId } from "@/lib/crypto-service";
 import { getLatestFxRate, convertCurrency, getDisplayCurrency, getRate } from "@/lib/fx-service";
-import { isSupportedCurrency, isMetalCurrency } from "@/lib/fx/supported-currencies";
+import { isMetalCurrency, isCryptoSymbol, isCurrencyCodeSymbol } from "@/lib/fx/supported-currencies";
 import { requireAuth } from "@/lib/auth/require-auth";
 import { getDEK } from "@/lib/crypto/dek-cache";
 import { decryptNamedRows } from "@/lib/crypto/encrypted-columns";
 import { resolveDividendsCategoryId } from "@/lib/dividends-category";
 import { cashLegSkipSql } from "@/lib/portfolio/aggregation-predicates";
-
-const CRYPTO_SYMBOLS = new Set([
-  "BTC", "ETH", "SOL", "ADA", "XRP", "DOGE", "AAVE", "ATOM", "AVAX",
-  "CRV", "FTM", "HBAR", "LINK", "LTC", "MATIC", "POL", "DOT", "XLM",
-  "UNI", "YFI", "SNX", "BNB", "SHIB", "ARB", "OP", "APT", "SUI",
-  "NEAR", "FIL", "ICP", "ALGO", "XTZ", "EOS", "SAND", "MANA", "AXS", "S",
-]);
-
-function isCryptoSymbol(symbol: string): boolean {
-  const base = symbol.toUpperCase().split("-")[0];
-  return CRYPTO_SYMBOLS.has(base);
-}
 
 export async function GET(request: NextRequest) {
   const auth = await requireAuth(request);
@@ -46,11 +34,8 @@ export async function GET(request: NextRequest) {
       if (Array.isArray(parsed)) activeCurrencies = parsed.map((s: string) => s.toUpperCase());
     } catch { /* fall through */ }
   }
-  const isCurrencyCodeSymbol = (sym: string | null | undefined): boolean => {
-    if (!sym) return false;
-    const s = sym.trim().toUpperCase();
-    return /^[A-Z]{3,4}$/.test(s) && (isSupportedCurrency(s) || activeCurrencies.includes(s));
-  };
+  const symbolIsCash = (sym: string | null | undefined): boolean =>
+    isCurrencyCodeSymbol(sym, activeCurrencies);
 
   // 1. Get all holdings with account info. Stream D Phase 4: plaintext
   // name/symbol/accountName columns dropped; read ciphertext only and
@@ -90,13 +75,13 @@ export async function GET(request: NextRequest) {
     if (h.isCrypto === 1) return false;
     if (!h.symbol) return false;
     if (isCryptoSymbol(h.symbol)) return false;
-    if (isCurrencyCodeSymbol(h.symbol)) return false; // cash, not a stock
+    if (symbolIsCash(h.symbol)) return false; // cash, not a stock
     return true;
   });
   const cashHoldings = holdings.filter(h => {
     if (h.isCrypto === 1) return false;
     if (!h.symbol) return true;
-    return isCurrencyCodeSymbol(h.symbol);
+    return symbolIsCash(h.symbol);
   });
 
   // 3. Fetch stock/ETF prices from Yahoo Finance
@@ -392,7 +377,7 @@ export async function GET(request: NextRequest) {
   const quoteCurrencyById = new Map<number, string>();
   for (const h of holdings) {
     const isCryptoH = h.isCrypto === 1 || (h.symbol ? isCryptoSymbol(h.symbol) : false);
-    const symbolIsCurrencyH = isCurrencyCodeSymbol(h.symbol);
+    const symbolIsCurrencyH = symbolIsCash(h.symbol);
     let qc = h.currency;
     if (isCryptoH) qc = "CAD";
     else if (symbolIsCurrencyH && h.symbol) {
@@ -443,7 +428,7 @@ export async function GET(request: NextRequest) {
 
   const enrichedHoldings = holdings.map(h => {
     const isCrypto = h.isCrypto === 1 || (h.symbol ? isCryptoSymbol(h.symbol) : false);
-    const symbolIsCurrency = isCurrencyCodeSymbol(h.symbol);
+    const symbolIsCurrency = symbolIsCash(h.symbol);
     const isEtf = h.symbol && !symbolIsCurrency ? (getEtfRegionBreakdown(h.symbol) !== null) : false;
 
     let assetType: AssetType = "cash";

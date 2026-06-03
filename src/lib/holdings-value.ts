@@ -16,34 +16,12 @@ import { alias } from "drizzle-orm/pg-core";
 import { fetchMultipleQuotes, fetchMultipleQuotesAtDate } from "@/lib/price-service";
 import { getCryptoSpotPrices, getCryptoPricesAtDate, symbolToCoinGeckoId } from "@/lib/crypto-service";
 import { getLatestFxRate, getRate } from "@/lib/fx-service";
-import { isSupportedCurrency, isMetalCurrency } from "@/lib/fx/supported-currencies";
+import { isMetalCurrency, isCryptoSymbol, isCurrencyCodeSymbol } from "@/lib/fx/supported-currencies";
 import { decryptNamedRows } from "@/lib/crypto/encrypted-columns";
 import { cashLegSkipSql } from "@/lib/portfolio/aggregation-predicates";
 
 function todayISO(): string {
   return new Date().toISOString().split("T")[0];
-}
-
-const CRYPTO_SYMBOLS = new Set([
-  "BTC", "ETH", "SOL", "ADA", "XRP", "DOGE", "AAVE", "ATOM", "AVAX",
-  "CRV", "FTM", "HBAR", "LINK", "LTC", "MATIC", "POL", "DOT", "XLM",
-  "UNI", "YFI", "SNX", "BNB", "SHIB", "ARB", "OP", "APT", "SUI",
-  "NEAR", "FIL", "ICP", "ALGO", "XTZ", "EOS", "SAND", "MANA", "AXS", "S",
-]);
-
-function isCrypto(symbol: string | null): boolean {
-  if (!symbol) return false;
-  return CRYPTO_SYMBOLS.has(symbol.toUpperCase().split("-")[0]);
-}
-
-// A holding whose symbol IS a currency code (CAD, USD, EUR, XAU, …)
-// represents a foreign-cash position, NOT a stock. Yahoo would return
-// data for unrelated tickers ("CAD" → Cadiz Inc on NASDAQ) that inflate
-// market value by 100×+. Mirrors the same check in /api/portfolio/overview.
-function isCurrencyCodeSymbol(sym: string | null | undefined): boolean {
-  if (!sym) return false;
-  const s = sym.trim().toUpperCase();
-  return /^[A-Z]{3,4}$/.test(s) && isSupportedCurrency(s);
 }
 
 export type AccountHoldingsValue = {
@@ -220,7 +198,7 @@ export async function getHoldingsValueByAccount(
   // == today use the regular live-quote endpoint; for past dates use
   // the historical chart endpoint.
   const stockSymbols = holdings
-    .filter(h => h.symbol && !isCrypto(h.symbol) && h.isCrypto !== 1 && !isCurrencyCodeSymbol(h.symbol))
+    .filter(h => h.symbol && !isCryptoSymbol(h.symbol) && h.isCrypto !== 1 && !isCurrencyCodeSymbol(h.symbol))
     .map(h => h.symbol!);
   const quotes = stockSymbols.length > 0
     ? (isToday
@@ -238,7 +216,7 @@ export async function getHoldingsValueByAccount(
   const cgPairs: Array<{ coinId: string; symbol: string }> = [];
   const seenCg = new Set<string>();
   for (const h of holdings) {
-    if (h.isCrypto === 1 || isCrypto(h.symbol)) {
+    if (h.isCrypto === 1 || isCryptoSymbol(h.symbol)) {
       const base = (h.symbol ?? "").toUpperCase().split("-")[0];
       const cg = base ? symbolToCoinGeckoId(base) : null;
       if (cg && !seenCg.has(cg)) {
@@ -302,7 +280,7 @@ export async function getHoldingsValueByAccount(
       }
     } else if (h.symbol) {
       // Symbol-priced holding (stock, ETF, crypto).
-      if (h.isCrypto === 1 || isCrypto(h.symbol)) {
+      if (h.isCrypto === 1 || isCryptoSymbol(h.symbol)) {
         const cp = cryptoByUpperSymbol.get(h.symbol.toUpperCase().split("-")[0]);
         if (cp) {
           price = cp.price;
