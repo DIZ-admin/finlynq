@@ -254,13 +254,24 @@ export async function getHoldingsValueByAccount(
   // USD using fx_rates cache + Yahoo backfill for missing dates.
   const out = new Map<number, AccountHoldingsValue>();
   const fxCache = new Map<string, number>();
+  // TEMP perf instrumentation (remove after diagnosing the ~11s dashboard).
+  let __fxCalls = 0;
+  let __fxMisses = 0;
+  let __fxMissMs = 0;
   const getFx = async (from: string, to: string): Promise<number> => {
     if (from === to) return 1;
     const key = `${from}->${to}`;
+    __fxCalls++;
     if (fxCache.has(key)) return fxCache.get(key)!;
+    const __s = Date.now();
     const rate = isToday
       ? await getLatestFxRate(from, to, userId)
       : await getRate(from, to, asOfDate, userId);
+    const __d = Date.now() - __s;
+    __fxMisses++;
+    __fxMissMs += __d;
+    // eslint-disable-next-line no-console
+    console.log(`[fx-timing] miss ${key} ${__d}ms (isToday=${isToday})`);
     fxCache.set(key, rate);
     return rate;
   };
@@ -370,6 +381,8 @@ export async function getHoldingsValueByAccount(
     }
   }
 
+  // eslint-disable-next-line no-console
+  console.log(`[fx-timing] TOTAL getFx calls=${__fxCalls} misses=${__fxMisses} missMs=${__fxMissMs}`);
   __hmark(`valuationLoop(${holdings.length} holdings, fx pairs cached)`);
   return out;
 }
