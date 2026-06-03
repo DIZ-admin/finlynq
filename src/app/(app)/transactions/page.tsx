@@ -35,6 +35,7 @@ import {
   type SortableColumnId,
   type FilterType,
 } from "@/lib/transactions/columns";
+import { buildTransactionQuery } from "@/lib/transactions/build-query";
 
 type Transaction = {
   id: number;
@@ -783,77 +784,11 @@ function TransactionsPageInner() {
 
   const loadTxns = useCallback(() => {
     setLoading(true);
-    const params = new URLSearchParams();
-    if (filters.startDate) params.set("startDate", filters.startDate);
-    if (filters.endDate) params.set("endDate", filters.endDate);
-    if (filters.accountId) params.set("accountId", filters.accountId);
-    if (filters.categoryId) params.set("categoryId", filters.categoryId);
-    if (filters.search) params.set("search", filters.search);
-    if (filters.portfolioHolding) params.set("portfolioHolding", filters.portfolioHolding);
-    if (filters.tag) params.set("tag", filters.tag);
-
-    // Issue #59 — sort + per-column filters. The top-bar quick filters
-    // above are URL-driven (deep links from /portfolio etc. must keep
-    // working); per-column filters are persisted server-side. Pushed as
-    // a union — both sets narrow the result.
-    if (sortPref.columnId && sortPref.direction) {
-      params.set("sort", sortPref.columnId);
-      params.set("sortDir", sortPref.direction);
-    }
-    for (const f of colFilters) {
-      if (f.type === "date") {
-        // Map column id → query param prefix that the route handler
-        // recognizes. `date` reuses the existing startDate/endDate;
-        // `createdAt`/`updatedAt` use their own pair.
-        if (f.columnId === "date") {
-          // Only set if the top-bar quick filter hasn't already.
-          if (!params.has("startDate") && f.from) params.set("startDate", f.from);
-          if (!params.has("endDate") && f.to) params.set("endDate", f.to);
-        } else if (f.columnId === "createdAt") {
-          if (f.from) params.set("createdAtFrom", f.from);
-          if (f.to) params.set("createdAtTo", f.to);
-        } else if (f.columnId === "updatedAt") {
-          if (f.from) params.set("updatedAtFrom", f.from);
-          if (f.to) params.set("updatedAtTo", f.to);
-        }
-      } else if (f.type === "text") {
-        // Encrypted-column substring filter — uses the post-decrypt path.
-        params.set(`filter_${f.columnId}`, f.value);
-      } else if (f.type === "numeric") {
-        const prefix = f.columnId === "amount" ? "amount" : f.columnId === "quantity" ? "quantity" : null;
-        if (!prefix) continue;
-        if (f.op === "eq") {
-          params.set(`${prefix}Eq`, String(f.value));
-        } else if (f.op === "gt") {
-          params.set(`${prefix}Min`, String(f.value));
-        } else if (f.op === "lt") {
-          params.set(`${prefix}Max`, String(f.value));
-        } else if (f.op === "between") {
-          params.set(`${prefix}Min`, String(f.value));
-          if (f.value2 != null) params.set(`${prefix}Max`, String(f.value2));
-        }
-      } else if (f.type === "enum") {
-        if (f.columnId === "source") {
-          params.set("sources", f.values.join(","));
-        } else if (f.columnId === "category") {
-          params.set("categoryIds", f.values.join(","));
-        } else if (f.columnId === "account" || f.columnId === "accountType") {
-          // accountType doesn't have a SQL pushdown — it's part of the
-          // account JOIN. Push the ids of accounts of that type instead.
-          if (f.columnId === "accountType") {
-            const ids = accounts
-              .filter((a) => a.type && f.values.includes(a.type))
-              .map((a) => a.id);
-            if (ids.length > 0) params.set("accountIds", ids.join(","));
-          } else {
-            params.set("accountIds", f.values.join(","));
-          }
-        }
-      }
-    }
-
-    params.set("limit", String(limit));
-    params.set("offset", String(page * limit));
+    // Issue #59 — the top-bar quick filters are URL-driven (deep links from
+    // /portfolio etc. must keep working); per-column filters + sort are
+    // persisted server-side. Both sets narrow the result. The param assembly
+    // is the pure, unit-tested buildTransactionQuery (FINLYNQ-111 Phase 1).
+    const params = buildTransactionQuery(filters, sortPref, colFilters, accounts, { page, limit });
 
     fetch(`/api/transactions?${params}`)
       .then((r) => r.json())
