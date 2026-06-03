@@ -40,6 +40,38 @@ function todayISO(): string {
   return new Date().toISOString().split("T")[0];
 }
 
+// ── Quote-fetch timeout + negative cache ────────────────────────────────────
+// A Yahoo symbol that returns no data (delisted/wrong/foreign ticker) is NEVER
+// written to price_cache (writePriceCache only runs on success), so it was
+// re-fetched on EVERY page load. Combined with fetchQuoteLive having no timeout,
+// a single dead/slow ticker stalled the whole holdings valuation for ~10s on
+// every dashboard / account-chart load (getHoldingsValueByAccount). Two guards:
+//   1. AbortSignal.timeout caps any single Yahoo call.
+//   2. An in-memory negative cache (per process) skips a known-bad symbol for a
+//      while so it can't re-stall every request. Entries expire so a transient
+//      Yahoo outage self-heals. Misses are logged so bad holding tickers surface.
+const QUOTE_FETCH_TIMEOUT_MS = 4000;
+const NEGATIVE_QUOTE_TTL_MS = 10 * 60 * 1000; // 10 min
+const negativeQuoteCache = new Map<string, number>(); // symbol -> expiry epoch ms
+
+function isQuoteNegativelyCached(symbol: string): boolean {
+  const exp = negativeQuoteCache.get(symbol);
+  if (exp == null) return false;
+  if (Date.now() > exp) {
+    negativeQuoteCache.delete(symbol);
+    return false;
+  }
+  return true;
+}
+
+function markQuoteMiss(symbol: string, reason: string): void {
+  negativeQuoteCache.set(symbol, Date.now() + NEGATIVE_QUOTE_TTL_MS);
+  // eslint-disable-next-line no-console
+  console.warn(
+    `[price-service] no live quote for "${symbol}" (${reason}) — negative-cached for ${NEGATIVE_QUOTE_TTL_MS / 60000}m`,
+  );
+}
+
 // FINLYNQ-92 follow-up: Yahoo's chart API OMITS `meta.previousClose` whenever
 // the regular session is closed (weekends, exchange holidays, pre-/after-hours)
 // — it only returns `meta.chartPreviousClose`. For a `range=1d` request the two
@@ -137,7 +169,11 @@ async function fetchQuoteLive(symbol: string): Promise<QuoteResult | null> {
   try {
     const res = await fetch(
       `${YAHOO_BASE}/chart/${encodeURIComponent(symbol)}?interval=1d&range=1d`,
-      { headers: { "User-Agent": "Mozilla/5.0" }, next: { revalidate: 300 } }
+      {
+        headers: { "User-Agent": "Mozilla/5.0" },
+        next: { revalidate: 300 },
+        signal: AbortSignal.timeout(QUOTE_FETCH_TIMEOUT_MS),
+      }
     );
     if (!res.ok) return null;
     const data = await res.json();
@@ -172,8 +208,12 @@ export async function fetchQuote(symbol: string): Promise<QuoteResult | null> {
   const today = todayISO();
   const cached = await readPriceCache(symbol, today);
   if (cached) return cached;
+  if (isQuoteNegativelyCached(symbol)) return null;
   const live = await fetchQuoteLive(symbol);
-  if (!live) return null;
+  if (!live) {
+    markQuoteMiss(symbol, "no data / timeout");
+    return null;
+  }
   await writePriceCache(symbol, today, live.price, live.currency, live.previousClose ?? null);
   return live;
 }
@@ -188,16 +228,21 @@ export async function fetchMultipleQuotes(symbols: string[]): Promise<Map<string
   if (unique.length === 0) return new Map();
   const today = todayISO();
   const results = await readPriceCacheBulk(unique, today);
-  const missing = unique.filter(s => !results.has(s));
+  // Skip cache hits AND symbols recently known to return no data — otherwise a
+  // single dead/slow ticker re-stalls every load (it never lands in price_cache).
+  const missing = unique.filter(s => !results.has(s) && !isQuoteNegativelyCached(s));
   if (missing.length === 0) return results;
 
   // Fetch misses in batches of 5 to avoid rate limiting.
   for (let i = 0; i < missing.length; i += 5) {
     const batch = missing.slice(i, i + 5);
-    const promises = batch.map((s) => fetchQuoteLive(s));
-    const quotes = await Promise.all(promises);
-    for (const q of quotes) {
-      if (!q) continue;
+    const quotes = await Promise.all(batch.map((s) => fetchQuoteLive(s)));
+    for (let j = 0; j < batch.length; j++) {
+      const q = quotes[j];
+      if (!q) {
+        markQuoteMiss(batch[j], "no data / timeout");
+        continue;
+      }
       results.set(q.symbol, q);
       await writePriceCache(q.symbol, today, q.price, q.currency, q.previousClose ?? null);
     }
@@ -230,6 +275,7 @@ export async function fetchQuoteAtDate(symbol: string, date: string): Promise<Qu
     const res = await fetch(url, {
       headers: { "User-Agent": "Mozilla/5.0" },
       next: { revalidate: 86400 },
+      signal: AbortSignal.timeout(QUOTE_FETCH_TIMEOUT_MS),
     });
     if (!res.ok) return null;
     const data = await res.json();

@@ -21,7 +21,7 @@ import {
   getDisplayCurrency,
 } from "@/lib/fx-service";
 import { getAccountBalances, getCashDailyDeltas, getInvestmentSnapshotsInRange } from "@/lib/queries";
-import { getHoldingsValueByAccount } from "@/lib/holdings-value";
+import { getHoldingsValueByAccount, type AccountHoldingsValue } from "@/lib/holdings-value";
 import { logApiError } from "@/lib/validate";
 import {
   buildNetWorthHistory,
@@ -109,7 +109,19 @@ export async function GET(request: NextRequest) {
     const investmentAccountIds = new Set(
       balances.filter((b) => Boolean(b.isInvestment)).map((b) => b.accountId),
     );
-    const holdingsByAccount = await getHoldingsValueByAccount(userId, dek);
+    // The live "today" override only applies to INVESTMENT accounts. Valuing the
+    // whole portfolio (getHoldingsValueByAccount prices every holding live) is
+    // pointless when the in-scope account set has no investment account — e.g. a
+    // cash account's per-account chart, which would otherwise pay the full
+    // ~all-holdings valuation for a result it immediately discards. Skip it.
+    const scopeHasInvestmentAccount =
+      accountId != null
+        ? investmentAccountIds.has(accountId)
+        : investmentAccountIds.size > 0;
+    const holdingsByAccount: Map<number, AccountHoldingsValue> =
+      scopeHasInvestmentAccount
+        ? await getHoldingsValueByAccount(userId, dek)
+        : new Map();
     const liveInvestmentByAccount = new Map<number, LiveInvestmentValue>();
     for (const [accId, v] of holdingsByAccount) {
       if (!investmentAccountIds.has(accId)) continue;
