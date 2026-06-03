@@ -1,7 +1,6 @@
-import { NextRequest, NextResponse } from "next/server";
+import { NextResponse } from "next/server";
 import { z } from "zod";
-import { requireEncryption } from "@/lib/auth/require-encryption";
-import { validateBody, safeErrorMessage, logApiError } from "@/lib/validate";
+import { apiHandler } from "@/lib/api-handler";
 import { recordBuy } from "@/lib/portfolio/operations";
 import { invalidateUser as invalidateUserTxCache } from "@/lib/mcp/user-tx-cache";
 import { markSnapshotsDirty } from "@/lib/portfolio/snapshots/dirty";
@@ -23,38 +22,36 @@ const schema = z.object({
   editId: z.number().int().positive().optional(),
 });
 
-export async function POST(request: NextRequest) {
-  const auth = await requireEncryption(request);
-  if (!auth.ok) return auth.response;
-  try {
-    const body = await request.json();
-    const parsed = validateBody(body, schema);
-    if (parsed.error) return parsed.error;
-    const { editId, ...input } = parsed.data;
+// raw/compat mode: this route is consumed BARE by the web portfolio forms +
+// mobile `postPortfolioOperation` (bare `{ id, ... }` on 2xx, bare structured
+// error on 4xx). apiHandler centralizes auth + body validation + error mapping
+// here WITHOUT changing the wire shape. → FINLYNQ-107 / CLAUDE.md.
+export const POST = apiHandler(
+  {
+    auth: "encryption",
+    body: schema,
+    raw: true,
+    mapError: mapOperationError,
+    fallbackMessage: "Failed to record buy",
+  },
+  async ({ userId, dek, body }) => {
+    const { editId, ...input } = body;
     if (editId != null) {
-      const refusal = await cascadeDeleteForReplace(auth.userId, editId);
+      const refusal = await cascadeDeleteForReplace(userId, editId);
       if (refusal) return refusal;
     }
     const result = await recordBuy({
       ...input,
-      userId: auth.userId,
-      dek: auth.dek,
+      userId,
+      dek,
       source: "manual",
     });
-    invalidateUserTxCache(auth.userId);
+    invalidateUserTxCache(userId);
     // Snapshot history is stale from this trade date forward — auto-rebuild.
-    await markSnapshotsDirty(auth.userId, input.date);
+    await markSnapshotsDirty(userId, input.date);
     return NextResponse.json(
       editId != null ? { ...result, replaced: editId } : result,
       { status: 201 },
     );
-  } catch (err: unknown) {
-    const mapped = mapOperationError(err);
-    if (mapped) return mapped;
-    await logApiError("POST", "/api/portfolio/operations/buy", err, auth.userId);
-    return NextResponse.json(
-      { error: safeErrorMessage(err, "Failed to record buy") },
-      { status: 500 },
-    );
-  }
-}
+  },
+);
