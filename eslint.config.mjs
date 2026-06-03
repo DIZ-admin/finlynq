@@ -15,6 +15,32 @@ const eslintConfig = defineConfig([
     // Claude Code worktrees — not part of the app source
     ".claude/**",
   ]),
+  {
+    // ── FINLYNQ-112 ESLint baseline ──────────────────────────────────────
+    // These 12 rules each carry a pre-existing violation backlog (178 errors
+    // total on the dev HEAD this baseline was cut against). They are
+    // downgraded from `error` to `warn` so the new blocking ESLint CI step
+    // (ci.yml `Lint`) can land today gating only on errors — `npm run lint`
+    // exits 0 with warnings, non-zero on any error. Every rule NOT listed
+    // here keeps its current severity, so the CI step still catches any
+    // FUTURE new-rule error. Burn down each rule's backlog and re-promote it
+    // to `error` here per the follow-up; the step's teeth grow as that
+    // happens. Do NOT add new violations of these rules — fix them at source.
+    rules: {
+      "@typescript-eslint/no-require-imports": "warn",
+      "react-hooks/set-state-in-effect": "warn",
+      "@typescript-eslint/no-explicit-any": "warn",
+      "react/display-name": "warn",
+      "react/no-unescaped-entities": "warn",
+      "prefer-const": "warn",
+      "react-hooks/static-components": "warn",
+      "react-hooks/use-memo": "warn",
+      "react-hooks/rules-of-hooks": "warn",
+      "@typescript-eslint/ban-ts-comment": "warn",
+      "@next/next/no-html-link-for-pages": "warn",
+      "react-hooks/immutability": "warn",
+    },
+  },
 ]);
 
 export default eslintConfig;
