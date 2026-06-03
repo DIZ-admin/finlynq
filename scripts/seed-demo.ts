@@ -442,7 +442,7 @@ async function main() {
       const enc = encryptName(demoDek, a.name);
       const { rows } = await client.query(
         `INSERT INTO accounts (user_id, type, "group", name_ct, name_lookup, currency, note, is_investment)
-         VALUES ($1, $2, $3, $4, $5, 'CAD', '', $6) RETURNING id`,
+         VALUES ($1, $2, $3, $4, $5, 'USD', '', $6) RETURNING id`,
         [userId, a.type, a.group, enc.ct, enc.lookup, a.isInvestment ?? false]
       );
       accountIds[a.name] = rows[0].id;
@@ -545,7 +545,7 @@ async function main() {
       );
       await client.query(
         `INSERT INTO transactions (user_id, date, account_id, category_id, currency, amount, payee, note, tags, is_business, source, import_hash)
-         VALUES ($1, $2, $3, $4, 'CAD', $5, $6, $7, $8, 0, 'sample_data', $9)`,
+         VALUES ($1, $2, $3, $4, 'USD', $5, $6, $7, $8, 0, 'sample_data', $9)`,
         [
           userId,
           tx.date,
@@ -566,7 +566,7 @@ async function main() {
     // /api/admin/portfolio-holding-fk-progress and blocks the Phase 5 cutover.
     const brokerageId = accountIds["Brokerage"];
     console.log(`[seed-demo] Inserting portfolio holdings…`);
-    // Stock holdings + 1 Cash CAD sleeve. The Cash sleeve is the implicit
+    // Stock holdings + 1 Cash USD sleeve. The Cash sleeve is the implicit
     // cash side for every investment-account transaction in this seed —
     // explicit creation (Phase 1 portfolio ops, 2026-05-25) replaces the
     // legacy getOrCreateCashHolding auto-create. `is_cash: true` lets the
@@ -580,17 +580,17 @@ async function main() {
       note: string;
     };
     const holdingsSeed: HoldingSeed[] = [
-      { name: "VTI",    symbol: "VTI",    currency: "CAD", isCrypto: 0, isCash: false, note: "Vanguard Total Stock Market (US broad)" },
-      { name: "VOO",    symbol: "VOO",    currency: "CAD", isCrypto: 0, isCash: false, note: "Vanguard S&P 500" },
-      { name: "VXUS",   symbol: "VXUS",   currency: "CAD", isCrypto: 0, isCash: false, note: "Vanguard International ex-US" },
-      { name: "VCN.TO", symbol: "VCN.TO", currency: "CAD", isCrypto: 0, isCash: false, note: "Vanguard FTSE Canada" },
-      { name: "VAB.TO", symbol: "VAB.TO", currency: "CAD", isCrypto: 0, isCash: false, note: "Vanguard Canadian Aggregate Bond" },
-      { name: "AAPL",   symbol: "AAPL",   currency: "CAD", isCrypto: 0, isCash: false, note: "Apple Inc. — single stock" },
-      { name: "BTC",    symbol: "BTC",    currency: "CAD", isCrypto: 1, isCash: false, note: "Bitcoin" },
+      { name: "VTI",    symbol: "VTI",    currency: "USD", isCrypto: 0, isCash: false, note: "Vanguard Total Stock Market (US broad)" },
+      { name: "VOO",    symbol: "VOO",    currency: "USD", isCrypto: 0, isCash: false, note: "Vanguard S&P 500" },
+      { name: "VXUS",   symbol: "VXUS",   currency: "USD", isCrypto: 0, isCash: false, note: "Vanguard International ex-US" },
+      { name: "VCN.TO", symbol: "VCN.TO", currency: "USD", isCrypto: 0, isCash: false, note: "Vanguard FTSE Canada" },
+      { name: "VAB.TO", symbol: "VAB.TO", currency: "USD", isCrypto: 0, isCash: false, note: "Vanguard Canadian Aggregate Bond" },
+      { name: "AAPL",   symbol: "AAPL",   currency: "USD", isCrypto: 0, isCash: false, note: "Apple Inc. — single stock" },
+      { name: "BTC",    symbol: "BTC",    currency: "USD", isCrypto: 1, isCash: false, note: "Bitcoin" },
       // Cash sleeve — explicit per portfolio ops Phase 1. symbol_ct stays
       // NULL (the canonical cash detection rule); the UI renders this as
-      // "Cash CAD" by combining is_cash=TRUE + currency.
-      { name: "Cash",   symbol: null,     currency: "CAD", isCrypto: 0, isCash: true,  note: "" },
+      // "Cash USD" by combining is_cash=TRUE + currency.
+      { name: "Cash",   symbol: null,     currency: "USD", isCrypto: 0, isCash: true,  note: "" },
     ];
     const holdingIdsByName: Record<string, number> = {};
     for (const h of holdingsSeed) {
@@ -655,7 +655,7 @@ async function main() {
       const kind = i.quantity > 0 ? "buy" : "sell";
       await client.query(
         `INSERT INTO transactions (user_id, date, account_id, category_id, currency, amount, quantity, portfolio_holding_id, payee, note, tags, is_business, source, kind)
-         VALUES ($1, $2, $3, NULL, 'CAD', $4, $5, $6, $7, $8, $9, 0, 'sample_data', $10)`,
+         VALUES ($1, $2, $3, NULL, 'USD', $4, $5, $6, $7, $8, $9, 0, 'sample_data', $10)`,
         [
           userId,
           isoDate(d),
@@ -685,7 +685,7 @@ async function main() {
       if (!categoryId) continue;
       await client.query(
         `INSERT INTO budgets (user_id, category_id, month, amount, currency)
-         VALUES ($1, $2, $3, $4, 'CAD')`,
+         VALUES ($1, $2, $3, $4, 'USD')`,
         [userId, categoryId, thisMonth, b.amount]
       );
     }

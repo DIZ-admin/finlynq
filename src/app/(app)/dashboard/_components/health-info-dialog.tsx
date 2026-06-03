@@ -7,6 +7,7 @@ import {
   DialogTitle,
   DialogDescription,
 } from "@/components/ui/dialog";
+import { formatCurrency } from "@/lib/currency";
 import type { HealthData } from "./types";
 
 interface HealthInfoDialogProps {
@@ -52,15 +53,7 @@ const COMPONENT_BLURBS: Record<
 };
 
 function fmtMoney(amount: number, currency: string): string {
-  try {
-    return new Intl.NumberFormat(undefined, {
-      style: "currency",
-      currency,
-      maximumFractionDigits: 0,
-    }).format(amount);
-  } catch {
-    return `${amount.toFixed(0)} ${currency}`;
-  }
+  return formatCurrency(amount, currency, { decimals: 0 });
 }
 
 function ComponentBlock({

@@ -128,7 +128,7 @@ const todayISO = (): string => new Date().toISOString().split("T")[0];
 
 /**
  * Resolve the display currency for an API request.
- * Priority: explicit `?currency=` query param → user's `settings.display_currency` → "CAD".
+ * Priority: explicit `?currency=` query param → user's `settings.display_currency` → "USD".
  */
 export async function getDisplayCurrency(
   userId: string,
@@ -148,7 +148,7 @@ export async function getDisplayCurrency(
       )
     )
     .limit(1);
-  return row[0]?.value ?? "CAD";
+  return row[0]?.value ?? "USD";
 }
 
 /**

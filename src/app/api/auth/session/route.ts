@@ -29,7 +29,7 @@ export async function GET(request: NextRequest) {
   let username: string | null = null;
   let email: string | null = null;
   let displayName: string | null = null;
-  let displayCurrency = "CAD";
+  let displayCurrency = "USD";
   if (getDialect() === "postgres" && auth.context.userId) {
     const user = await getUserById(auth.context.userId).catch(() => null);
     onboardingComplete = Boolean(user?.onboardingComplete);

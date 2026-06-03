@@ -32,6 +32,37 @@ describe("formatCurrency", () => {
     const result = formatCurrency(0, "CAD");
     expect(result).toContain("0.00");
   });
+
+  it("renders CAD with the C$ symbol", () => {
+    expect(formatCurrency(1234.56, "CAD")).toBe("C$1,234.56");
+  });
+
+  it("renders USD with the bare $ symbol", () => {
+    expect(formatCurrency(99.9, "USD")).toBe("$99.90");
+  });
+
+  it("defaults to USD", () => {
+    expect(formatCurrency(100)).toBe("$100.00");
+  });
+
+  it("renders other dollar-family symbols", () => {
+    expect(formatCurrency(50, "AUD")).toBe("A$50.00");
+    expect(formatCurrency(50, "NZD")).toBe("NZ$50.00");
+    expect(formatCurrency(50, "SGD")).toBe("S$50.00");
+  });
+
+  it("places the minus sign before the symbol", () => {
+    expect(formatCurrency(-500.1, "CAD")).toBe("-C$500.10");
+  });
+
+  it("honors a custom decimals option", () => {
+    expect(formatCurrency(1234.56, "USD", { decimals: 0 })).toBe("$1,235");
+  });
+
+  it("keeps native Intl symbols for non-dollar currencies", () => {
+    expect(formatCurrency(10, "EUR")).toContain("€");
+    expect(formatCurrency(10, "GBP")).toContain("£");
+  });
 });
 
 describe("formatNumber", () => {
