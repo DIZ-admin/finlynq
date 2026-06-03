@@ -14,6 +14,14 @@ const eslintConfig = defineConfig([
     "next-env.d.ts",
     // Claude Code worktrees — not part of the app source
     ".claude/**",
+    // Mobile is a separate React Native (Expo) workspace with its own CI lane
+    // (mobile-ci.yml: tsc + jest). This Next.js *web* config (core-web-vitals +
+    // React Compiler rules) is the wrong linter for RN code — Expo doesn't run
+    // the React Compiler, so rules like `react-hooks/preserve-manual-memoization`
+    // are false positives on mobile screens. Excluding `mobile/**` keeps the
+    // blocking web lint (FINLYNQ-112) from gating React Native code on web-only
+    // rules. If mobile wants linting, add an RN-appropriate config under mobile-ci.
+    "mobile/**",
   ]),
   {
     // ── FINLYNQ-112 ESLint baseline ──────────────────────────────────────
