@@ -1,155 +1,43 @@
 "use client";
 
-import { useEffect, useState, useCallback, useRef, Suspense } from "react";
+import { useState, useRef, Suspense } from "react";
 import { useSearchParams, useRouter } from "next/navigation";
 import Link from "next/link";
-import { Card, CardContent, CardHeader, CardTitle } from "@/components/ui/card";
-import { Table, TableBody, TableCell, TableHead, TableHeader, TableRow } from "@/components/ui/table";
+import { Card, CardContent } from "@/components/ui/card";
 import { Button } from "@/components/ui/button";
 import { Input } from "@/components/ui/input";
-import { Label } from "@/components/ui/label";
 import { Select, SelectContent, SelectItem, SelectTrigger, SelectValue } from "@/components/ui/select";
 import { Combobox, type ComboboxItemShape } from "@/components/ui/combobox";
 import { useDropdownOrder } from "@/components/dropdown-order-provider";
-import { Dialog, DialogContent, DialogHeader, DialogTitle, DialogTrigger } from "@/components/ui/dialog";
+import { Dialog, DialogContent, DialogHeader, DialogTitle } from "@/components/ui/dialog";
 import { OnboardingTips } from "@/components/onboarding-tips";
-import { EmptyState } from "@/components/empty-state";
 import { Badge } from "@/components/ui/badge";
-import { formatCurrency, formatDate } from "@/lib/currency";
-import { SUPPORTED_FIAT_CURRENCIES } from "@/lib/fx/supported-currencies";
-import { Plus, ChevronLeft, ChevronRight, Trash2, Pencil, SlidersHorizontal, ChevronDown, Receipt, Search, X, Scissors, AlertTriangle, Link2, ArrowRightLeft, Columns3, ArrowUp, ArrowDown, Filter, TrendingUp } from "lucide-react";
+import { Plus, ChevronLeft, ChevronRight, SlidersHorizontal, ChevronDown, Receipt, Search, X, AlertTriangle, ArrowRightLeft, Columns3, TrendingUp } from "lucide-react";
 import { DropdownMenu, DropdownMenuTrigger, DropdownMenuContent, DropdownMenuGroup, DropdownMenuLabel, DropdownMenuCheckboxItem, DropdownMenuItem, DropdownMenuSeparator } from "@/components/ui/dropdown-menu";
 import { SplitDialog } from "./_components/split-dialog";
 import { TransactionDialog, type TransactionDialogInitialState, type DialogLinkedSibling } from "@/components/transactions/transaction-dialog";
 import { formatAccountLabel } from "@/lib/account-label";
-import { type TransactionSource, labelForSource, SOURCES } from "@/lib/tx-source";
+import { type TransactionSource, labelForSource } from "@/lib/tx-source";
 import {
-  COLUMN_IDS as SHARED_COLUMN_IDS,
   COLUMN_LABELS as SHARED_COLUMN_LABELS,
-  DEFAULT_COLUMNS as SHARED_DEFAULT_COLUMNS,
   TOGGLEABLE_COLUMN_IDS as SHARED_TOGGLEABLE_COLUMN_IDS,
-  SORTABLE_COLUMN_IDS,
-  FILTER_COLUMN_TYPES,
-  isSortableColumnId,
   type ColumnId as SharedColumnId,
-  type SortableColumnId,
-  type FilterType,
 } from "@/lib/transactions/columns";
-import { buildTransactionQuery } from "@/lib/transactions/build-query";
+import type {
+  Transaction,
+  LinkedSibling,
+} from "./_types";
+import { useLookups, useTxColumnPrefs, useTxSortPref, useTxFilterPrefs } from "./_hooks/use-tx-prefs";
+import { useTransactions } from "./_hooks/use-transactions";
+import { TransactionTable } from "./_components/transaction-table";
 
-type Transaction = {
-  id: number;
-  date: string;
-  accountId: number;
-  accountName: string;
-  accountAlias?: string | null;
-  accountType?: string | null;
-  categoryId: number;
-  categoryName: string;
-  categoryType: string;
-  currency: string;
-  amount: number;
-  // Phase 2 currency rework — entered/account trilogy. Server may or may not
-  // populate these (older rows + GET responses that pre-date the column
-  // selection won't); use the soft-fallback chokepoint at every read site.
-  enteredAmount?: number | null;
-  enteredCurrency?: string | null;
-  enteredFxRate?: number | null;
-  quantity: number | null;
-  portfolioHolding: string | null;
-  // Ticker for the transaction's holding (e.g. "VGRO.TO"). Surfaced so the
-  // optional Ticker column doesn't need a separate fetch per row.
-  portfolioHoldingSymbol?: string | null;
-  note: string;
-  payee: string;
-  tags: string;
-  isBusiness: number | null;
-  linkId: string | null;
-  // Audit-trio (issue #28). Surfaced as a footer line in the edit dialog so
-  // users can see when a row was created/last edited and which writer
-  // surface authored it. Server-side fields are non-null (NOT NULL DEFAULTs)
-  // but typed optional here for tolerance against any stale client state.
-  createdAt?: string | null;
-  updatedAt?: string | null;
-  source?: TransactionSource | null;
-  // Phase 2 portfolio-ops refactor (2026-05-25) — `kind` is the operation
-  // discriminator (buy/sell/buy_cash_leg/etc). When set, Edit routes to
-  // the dedicated /portfolio/new form instead of the generic edit dialog.
-  // `tradeLinkId` is the buy/sell pair UUID — used to fetch the sibling
-  // cash leg in the editor.
-  kind?: string | null;
-  tradeLinkId?: string | null;
-};
+// Types (Transaction / LinkedSibling / Account / Category / Holding /
+// ColFilterShape), the ColumnFilterPopover, the SplitBadge, and the
+// TableSkeleton + category-badge helpers were extracted to ./_types and
+// ./_components (FINLYNQ-111 Phase 2). The TransactionsPageInner below now
+// composes the extracted hooks + <TransactionTable>.
 
-type LinkedSibling = {
-  id: number;
-  date: string;
-  accountId: number | null;
-  accountName: string | null;
-  accountCurrency: string | null;
-  categoryId: number | null;
-  categoryName: string | null;
-  // Returned by /api/transactions/linked so the client can run the four-check
-  // rule for "is this a transfer pair I should open in unified Transfer mode?"
-  categoryType: string | null;
-  amount: number;
-  currency: string;
-  enteredAmount: number | null;
-  enteredCurrency: string | null;
-  enteredFxRate: number | null;
-  quantity: number | null;
-  portfolioHolding: string | null;
-  payee: string | null;
-  note: string | null;
-  tags: string | null;
-};
-
-type Account = {
-  id: number;
-  name: string;
-  currency: string;
-  alias?: string | null;
-  type?: string | null;
-  // Surfaced from /api/accounts so the Transfer dialog can hide the in-kind
-  // / portfolio block when neither the source nor destination is an
-  // investment account (Section E #10). Always present on the wire because
-  // getAccounts uses select()-all on the row.
-  isInvestment?: boolean;
-};
-type Category = { id: number; name: string; type: string; group: string };
-type Holding = {
-  id: number;
-  // accountId is the source-of-truth account linkage on portfolio_holdings.
-  // Used to filter the picker in Add Transaction so the user only sees
-  // holdings that belong to the selected account. Future M2M migration
-  // (Section F/G #15) will swap this for `accounts: number[]`; the dialog
-  // filter is the only line that changes.
-  accountId: number | null;
-  name: string;
-  symbol: string | null;
-  accountName: string | null;
-  // Sum of transactions.quantity for this holding — surfaces in the in-kind
-  // Source / Destination dropdowns so the user can see current positions.
-  currentShares?: number | null;
-};
-
-// SplitRow + emptySplitRow used to live here for the inline Add Transaction
-// dialog. They now live inside TransactionDialog. The legacy SplitDialog
-// (for editing splits on already-saved transactions) has its own copy at
-// _components/split-dialog.tsx.
-
-const categoryColorMap: Record<string, string> = {
-  income: "border-emerald-300 bg-emerald-50 text-emerald-700 dark:border-emerald-700 dark:bg-emerald-950 dark:text-emerald-300",
-  expense: "border-rose-300 bg-rose-50 text-rose-700 dark:border-rose-700 dark:bg-rose-950 dark:text-rose-300",
-  transfer: "border-sky-300 bg-sky-50 text-sky-700 dark:border-sky-700 dark:bg-sky-950 dark:text-sky-300",
-  investment: "border-violet-300 bg-violet-50 text-violet-700 dark:border-violet-700 dark:bg-violet-950 dark:text-violet-300",
-};
-
-function getCategoryBadgeClass(categoryType: string): string {
-  const key = categoryType?.toLowerCase() ?? "";
-  return categoryColorMap[key] ?? "border-zinc-300 bg-zinc-50 text-zinc-700 dark:border-zinc-700 dark:bg-zinc-950 dark:text-zinc-300";
-}
-
+// Inline TableSkeleton kept only for the Suspense fallback below.
 function TableSkeleton() {
   return (
     <div className="p-4 space-y-3">
@@ -168,316 +56,6 @@ function TableSkeleton() {
   );
 }
 
-// Split indicator — shows a small badge if the transaction has splits
-function SplitBadge({ transactionId }: { transactionId: number }) {
-  const [hasSplits, setHasSplits] = useState<boolean | null>(null);
-
-  useEffect(() => {
-    fetch(`/api/transactions/splits?transactionId=${transactionId}`)
-      .then((r) => (r.ok ? r.json() : []))
-      .then((d: unknown[]) => setHasSplits(d.length > 0))
-      .catch(() => setHasSplits(false));
-  }, [transactionId]);
-
-  if (!hasSplits) return null;
-  return (
-    <Badge variant="outline" className="text-[10px] border-violet-300 bg-violet-50 text-violet-700 ml-1">
-      split
-    </Badge>
-  );
-}
-
-// Issue #59 — discriminated-union shape for per-column filters. Mirrors the
-// server-side zod schema in /api/settings/tx-filters; the page state holds
-// the same shape so persistence is byte-identical.
-type ColFilterShape =
-  | { type: "date"; columnId: SharedColumnId; from?: string; to?: string }
-  | { type: "text"; columnId: SharedColumnId; value: string }
-  | { type: "numeric"; columnId: SharedColumnId; op: "eq" | "gt" | "lt" | "between"; value: number; value2?: number }
-  | { type: "enum"; columnId: SharedColumnId; values: string[] };
-
-/**
- * Per-column filter popover. Renders a small dropdown with a type-
- * appropriate input(s) — date range / substring / numeric op / multi-
- * select enum. The icon turns primary-colored when a filter is active.
- *
- * Encrypted-column substring filters route through the post-decrypt path
- * server-side; date / numeric / id / source filters push down into SQL.
- */
-function ColumnFilterPopover({
-  columnId,
-  filterType,
-  activeFilter,
-  onChange,
-  accounts,
-  categories,
-}: {
-  columnId: SharedColumnId;
-  filterType: FilterType;
-  activeFilter: ColFilterShape | undefined;
-  onChange: (f: ColFilterShape | null) => void;
-  accounts: Array<{ id: number; name: string; type?: string | null; alias?: string | null }>;
-  categories: Array<{ id: number; name: string }>;
-}) {
-  const isActive = !!activeFilter;
-  // Local draft state so the user can type without firing one network
-  // request per keystroke. Committed on Apply.
-  const [draft, setDraft] = useState<ColFilterShape | null>(activeFilter ?? null);
-  useEffect(() => {
-    setDraft(activeFilter ?? null);
-  }, [activeFilter]);
-
-  const initDraft = (): ColFilterShape => {
-    if (filterType === "date") return { type: "date", columnId };
-    if (filterType === "text") return { type: "text", columnId, value: "" };
-    if (filterType === "numeric") return { type: "numeric", columnId, op: "eq", value: 0 };
-    return { type: "enum", columnId, values: [] };
-  };
-
-  return (
-    <DropdownMenu>
-      <DropdownMenuTrigger
-        render={
-          <button
-            type="button"
-            className={`p-0.5 rounded hover:bg-muted transition-colors ${isActive ? "text-primary" : "text-muted-foreground/60"}`}
-            title={isActive ? "Filter active — click to edit" : "Filter column"}
-            onClick={(e) => e.stopPropagation()}
-          />
-        }
-      >
-        <Filter className="h-3 w-3" />
-      </DropdownMenuTrigger>
-      <DropdownMenuContent align="end" className="min-w-64 p-3 space-y-2">
-        {filterType === "date" && (
-          <>
-            <Label className="text-xs">From</Label>
-            <Input
-              type="date"
-              className="h-8 text-xs"
-              value={(draft as { from?: string } | null)?.from ?? ""}
-              onChange={(e) => {
-                const cur = (draft as ColFilterShape | null) ?? initDraft();
-                if (cur.type !== "date") return;
-                setDraft({ ...cur, from: e.target.value || undefined });
-              }}
-              // base-ui Menu.Root attaches keydown listeners on the menu surface
-              // for type-ahead (printable chars) and back/close (Backspace).
-              // Without this stopPropagation the input never sees its own
-              // keystrokes — the menu eats them first. Allow Escape and Tab
-              // to bubble so dropdown-close + focus traversal still work.
-              onKeyDown={(e) => {
-                if (e.key !== "Escape" && e.key !== "Tab") e.stopPropagation();
-              }}
-            />
-            <Label className="text-xs">To</Label>
-            <Input
-              type="date"
-              className="h-8 text-xs"
-              value={(draft as { to?: string } | null)?.to ?? ""}
-              onChange={(e) => {
-                const cur = (draft as ColFilterShape | null) ?? initDraft();
-                if (cur.type !== "date") return;
-                setDraft({ ...cur, to: e.target.value || undefined });
-              }}
-              onKeyDown={(e) => {
-                if (e.key !== "Escape" && e.key !== "Tab") e.stopPropagation();
-              }}
-            />
-          </>
-        )}
-        {filterType === "text" && (
-          <>
-            <Label className="text-xs">Contains</Label>
-            <Input
-              className="h-8 text-xs"
-              placeholder="Substring…"
-              value={(draft as { value?: string } | null)?.value ?? ""}
-              onChange={(e) => setDraft({ type: "text", columnId, value: e.target.value })}
-              onKeyDown={(e) => {
-                if (e.key !== "Escape" && e.key !== "Tab") e.stopPropagation();
-              }}
-            />
-          </>
-        )}
-        {filterType === "numeric" && (
-          <>
-            <Label className="text-xs">Operator</Label>
-            <Select
-              value={(draft as { op?: string } | null)?.op ?? "eq"}
-              onValueChange={(v) => {
-                const op = (v ?? "eq") as "eq" | "gt" | "lt" | "between";
-                const cur = draft && draft.type === "numeric" ? draft : { type: "numeric" as const, columnId, value: 0, op };
-                setDraft({ ...cur, op } as ColFilterShape);
-              }}
-            >
-              <SelectTrigger className="h-8 text-xs"><SelectValue /></SelectTrigger>
-              <SelectContent>
-                <SelectItem value="eq">=</SelectItem>
-                <SelectItem value="gt">&gt;</SelectItem>
-                <SelectItem value="lt">&lt;</SelectItem>
-                <SelectItem value="between">Between</SelectItem>
-              </SelectContent>
-            </Select>
-            <Label className="text-xs">Value</Label>
-            <Input
-              type="number"
-              className="h-8 text-xs"
-              value={(draft as { value?: number } | null)?.value ?? ""}
-              onChange={(e) => {
-                const n = e.target.value === "" ? 0 : Number(e.target.value);
-                if (!Number.isFinite(n)) return;
-                const cur = draft && draft.type === "numeric" ? draft : { type: "numeric" as const, columnId, op: "eq" as const, value: 0 };
-                setDraft({ ...cur, value: n } as ColFilterShape);
-              }}
-              onKeyDown={(e) => {
-                if (e.key !== "Escape" && e.key !== "Tab") e.stopPropagation();
-              }}
-            />
-            {draft?.type === "numeric" && draft.op === "between" && (
-              <>
-                <Label className="text-xs">Upper bound</Label>
-                <Input
-                  type="number"
-                  className="h-8 text-xs"
-                  value={draft.value2 ?? ""}
-                  onChange={(e) => {
-                    const n = e.target.value === "" ? undefined : Number(e.target.value);
-                    if (n != null && !Number.isFinite(n)) return;
-                    setDraft({ ...draft, value2: n });
-                  }}
-                  onKeyDown={(e) => {
-                    if (e.key !== "Escape" && e.key !== "Tab") e.stopPropagation();
-                  }}
-                />
-              </>
-            )}
-          </>
-        )}
-        {filterType === "enum" && (
-          <>
-            <Label className="text-xs">Match any of</Label>
-            <div className="max-h-48 overflow-y-auto space-y-1 border rounded p-2">
-              {columnId === "source" &&
-                SOURCES.map((s) => {
-                  const checked = draft?.type === "enum" && draft.values.includes(s);
-                  return (
-                    <label key={s} className="flex items-center gap-2 text-xs cursor-pointer">
-                      <input
-                        type="checkbox"
-                        checked={checked}
-                        onChange={(e) => {
-                          const cur = draft && draft.type === "enum" ? draft : { type: "enum" as const, columnId, values: [] };
-                          const values = e.target.checked
-                            ? Array.from(new Set([...cur.values, s]))
-                            : cur.values.filter((v) => v !== s);
-                          setDraft({ ...cur, values });
-                        }}
-                      />
-                      {labelForSource(s)}
-                    </label>
-                  );
-                })}
-              {columnId === "category" &&
-                categories.map((cat) => {
-                  const checked = draft?.type === "enum" && draft.values.includes(String(cat.id));
-                  return (
-                    <label key={cat.id} className="flex items-center gap-2 text-xs cursor-pointer">
-                      <input
-                        type="checkbox"
-                        checked={checked}
-                        onChange={(e) => {
-                          const cur = draft && draft.type === "enum" ? draft : { type: "enum" as const, columnId, values: [] };
-                          const values = e.target.checked
-                            ? Array.from(new Set([...cur.values, String(cat.id)]))
-                            : cur.values.filter((v) => v !== String(cat.id));
-                          setDraft({ ...cur, values });
-                        }}
-                      />
-                      {cat.name}
-                    </label>
-                  );
-                })}
-              {columnId === "account" &&
-                accounts.map((a) => {
-                  const checked = draft?.type === "enum" && draft.values.includes(String(a.id));
-                  return (
-                    <label key={a.id} className="flex items-center gap-2 text-xs cursor-pointer">
-                      <input
-                        type="checkbox"
-                        checked={checked}
-                        onChange={(e) => {
-                          const cur = draft && draft.type === "enum" ? draft : { type: "enum" as const, columnId, values: [] };
-                          const values = e.target.checked
-                            ? Array.from(new Set([...cur.values, String(a.id)]))
-                            : cur.values.filter((v) => v !== String(a.id));
-                          setDraft({ ...cur, values });
-                        }}
-                      />
-                      {a.name}
-                    </label>
-                  );
-                })}
-              {columnId === "accountType" &&
-                Array.from(new Set(accounts.map((a) => a.type).filter(Boolean) as string[])).map((t) => {
-                  const checked = draft?.type === "enum" && draft.values.includes(t);
-                  return (
-                    <label key={t} className="flex items-center gap-2 text-xs cursor-pointer">
-                      <input
-                        type="checkbox"
-                        checked={checked}
-                        onChange={(e) => {
-                          const cur = draft && draft.type === "enum" ? draft : { type: "enum" as const, columnId, values: [] };
-                          const values = e.target.checked
-                            ? Array.from(new Set([...cur.values, t]))
-                            : cur.values.filter((v) => v !== t);
-                          setDraft({ ...cur, values });
-                        }}
-                      />
-                      {t}
-                    </label>
-                  );
-                })}
-            </div>
-          </>
-        )}
-        <DropdownMenuSeparator />
-        <div className="flex gap-2 justify-end">
-          {isActive && (
-            <Button
-              type="button"
-              size="sm"
-              variant="ghost"
-              className="h-7 text-xs"
-              onClick={() => onChange(null)}
-            >
-              Clear
-            </Button>
-          )}
-          <Button
-            type="button"
-            size="sm"
-            className="h-7 text-xs"
-            onClick={() => {
-              if (!draft) {
-                onChange(null);
-                return;
-              }
-              // Drop empty-state filters (no values, no inputs)
-              if (draft.type === "date" && !draft.from && !draft.to) onChange(null);
-              else if (draft.type === "text" && !draft.value.trim()) onChange(null);
-              else if (draft.type === "enum" && draft.values.length === 0) onChange(null);
-              else onChange(draft);
-            }}
-          >
-            Apply
-          </Button>
-        </div>
-      </DropdownMenuContent>
-    </DropdownMenu>
-  );
-}
-
 // useSearchParams requires Suspense. The inner component owns the page
 // state + side effects; the default export just wraps it.
 export default function TransactionsPage() {
@@ -491,16 +69,12 @@ export default function TransactionsPage() {
 function TransactionsPageInner() {
   const urlParams = useSearchParams();
   const router = useRouter();
-  const [txns, setTxns] = useState<Transaction[]>([]);
-  const [total, setTotal] = useState(0);
-  const [accounts, setAccounts] = useState<Account[]>([]);
-  const [categories, setCategories] = useState<Category[]>([]);
-  const [holdings, setHoldings] = useState<Holding[]>([]);
+  // Lookups (accounts / categories / holdings) — extracted to useLookups
+  // (FINLYNQ-111 Phase 2). Same uncoordinated mount-time parallel fetch.
+  const { accounts, categories, holdings } = useLookups();
   const sortAccount = useDropdownOrder("account");
   const sortCategory = useDropdownOrder("category");
   const sortHolding = useDropdownOrder("holding");
-  const [page, setPage] = useState(0);
-  const [loading, setLoading] = useState(true);
   const [searchInput, setSearchInput] = useState("");
   // Initialize from URL params so /portfolio can deep-link into a scoped view.
   // `portfolioHolding` is a server-side post-decrypt filter (ciphertext-at-
@@ -516,118 +90,34 @@ function TransactionsPageInner() {
   });
   const searchTimer = useRef<ReturnType<typeof setTimeout> | null>(null);
 
-  // Per-user table column layout (visibility + order) persisted via
-  // /api/settings/tx-columns. Mirrors display-currency's pattern — last-
-  // writer-wins is acceptable for column prefs. Migrates the legacy
-  // localStorage["pf-tx-cols-v1"] blob on first load (then clears it) so
-  // existing users keep their Portfolio toggle.
-  //
-  // Issue #59: column metadata sourced from `@/lib/transactions/columns`
-  // so the API routes, the sort whitelist, and the page client share one
-  // authority. Adding/removing a column happens there.
   type ColumnId = SharedColumnId;
-  type ColumnPref = { id: ColumnId; visible: boolean };
-  const ALL_COLUMNS = SHARED_COLUMN_IDS as readonly ColumnId[];
   const COLUMN_LABELS = SHARED_COLUMN_LABELS;
   const TOGGLEABLE_COLUMNS = new Set<ColumnId>(SHARED_TOGGLEABLE_COLUMN_IDS);
-  const DEFAULT_COL_PREFS = SHARED_DEFAULT_COLUMNS;
-  function mergeColPrefs(saved: ColumnPref[] | null | undefined): ColumnPref[] {
-    if (!saved || saved.length === 0) return DEFAULT_COL_PREFS;
-    const seen = new Set<ColumnId>();
-    const out: ColumnPref[] = [];
-    for (const entry of saved) {
-      if (!ALL_COLUMNS.includes(entry.id)) continue;
-      if (seen.has(entry.id)) continue;
-      seen.add(entry.id);
-      out.push({ id: entry.id, visible: !!entry.visible });
-    }
-    for (const def of DEFAULT_COL_PREFS) {
-      if (seen.has(def.id)) continue;
-      out.push(def);
-    }
-    return out;
-  }
-  const [columnPrefs, setColumnPrefs] = useState<ColumnPref[]>(DEFAULT_COL_PREFS);
-  const colPrefsLoaded = useRef(false);
-  const colPrefsSaveTimer = useRef<ReturnType<typeof setTimeout> | null>(null);
-  useEffect(() => {
-    let cancelled = false;
-    (async () => {
-      // Read the legacy localStorage blob only when the server endpoint has
-      // never been written for this user — otherwise the server-side layout
-      // wins (cross-device sync). The legacy blob is cleared after one
-      // successful migration.
-      let legacy: ColumnPref[] | null = null;
-      try {
-        const raw = localStorage.getItem("pf-tx-cols-v1");
-        if (raw) {
-          const parsed = JSON.parse(raw) as { portfolio?: boolean };
-          if (parsed && typeof parsed === "object") {
-            legacy = DEFAULT_COL_PREFS.map((c) =>
-              c.id === "portfolio"
-                ? { ...c, visible: !!parsed.portfolio }
-                : c,
-            );
-          }
-        }
-      } catch { /* ignore */ }
-      try {
-        const r = await fetch("/api/settings/tx-columns");
-        if (cancelled) return;
-        if (r.ok) {
-          const d = (await r.json()) as { columns?: ColumnPref[] };
-          const serverPrefs = mergeColPrefs(d?.columns ?? null);
-          // If the server has the canonical defaults AND we have a legacy
-          // blob, push the legacy preferences up so the migration sticks.
-          const isServerDefault =
-            !d?.columns || d.columns.length === 0;
-          if (legacy && isServerDefault) {
-            setColumnPrefs(legacy);
-            try {
-              await fetch("/api/settings/tx-columns", {
-                method: "PUT",
-                headers: { "Content-Type": "application/json" },
-                body: JSON.stringify({ columns: legacy }),
-              });
-              localStorage.removeItem("pf-tx-cols-v1");
-            } catch { /* best-effort */ }
-          } else {
-            setColumnPrefs(serverPrefs);
-            try { localStorage.removeItem("pf-tx-cols-v1"); } catch { /* ignore */ }
-          }
-        } else if (legacy) {
-          setColumnPrefs(legacy);
-        }
-      } catch {
-        if (legacy) setColumnPrefs(legacy);
-      } finally {
-        if (!cancelled) colPrefsLoaded.current = true;
-      }
-    })();
-    return () => { cancelled = true; };
-  }, []);
-  useEffect(() => {
-    if (!colPrefsLoaded.current) return;
-    if (colPrefsSaveTimer.current) clearTimeout(colPrefsSaveTimer.current);
-    colPrefsSaveTimer.current = setTimeout(() => {
-      fetch("/api/settings/tx-columns", {
-        method: "PUT",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ columns: columnPrefs }),
-      }).catch(() => { /* swallow — next save retries */ });
-    }, 400);
-    return () => {
-      if (colPrefsSaveTimer.current) clearTimeout(colPrefsSaveTimer.current);
-    };
-  }, [columnPrefs]);
-  const isColVisible = (id: ColumnId): boolean => {
-    const e = columnPrefs.find((c) => c.id === id);
-    return e ? e.visible : true;
-  };
-  const toggleCol = (id: ColumnId, value: boolean) => {
-    setColumnPrefs((prev) => prev.map((c) => (c.id === id ? { ...c, visible: value } : c)));
-  };
-  const resetColPrefs = () => setColumnPrefs(DEFAULT_COL_PREFS);
+
+  // Pagination index lives at the page level (as it did pre-refactor) so the
+  // sort/filter hooks can reset it to 0 on change without a forward reference.
+  const [page, setPage] = useState(0);
+
+  // Per-user table column layout (visibility + order), header sort, and
+  // per-column filters — all extracted to hooks (FINLYNQ-111 Phase 2). Each
+  // hook owns the same load-on-mount + debounced-PUT-on-change effects + the
+  // legacy localStorage migration. `cycleSort` / `setColFilter` reset the page
+  // to 0 via the onChange callback (verbatim with the old inline setPage(0)).
+  const { columnPrefs, setColumnPrefs, resetColPrefs } = useTxColumnPrefs();
+  const { sortPref, setSortPref, cycleSort } = useTxSortPref(() => setPage(0));
+  const { colFilters, setColFilters, findColFilter, setColFilter } = useTxFilterPrefs(() => setPage(0));
+
+  // Main list (txns / total / loading) + loadTxns — extracted to
+  // useTransactions (FINLYNQ-111 Phase 2). Same deps, fetch URL, {data,total}
+  // unwrap, and driving effect; `page` is owned by the page-level state above.
+  const { txns, total, loading, limit, loadTxns } = useTransactions(
+    filters,
+    sortPref,
+    colFilters,
+    accounts,
+    page,
+  );
+
   // Native HTML5 drag state — id of the column currently being dragged. The
   // ondragover handler reorders in place, so we only need to track the source.
   const [draggingCol, setDraggingCol] = useState<ColumnId | null>(null);
@@ -652,97 +142,10 @@ function TransactionsPageInner() {
   };
   const onColDragEnd = () => setDraggingCol(null);
 
-  // Per-user header sort (issue #59). `null` direction = unsorted (default
-  // `date DESC` server-side). Persisted via /api/settings/tx-sort. Cycles
-  // desc → asc → null on repeated clicks.
-  type SortPref = { columnId: SortableColumnId | null; direction: "asc" | "desc" | null };
-  const [sortPref, setSortPref] = useState<SortPref>({ columnId: null, direction: null });
-  const sortPrefLoaded = useRef(false);
-  const sortPrefSaveTimer = useRef<ReturnType<typeof setTimeout> | null>(null);
-  useEffect(() => {
-    let cancelled = false;
-    fetch("/api/settings/tx-sort")
-      .then((r) => (r.ok ? r.json() : null))
-      .then((d: SortPref | null) => {
-        if (cancelled) return;
-        if (d && (d.columnId === null || isSortableColumnId(d.columnId)) && (d.direction === null || d.direction === "asc" || d.direction === "desc")) {
-          setSortPref({ columnId: d.columnId, direction: d.direction });
-        }
-      })
-      .catch(() => { /* default = unsorted */ })
-      .finally(() => {
-        if (!cancelled) sortPrefLoaded.current = true;
-      });
-    return () => { cancelled = true; };
-  }, []);
-  useEffect(() => {
-    if (!sortPrefLoaded.current) return;
-    if (sortPrefSaveTimer.current) clearTimeout(sortPrefSaveTimer.current);
-    sortPrefSaveTimer.current = setTimeout(() => {
-      fetch("/api/settings/tx-sort", {
-        method: "PUT",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify(sortPref),
-      }).catch(() => { /* swallow */ });
-    }, 400);
-    return () => {
-      if (sortPrefSaveTimer.current) clearTimeout(sortPrefSaveTimer.current);
-    };
-  }, [sortPref]);
-  function cycleSort(columnId: SortableColumnId) {
-    setSortPref((prev) => {
-      if (prev.columnId !== columnId) return { columnId, direction: "desc" };
-      if (prev.direction === "desc") return { columnId, direction: "asc" };
-      return { columnId: null, direction: null };
-    });
-    setPage(0);
-  }
+  const toggleCol = (id: ColumnId, value: boolean) => {
+    setColumnPrefs((prev) => prev.map((c) => (c.id === id ? { ...c, visible: value } : c)));
+  };
 
-  // Per-column filters (issue #59). Discriminated union by column type;
-  // persisted via /api/settings/tx-filters. Each column has at most one
-  // filter active at a time. Shape mirrors the server-side zod schema.
-  type ColFilter = ColFilterShape;
-  const [colFilters, setColFilters] = useState<ColFilter[]>([]);
-  const colFiltersLoaded = useRef(false);
-  const colFiltersSaveTimer = useRef<ReturnType<typeof setTimeout> | null>(null);
-  useEffect(() => {
-    let cancelled = false;
-    fetch("/api/settings/tx-filters")
-      .then((r) => (r.ok ? r.json() : null))
-      .then((d: { filters?: ColFilter[] } | null) => {
-        if (cancelled) return;
-        if (d?.filters) setColFilters(d.filters);
-      })
-      .catch(() => { /* default = no filters */ })
-      .finally(() => {
-        if (!cancelled) colFiltersLoaded.current = true;
-      });
-    return () => { cancelled = true; };
-  }, []);
-  useEffect(() => {
-    if (!colFiltersLoaded.current) return;
-    if (colFiltersSaveTimer.current) clearTimeout(colFiltersSaveTimer.current);
-    colFiltersSaveTimer.current = setTimeout(() => {
-      fetch("/api/settings/tx-filters", {
-        method: "PUT",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ filters: colFilters }),
-      }).catch(() => { /* swallow */ });
-    }, 400);
-    return () => {
-      if (colFiltersSaveTimer.current) clearTimeout(colFiltersSaveTimer.current);
-    };
-  }, [colFilters]);
-  function findColFilter(columnId: ColumnId): ColFilter | undefined {
-    return colFilters.find((f) => f.columnId === columnId);
-  }
-  function setColFilter(filter: ColFilter | null, columnId: ColumnId) {
-    setColFilters((prev) => {
-      const without = prev.filter((f) => f.columnId !== columnId);
-      return filter ? [...without, filter] : without;
-    });
-    setPage(0);
-  }
   // Add/edit dialog. State that used to live inline (form, transferForm,
   // FX preview, splits, etc.) now belongs to TransactionDialog. The parent
   // only tracks open + the seed `initialState` it hands the dialog on
@@ -779,33 +182,6 @@ function TransactionsPageInner() {
   const [bulkTags, setBulkTags] = useState("");
   const [bulkProcessing, setBulkProcessing] = useState(false);
   const [bulkDeleteConfirm, setBulkDeleteConfirm] = useState(false);
-
-  const limit = 50;
-
-  const loadTxns = useCallback(() => {
-    setLoading(true);
-    // Issue #59 — the top-bar quick filters are URL-driven (deep links from
-    // /portfolio etc. must keep working); per-column filters + sort are
-    // persisted server-side. Both sets narrow the result. The param assembly
-    // is the pure, unit-tested buildTransactionQuery (FINLYNQ-111 Phase 1).
-    const params = buildTransactionQuery(filters, sortPref, colFilters, accounts, { page, limit });
-
-    fetch(`/api/transactions?${params}`)
-      .then((r) => r.json())
-      .then((d) => {
-        setTxns(d.data ?? []);
-        setTotal(d.total ?? 0);
-      })
-      .finally(() => setLoading(false));
-  }, [filters, page, sortPref, colFilters, accounts]);
-
-  useEffect(() => { loadTxns(); }, [loadTxns]);
-
-  useEffect(() => {
-    fetch("/api/accounts").then((r) => r.ok ? r.json() : []).then(setAccounts);
-    fetch("/api/categories").then((r) => r.ok ? r.json() : []).then(setCategories);
-    fetch("/api/portfolio").then((r) => r.ok ? r.json() : []).then(setHoldings);
-  }, []);
 
   function handleSearchChange(value: string) {
     setSearchInput(value);
@@ -1480,387 +856,34 @@ function TransactionsPageInner() {
         </div>
       )}
 
-      {/* Table */}
+      {/* Table — extracted to <TransactionTable> (FINLYNQ-111 Phase 2). */}
       <Card>
         <CardContent className="p-0">
-          {loading ? (
-            <TableSkeleton />
-          ) : txns.length === 0 ? (
-            <EmptyState
-              icon={Receipt}
-              title="No transactions yet"
-              description="Add your first transaction or import bank statements to get started."
-              action={{ label: "Import data", href: "/import" }}
-            />
-          ) : (
-            <div className="overflow-x-auto">
-            <Table>
-              <TableHeader>
-                <TableRow>
-                  {columnPrefs.filter((c) => c.visible).map((c) => {
-                    const isDraggable = TOGGLEABLE_COLUMNS.has(c.id);
-                    const isAmount = c.id === "amount" || c.id === "quantity";
-                    const widthClass =
-                      c.id === "select" ? "w-10" :
-                      c.id === "actions" ? "w-24" :
-                      "";
-                    const isDragging = draggingCol === c.id;
-                    const sortable = isSortableColumnId(c.id);
-                    const filterType = FILTER_COLUMN_TYPES[c.id];
-                    const activeFilter = findColFilter(c.id);
-                    const sortActive = sortPref.columnId === c.id ? sortPref.direction : null;
-                    return (
-                      <TableHead
-                        key={c.id}
-                        className={`${widthClass} ${isAmount ? "text-right" : ""} ${isDraggable ? "select-none" : ""} ${isDragging ? "opacity-50" : ""}`}
-                        draggable={isDraggable}
-                        onDragStart={isDraggable ? onColDragStart(c.id) : undefined}
-                        onDragOver={isDraggable ? onColDragOver(c.id) : undefined}
-                        onDragEnd={isDraggable ? onColDragEnd : undefined}
-                      >
-                        {c.id === "select" ? (
-                          <input
-                            type="checkbox"
-                            checked={allSelected}
-                            onChange={toggleAll}
-                            className="h-4 w-4 rounded border-input cursor-pointer"
-                            title="Select all"
-                          />
-                        ) : c.id === "actions" ? (
-                          ""
-                        ) : (
-                          <div className={`flex items-center gap-1 ${isAmount ? "justify-end" : ""}`}>
-                            {sortable ? (
-                              <button
-                                type="button"
-                                onClick={() => cycleSort(c.id as SortableColumnId)}
-                                className="inline-flex items-center gap-0.5 hover:text-foreground transition-colors"
-                                title="Click to sort"
-                              >
-                                <span>{COLUMN_LABELS[c.id]}</span>
-                                {sortActive === "asc" && <ArrowUp className="h-3 w-3 text-primary" />}
-                                {sortActive === "desc" && <ArrowDown className="h-3 w-3 text-primary" />}
-                              </button>
-                            ) : (
-                              <span>{COLUMN_LABELS[c.id]}</span>
-                            )}
-                            {filterType && (
-                              <ColumnFilterPopover
-                                columnId={c.id}
-                                filterType={filterType}
-                                activeFilter={activeFilter}
-                                onChange={(f) => setColFilter(f, c.id)}
-                                accounts={accounts}
-                                categories={categories}
-                              />
-                            )}
-                          </div>
-                        )}
-                      </TableHead>
-                    );
-                  })}
-                </TableRow>
-              </TableHeader>
-              <TableBody>
-                {txns.map((t) => (
-                  <TableRow key={t.id} className={`hover:bg-muted/30 ${selected.has(t.id) ? "bg-primary/5" : ""}`}>
-                    {columnPrefs.filter((c) => c.visible).map((c) => {
-                      switch (c.id) {
-                        case "select":
-                          return (
-                            <TableCell key={c.id}>
-                              <input
-                                type="checkbox"
-                                checked={selected.has(t.id)}
-                                onChange={() => toggleOne(t.id)}
-                                className="h-4 w-4 rounded border-input cursor-pointer"
-                              />
-                            </TableCell>
-                          );
-                        case "date":
-                          return (
-                            <TableCell key={c.id} className="text-sm">{formatDate(t.date)}</TableCell>
-                          );
-                        case "account":
-                          return (
-                            <TableCell key={c.id} className="text-sm">
-                              {formatAccountLabel({ name: t.accountName, alias: t.accountAlias, type: t.accountType })}
-                            </TableCell>
-                          );
-                        case "accountType":
-                          return (
-                            <TableCell key={c.id} className="text-sm text-muted-foreground">
-                              {t.accountType || "-"}
-                            </TableCell>
-                          );
-                        case "accountName":
-                          return (
-                            <TableCell key={c.id} className="text-sm">{t.accountName || "-"}</TableCell>
-                          );
-                        case "accountAlias":
-                          return (
-                            <TableCell key={c.id} className="text-sm text-muted-foreground">
-                              {t.accountAlias || "-"}
-                            </TableCell>
-                          );
-                        case "category":
-                          return (
-                            <TableCell key={c.id} className="text-sm">
-                              <span className="flex items-center gap-1">
-                                {t.categoryName && (
-                                  <Badge variant="outline" className={`text-xs ${getCategoryBadgeClass(t.categoryType)}`}>{t.categoryName}</Badge>
-                                )}
-                                <SplitBadge transactionId={t.id} />
-                                {t.linkId && (
-                                  <Link2 className="h-3 w-3 text-sky-500 shrink-0" aria-label="Linked transaction" />
-                                )}
-                              </span>
-                            </TableCell>
-                          );
-                        case "payee":
-                          return (
-                            <TableCell key={c.id} className="text-sm">{t.payee || "-"}</TableCell>
-                          );
-                        case "portfolio":
-                          return (
-                            <TableCell key={c.id} className="text-sm text-muted-foreground">
-                              {t.portfolioHolding || "-"}
-                            </TableCell>
-                          );
-                        case "portfolioTicker":
-                          return (
-                            <TableCell key={c.id} className="text-sm font-mono text-muted-foreground">
-                              {t.portfolioHoldingSymbol || "-"}
-                            </TableCell>
-                          );
-                        case "note":
-                          return (
-                            <TableCell key={c.id} className="text-sm text-muted-foreground max-w-60">
-                              {t.note ? <span className="truncate block">{t.note}</span> : <span>-</span>}
-                            </TableCell>
-                          );
-                        case "tags":
-                          return (
-                            <TableCell key={c.id} className="text-sm text-muted-foreground">
-                              {t.tags ? (
-                                <div className="flex flex-wrap gap-1">
-                                  {t.tags.split(",").map((rawTag) => rawTag.trim()).filter(Boolean).map((tagValue) => (
-                                    <button
-                                      key={tagValue}
-                                      type="button"
-                                      onClick={(e) => {
-                                        e.stopPropagation();
-                                        setFilters({ ...filters, tag: tagValue });
-                                        setPage(0);
-                                      }}
-                                      className="inline-flex items-center rounded-md border border-sky-200 bg-sky-50 text-sky-700 dark:border-sky-800 dark:bg-sky-950 dark:text-sky-300 px-1.5 py-0 text-[10px] font-mono hover:border-sky-400 hover:bg-sky-100 dark:hover:bg-sky-900 transition-colors"
-                                      title={`Filter by tag: ${tagValue}`}
-                                    >
-                                      {tagValue}
-                                    </button>
-                                  ))}
-                                </div>
-                              ) : (
-                                <span>-</span>
-                              )}
-                            </TableCell>
-                          );
-                        case "quantity":
-                          return (
-                            <TableCell key={c.id} className="text-right font-mono text-xs text-muted-foreground">
-                              {t.quantity != null && t.quantity !== 0
-                                ? t.quantity.toLocaleString("en-CA", {
-                                    minimumFractionDigits: 0,
-                                    maximumFractionDigits: t.quantity % 1 === 0 ? 0 : 4,
-                                  })
-                                : "-"}
-                            </TableCell>
-                          );
-                        case "amount": {
-                          // Show the entered side (what the user typed); fall
-                          // back to amount/currency on legacy rows. When the
-                          // settlement currency differs, append a muted
-                          // converted label so both the trade and settlement
-                          // are visible.
-                          const enteredAmt = t.enteredAmount ?? t.amount;
-                          const enteredCcy = t.enteredCurrency ?? t.currency;
-                          const showSecondary = enteredCcy !== t.currency;
-                          return (
-                            <TableCell key={c.id} className={`text-right font-mono text-sm font-semibold ${t.amount >= 0 ? "text-emerald-600" : "text-rose-600"}`}>
-                              <div className="flex flex-col items-end">
-                                <span>{formatCurrency(enteredAmt, enteredCcy)}</span>
-                                {showSecondary && (
-                                  <span className="text-[10px] font-normal text-muted-foreground">
-                                    → {formatCurrency(t.amount, t.currency)}
-                                  </span>
-                                )}
-                              </div>
-                            </TableCell>
-                          );
-                        }
-                        case "createdAt":
-                          return (
-                            <TableCell key={c.id} className="text-sm text-muted-foreground whitespace-nowrap">
-                              {t.createdAt ? formatDate(t.createdAt.split("T")[0]) : "-"}
-                            </TableCell>
-                          );
-                        case "updatedAt":
-                          return (
-                            <TableCell key={c.id} className="text-sm text-muted-foreground whitespace-nowrap">
-                              {t.updatedAt ? formatDate(t.updatedAt.split("T")[0]) : "-"}
-                            </TableCell>
-                          );
-                        case "source":
-                          return (
-                            <TableCell key={c.id} className="text-sm">
-                              {t.source ? (
-                                <Badge variant="outline" className="text-[10px]">
-                                  {labelForSource(t.source)}
-                                </Badge>
-                              ) : (
-                                "-"
-                              )}
-                            </TableCell>
-                          );
-                        case "kind": {
-                          // Phase 2 canonicalization tag — surfaces what the
-                          // /settings/backfill coverage dashboard reads from.
-                          // Empty = not yet canonicalized (legacy/pre-Phase-2
-                          // or pre-backfill). A coloured pill means the row
-                          // has a portfolio-op shape the lot engine recognizes.
-                          // `opening_balance` (violet) is distinct from `buy`
-                          // (amber) so users can tell carried-in positions
-                          // from regular buys at a glance.
-                          //
-                          // Solid border = row is coverage-canonical
-                          // (PAIRLESS kind OR trade_link_id OR link_id).
-                          // Dashed border = kind is set but the row is still
-                          // coverage-pending (needs a pair / is missing
-                          // canonical shape). Mirror of
-                          // PAIRLESS_CANONICAL_KINDS in
-                          // src/lib/portfolio/backfill/types.ts — keep in
-                          // sync with the coverage SQL predicate.
-                          const PAIRLESS_KINDS = new Set([
-                            "dividend",
-                            "interest",
-                            "portfolio_income",
-                            "portfolio_expense",
-                            "opening_balance",
-                          ]);
-                          const isCanonical =
-                            !!t.kind &&
-                            (PAIRLESS_KINDS.has(t.kind) ||
-                              t.tradeLinkId != null ||
-                              t.linkId != null);
-                          // Badge already renders `border` (1px). Add
-                          // `border-dashed` for pending rows; default solid
-                          // for canonical rows.
-                          const borderStyle = isCanonical ? "" : "border-dashed";
-                          return (
-                            <TableCell key={c.id} className="text-sm">
-                              {t.kind ? (
-                                <Badge
-                                  variant="outline"
-                                  className={`text-[10px] ${borderStyle} ${
-                                    /_cash_leg$/.test(t.kind)
-                                      ? "border-sky-500/40 bg-sky-500/10 text-sky-700 dark:text-sky-300"
-                                      : t.kind === "dividend" || t.kind === "interest"
-                                        ? "border-emerald-500/40 bg-emerald-500/10 text-emerald-700 dark:text-emerald-300"
-                                        : t.kind === "opening_balance"
-                                          ? "border-violet-500/40 bg-violet-500/10 text-violet-700 dark:text-violet-300"
-                                          : "border-amber-500/40 bg-amber-500/10 text-amber-700 dark:text-amber-300"
-                                  }`}
-                                  title={
-                                    isCanonical
-                                      ? t.kind
-                                      : `${t.kind} — pending canonicalization, visit /settings/backfill`
-                                  }
-                                >
-                                  {t.kind}
-                                </Badge>
-                              ) : (
-                                <span className="text-muted-foreground/50">—</span>
-                              )}
-                            </TableCell>
-                          );
-                        }
-                        case "canonical": {
-                          // 2026-06-09 — companion to the `kind` column.
-                          // Mirrors the predicate the /settings/backfill
-                          // coverage dashboard uses to count canonical vs
-                          // pending vs not-yet-classified rows. Keep this
-                          // PAIRLESS set in sync with PAIRLESS_CANONICAL_KINDS
-                          // in src/lib/portfolio/backfill/types.ts and with
-                          // the duplicate set above in the `kind` case —
-                          // ideally hoist to module scope on next touch.
-                          const PAIRLESS_KINDS = new Set([
-                            "dividend",
-                            "interest",
-                            "portfolio_income",
-                            "portfolio_expense",
-                            "opening_balance",
-                          ]);
-                          const status: "canonical" | "pending" | "none" =
-                            t.kind == null
-                              ? "none"
-                              : PAIRLESS_KINDS.has(t.kind) ||
-                                  t.tradeLinkId != null ||
-                                  t.linkId != null
-                                ? "canonical"
-                                : "pending";
-                          return (
-                            <TableCell key={c.id} className="text-sm">
-                              {status === "canonical" ? (
-                                <Badge
-                                  variant="outline"
-                                  className="text-[10px] border-emerald-500/40 bg-emerald-500/10 text-emerald-700 dark:text-emerald-300"
-                                  title="Row has a canonical Phase-2 shape — kind set AND (pair-less kind OR trade_link_id OR link_id)."
-                                >
-                                  canonical
-                                </Badge>
-                              ) : status === "pending" ? (
-                                <Badge
-                                  variant="outline"
-                                  className="text-[10px] border-amber-500/40 bg-amber-500/10 text-amber-700 dark:text-amber-300 border-dashed"
-                                  title={`Kind is '${t.kind}' but row lacks the canonical pair shape — visit /settings/backfill to canonicalize.`}
-                                >
-                                  pending
-                                </Badge>
-                              ) : (
-                                <span
-                                  className="text-muted-foreground/50"
-                                  title="No kind set — row predates Phase-2 portfolio ops or has no portfolio-op classification."
-                                >
-                                  —
-                                </span>
-                              )}
-                            </TableCell>
-                          );
-                        }
-                        case "actions":
-                          return (
-                            <TableCell key={c.id}>
-                              <div className="flex gap-0.5">
-                                <Button variant="ghost" size="icon" className="h-7 w-7" onClick={() => startEdit(t)} title="Edit">
-                                  <Pencil className="h-3 w-3" />
-                                </Button>
-                                <Button variant="ghost" size="icon" className="h-7 w-7 text-violet-500" onClick={() => openSplitDialog(t)} title="Split">
-                                  <Scissors className="h-3 w-3" />
-                                </Button>
-                                <Button variant="ghost" size="icon" className="h-7 w-7 text-destructive" onClick={() => confirmDelete(t)} title="Delete">
-                                  <Trash2 className="h-3 w-3" />
-                                </Button>
-                              </div>
-                            </TableCell>
-                          );
-                      }
-                    })}
-                  </TableRow>
-                ))}
-              </TableBody>
-            </Table>
-            </div>
-          )}
+          <TransactionTable
+            loading={loading}
+            txns={txns}
+            columnPrefs={columnPrefs}
+            accounts={accounts}
+            categories={categories}
+            selected={selected}
+            allSelected={allSelected}
+            draggingCol={draggingCol}
+            sortPref={sortPref}
+            filters={filters}
+            setFilters={(f) => setFilters(f as typeof filters)}
+            setPage={setPage}
+            toggleAll={toggleAll}
+            toggleOne={toggleOne}
+            cycleSort={cycleSort}
+            findColFilter={findColFilter}
+            setColFilter={setColFilter}
+            onColDragStart={onColDragStart}
+            onColDragOver={onColDragOver}
+            onColDragEnd={onColDragEnd}
+            startEdit={startEdit}
+            openSplitDialog={openSplitDialog}
+            confirmDelete={confirmDelete}
+          />
         </CardContent>
       </Card>
 
