@@ -13,6 +13,7 @@
 import { eq, sql } from "drizzle-orm";
 import { db, schema } from "@/db";
 import { buildDailySnapshot } from "@/lib/portfolio/snapshots/builder";
+import { rebuildCashSnapshots } from "@/lib/portfolio/snapshots/cash-builder";
 
 export interface RebuildResult {
   fromDate: string;
@@ -58,6 +59,32 @@ export function isRebuildInFlight(userId: string): boolean {
   return inFlightSet().has(userId);
 }
 
+// Parallel in-flight guard for the DEK-free CASH rebuild. Separate from the
+// investment set so a long investment rebuild doesn't block a cash self-heal
+// (and vice-versa); shared by the rebuild endpoint, the cron, and the
+// chart-load cash self-heal so they don't double-build for the same user.
+const gc = globalThis as typeof globalThis & { __pfCashRebuildInFlight?: Set<string> };
+function cashInFlightSet(): Set<string> {
+  if (!gc.__pfCashRebuildInFlight) gc.__pfCashRebuildInFlight = new Set();
+  return gc.__pfCashRebuildInFlight;
+}
+
+/** Returns true and marks the user cash-in-flight, or false if one is running. */
+export function tryBeginCashRebuild(userId: string): boolean {
+  const s = cashInFlightSet();
+  if (s.has(userId)) return false;
+  s.add(userId);
+  return true;
+}
+
+export function endCashRebuild(userId: string): void {
+  cashInFlightSet().delete(userId);
+}
+
+export function isCashRebuildInFlight(userId: string): boolean {
+  return cashInFlightSet().has(userId);
+}
+
 function addDayUTC(iso: string): string {
   const d = new Date(`${iso}T00:00:00Z`);
   d.setUTCDate(d.getUTCDate() + 1);
@@ -101,6 +128,26 @@ export async function rebuildPortfolioSnapshots(
     daysProcessed++;
     if (day === to) break;
     day = addDayUTC(day);
+  }
+
+  // Cash side (DEK-free): rebuild the per-account historical-FX cash snapshots
+  // over FULL history (decoupled from the investment `from`, which may be a
+  // recent dirty-marker date — a partial cash build would otherwise wrongly
+  // claim the watermark fresh). Guarded by the separate cash in-flight set so a
+  // concurrent chart-load cash self-heal doesn't double-build. Best-effort: a
+  // cash failure must never fail the investment rebuild the caller awaited.
+  if (tryBeginCashRebuild(userId)) {
+    try {
+      await rebuildCashSnapshots({ userId, fromDate: null, toDate: to, stampMeta: true });
+    } catch (err) {
+      // eslint-disable-next-line no-console
+      console.warn(
+        "[rebuild] cash snapshot build failed:",
+        err instanceof Error ? err.message : err,
+      );
+    } finally {
+      endCashRebuild(userId);
+    }
   }
 
   return { fromDate: from, toDate: to, daysProcessed, gapsFilledDays };

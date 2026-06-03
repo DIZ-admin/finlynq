@@ -1,9 +1,13 @@
 /**
- * Pure-unit tests for buildNetWorthHistory (plan/net-worth-over-time.md Part A).
+ * Pure-unit tests for buildNetWorthHistory (plan/net-worth-over-time.md Part A
+ * + plan/net-worth-cash-snapshots.md Phase 5).
  *
  * Self-contained: `@/lib/fx-service` is mocked so the suite never bootstraps
  * the Postgres harness. The mock mirrors the real convertWithRateMap math
  * (amount × rate, rounded to cents).
+ *
+ * The cash side now reads STORED per-account snapshots (same per-account
+ * carry-forward machinery as the investment side) instead of live tx deltas.
  */
 
 import { describe, it, expect, vi } from "vitest";
@@ -15,22 +19,24 @@ vi.mock("@/lib/fx-service", () => ({
 
 import {
   buildNetWorthHistory,
-  type CashDelta,
-  type InvestmentSnapshot,
+  type AccountSnapshot,
+  type LiveAccountValue,
 } from "@/lib/net-worth-history";
 
 const CAD = new Map<string, number>([["CAD", 1]]);
 
 describe("buildNetWorthHistory", () => {
   it("carries cash forward across quiet days (all period)", () => {
-    const cashDeltas: CashDelta[] = [
-      { date: "2026-05-01", currency: "CAD", delta: 100 },
+    // One stored cash snapshot — carried forward across quiet days, exactly
+    // like an investment snapshot.
+    const cashSnapshots: AccountSnapshot[] = [
+      { accountId: 1, snapDate: "2026-05-01", marketValue: 100, currency: "CAD" },
     ];
     const res = buildNetWorthHistory({
       period: "all",
       displayCurrency: "CAD",
       rateMap: CAD,
-      cashDeltas,
+      cashSnapshots,
       snapshots: [],
       today: "2026-05-03",
     });
@@ -42,17 +48,18 @@ describe("buildNetWorthHistory", () => {
     expect(res.hasInvestmentData).toBe(false);
   });
 
-  it("includes the full pre-window cumulative balance on the first day of a 6m window", () => {
-    // A single old delta — by the time the 6m window starts, the running
-    // total must already be 500 (deltas before firstDay fold into day 1).
-    const cashDeltas: CashDelta[] = [
-      { date: "2020-01-01", currency: "CAD", delta: 500 },
+  it("carries the last cash snapshot at-or-before the first day of a 6m window", () => {
+    // A single old snapshot — by the time the 6m window starts, the carried
+    // value must already be 500 (the builder writes a daily row; here a sparse
+    // pre-window snapshot is carried forward).
+    const cashSnapshots: AccountSnapshot[] = [
+      { accountId: 1, snapDate: "2020-01-01", marketValue: 500, currency: "CAD" },
     ];
     const res = buildNetWorthHistory({
       period: "6m",
       displayCurrency: "CAD",
       rateMap: CAD,
-      cashDeltas,
+      cashSnapshots,
       snapshots: [],
       today: "2026-06-02",
     });
@@ -66,7 +73,7 @@ describe("buildNetWorthHistory", () => {
   });
 
   it("reads investment value from the nearest snapshot at-or-before each day", () => {
-    const snapshots: InvestmentSnapshot[] = [
+    const snapshots: AccountSnapshot[] = [
       { accountId: 1, snapDate: "2026-05-01", marketValue: 1000, currency: "CAD" },
       { accountId: 1, snapDate: "2026-05-03", marketValue: 1100, currency: "CAD" },
     ];
@@ -74,7 +81,7 @@ describe("buildNetWorthHistory", () => {
       period: "all",
       displayCurrency: "CAD",
       rateMap: CAD,
-      cashDeltas: [],
+      cashSnapshots: [],
       snapshots,
       today: "2026-05-04",
     });
@@ -87,20 +94,23 @@ describe("buildNetWorthHistory", () => {
     expect(res.hasInvestmentData).toBe(true);
   });
 
-  it("converts multiple currencies via the rate map", () => {
+  it("converts per-account cash snapshots via the rate map (display-switch re-FX)", () => {
     const rateMap = new Map<string, number>([
       ["CAD", 1],
       ["USD", 1.4],
     ]);
-    const cashDeltas: CashDelta[] = [
-      { date: "2026-05-01", currency: "CAD", delta: 100 },
-      { date: "2026-05-01", currency: "USD", delta: 50 },
+    // Two accounts, one stored in each currency on the same day. The USD
+    // snapshot re-bases at the current rate (the documented display-switch
+    // discontinuity).
+    const cashSnapshots: AccountSnapshot[] = [
+      { accountId: 1, snapDate: "2026-05-01", marketValue: 100, currency: "CAD" },
+      { accountId: 2, snapDate: "2026-05-01", marketValue: 50, currency: "USD" },
     ];
     const res = buildNetWorthHistory({
       period: "all",
       displayCurrency: "CAD",
       rateMap,
-      cashDeltas,
+      cashSnapshots,
       snapshots: [],
       today: "2026-05-01",
     });
@@ -108,8 +118,50 @@ describe("buildNetWorthHistory", () => {
     expect(res.series).toEqual([{ date: "2026-05-01", value: 170 }]);
   });
 
+  it("re-FXes a CAD-stored cash snapshot when displayCurrency switched to USD", () => {
+    // Snapshot stored as CAD; user now displays USD → re-base at current rate.
+    const rateMap = new Map<string, number>([
+      ["USD", 1],
+      ["CAD", 0.7],
+    ]);
+    const cashSnapshots: AccountSnapshot[] = [
+      { accountId: 1, snapDate: "2026-05-01", marketValue: 100, currency: "CAD" },
+    ];
+    const res = buildNetWorthHistory({
+      period: "all",
+      displayCurrency: "USD",
+      rateMap,
+      cashSnapshots,
+      snapshots: [],
+      today: "2026-05-01",
+    });
+    expect(res.series).toEqual([{ date: "2026-05-01", value: 70 }]);
+  });
+
+  it("substitutes live cash balance on the final (today) grid point", () => {
+    const cashSnapshots: AccountSnapshot[] = [
+      { accountId: 1, snapDate: "2026-05-01", marketValue: 100, currency: "CAD" },
+    ];
+    const liveCashByAccount = new Map<number, LiveAccountValue>([
+      [1, { value: 130, currency: "CAD" }],
+    ]);
+    const res = buildNetWorthHistory({
+      period: "all",
+      displayCurrency: "CAD",
+      rateMap: CAD,
+      cashSnapshots,
+      liveCashByAccount,
+      snapshots: [],
+      today: "2026-05-02",
+    });
+    expect(res.series).toEqual([
+      { date: "2026-05-01", value: 100 }, // historical snapshot
+      { date: "2026-05-02", value: 130 }, // live override on today
+    ]);
+  });
+
   it("substitutes live holdings value on the final (today) grid point", () => {
-    const snapshots: InvestmentSnapshot[] = [
+    const snapshots: AccountSnapshot[] = [
       { accountId: 1, snapDate: "2026-05-01", marketValue: 1000, currency: "CAD" },
     ];
     const live = new Map([[1, { value: 1200, currency: "CAD" }]]);
@@ -117,7 +169,7 @@ describe("buildNetWorthHistory", () => {
       period: "all",
       displayCurrency: "CAD",
       rateMap: CAD,
-      cashDeltas: [],
+      cashSnapshots: [],
       snapshots,
       liveInvestmentByAccount: live,
       today: "2026-05-02",
@@ -129,21 +181,48 @@ describe("buildNetWorthHistory", () => {
     expect(res.hasInvestmentData).toBe(true);
   });
 
-  it("excludes investment accounts from the cash sum — combines both sides", () => {
-    // Cash account delta + investment snapshot, same day. The investment
-    // account's tx legs are NOT in cashDeltas (the query filters them out),
-    // so the merged value is cash + snapshot.
-    const cashDeltas: CashDelta[] = [
-      { date: "2026-05-01", currency: "CAD", delta: 250 },
+  it("combines cash + investment with BOTH overridden live on today", () => {
+    const cashSnapshots: AccountSnapshot[] = [
+      { accountId: 1, snapDate: "2026-05-01", marketValue: 100, currency: "CAD" },
     ];
-    const snapshots: InvestmentSnapshot[] = [
+    const snapshots: AccountSnapshot[] = [
+      { accountId: 2, snapDate: "2026-05-01", marketValue: 800, currency: "CAD" },
+    ];
+    const liveCashByAccount = new Map<number, LiveAccountValue>([
+      [1, { value: 120, currency: "CAD" }],
+    ]);
+    const liveInvestmentByAccount = new Map<number, LiveAccountValue>([
+      [2, { value: 850, currency: "CAD" }],
+    ]);
+    const res = buildNetWorthHistory({
+      period: "all",
+      displayCurrency: "CAD",
+      rateMap: CAD,
+      cashSnapshots,
+      liveCashByAccount,
+      snapshots,
+      liveInvestmentByAccount,
+      today: "2026-05-02",
+    });
+    expect(res.series).toEqual([
+      { date: "2026-05-01", value: 900 }, // 100 cash + 800 investment (historical)
+      { date: "2026-05-02", value: 970 }, // 120 live cash + 850 live investment
+    ]);
+    expect(res.hasInvestmentData).toBe(true);
+  });
+
+  it("excludes investment accounts from the cash sum — combines both sides", () => {
+    const cashSnapshots: AccountSnapshot[] = [
+      { accountId: 1, snapDate: "2026-05-01", marketValue: 250, currency: "CAD" },
+    ];
+    const snapshots: AccountSnapshot[] = [
       { accountId: 2, snapDate: "2026-05-01", marketValue: 800, currency: "CAD" },
     ];
     const res = buildNetWorthHistory({
       period: "all",
       displayCurrency: "CAD",
       rateMap: CAD,
-      cashDeltas,
+      cashSnapshots,
       snapshots,
       today: "2026-05-01",
     });
@@ -155,7 +234,7 @@ describe("buildNetWorthHistory", () => {
       period: "all",
       displayCurrency: "CAD",
       rateMap: CAD,
-      cashDeltas: [],
+      cashSnapshots: [],
       snapshots: [],
       today: "2026-05-01",
     });
@@ -169,7 +248,7 @@ describe("buildNetWorthHistory", () => {
       period: "1y",
       displayCurrency: "CAD",
       rateMap: CAD,
-      cashDeltas: [],
+      cashSnapshots: [],
       snapshots: [],
       today: "2026-06-02",
     });

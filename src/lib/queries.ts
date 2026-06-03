@@ -908,3 +908,111 @@ export async function getInvestmentSnapshotsInRange(
     .orderBy(asc(schema.portfolioSnapshots.snapDate))
     .all();
 }
+
+/**
+ * Per-ACCOUNT per-day cash delta (is_investment=false, archived=false). Mirror
+ * of {@link getCashDailyDeltas} grouped by account_id so the cash-snapshot
+ * builder can keep a separate running cumulative per account (each account has
+ * exactly one currency, carried on the row). plan/net-worth-cash-snapshots.md
+ * Phase 2.
+ */
+export async function getCashDailyDeltasByAccount(userId: string, accountId?: number) {
+  const conditions = [
+    eq(transactions.userId, userId),
+    eq(accounts.isInvestment, false),
+    eq(accounts.archived, false),
+  ];
+  if (accountId != null) conditions.push(eq(transactions.accountId, accountId));
+  return db
+    .select({
+      accountId: transactions.accountId,
+      currency: accounts.currency,
+      date: transactions.date,
+      delta: sql<number>`COALESCE(SUM(${transactions.amount}), 0)`,
+    })
+    .from(transactions)
+    .innerJoin(accounts, eq(transactions.accountId, accounts.id))
+    .where(and(...conditions))
+    .groupBy(transactions.accountId, accounts.currency, transactions.date)
+    .orderBy(asc(transactions.date))
+    .all();
+}
+
+/**
+ * Stored CASH snapshots in [from, to] — the cash-side mirror of
+ * {@link getInvestmentSnapshotsInRange}. Filters `is_investment=false`,
+ * `archived=false`, and `source='cash'` (defense-in-depth: source + the
+ * is_investment partition keep this disjoint from the investment reader, which
+ * filters `is_investment=true`). NEVER returns the whole-portfolio NULL
+ * aggregate (the cash builder never writes one, and the inner join on a NULL
+ * account_id wouldn't match anyway — the explicit isNotNull is belt-and-braces).
+ * plan/net-worth-cash-snapshots.md Phase 2.
+ */
+export async function getCashSnapshotsInRange(
+  userId: string,
+  from: string,
+  to: string,
+  accountId?: number,
+) {
+  const conditions = [
+    eq(schema.portfolioSnapshots.userId, userId),
+    gte(schema.portfolioSnapshots.snapDate, from),
+    lte(schema.portfolioSnapshots.snapDate, to),
+    eq(accounts.isInvestment, false),
+    eq(accounts.archived, false),
+    eq(schema.portfolioSnapshots.source, "cash"),
+  ];
+  if (accountId != null) {
+    conditions.push(eq(schema.portfolioSnapshots.accountId, accountId));
+  } else {
+    conditions.push(isNotNull(schema.portfolioSnapshots.accountId));
+  }
+  return db
+    .select({
+      accountId: schema.portfolioSnapshots.accountId,
+      snapDate: schema.portfolioSnapshots.snapDate,
+      marketValue: schema.portfolioSnapshots.marketValue,
+      currency: schema.portfolioSnapshots.currency,
+    })
+    .from(schema.portfolioSnapshots)
+    .innerJoin(accounts, eq(schema.portfolioSnapshots.accountId, accounts.id))
+    .where(and(...conditions))
+    .orderBy(asc(schema.portfolioSnapshots.snapDate))
+    .all();
+}
+
+/**
+ * Cheap staleness fingerprint over the user's CASH (is_investment=false,
+ * archived=false) transactions: the newest create/update instant plus the row
+ * count. `count` is load-bearing — a DELETE leaves max-updated untouched, so
+ * only the count drop reveals it. Mirrors the exact filter the cash builder
+ * reads through so archiving an account (which removes its txns from the set)
+ * flips the count and triggers a rebuild that drops its snapshots.
+ * plan/net-worth-cash-snapshots.md Phase 2.
+ */
+export async function getCashTxFingerprint(
+  userId: string,
+): Promise<{ maxUpdated: Date | null; count: number }> {
+  const rows = await db
+    .select({
+      maxUpdated: sql<
+        Date | string | null
+      >`GREATEST(MAX(${transactions.createdAt}), MAX(${transactions.updatedAt}))`,
+      count: sql<number>`COUNT(*)`,
+    })
+    .from(transactions)
+    .innerJoin(accounts, eq(transactions.accountId, accounts.id))
+    .where(
+      and(
+        eq(transactions.userId, userId),
+        eq(accounts.isInvestment, false),
+        eq(accounts.archived, false),
+      ),
+    )
+    .all();
+  const r = rows[0];
+  const raw = r?.maxUpdated ?? null;
+  const maxUpdated =
+    raw == null ? null : raw instanceof Date ? raw : new Date(String(raw));
+  return { maxUpdated, count: Number(r?.count ?? 0) };
+}

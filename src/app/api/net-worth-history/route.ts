@@ -20,19 +20,28 @@ import {
   getRateMap,
   getDisplayCurrency,
 } from "@/lib/fx-service";
-import { getAccountBalances, getCashDailyDeltas, getInvestmentSnapshotsInRange } from "@/lib/queries";
+import {
+  getAccountBalances,
+  getCashSnapshotsInRange,
+  getCashTxFingerprint,
+  getInvestmentSnapshotsInRange,
+} from "@/lib/queries";
 import { getHoldingsValueByAccount, type AccountHoldingsValue } from "@/lib/holdings-value";
 import { logApiError } from "@/lib/validate";
 import {
   buildNetWorthHistory,
   type NetWorthPeriod,
-  type LiveInvestmentValue,
+  type LiveAccountValue,
 } from "@/lib/net-worth-history";
 import {
   rebuildPortfolioSnapshots,
   tryBeginRebuild,
   endRebuild,
+  tryBeginCashRebuild,
+  endCashRebuild,
 } from "@/lib/portfolio/snapshots/rebuild";
+import { rebuildCashSnapshots } from "@/lib/portfolio/snapshots/cash-builder";
+import { getCashSnapshotMeta, isCashStale } from "@/lib/portfolio/snapshots/cash-meta";
 import { listDirtySnapshotUsers, clearDirtyIfUnchanged } from "@/lib/portfolio/snapshots/dirty";
 
 /**
@@ -73,6 +82,33 @@ function kickSelfHeal(
   })();
 }
 
+/**
+ * DEK-FREE cash self-heal. Cash balance = cumulative SUM(tx.amount) + cached FX,
+ * so unlike the investment self-heal this needs no DEK and runs on every chart
+ * load when the staleness watermark trips (a cash tx inserted/edited/deleted, a
+ * new calendar day, or never-built). Fire-and-forget + in-flight guarded; the
+ * current response uses existing snapshots and the NEXT load reflects the
+ * rebuild. plan/net-worth-cash-snapshots.md Phase 4.
+ */
+function kickCashSelfHeal(userId: string, today: string): void {
+  if (!tryBeginCashRebuild(userId)) return; // a cash rebuild is already running
+  void (async () => {
+    try {
+      // Full history + stamp the watermark fresh (it captures the fingerprint
+      // BEFORE building, so a mid-build write re-trips stale on the next load).
+      await rebuildCashSnapshots({ userId, fromDate: null, toDate: today, stampMeta: true });
+    } catch (err) {
+      // eslint-disable-next-line no-console
+      console.warn(
+        "[net-worth-history] cash self-heal failed:",
+        err instanceof Error ? err.message : err,
+      );
+    } finally {
+      endCashRebuild(userId);
+    }
+  })();
+}
+
 function parsePeriod(raw: string | null): NetWorthPeriod {
   return raw === "6m" || raw === "1y" || raw === "all" ? raw : "6m";
 }
@@ -94,8 +130,16 @@ export async function GET(request: NextRequest) {
     const displayCurrency = await getDisplayCurrency(userId, params.get("currency"));
     const rateMap = await getRateMap(displayCurrency, userId);
 
-    // Cash side (live from transactions) + investment side (stored snapshots).
-    const cashDeltas = await getCashDailyDeltas(userId, accountId ?? undefined);
+    // Cash side AND investment side now both read stored per-account snapshots
+    // (cash translated at each day's historical FX rate; investment at market
+    // value). The cash side used to be computed live from transactions and
+    // re-translated at TODAY's rate every load (the drift this change fixes).
+    const cashSnapshotRows = await getCashSnapshotsInRange(
+      userId,
+      "1900-01-01",
+      today,
+      accountId ?? undefined,
+    );
     const snapshotRows = await getInvestmentSnapshotsInRange(
       userId,
       "1900-01-01",
@@ -103,12 +147,23 @@ export async function GET(request: NextRequest) {
       accountId ?? undefined,
     );
 
-    // Today's live override. Restrict to the SAME non-archived investment
-    // account set the dashboard hero sums over, so the latest point matches.
+    // Today's live override. Restrict to the SAME non-archived account sets the
+    // dashboard hero sums over, so the latest point matches.
     const balances = await getAccountBalances(userId);
     const investmentAccountIds = new Set(
       balances.filter((b) => Boolean(b.isInvestment)).map((b) => b.accountId),
     );
+    // Live cash balance (native ccy, current rate) per non-investment account —
+    // overrides the snapshot value on TODAY so the latest point equals the hero.
+    const liveCashByAccount = new Map<number, LiveAccountValue>();
+    for (const b of balances) {
+      if (b.isInvestment) continue; // investment value comes from the holdings aggregator
+      if (accountId != null && b.accountId !== accountId) continue;
+      liveCashByAccount.set(b.accountId, {
+        value: Number(b.balance ?? 0),
+        currency: b.currency,
+      });
+    }
     // The live "today" override only applies to INVESTMENT accounts. Valuing the
     // whole portfolio (getHoldingsValueByAccount prices every holding live) is
     // pointless when the in-scope account set has no investment account — e.g. a
@@ -122,7 +177,7 @@ export async function GET(request: NextRequest) {
       scopeHasInvestmentAccount
         ? await getHoldingsValueByAccount(userId, dek)
         : new Map();
-    const liveInvestmentByAccount = new Map<number, LiveInvestmentValue>();
+    const liveInvestmentByAccount = new Map<number, LiveAccountValue>();
     for (const [accId, v] of holdingsByAccount) {
       if (!investmentAccountIds.has(accId)) continue;
       if (accountId != null && accId !== accountId) continue;
@@ -135,16 +190,19 @@ export async function GET(request: NextRequest) {
       marketValue: Number(r.marketValue),
       currency: r.currency,
     }));
+    const cashSnapshots = cashSnapshotRows.map((r) => ({
+      accountId: r.accountId as number,
+      snapDate: r.snapDate,
+      marketValue: Number(r.marketValue),
+      currency: r.currency,
+    }));
 
     const { series, hasInvestmentData, fxApproximation } = buildNetWorthHistory({
       period,
       displayCurrency,
       rateMap,
-      cashDeltas: cashDeltas.map((d) => ({
-        date: d.date,
-        currency: d.currency,
-        delta: Number(d.delta),
-      })),
+      cashSnapshots,
+      liveCashByAccount,
       snapshots,
       liveInvestmentByAccount,
       today,
@@ -168,6 +226,19 @@ export async function GET(request: NextRequest) {
         /* dirty lookup is best-effort */
       }
       kickSelfHeal(userId, dek, today, dirtyFrom, dirtyMarkedAt, needsInitialBackfill);
+    }
+
+    // Cash self-heal — DEK-free, so it runs regardless of `dek`. Fires when the
+    // stored cash snapshots are stale (a cash tx changed, a new day rolled over,
+    // or they were never built). plan/net-worth-cash-snapshots.md Phase 4.
+    try {
+      const cashFp = await getCashTxFingerprint(userId);
+      const cashMeta = await getCashSnapshotMeta(userId);
+      if (cashFp.count > 0 && isCashStale(cashFp, cashMeta, today)) {
+        kickCashSelfHeal(userId, today);
+      }
+    } catch {
+      /* cash staleness check is best-effort */
     }
 
     return NextResponse.json({

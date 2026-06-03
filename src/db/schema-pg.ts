@@ -1567,6 +1567,26 @@ export const portfolioSnapshotDirty = pgTable("portfolio_snapshot_dirty", {
   markedAt: timestamp("marked_at", { withTimezone: true }).notNull().defaultNow(),
 });
 
+// ─── portfolio_cash_snapshot_meta — cash-snapshot staleness watermark (2026-06-13)
+//
+// The "Net Worth Over Time" chart stores per-account daily CASH balances in
+// portfolio_snapshots (source='cash', is_investment=false accounts) at each
+// day's historical FX rate. Unlike the investment side, the cash side needs no
+// DEK, so it's kept fresh by a real background cron + a DEK-free chart-load
+// self-heal. `created_at` on portfolio_snapshots isn't bumped on re-UPSERT, so
+// this per-user row is the watermark instead: a fingerprint of the user's cash
+// transactions (max updated-time + row count, the latter catching DELETEs)
+// captured at build time, plus the 'to' date the build covered.
+// isCashStale() compares a live fingerprint against this row.
+// plan/net-worth-cash-snapshots.md Phase 1.
+export const portfolioCashSnapshotMeta = pgTable("portfolio_cash_snapshot_meta", {
+  userId: text("user_id").primaryKey(),
+  txMaxUpdated: timestamp("tx_max_updated", { withTimezone: true }),
+  txCount: integer("tx_count").notNull().default(0),
+  builtThrough: text("built_through"),
+  builtAt: timestamp("built_at", { withTimezone: true }).notNull().defaultNow(),
+});
+
 // ─── portfolio_legacy_realized_gain_snapshot — pre-cutover avg-cost gain
 //
 // Avg-cost realized gain ≠ FIFO realized gain on partial-sell users. This
