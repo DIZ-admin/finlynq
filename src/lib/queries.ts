@@ -335,7 +335,12 @@ export async function getTransactionCount(userId: string, filters?: TxSortFilter
 export async function createTransaction(userId: string, data: {
   date: string;
   accountId: number;
-  categoryId: number;
+  // Nullable: MCP `record_transaction` / `bulk_record_transactions` write
+  // uncategorized rows (`category_id = NULL`) when no category resolves and
+  // the account isn't an investment account. The REST POST route always
+  // supplies a number, so `null` here is a widening that doesn't change its
+  // behavior. The DB column is nullable (schema-pg.ts:76).
+  categoryId: number | null;
   currency?: string;
   amount?: number;
   // Phase 2 of the currency rework — entered/account trilogy. The route
@@ -345,14 +350,24 @@ export async function createTransaction(userId: string, data: {
   enteredCurrency?: string | null;
   enteredAmount?: number | null;
   enteredFxRate?: number | null;
-  quantity?: number;
+  quantity?: number | null;
   portfolioHoldingId?: number | null;
-  note?: string;
-  payee?: string;
-  tags?: string;
+  // Nullable: the MCP HTTP write path (FINLYNQ-108) passes already-encrypted
+  // payee/note/tags whose ternary fallback can be `null` under a cold DEK.
+  // REST passes encrypted strings; the columns are nullable text.
+  note?: string | null;
+  payee?: string | null;
+  tags?: string | null;
   isBusiness?: number;
   splitPerson?: string;
   splitRatio?: number;
+  // Issue #96 multi-currency trade-pair linker. Server-generated UUID stamped
+  // into `trade_link_id`. REST never passes it (the column defaults NULL);
+  // FINLYNQ-108 routes MCP HTTP record_transaction/bulk_record_transactions
+  // through this helper, and those pass a validated/minted UUID here so the
+  // cost-basis aggregators can pair the cash + stock legs. Distinct from the
+  // transfer-pair `link_id`.
+  tradeLinkId?: string | null;
   // Audit-source attribution (issue #28). Defaults to 'manual' when the
   // caller doesn't pass one — the UI POST handler relies on the default,
   // every other writer (import/MCP/connector/sample-data/restore) sets
