@@ -94,8 +94,7 @@ export const unwrapDEKForApiKey = unwrapDEKForSecret;
  */
 async function storeApiKeyDEK(userId: string, wrapped: string): Promise<void> {
   const { sql } = await import("drizzle-orm");
-  // eslint-disable-next-line @typescript-eslint/no-explicit-any
-  await (db as any).execute(sql`
+  await db.execute(sql`
     INSERT INTO settings (key, user_id, value)
     VALUES (${API_KEY_DEK_SETTING}, ${userId}, ${wrapped})
     ON CONFLICT (key, user_id) DO UPDATE SET value = EXCLUDED.value
@@ -105,8 +104,7 @@ async function storeApiKeyDEK(userId: string, wrapped: string): Promise<void> {
 /** Remove any stored API-key-wrapped DEK for this user. Used on key regeneration. */
 async function clearApiKeyDEK(userId: string): Promise<void> {
   const { sql } = await import("drizzle-orm");
-  // eslint-disable-next-line @typescript-eslint/no-explicit-any
-  await (db as any).execute(sql`
+  await db.execute(sql`
     DELETE FROM settings WHERE key = ${API_KEY_DEK_SETTING} AND user_id = ${userId}
   `);
 }
@@ -138,8 +136,7 @@ export async function getOrCreateApiKey(
   const key = `pf_${crypto.randomBytes(24).toString("hex")}`;
 
   const { sql } = await import("drizzle-orm");
-  // eslint-disable-next-line @typescript-eslint/no-explicit-any
-  await (db as any).execute(sql`
+  await db.execute(sql`
     INSERT INTO settings (key, user_id, value)
     VALUES (${API_KEY_SETTING}, ${userId}, ${hashApiKey(key)})
     ON CONFLICT (key, user_id) DO UPDATE SET value = EXCLUDED.value
@@ -164,8 +161,7 @@ export async function regenerateApiKey(userId: string, dek: Buffer): Promise<str
   const key = `pf_${crypto.randomBytes(24).toString("hex")}`;
 
   const { sql } = await import("drizzle-orm");
-  // eslint-disable-next-line @typescript-eslint/no-explicit-any
-  await (db as any).execute(sql`
+  await db.execute(sql`
     INSERT INTO settings (key, user_id, value)
     VALUES (${API_KEY_SETTING}, ${userId}, ${hashApiKey(key)})
     ON CONFLICT (key, user_id) DO UPDATE SET value = EXCLUDED.value
@@ -179,8 +175,7 @@ export async function regenerateApiKey(userId: string, dek: Buffer): Promise<str
 /** Remove all API-key artifacts for a user (used by wipe flow). */
 export async function deleteApiKey(userId: string): Promise<void> {
   const { sql } = await import("drizzle-orm");
-  // eslint-disable-next-line @typescript-eslint/no-explicit-any
-  await (db as any).execute(sql`
+  await db.execute(sql`
     DELETE FROM settings WHERE key IN (${API_KEY_SETTING}, ${API_KEY_DEK_SETTING}) AND user_id = ${userId}
   `);
   void clearApiKeyDEK;

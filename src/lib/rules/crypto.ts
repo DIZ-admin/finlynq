@@ -23,6 +23,7 @@
  * it is NOT changed. See plan/encryption-plaintext-gaps.md.
  */
 
+import { z } from "zod";
 import { encryptField, tryDecryptField, isEncrypted } from "@/lib/crypto/envelope";
 import type { ConditionGroup, Action } from "./schema";
 
@@ -39,6 +40,27 @@ const STRING_CONDITION_FIELDS = new Set(["payee", "note", "tags"]);
 
 function isObj(v: unknown): v is Record<string, unknown> {
   return v != null && typeof v === "object";
+}
+
+/**
+ * Read-boundary narrowing for the JSONB arrays crossing the encryption boundary
+ * (FINLYNQ-114). The DB hands these in as `unknown` (Drizzle JSONB), and this
+ * module deliberately treats elements loosely — it only touches the free-text
+ * fields and spreads everything else through verbatim, so it must tolerate ANY
+ * legacy/partial/encrypted rule shape.
+ *
+ * `JsonArray` is intentionally the most permissive schema that still TYPES the
+ * value as an array: `z.array(z.unknown())`. We use `.safeParse` and fall back
+ * to `[]` only when the value is not array-like — it NEVER throws, so a parse
+ * miss degrades to today's behavior (the per-element `isObj()` guards below
+ * already pass non-object survivors through untouched). This replaces the four
+ * unchecked array casts with a runtime-validated narrowing.
+ */
+const JsonArray = z.array(z.unknown());
+
+function asJsonArray(value: unknown): unknown[] {
+  const parsed = JsonArray.safeParse(value);
+  return parsed.success ? parsed.data : [];
 }
 
 /**
@@ -60,7 +82,7 @@ function mapRuleStrings<T extends RuleCryptoFields>(
   if (Array.isArray(condAll)) {
     out.conditions = {
       ...rule.conditions,
-      all: (condAll as unknown[]).map((c) => {
+      all: asJsonArray(condAll).map((c) => {
         if (
           isObj(c) &&
           typeof c.field === "string" &&
@@ -76,7 +98,7 @@ function mapRuleStrings<T extends RuleCryptoFields>(
   }
 
   if (Array.isArray(rule.actions)) {
-    out.actions = (rule.actions as unknown[]).map((a) => {
+    out.actions = asJsonArray(rule.actions).map((a) => {
       if (!isObj(a) || typeof a.kind !== "string") return a;
       if (a.kind === "rename_payee" && typeof a.to === "string" && a.to !== "") {
         return { ...a, to: fn(a.to) };
@@ -129,7 +151,7 @@ export function ruleHasPlaintext(rule: RuleCryptoFields): boolean {
   if (typeof rule.name === "string" && rule.name !== "" && !isEncrypted(rule.name)) return true;
   const condAll = rule.conditions?.all;
   if (Array.isArray(condAll)) {
-    for (const c of condAll as unknown[]) {
+    for (const c of asJsonArray(condAll)) {
       if (
         isObj(c) &&
         typeof c.field === "string" &&
@@ -143,7 +165,7 @@ export function ruleHasPlaintext(rule: RuleCryptoFields): boolean {
     }
   }
   if (Array.isArray(rule.actions)) {
-    for (const a of rule.actions as unknown[]) {
+    for (const a of asJsonArray(rule.actions)) {
       if (!isObj(a)) continue;
       if (a.kind === "rename_payee" && typeof a.to === "string" && a.to !== "" && !isEncrypted(a.to)) return true;
       if (a.kind === "set_tags" && typeof a.tags === "string" && a.tags !== "" && !isEncrypted(a.tags)) return true;

@@ -53,6 +53,7 @@ import {
 } from "lucide-react";
 import { computePureActionPatch } from "@/lib/rules/execute";
 import type { Condition, Action, ConditionGroup } from "@/lib/rules/schema";
+import { defaultConditionForField, defaultActionForKind } from "@/lib/rules/schema";
 
 export type Category = { id: number; name: string; type: string; group: string };
 export type Account = { id: number; name: string };
@@ -118,11 +119,11 @@ export const ACTION_KINDS: Array<{ value: Action["kind"]; label: string; sideEff
 ];
 
 export function blankCondition(): Condition {
-  return { field: "payee", op: "contains", value: "" } as Condition;
+  return defaultConditionForField("payee");
 }
 
 export function blankAction(): Action {
-  return { kind: "set_category", categoryId: 0 } as Action;
+  return defaultActionForKind("set_category", 0);
 }
 
 export function RuleEditorDialog({
@@ -316,18 +317,10 @@ function ConditionRow({
   onRemove: () => void;
 }) {
   function setField(field: Condition["field"]) {
-    // When switching field, blank to a safe default for the new shape.
-    if (field === "payee" || field === "note" || field === "tags") {
-      onChange({ field, op: "contains", value: "" } as unknown as Partial<Condition>);
-    } else if (field === "amount") {
-      onChange({ field, op: "gt", value: 0 } as unknown as Partial<Condition>);
-    } else if (field === "account") {
-      onChange({ field, op: "is", accountId: accounts[0]?.id ?? 0 } as unknown as Partial<Condition>);
-    } else if (field === "currency") {
-      onChange({ field, op: "is", value: "CAD" } as unknown as Partial<Condition>);
-    } else if (field === "date") {
-      onChange({ field, op: "weekday", weekday: 1 } as unknown as Partial<Condition>);
-    }
+    // When switching field, blank to a fully-typed default for the new shape.
+    // The factory map (rules/schema.ts) owns each variant's default, so a wrong
+    // field on a variant is a compile error there instead of a silent type hole.
+    onChange(defaultConditionForField(field, accounts[0]?.id ?? 0));
   }
 
   return (
@@ -489,13 +482,16 @@ function ActionRow({
   const sortCategory = useDropdownOrder("category");
 
   function setKind(kind: Action["kind"]) {
-    if (kind === "set_category") onChange({ kind, categoryId: categories[0]?.id ?? 0 } as unknown as Partial<Action>);
-    else if (kind === "set_tags") onChange({ kind, tags: "" } as unknown as Partial<Action>);
-    else if (kind === "rename_payee") onChange({ kind, to: "" } as unknown as Partial<Action>);
-    else if (kind === "set_account") onChange({ kind, accountId: accounts[0]?.id ?? 0 } as unknown as Partial<Action>);
-    else if (kind === "set_entered_currency") onChange({ kind, currency: "USD" } as unknown as Partial<Action>);
-    else if (kind === "set_portfolio_holding") onChange({ kind, holdingId: holdings[0]?.id ?? 0 } as unknown as Partial<Action>);
-    else if (kind === "create_transfer") onChange({ kind, destAccountId: accounts[0]?.id ?? 0 } as unknown as Partial<Action>);
+    // The id arg seeds the single FK each kind needs (category / account /
+    // holding); FK-less kinds (set_tags, rename_payee, set_entered_currency)
+    // ignore it. The factory map (rules/schema.ts) owns each kind's default.
+    const seedId =
+      kind === "set_category"
+        ? categories[0]?.id ?? 0
+        : kind === "set_portfolio_holding"
+          ? holdings[0]?.id ?? 0
+          : accounts[0]?.id ?? 0;
+    onChange(defaultActionForKind(kind, seedId));
   }
 
   const isSideEffect = action.kind === "set_account" || action.kind === "create_transfer";

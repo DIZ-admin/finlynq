@@ -121,6 +121,76 @@ export const Rule = z.object({
 });
 export type Rule = z.infer<typeof Rule>;
 
+// ─── Typed factory maps (FINLYNQ-114) ────────────────────────────────────────
+//
+// When the rule editor switches a condition's `field` or an action's `kind`,
+// it must reset the row to a fully-typed default for the NEW variant (not just
+// patch the discriminator). Modeling these as typed factory maps gives each
+// default a precise member type — a wrong field on a variant is now a compile
+// error here, instead of being hidden behind `as unknown as Partial<…>` at the
+// 12 call sites in `rule-editor-dialog.tsx`. The objects produced are
+// byte-identical to what those casts produced, so the wire shape is unchanged.
+
+/** Discriminate a Condition union member by its `field` literal. */
+export type ConditionField = Condition["field"];
+
+/** Discriminate an Action union member by its `kind` literal. */
+export type ActionKind = Action["kind"];
+
+/**
+ * Default `Condition` for a freshly-selected field. The `amount` and `date`
+ * fields have multiple op-variants in the union; the editor seeds the first
+ * variant (single `amount` / `weekday` `date`) and the user refines `op` after.
+ */
+export const CONDITION_DEFAULTS: {
+  payee: () => Extract<Condition, { field: "payee" | "note" | "tags" }>;
+  note: () => Extract<Condition, { field: "payee" | "note" | "tags" }>;
+  tags: () => Extract<Condition, { field: "payee" | "note" | "tags" }>;
+  amount: () => Extract<Condition, { field: "amount" }>;
+  account: (accountId: number) => Extract<Condition, { field: "account" }>;
+  currency: () => Extract<Condition, { field: "currency" }>;
+  date: () => Extract<Condition, { field: "date" }>;
+} = {
+  payee: () => ({ field: "payee", op: "contains", value: "" }),
+  note: () => ({ field: "note", op: "contains", value: "" }),
+  tags: () => ({ field: "tags", op: "contains", value: "" }),
+  amount: () => ({ field: "amount", op: "gt", value: 0 }),
+  account: (accountId: number) => ({ field: "account", op: "is", accountId }),
+  currency: () => ({ field: "currency", op: "is", value: "CAD" }),
+  date: () => ({ field: "date", op: "weekday", weekday: 1 }),
+};
+
+/** Build a fully-typed default `Condition` when the editor switches `field`. */
+export function defaultConditionForField(
+  field: ConditionField,
+  accountId = 0,
+): Condition {
+  return field === "account"
+    ? CONDITION_DEFAULTS.account(accountId)
+    : CONDITION_DEFAULTS[field]();
+}
+
+/**
+ * Default `Action` for a freshly-selected kind. Each entry returns the exact
+ * discriminated-union member, so a typo in the config object fails to compile.
+ */
+export const ACTION_DEFAULTS: {
+  [K in ActionKind]: (id: number) => Extract<Action, { kind: K }>;
+} = {
+  set_category: (categoryId) => ({ kind: "set_category", categoryId }),
+  set_tags: () => ({ kind: "set_tags", tags: "" }),
+  rename_payee: () => ({ kind: "rename_payee", to: "" }),
+  set_account: (accountId) => ({ kind: "set_account", accountId }),
+  set_entered_currency: () => ({ kind: "set_entered_currency", currency: "USD" }),
+  set_portfolio_holding: (holdingId) => ({ kind: "set_portfolio_holding", holdingId }),
+  create_transfer: (destAccountId) => ({ kind: "create_transfer", destAccountId }),
+};
+
+/** Build a fully-typed default `Action` when the editor switches `kind`. */
+export function defaultActionForKind(kind: ActionKind, id = 0): Action {
+  return ACTION_DEFAULTS[kind](id);
+}
+
 /**
  * Helper — extract every FK id referenced by an action array, so callers
  * can drive `verifyOwnership` in one batch instead of N+1 queries.
