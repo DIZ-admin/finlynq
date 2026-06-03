@@ -176,6 +176,39 @@ export async function getBaseCurrency(
   return row[0]?.value ?? "USD";
 }
 
+// ── External FX-fetch timeout + negative cache ──────────────────────────────
+// fetchYahooRateToUsd / fetchStooqMetalRateToUsd had NO timeout. When an
+// upstream hangs (observed: stooq.com for metals returning no response for 10s+
+// after the snapshot rebuild hammered it with ~1,250 days of history), every
+// holdings valuation re-hung on it — a single XAU/gold holding froze the whole
+// dashboard for ~10.5s on EVERY load, because a failed fetch returns null and is
+// therefore never cached for `today`. Two guards mirror price-service.ts:
+//   1. AbortSignal.timeout caps any single upstream call.
+//   2. A per-process negative cache skips a recently-failed source so we fall
+//      back to the most-recent cached rate (findNearestCached) instead of
+//      re-hanging. Entries expire so a transient outage self-heals.
+const FX_FETCH_TIMEOUT_MS = 4000;
+const FX_NEGATIVE_TTL_MS = 10 * 60 * 1000; // 10 min
+const fxNegativeCache = new Map<string, number>(); // currency -> expiry epoch ms
+
+function isFxNegativelyCached(code: string): boolean {
+  const exp = fxNegativeCache.get(code);
+  if (exp == null) return false;
+  if (Date.now() > exp) {
+    fxNegativeCache.delete(code);
+    return false;
+  }
+  return true;
+}
+
+function markFxFetchMiss(code: string): void {
+  fxNegativeCache.set(code, Date.now() + FX_NEGATIVE_TTL_MS);
+  // eslint-disable-next-line no-console
+  console.warn(
+    `[fx-service] live rate fetch for "${code}" failed/timed out — falling back to nearest cached rate, skipping live fetch for ${FX_NEGATIVE_TTL_MS / 60000}m`,
+  );
+}
+
 // ─── Yahoo Finance fetch ────────────────────────────────────────────────
 
 async function fetchYahooRateToUsd(currency: string, date: string): Promise<number | null> {
@@ -205,6 +238,7 @@ async function fetchYahooRateToUsd(currency: string, date: string): Promise<numb
     const res = await fetch(url, {
       headers: { "User-Agent": "Mozilla/5.0" },
       next: { revalidate: 3600 },
+      signal: AbortSignal.timeout(FX_FETCH_TIMEOUT_MS),
     });
     if (!res.ok) return null;
     const data = await res.json();
@@ -268,6 +302,7 @@ async function fetchStooqMetalRateToUsd(currency: string, date: string): Promise
       const res = await fetch(url, {
         headers: { "User-Agent": "Mozilla/5.0" },
         next: { revalidate: 3600 },
+        signal: AbortSignal.timeout(FX_FETCH_TIMEOUT_MS),
       });
       if (!res.ok) return null;
       const text = await res.text();
@@ -287,6 +322,7 @@ async function fetchStooqMetalRateToUsd(currency: string, date: string): Promise
     const res = await fetch(url, {
       headers: { "User-Agent": "Mozilla/5.0" },
       next: { revalidate: 3600 },
+      signal: AbortSignal.timeout(FX_FETCH_TIMEOUT_MS),
     });
     if (!res.ok) return null;
     const text = await res.text();
@@ -421,18 +457,27 @@ export async function getRateToUsdDetailed(
   const cached = await findCached(code, date);
   if (cached) return { rate: cached.rate, source: "yahoo", effectiveDate: cached.effectiveDate };
 
-  // 3. Live fetch — Yahoo for fiat, CoinGecko for crypto, stooq for metals
-  let fetched: number | null;
-  let liveSource: "yahoo" | "coingecko" | "stooq";
-  if (isCryptoCurrency(code)) {
-    fetched = await fetchCryptoRateToUsd(code);
-    liveSource = "coingecko";
-  } else if (isMetalCurrency(code)) {
-    fetched = await fetchStooqMetalRateToUsd(code, date);
-    liveSource = "stooq";
-  } else {
-    fetched = await fetchYahooRateToUsd(code, date);
-    liveSource = "yahoo";
+  // 3. Live fetch — Yahoo for fiat, CoinGecko for crypto, stooq for metals.
+  //    Skip the live call entirely if this currency's source recently failed or
+  //    timed out (negative cache), so a hung/throttled upstream can't re-stall
+  //    every request — we fall through to the most-recent cached rate (step 4).
+  let fetched: number | null = null;
+  let liveSource: "yahoo" | "coingecko" | "stooq" = "yahoo";
+  if (!isFxNegativelyCached(code)) {
+    if (isCryptoCurrency(code)) {
+      fetched = await fetchCryptoRateToUsd(code);
+      liveSource = "coingecko";
+    } else if (isMetalCurrency(code)) {
+      fetched = await fetchStooqMetalRateToUsd(code, date);
+      liveSource = "stooq";
+    } else {
+      fetched = await fetchYahooRateToUsd(code, date);
+      liveSource = "yahoo";
+    }
+    // A null result means the upstream is down/timed out (NOT a clean "no data"
+    // for a real symbol — those still null but are rare). Negative-cache so the
+    // next lookup skips the slow path and serves the nearest cached rate.
+    if (fetched == null) markFxFetchMiss(code);
   }
   if (fetched != null) {
     // Issue #206: never persist future-dated rates. They would outrank
