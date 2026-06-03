@@ -68,14 +68,6 @@ export async function getHoldingsValueByAccount(
 ): Promise<Map<number, AccountHoldingsValue>> {
   const asOfDate = opts?.asOfDate ?? todayISO();
   const isToday = asOfDate >= todayISO();
-  // TEMP perf instrumentation (remove after diagnosing the ~11s dashboard).
-  let __h = Date.now();
-  const __hmark = (label: string) => {
-    const now = Date.now();
-    // eslint-disable-next-line no-console
-    console.log(`[holdings-timing] ${label} ${now - __h}ms`);
-    __h = now;
-  };
   // Stream D Phase 4 — plaintext name/symbol dropped; ciphertext only.
   const rawHoldings = await db
     .select({
@@ -91,7 +83,6 @@ export async function getHoldingsValueByAccount(
     .leftJoin(schema.accounts, eq(schema.portfolioHoldings.accountId, schema.accounts.id))
     .where(eq(schema.portfolioHoldings.userId, userId));
 
-  __hmark(`rawHoldings(${rawHoldings.length})`);
   if (rawHoldings.length === 0) return new Map();
 
   // Stream D Phase 4 — plaintext columns dropped, decrypt the ciphertext.
@@ -183,7 +174,6 @@ export async function getHoldingsValueByAccount(
       lte(schema.transactions.date, asOfDate),
     ))
     .groupBy(schema.transactions.portfolioHoldingId, effectiveEnteredCurrency);
-  __hmark(`fkAggRows(${fkAggRows.length})`);
 
   const qtyByHoldingId = new Map<number, number>();
   // Per-currency cost buckets per holding. Each entry is the SUM of buy/sell
@@ -220,7 +210,6 @@ export async function getHoldingsValueByAccount(
         ? await fetchMultipleQuotes(stockSymbols)
         : await fetchMultipleQuotesAtDate(stockSymbols, asOfDate))
     : new Map();
-  __hmark(`stockQuotes(${stockSymbols.length} syms)`);
 
   // Cache-first crypto prices (price-only). Pass both the CoinGecko coin id AND
   // the holding's base symbol so the returned price re-keys to the symbol
@@ -247,31 +236,19 @@ export async function getHoldingsValueByAccount(
       ? await getCryptoSpotPrices(cgPairs)
       : await getCryptoPricesAtDate(cgPairs, asOfDate);
   const cryptoByUpperSymbol = new Map(cryptoPrices.map(p => [p.symbol.toUpperCase(), p]));
-  __hmark(`cryptoPrices(${cgPairs.length} coins)`);
 
   // Accumulate market value per accountId, converting holding currency -> account currency via FX
   // Historical FX uses getRate(from, to, asOfDate) which triangulates via
   // USD using fx_rates cache + Yahoo backfill for missing dates.
   const out = new Map<number, AccountHoldingsValue>();
   const fxCache = new Map<string, number>();
-  // TEMP perf instrumentation (remove after diagnosing the ~11s dashboard).
-  let __fxCalls = 0;
-  let __fxMisses = 0;
-  let __fxMissMs = 0;
   const getFx = async (from: string, to: string): Promise<number> => {
     if (from === to) return 1;
     const key = `${from}->${to}`;
-    __fxCalls++;
     if (fxCache.has(key)) return fxCache.get(key)!;
-    const __s = Date.now();
     const rate = isToday
       ? await getLatestFxRate(from, to, userId)
       : await getRate(from, to, asOfDate, userId);
-    const __d = Date.now() - __s;
-    __fxMisses++;
-    __fxMissMs += __d;
-    // eslint-disable-next-line no-console
-    console.log(`[fx-timing] miss ${key} ${__d}ms (isToday=${isToday})`);
     fxCache.set(key, rate);
     return rate;
   };
@@ -381,8 +358,5 @@ export async function getHoldingsValueByAccount(
     }
   }
 
-  // eslint-disable-next-line no-console
-  console.log(`[fx-timing] TOTAL getFx calls=${__fxCalls} misses=${__fxMisses} missMs=${__fxMissMs}`);
-  __hmark(`valuationLoop(${holdings.length} holdings, fx pairs cached)`);
   return out;
 }
