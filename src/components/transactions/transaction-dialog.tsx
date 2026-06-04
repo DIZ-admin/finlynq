@@ -162,6 +162,18 @@ export type TransactionDialogInitialState =
   | {
       kind: "transaction-prefill";
       values: Partial<TransactionFormValues>;
+      /** Optional Transfer-tab seed (reconcile materialize, 2026-06-04). When
+       *  present, the Transfer tab is pre-filled from the same bank row so
+       *  switching tabs no longer wipes the context. A non-empty `toAccountId`
+       *  (sourced from a matched `create_transfer` rule) also opens the dialog
+       *  directly in Transfer mode. */
+      transferSeed?: {
+        fromAccountId?: string;
+        toAccountId?: string;
+        date?: string;
+        amount?: string;
+        note?: string;
+      };
     }
   | {
       /** Open in Transfer mode without any prefill (Quick-add Transfer entry). */
@@ -420,6 +432,23 @@ export function TransactionDialog({
     // transaction-prefill
     resetToCreateDefaults();
     setForm((prev) => ({ ...prev, ...initialState.values }));
+    // Reconcile materialize (2026-06-04): seed the Transfer tab from the same
+    // bank row so switching tabs keeps the date/amount/source account, and
+    // open in Transfer mode when a rule named a destination account.
+    const seed = initialState.transferSeed;
+    if (seed) {
+      setTransferForm((tf) => ({
+        ...tf,
+        ...(seed.fromAccountId != null ? { fromAccountId: seed.fromAccountId } : {}),
+        ...(seed.toAccountId != null ? { toAccountId: seed.toAccountId } : {}),
+        ...(seed.date != null ? { date: seed.date } : {}),
+        ...(seed.amount != null ? { amount: seed.amount } : {}),
+        ...(seed.note != null ? { note: seed.note } : {}),
+      }));
+      if (seed.toAccountId) {
+        setDialogMode("transfer");
+      }
+    }
   }
 
   function resetToCreateDefaults() {
@@ -871,7 +900,11 @@ export function TransactionDialog({
     let debitTxId = transferEdit?.fromTxId ?? 0;
     try {
       const created = await res.clone().json();
-      if (typeof created?.fromTxId === "number") debitTxId = created.fromTxId;
+      // `/api/transactions/transfer` returns `fromTransactionId` (the debit
+      // leg). Read it first so the reconcile materialize flow can auto-link
+      // the bank row to that leg; `fromTxId`/`id` kept as defensive fallbacks.
+      if (typeof created?.fromTransactionId === "number") debitTxId = created.fromTransactionId;
+      else if (typeof created?.fromTxId === "number") debitTxId = created.fromTxId;
       else if (typeof created?.id === "number") debitTxId = created.id;
     } catch {
       /* response may not have JSON body — ignore */
