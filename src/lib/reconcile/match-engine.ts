@@ -47,6 +47,7 @@ import { decryptRuleFields } from "@/lib/rules/crypto";
 import type { Action, ConditionGroup } from "@/lib/rules/schema";
 import { invalidateUser } from "@/lib/mcp/user-tx-cache";
 import { validateSignVsCategoryById } from "@/lib/transactions/sign-category-invariant";
+import { materializeBankRowAsTransfer } from "./materialize-transfer";
 import {
   buildBankLedgerCandidatePool,
   type BankCandidateRow,
@@ -833,7 +834,9 @@ export interface ApplyRulesPerRowResult {
   transactionId?: number;
   /** Reason a matched row was skipped despite autoMaterialize=true
    *  (e.g. 'already_linked', 'investment_account', 'sign_category_mismatch',
-   *  'no_set_category_action'). Absent on clean matches. */
+   *  'no_set_category_action'; or a transfer-rule code 'transfer_self' /
+   *  'transfer_inflow' / 'transfer_investment_dest' / 'transfer_dest_not_found'
+   *  / 'transfer_write_failed'). Absent on clean matches. */
   skipReason?: string;
 }
 
@@ -1014,10 +1017,51 @@ export async function applyRulesToBankRows(
 
     const categoryId = pickCategoryFromActions(match.actions);
     if (categoryId == null) {
-      // Rule matched but its actions don't include a `set_category`. We
-      // can't materialize without a category (the row would be
-      // uncategorized and indistinguishable from a no-match row). Skip
-      // and let the user categorize manually via /inbox To-categorize.
+      // Rule matched but its actions don't include a `set_category`. A
+      // transfer-only rule (`create_transfer`, no `set_category`) is the
+      // common case here — auto-route it through the shared transfer
+      // materializer so Auto-pilot accounts get transfer pairs written
+      // immediately (mirrors the Manual materialize-dialog fix). Outflow
+      // rows only; the helper refuses inflow / self / investment-dest.
+      const transferDest = pickTransferDestFromActions(match.actions);
+      if (autoMaterialize && transferDest != null) {
+        // dek is non-null here — guarded by the autoMaterialize=>dek check
+        // at the top of the function.
+        const payeePlain = decodeBankString(bank.encryptionTier, dek, bank.payee);
+        const result = await materializeBankRowAsTransfer({
+          userId,
+          dek: dek!,
+          bank: {
+            id: bank.id,
+            accountId: bank.accountId,
+            date: bank.date,
+            amount: bank.amount,
+            currency: bank.currency,
+          },
+          payeePlain,
+          destAccountId: transferDest,
+          txSource: "auto_rule",
+        });
+        if (result.ok) {
+          materialized += 1;
+          perRow.push({
+            bankRowId: bank.id,
+            matched: true,
+            transactionId: result.fromTransactionId,
+          });
+        } else {
+          perRow.push({
+            bankRowId: bank.id,
+            matched: true,
+            skipReason: result.code,
+          });
+        }
+        continue;
+      }
+      // No transfer destination (or planning mode) — can't materialize
+      // without a category. Skip and let the user categorize manually via
+      // /inbox To-categorize. Non-autoMaterialize callers just report the
+      // match.
       perRow.push({
         bankRowId: bank.id,
         matched: true,

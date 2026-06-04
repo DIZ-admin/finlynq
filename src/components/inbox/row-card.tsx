@@ -21,7 +21,15 @@
 
 import { Badge } from "@/components/ui/badge";
 import { Button } from "@/components/ui/button";
-import { Check, Link2, Pencil, Plus, Sparkles, Trash2 } from "lucide-react";
+import {
+  ArrowLeftRight,
+  Check,
+  Link2,
+  Pencil,
+  Plus,
+  Sparkles,
+  Trash2,
+} from "lucide-react";
 import { formatCurrency } from "@/lib/currency";
 
 export interface RowCardSuggestion {
@@ -37,7 +45,17 @@ export interface RowCardSuggestionCreate {
   categoryId: number;
   categoryName: string;
 }
-export type RowCardSuggestionAny = RowCardSuggestion | RowCardSuggestionCreate;
+export interface RowCardSuggestionTransfer {
+  /** A transfer-only rule (`create_transfer`, no `set_category`) matched —
+   *  approve as a transfer pair (source leg on this bank row → dest account). */
+  kind: "transfer";
+  destAccountId: number;
+  destAccountName: string;
+}
+export type RowCardSuggestionAny =
+  | RowCardSuggestion
+  | RowCardSuggestionCreate
+  | RowCardSuggestionTransfer;
 
 export interface RowCardBank {
   id: string;
@@ -84,6 +102,17 @@ function SuggestionLine({ s }: { s: RowCardSuggestionAny | null }) {
             {s.txCategoryName}
           </Badge>
         )}
+      </span>
+    );
+  }
+  if (s.kind === "transfer") {
+    return (
+      <span className="inline-flex items-center gap-1.5 text-xs">
+        <ArrowLeftRight className="h-3.5 w-3.5 text-violet-500" />
+        <span className="text-muted-foreground">transfer to</span>
+        <Badge variant="secondary" className="font-mono text-[10px]">
+          {s.destAccountName}
+        </Badge>
       </span>
     );
   }

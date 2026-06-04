@@ -22,18 +22,28 @@
  * The shape mirrors /materialize so the implementation can grow into a
  * shared helper once the third caller (Phase 4 /categorize) is in place.
  *
- * Request body (JSON):
+ * Request body (JSON) — EXACTLY ONE of categoryId / transferDestAccountId:
  *   {
- *     categoryId:  number,        // required — Approve-each commits to a real category
+ *     categoryId?:            number,   // commit a categorized tx
+ *     transferDestAccountId?: number,   // commit a transfer pair (source leg
+ *                                       //   on the bank row's account → dest).
+ *                                       //   Outflow rows only; refuses
+ *                                       //   inflow / self / investment-dest.
  *     payee?:      string,        // optional — overrides the bank row's payee
  *     accountId?:  number,        // optional — defaults to the bank row's account
+ *                                 //   (categoryId path only; transfer source is
+ *                                 //   always the bank row's account)
  *     linkType?:   'primary'      // ignored; primary is the only legal value here
  *   }
  *
  * Response:
- *   200  { success: true, data: { transactionId } }
- *   400  { error, code? }   — validation / sign-vs-category / investment guard
- *   404  { error: 'Not found' }   — bank row or account or category not owned by user
+ *   200  { success: true, data: { transactionId } }   — transactionId is the
+ *                                 source leg id for the transfer path.
+ *   400  { error, code? }   — validation / sign-vs-category / investment guard /
+ *                             transfer guard (transfer_self / transfer_inflow /
+ *                             transfer_investment_dest)
+ *   404  { error: 'Not found' }   — bank row / account / category / transfer
+ *                                   destination not owned by user
  *   423  { error: 'session_locked' }   — DEK unavailable
  *
  * Invariants honored (all per CLAUDE.md):
@@ -66,15 +76,30 @@ import { encryptField, tryDecryptField } from "@/lib/crypto/envelope";
 import { decryptStaged } from "@/lib/crypto/staging-envelope";
 import { invalidateUser } from "@/lib/mcp/user-tx-cache";
 import { validateSignVsCategoryById } from "@/lib/transactions/sign-category-invariant";
+import { materializeBankRowAsTransfer } from "@/lib/reconcile/materialize-transfer";
 
 export const dynamic = "force-dynamic";
 
-const bodySchema = z.object({
-  categoryId: z.number().int().positive(),
-  payee: z.string().max(512).optional(),
-  accountId: z.number().int().positive().optional(),
-  linkType: z.literal("primary").optional(),
-});
+const bodySchema = z
+  .object({
+    // categoryId OR transferDestAccountId — exactly one (refine below).
+    // categoryId commits a categorized tx; transferDestAccountId commits a
+    // transfer pair (source leg on the bank row's account).
+    categoryId: z.number().int().positive().optional(),
+    transferDestAccountId: z.number().int().positive().optional(),
+    payee: z.string().max(512).optional(),
+    accountId: z.number().int().positive().optional(),
+    linkType: z.literal("primary").optional(),
+  })
+  .refine(
+    (b) =>
+      (b.categoryId != null) !== (b.transferDestAccountId != null),
+    {
+      message:
+        "Provide exactly one of categoryId or transferDestAccountId.",
+      path: ["categoryId"],
+    },
+  );
 
 export async function POST(
   request: NextRequest,
@@ -132,6 +157,48 @@ export async function POST(
   }
   const bank = bankRow[0];
 
+  // ─── Approve-as-transfer branch ──────────────────────────────────────────
+  // When the request supplies `transferDestAccountId` (a transfer-only rule
+  // matched this row), write a transfer pair through the shared materializer
+  // instead of a categorized tx. Outflow rows only; the helper refuses
+  // inflow / self / investment-dest with a typed code we map to a 400. The
+  // categoryId path below is unchanged.
+  if (parsed.data.transferDestAccountId != null) {
+    const payeePlain = decodeBankString(bank.encryptionTier, dek, bank.payee);
+    const result = await materializeBankRowAsTransfer({
+      userId,
+      dek,
+      bank: {
+        id: bank.id,
+        accountId: bank.accountId,
+        date: bank.date,
+        amount: bank.amount,
+        currency: bank.currency,
+      },
+      payeePlain: parsed.data.payee ?? payeePlain,
+      destAccountId: parsed.data.transferDestAccountId,
+      txSource: "manual",
+    });
+    if (!result.ok) {
+      // transfer_dest_not_found is a cross-tenant / missing-account miss →
+      // 404 (never 403) like the rest of the surface; everything else is a
+      // client guard violation → 400 with the code.
+      const status = result.code === "transfer_dest_not_found" ? 404 : 400;
+      return NextResponse.json(
+        { error: result.message, code: result.code },
+        { status },
+      );
+    }
+    return NextResponse.json({
+      success: true,
+      data: { transactionId: result.fromTransactionId },
+    });
+  }
+
+  // From here on, the categoryId path. categoryId is guaranteed present by
+  // the body schema's exactly-one refine.
+  const categoryId = parsed.data.categoryId!;
+
   // Resolve target account. Default = bank row's account; override allowed
   // but ownership re-checked. Investment-account guard same as /materialize.
   const targetAccountId = parsed.data.accountId ?? bank.accountId;
@@ -168,7 +235,7 @@ export async function POST(
   const violation = await validateSignVsCategoryById(
     userId,
     dek,
-    parsed.data.categoryId,
+    categoryId,
     bank.amount,
   );
   if (violation) {
@@ -187,7 +254,7 @@ export async function POST(
     .from(schema.categories)
     .where(
       and(
-        eq(schema.categories.id, parsed.data.categoryId),
+        eq(schema.categories.id, categoryId),
         eq(schema.categories.userId, userId),
       ),
     )
@@ -214,7 +281,7 @@ export async function POST(
         userId,
         date: bank.date,
         accountId: targetAccountId,
-        categoryId: parsed.data.categoryId,
+        categoryId,
         currency: bank.currency,
         amount: bank.amount,
         enteredCurrency: bank.enteredCurrency,

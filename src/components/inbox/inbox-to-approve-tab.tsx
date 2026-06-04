@@ -86,6 +86,10 @@ interface BankSnapshot {
   payee: string | null;
   accountId: number;
   suggestedCategoryId: number | null;
+  /** Destination account id from a matched transfer-only rule
+   *  (`create_transfer`, no `set_category`). Already self-transfer-filtered
+   *  by the match engine. Drives the one-click approve-as-transfer path. */
+  suggestedTransferAccountId: number | null;
 }
 
 interface SnapshotShape {
@@ -241,10 +245,35 @@ export function InboxToApproveTab({
           categoryId: b.suggestedCategoryId,
           categoryName: catName(b.suggestedCategoryId),
         });
+        continue;
+      }
+      // 3) Transfer-only rule matched (no category). Outflow rows only — the
+      //    transfer's source (debit) leg links to the bank row, so we only
+      //    surface this for `amount < 0`. The dest account must exist and be
+      //    non-investment (the approve endpoint refuses those server-side; we
+      //    pre-filter so the card never offers an impossible action).
+      if (
+        b.suggestedTransferAccountId != null &&
+        b.amount < 0
+      ) {
+        const dest = accounts.find(
+          (a) => a.id === b.suggestedTransferAccountId,
+        );
+        if (
+          dest &&
+          dest.isInvestment !== true &&
+          dest.id !== b.accountId
+        ) {
+          map.set(b.id, {
+            kind: "transfer",
+            destAccountId: dest.id,
+            destAccountName: safeAccountName(dest),
+          });
+        }
       }
     }
     return map;
-  }, [snapshot, categories]);
+  }, [snapshot, categories, accounts]);
 
   const suggestedUnlinked = useMemo(
     () => unlinkedRows.filter((b) => suggestionByBank.has(b.id)),
@@ -259,6 +288,27 @@ export function InboxToApproveTab({
           method: "POST",
           headers: { "Content-Type": "application/json" },
           body: JSON.stringify({ categoryId }),
+        },
+      );
+      if (!res.ok) {
+        const body = await res.json().catch(() => ({}));
+        throw new Error(body.error ?? `HTTP ${res.status}`);
+      }
+    },
+    [],
+  );
+
+  /** Approve a transfer-only-rule row as a transfer pair (source leg on the
+   *  bank row's account → destAccountId). Same endpoint as approveOne, with
+   *  transferDestAccountId instead of categoryId. */
+  const approveTransfer = useCallback(
+    async (bankId: string, destAccountId: number) => {
+      const res = await fetch(
+        `/api/bank-transactions/${encodeURIComponent(bankId)}/approve`,
+        {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ transferDestAccountId: destAccountId }),
         },
       );
       if (!res.ok) {
@@ -310,6 +360,20 @@ export function InboxToApproveTab({
         setError("No suggestion available for this row. Use Categorize.");
         return;
       }
+      // Transfer-only-rule row → write the pair via the transfer endpoint.
+      if (sug.kind === "transfer") {
+        setBusyBankId(bankId);
+        setError(null);
+        try {
+          await approveTransfer(bankId, sug.destAccountId);
+          await refresh();
+        } catch (e) {
+          setError(e instanceof Error ? e.message : String(e));
+        } finally {
+          setBusyBankId(null);
+        }
+        return;
+      }
       // For 'match' suggestions we don't have a categoryId on hand — fall
       // back to the linked tx's category if any, else open the dialog so
       // the user picks. Phase 3 keeps the surface simple: 'match' acts
@@ -347,7 +411,15 @@ export function InboxToApproveTab({
         setBusyBankId(null);
       }
     },
-    [approveOne, refresh, snapshot, suggestionByBank, categories, onEdit],
+    [
+      approveOne,
+      approveTransfer,
+      refresh,
+      snapshot,
+      suggestionByBank,
+      categories,
+      onEdit,
+    ],
   );
 
   const deleteBankRow = useCallback(
@@ -413,6 +485,17 @@ export function InboxToApproveTab({
       suggestedUnlinked.map(async (b) => {
         const sug = suggestionByBank.get(b.id);
         if (!sug) return;
+        // Transfer-only-rule row → write the pair via the transfer endpoint.
+        if (sug.kind === "transfer") {
+          try {
+            await approveTransfer(b.id, sug.destAccountId);
+          } catch (e) {
+            errors.push(
+              `${b.payee ?? b.id}: ${e instanceof Error ? e.message : String(e)}`,
+            );
+          }
+          return;
+        }
         let categoryId: number | null = null;
         if (sug.kind === "create") {
           categoryId = sug.categoryId;
@@ -445,6 +528,7 @@ export function InboxToApproveTab({
     setBulkBusy(false);
   }, [
     approveOne,
+    approveTransfer,
     categories,
     refresh,
     snapshot,
