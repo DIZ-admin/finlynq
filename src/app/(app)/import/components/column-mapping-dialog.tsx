@@ -20,8 +20,10 @@ import {
   SelectValue,
 } from "@/components/ui/select";
 import { AlertCircle, Loader2, Sparkles } from "lucide-react";
-import type { ColumnMapping } from "@/lib/import-templates";
+import type { ColumnMapping, DateFormatOverride } from "@/lib/import-templates";
 import { SUPPORTED_CURRENCIES } from "@/lib/fx/supported-currencies";
+
+type DateFormatUi = "auto" | DateFormatOverride;
 
 /** Fresh column detection for a given skip — returned by the parent's re-parse. */
 export interface ReparseResult {
@@ -52,6 +54,8 @@ interface ColumnMappingDialogProps {
     skipHeaderRows: number;
     skipFooterRows: number;
     defaultCurrency: string | null;
+    /** Date-format override; `null` means auto-detect. */
+    dateFormatOverride: DateFormatOverride | null;
     /** The headers the mapping was built against — reflects any re-detect, so
      *  the saved template stores the REAL column names, not the pre-trim junk row. */
     headers: string[];
@@ -115,6 +119,7 @@ export function ColumnMappingDialog({
   const [skipHeaderRows, setSkipHeaderRows] = useState("0");
   const [skipFooterRows, setSkipFooterRows] = useState("0");
   const [defaultCurrency, setDefaultCurrency] = useState("");
+  const [dateFormatOverride, setDateFormatOverride] = useState<DateFormatUi>("auto");
   const [redetecting, setRedetecting] = useState(false);
   const [error, setError] = useState("");
 
@@ -137,6 +142,7 @@ export function ColumnMappingDialog({
     setSkipHeaderRows("0");
     setSkipFooterRows("0");
     setDefaultCurrency("");
+    setDateFormatOverride("auto");
     setRedetecting(false);
     setError("");
     // Invalidate any in-flight re-detect from a previous file + clear debounce.
@@ -206,6 +212,7 @@ export function ColumnMappingDialog({
       skipHeaderRows: clampSkip(skipHeaderRows),
       skipFooterRows: clampSkip(skipFooterRows),
       defaultCurrency: defaultCurrency || null,
+      dateFormatOverride: dateFormatOverride === "auto" ? null : dateFormatOverride,
       headers: localHeaders,
     });
   };
@@ -248,11 +255,12 @@ export function ColumnMappingDialog({
             </div>
           )}
 
-          {/* Import options — skip junk rows above/below the data + default
-              currency. Changing the skip count re-detects the columns below. */}
+          {/* Import options — skip junk rows above/below the data + date format
+              + default currency. Changing the skip count re-detects the columns
+              below; date format / currency apply on Continue. */}
           <details className="rounded-lg border bg-muted/30 p-3" open>
             <summary className="cursor-pointer text-sm font-medium">
-              Import options (skip header / footer rows, default currency)
+              Import options (skip header / footer rows, date format, default currency)
             </summary>
             <div className="mt-3 space-y-3">
               <p className="text-xs text-muted-foreground">
@@ -260,7 +268,7 @@ export function ColumnMappingDialog({
                 summary row sits above them), skip those rows — the columns below
                 refresh automatically.
               </p>
-              <div className="grid gap-3 sm:grid-cols-3">
+              <div className="grid gap-3 sm:grid-cols-2">
                 <div className="space-y-1">
                   <Label htmlFor="map-skip-h" className="text-xs">Skip N header rows</Label>
                   <Input
@@ -290,6 +298,20 @@ export function ColumnMappingDialog({
                       scheduleReparse(skipHeaderRows, v);
                     }}
                   />
+                </div>
+                <div className="space-y-1">
+                  <Label htmlFor="map-date-fmt" className="text-xs">Date format</Label>
+                  <select
+                    id="map-date-fmt"
+                    value={dateFormatOverride}
+                    onChange={(e) => setDateFormatOverride(e.target.value as DateFormatUi)}
+                    className="h-9 w-full rounded-md border bg-transparent px-3 text-sm"
+                  >
+                    <option value="auto">Auto-detect</option>
+                    <option value="DD/MM/YYYY">DD/MM/YYYY</option>
+                    <option value="MM/DD/YYYY">MM/DD/YYYY</option>
+                    <option value="YYYY-MM-DD">YYYY-MM-DD</option>
+                  </select>
                 </div>
                 <div className="space-y-1">
                   <Label className="text-xs">Default currency (rows missing one)</Label>

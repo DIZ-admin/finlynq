@@ -352,6 +352,7 @@ export function UploadDrawer({
       skipHeaderRows: number;
       skipFooterRows: number;
       defaultCurrency: string | null;
+      dateFormatOverride: string | null;
       headers: string[];
     }) => {
       if (!pendingFile || !pendingParams) {
@@ -360,9 +361,10 @@ export function UploadDrawer({
       }
       setMappingSubmitting(true);
       try {
-        // The dialog's skip / currency / headers WIN over the upload card's
-        // values — the user set them here after seeing the columns, so they're
-        // authoritative for both the saved template and the re-fired upload.
+        // The dialog's skip / date-format / currency / headers WIN over the
+        // upload card's values — the user set them here after seeing the
+        // columns, so they're authoritative for both the saved template and
+        // the re-fired upload.
         const tplRes = await fetch("/api/import/templates", {
           method: "POST",
           headers: { "Content-Type": "application/json" },
@@ -373,10 +375,7 @@ export function UploadDrawer({
             defaultAccount: params.defaultAccount ?? undefined,
             skipHeaderRows: params.skipHeaderRows,
             skipFooterRows: params.skipFooterRows,
-            dateFormatOverride:
-              pendingParams.dateFormatOverride === "auto"
-                ? null
-                : pendingParams.dateFormatOverride,
+            dateFormatOverride: params.dateFormatOverride,
             defaultCurrency: params.defaultCurrency,
           }),
         });
@@ -405,7 +404,7 @@ export function UploadDrawer({
           statementBalance: carried.statementBalance,
           skipHeaderRows: params.skipHeaderRows,
           skipFooterRows: params.skipFooterRows,
-          dateFormatOverride: carried.dateFormatOverride,
+          dateFormatOverride: (params.dateFormatOverride ?? "auto") as DateFormatOverrideUi,
           defaultCurrency: params.defaultCurrency,
         });
       } catch (err) {

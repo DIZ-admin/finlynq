@@ -55,6 +55,7 @@ export async function POST(request: NextRequest) {
         skipHeaderRows: knobs.skipHeaderRows,
         skipFooterRows: knobs.skipFooterRows,
         defaultCurrency: knobs.defaultCurrency,
+        dateFormatOverride: knobs.dateFormatOverride,
         skipAutoMatchTemplate: noTemplate,
       });
       if (result.kind === "template-not-found") {
@@ -66,6 +67,7 @@ export async function POST(request: NextRequest) {
           skipHeaderRows: knobs.skipHeaderRows,
           skipFooterRows: knobs.skipFooterRows,
           defaultCurrency: knobs.defaultCurrency,
+          dateFormatOverride: knobs.dateFormatOverride,
           skipAutoMatchTemplate: noTemplate,
         });
         return await respondWithCsvResult(fallback, file.name, userId, auth.context.dek ?? undefined);

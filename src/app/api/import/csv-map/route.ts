@@ -43,7 +43,7 @@ export async function POST(request: NextRequest) {
     const { rows, errors: parseErrors } = csvToRawTransactionsWithMapping(
       text,
       mapping,
-      undefined,
+      knobs.dateFormatOverride,
       knobs.defaultCurrency,
     );
 

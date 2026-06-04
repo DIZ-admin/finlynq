@@ -171,20 +171,21 @@ export async function parseCsvWithFallback(
     const effSkipH = req.skipHeaderRows ?? tpl.skipHeaderRows ?? 0;
     const effSkipF = req.skipFooterRows ?? tpl.skipFooterRows ?? 0;
     const effCurrency = req.defaultCurrency ?? tpl.defaultCurrency ?? null;
+    const effDateFmt = req.dateFormatOverride ?? tpl.dateFormatOverride ?? null;
     const tplText = trimCsvRows(req.text, effSkipH, effSkipF);
     const tplHeaders = extractCsvHeaders(tplText);
     const mapped = parseWithMapping(
       tplText,
       tpl.columnMapping,
       tpl.defaultAccount ?? null,
-      dateFormatOverride,
+      effDateFmt,
       effCurrency,
     );
     const filled = applyDefaultAccount(mapped.rows, defaultAccountName);
     const anchors = extractBalanceAnchors(
       tplText,
       tpl.columnMapping,
-      dateFormatOverride,
+      effDateFmt,
       anchorCcy,
     );
     return {
@@ -254,16 +255,18 @@ export async function parseCsvWithFallback(
   const templates: ImportTemplate[] = allTemplates.map(deserializeTemplate);
   const best = skipAutoMatchTemplate ? null : findBestTemplate(headers, templates);
   if (best) {
-    // FINLYNQ — apply the matched template's default currency (request override
-    // first). Skip-fallback for step 3 is deferred: `headers`/`findBestTemplate`
-    // are computed on the request-skip-trimmed text, so re-trimming post-match
-    // could shift which rows parse. Currency has no such ordering hazard.
+    // FINLYNQ — apply the matched template's default currency + date format
+    // (request override first). Skip-fallback for step 3 is deferred:
+    // `headers`/`findBestTemplate` are computed on the request-skip-trimmed
+    // text, so re-trimming post-match could shift which rows parse. Currency
+    // and date format have no such ordering hazard.
     const effCurrency = req.defaultCurrency ?? best.template.defaultCurrency ?? null;
+    const effDateFmt = req.dateFormatOverride ?? best.template.dateFormatOverride ?? null;
     const mapped = parseWithMapping(
       text,
       best.template.columnMapping,
       best.template.defaultAccount ?? null,
-      dateFormatOverride,
+      effDateFmt,
       effCurrency,
     );
     if (mapped.rows.length > 0) {
@@ -271,7 +274,7 @@ export async function parseCsvWithFallback(
       const anchors = extractBalanceAnchors(
         text,
         best.template.columnMapping,
-        dateFormatOverride,
+        effDateFmt,
         anchorCcy,
       );
       return {
