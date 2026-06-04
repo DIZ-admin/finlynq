@@ -25,6 +25,7 @@ import { ReconcileUploadCard } from "@/components/reconcile/upload-card";
 import type { AccountOption } from "@/components/reconcile/preview-table";
 import { ColumnMappingDialog } from "@/app/(app)/import/components/column-mapping-dialog";
 import type { ColumnMapping, ImportTemplate } from "@/lib/import-templates";
+import { formatCurrency } from "@/lib/currency";
 
 interface AfterUploadBullet {
   body: React.ReactNode;
@@ -115,6 +116,16 @@ interface UploadResponse {
   };
   tolerance: number;
   merged?: boolean;
+  /** At-upload statement snapshot (restores the old OFX-preview balance
+   *  validation): statement balance + date range + parsed-row/anchor counts. */
+  statement?: {
+    balance: number | null;
+    balanceDate: string | null;
+    currency: string | null;
+    rowCount: number;
+    anchorCount: number;
+    dateRange: { start: string; end: string } | null;
+  };
 }
 
 export function UploadDrawer({
@@ -429,6 +440,48 @@ export function UploadDrawer({
                   {c?.errors ? ` · ${c.errors} error${c.errors === 1 ? "" : "s"}` : ""}
                 </p>
               </div>
+              {result.statement && (
+                <div className="rounded-md border px-3 py-2.5 text-xs space-y-1">
+                  <p className="font-medium">Statement snapshot</p>
+                  <dl className="space-y-0.5 text-muted-foreground">
+                    {result.statement.balance != null && (
+                      <div className="flex justify-between gap-3">
+                        <dt>Statement balance</dt>
+                        <dd className="font-medium text-foreground text-right">
+                          {formatCurrency(
+                            result.statement.balance,
+                            result.statement.currency ?? accountCurrency,
+                          )}
+                          {result.statement.balanceDate
+                            ? ` · ${result.statement.balanceDate}`
+                            : ""}
+                        </dd>
+                      </div>
+                    )}
+                    {result.statement.dateRange && (
+                      <div className="flex justify-between gap-3">
+                        <dt>Date range</dt>
+                        <dd className="text-right">
+                          {result.statement.dateRange.start} →{" "}
+                          {result.statement.dateRange.end}
+                        </dd>
+                      </div>
+                    )}
+                    <div className="flex justify-between gap-3">
+                      <dt>Rows parsed</dt>
+                      <dd className="text-right">{result.statement.rowCount}</dd>
+                    </div>
+                    {result.statement.anchorCount > 0 && (
+                      <div className="flex justify-between gap-3">
+                        <dt>Balance anchors</dt>
+                        <dd className="text-right">
+                          {result.statement.anchorCount}
+                        </dd>
+                      </div>
+                    )}
+                  </dl>
+                </div>
+              )}
               <div className={`rounded-md border px-3 py-2.5 text-xs ${cfg.tone}`}>
                 <p className="font-medium">Where they landed — {cfg.label}:</p>
                 <ul className="mt-1.5 space-y-0.5 text-muted-foreground list-disc pl-4">

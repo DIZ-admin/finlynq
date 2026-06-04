@@ -31,7 +31,8 @@ import {
 import { useSearchParams } from "next/navigation";
 import { Card, CardContent } from "@/components/ui/card";
 import { Button } from "@/components/ui/button";
-import { Info } from "lucide-react";
+import { Info, AlertTriangle } from "lucide-react";
+import { formatCurrency } from "@/lib/currency";
 import { ReconciliationCallout } from "@/components/staging/reconciliation-callout";
 import {
   type StagedEditableRow,
@@ -290,6 +291,38 @@ function PendingImportsPageInner() {
     }
     return map;
   }, [detail]);
+
+  // 2026-06-04 — existing bank-ledger drift summary. The bank pane shows the
+  // per-row Calculated (runningBalance) vs Loaded (anchorBalance) mismatch,
+  // but only inline; this rolls it up into a top banner so a multi-day drift
+  // (a missing/duplicated bank-ledger row) isn't easy to miss. Deduped by
+  // date (the server stamps the same balances on every row of a day) and
+  // rounded to cents so float noise doesn't register as drift.
+  const bankLedgerDrift = useMemo(() => {
+    const byDate = new Map<string, { calculated: number; loaded: number }>();
+    for (const r of dbRows) {
+      if (r.runningBalance == null || r.anchorBalance == null) continue;
+      if (!byDate.has(r.date)) {
+        byDate.set(r.date, {
+          calculated: r.runningBalance,
+          loaded: r.anchorBalance,
+        });
+      }
+    }
+    const drifts: {
+      date: string;
+      calculated: number;
+      loaded: number;
+      diff: number;
+    }[] = [];
+    for (const [date, v] of byDate) {
+      const diff = Math.round((v.calculated - v.loaded) * 100) / 100;
+      if (Math.abs(diff) > 0.01) drifts.push({ date, ...v, diff });
+    }
+    drifts.sort((a, z) => Math.abs(z.diff) - Math.abs(a.diff));
+    return drifts;
+  }, [dbRows]);
+  const driftCurrency = dbRows[0]?.currency ?? "USD";
 
   // Anchors-only approve detector. When every staged row is already in
   // the bank ledger (skipped_duplicate) or already linked to a system-side
@@ -1037,6 +1070,36 @@ function PendingImportsPageInner() {
             null
           }
         />
+      )}
+
+      {detail && bankLedgerDrift.length > 0 && (
+        <Card className="border-amber-300 bg-amber-50/50">
+          <CardContent className="py-2.5 px-3 text-sm flex items-start gap-3">
+            <AlertTriangle className="h-4 w-4 mt-0.5 shrink-0 text-amber-600" />
+            <div className="flex-1">
+              <p className="font-medium text-amber-900">
+                Bank ledger balance drift on {bankLedgerDrift.length}{" "}
+                {bankLedgerDrift.length === 1 ? "day" : "days"}
+              </p>
+              <p className="text-amber-800/90 text-xs mt-0.5">
+                The calculated running balance doesn&apos;t match the loaded
+                statement anchor — usually a missing or duplicated bank-ledger
+                row. Largest gap:{" "}
+                <span className="font-medium">
+                  {formatCurrency(
+                    Math.abs(bankLedgerDrift[0].diff),
+                    driftCurrency,
+                  )}
+                </span>{" "}
+                on {bankLedgerDrift[0].date} (calculated{" "}
+                {formatCurrency(bankLedgerDrift[0].calculated, driftCurrency)} vs
+                loaded {formatCurrency(bankLedgerDrift[0].loaded, driftCurrency)}
+                ). Review the Calculated vs Loaded columns in the bank ledger
+                below.
+              </p>
+            </div>
+          </CardContent>
+        </Card>
       )}
 
       {anchorsOnlyHint && (

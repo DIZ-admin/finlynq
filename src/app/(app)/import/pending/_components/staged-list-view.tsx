@@ -90,11 +90,11 @@ export function StagedListView({
             <div>
               <p className="text-sm font-medium">Nothing pending</p>
               <p className="text-xs text-muted-foreground mt-1">
-                Upload a CSV/OFX/QFX statement at{" "}
-                <Link href="/import/reconcile" className="underline">
-                  Import → Reconciliation
-                </Link>
-                , or forward a bank statement to your import address — both
+                Upload a CSV/OFX/QFX statement from the{" "}
+                <Link href="/import" className="underline">
+                  Import
+                </Link>{" "}
+                page, or forward a bank statement to your import address — both
                 land here for review.
               </p>
             </div>
