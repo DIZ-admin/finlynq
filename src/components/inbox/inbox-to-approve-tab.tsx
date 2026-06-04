@@ -31,7 +31,11 @@ import { useCallback, useEffect, useMemo, useState } from "react";
 import { Button } from "@/components/ui/button";
 import { Card, CardContent } from "@/components/ui/card";
 import { Check, Inbox } from "lucide-react";
-import { RowCard, type RowCardSuggestionAny } from "./row-card";
+import {
+  RowCard,
+  type RowCardSuggestionAny,
+  type RowCardDuplicate,
+} from "./row-card";
 import { ConfirmDeleteBankRow } from "@/components/reconcile/confirm-delete-bank-row";
 import {
   TransactionDialog,
@@ -86,6 +90,13 @@ interface BankSnapshot {
   payee: string | null;
   accountId: number;
   suggestedCategoryId: number | null;
+  /** Destination account id from a matched transfer-only rule
+   *  (`create_transfer`, no `set_category`). Already self-transfer-filtered
+   *  by the match engine. Drives the one-click approve-as-transfer path. */
+  suggestedTransferAccountId: number | null;
+  /** Strict possible-duplicate: id of an existing unlinked ledger tx this
+   *  bank row matches (exact hash / exact amount + close date). null = none. */
+  duplicateOfTransactionId: number | null;
 }
 
 interface SnapshotShape {
@@ -211,24 +222,36 @@ export function InboxToApproveTab({
       .sort((a, b) => b.date.localeCompare(a.date));
   }, [snapshot]);
 
+  /** Possible ledger duplicates — bank rows the match engine paired with an
+   *  existing UNLINKED ledger transaction (exact-hash or fuzzy date/amount).
+   *  These are surfaced as a "Link to existing vs Keep separate" choice
+   *  instead of a one-click Approve that would mint a second ledger entry
+   *  (2026-06-04). Takes priority over the rule suggestion in the card. */
+  const duplicateByBank = useMemo(() => {
+    const map = new Map<string, RowCardDuplicate>();
+    if (!snapshot) return map;
+    for (const b of Object.values(snapshot.bankTransactions)) {
+      if (b.duplicateOfTransactionId == null) continue;
+      const tx = snapshot.transactions[b.duplicateOfTransactionId];
+      if (!tx) continue;
+      map.set(b.id, {
+        transactionId: tx.id,
+        txPayee: tx.payee,
+        txDate: tx.date,
+        txAmount: tx.amount,
+        txCurrency: tx.currency,
+      });
+    }
+    return map;
+  }, [snapshot]);
+
   /** Build the per-bank-row suggestion shape the RowCard expects. */
   const suggestionByBank = useMemo(() => {
     const map = new Map<string, RowCardSuggestionAny>();
     if (!snapshot) return map;
-    // 1) Match against an existing tx — preferred over Create.
-    for (const s of snapshot.suggestions) {
-      if (map.has(s.bankTransactionId)) continue;
-      const tx = snapshot.transactions[s.transactionId];
-      if (!tx) continue;
-      map.set(s.bankTransactionId, {
-        kind: "match",
-        transactionId: s.transactionId,
-        txPayee: tx.payee,
-        txCategoryName: tx.categoryName,
-      });
-    }
-    // 2) Fallback: match-engine's suggestedCategoryId on the bank row
-    //    (the same data /reconcile's materialize dialog reads).
+    // match-engine's suggestedCategoryId on the bank row (the same data
+    // /reconcile's materialize dialog reads). Rows that match an existing
+    // ledger tx are handled by `duplicateByBank` above, not here.
     const catName = (id: number) => {
       const c = categories.find((x) => x.id === id);
       return c?.name ?? `Category #${id}`;
@@ -241,14 +264,45 @@ export function InboxToApproveTab({
           categoryId: b.suggestedCategoryId,
           categoryName: catName(b.suggestedCategoryId),
         });
+        continue;
+      }
+      // 3) Transfer-only rule matched (no category). Outflow rows only — the
+      //    transfer's source (debit) leg links to the bank row, so we only
+      //    surface this for `amount < 0`. The dest account must exist and be
+      //    non-investment (the approve endpoint refuses those server-side; we
+      //    pre-filter so the card never offers an impossible action).
+      if (
+        b.suggestedTransferAccountId != null &&
+        b.amount < 0
+      ) {
+        const dest = accounts.find(
+          (a) => a.id === b.suggestedTransferAccountId,
+        );
+        if (
+          dest &&
+          dest.isInvestment !== true &&
+          dest.id !== b.accountId
+        ) {
+          map.set(b.id, {
+            kind: "transfer",
+            destAccountId: dest.id,
+            destAccountName: safeAccountName(dest),
+          });
+        }
       }
     }
     return map;
-  }, [snapshot, categories]);
+  }, [snapshot, categories, accounts]);
 
   const suggestedUnlinked = useMemo(
-    () => unlinkedRows.filter((b) => suggestionByBank.has(b.id)),
-    [unlinkedRows, suggestionByBank],
+    // Exclude possible ledger duplicates — "Accept all suggested" must not
+    // blindly create a second ledger entry for a row that matches an existing
+    // transaction. The user resolves those one-by-one (link vs keep separate).
+    () =>
+      unlinkedRows.filter(
+        (b) => suggestionByBank.has(b.id) && !duplicateByBank.has(b.id),
+      ),
+    [unlinkedRows, suggestionByBank, duplicateByBank],
   );
 
   const approveOne = useCallback(
@@ -267,6 +321,53 @@ export function InboxToApproveTab({
       }
     },
     [],
+  );
+
+  /** Approve a transfer-only-rule row as a transfer pair (source leg on the
+   *  bank row's account → destAccountId). Same endpoint as approveOne, with
+   *  transferDestAccountId instead of categoryId. */
+  const approveTransfer = useCallback(
+    async (bankId: string, destAccountId: number) => {
+      const res = await fetch(
+        `/api/bank-transactions/${encodeURIComponent(bankId)}/approve`,
+        {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ transferDestAccountId: destAccountId }),
+        },
+      );
+      if (!res.ok) {
+        const body = await res.json().catch(() => ({}));
+        throw new Error(body.error ?? `HTTP ${res.status}`);
+      }
+    },
+    [],
+  );
+
+  /** Resolve a possible duplicate by linking the bank row to the matched
+   *  existing ledger transaction (no new tx created). */
+  const linkExisting = useCallback(
+    async (bankId: string, transactionId: number) => {
+      setBusyBankId(bankId);
+      setError(null);
+      try {
+        const res = await fetch("/api/reconcile/links", {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ transactionId, bankTransactionId: bankId }),
+        });
+        if (!res.ok) {
+          const body = await res.json().catch(() => ({}));
+          throw new Error(body.error ?? `HTTP ${res.status}`);
+        }
+        await refresh();
+      } catch (e) {
+        setError(e instanceof Error ? e.message : String(e));
+      } finally {
+        setBusyBankId(null);
+      }
+    },
+    [refresh],
   );
 
   // Declared before onApprove so it can reference onEdit without a temporal
@@ -310,6 +411,20 @@ export function InboxToApproveTab({
         setError("No suggestion available for this row. Use Categorize.");
         return;
       }
+      // Transfer-only-rule row → write the pair via the transfer endpoint.
+      if (sug.kind === "transfer") {
+        setBusyBankId(bankId);
+        setError(null);
+        try {
+          await approveTransfer(bankId, sug.destAccountId);
+          await refresh();
+        } catch (e) {
+          setError(e instanceof Error ? e.message : String(e));
+        } finally {
+          setBusyBankId(null);
+        }
+        return;
+      }
       // For 'match' suggestions we don't have a categoryId on hand — fall
       // back to the linked tx's category if any, else open the dialog so
       // the user picks. Phase 3 keeps the surface simple: 'match' acts
@@ -347,7 +462,15 @@ export function InboxToApproveTab({
         setBusyBankId(null);
       }
     },
-    [approveOne, refresh, snapshot, suggestionByBank, categories, onEdit],
+    [
+      approveOne,
+      approveTransfer,
+      refresh,
+      snapshot,
+      suggestionByBank,
+      categories,
+      onEdit,
+    ],
   );
 
   const deleteBankRow = useCallback(
@@ -413,6 +536,17 @@ export function InboxToApproveTab({
       suggestedUnlinked.map(async (b) => {
         const sug = suggestionByBank.get(b.id);
         if (!sug) return;
+        // Transfer-only-rule row → write the pair via the transfer endpoint.
+        if (sug.kind === "transfer") {
+          try {
+            await approveTransfer(b.id, sug.destAccountId);
+          } catch (e) {
+            errors.push(
+              `${b.payee ?? b.id}: ${e instanceof Error ? e.message : String(e)}`,
+            );
+          }
+          return;
+        }
         let categoryId: number | null = null;
         if (sug.kind === "create") {
           categoryId = sug.categoryId;
@@ -445,6 +579,7 @@ export function InboxToApproveTab({
     setBulkBusy(false);
   }, [
     approveOne,
+    approveTransfer,
     categories,
     refresh,
     snapshot,
@@ -521,6 +656,11 @@ export function InboxToApproveTab({
               onApprove={() => void onApprove(b.id)}
               onEdit={() => onEdit(b.id)}
               onDelete={() => onDelete(b.id)}
+              duplicate={duplicateByBank.get(b.id) ?? null}
+              onLinkExisting={() => {
+                const dup = duplicateByBank.get(b.id);
+                if (dup) void linkExisting(b.id, dup.transactionId);
+              }}
             />
           ))}
         </div>

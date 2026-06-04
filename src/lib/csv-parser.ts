@@ -281,6 +281,7 @@ export function extractCSVHeaders(csvText: string): string[] {
 export function csvToRawTransactions(
   csvText: string,
   dateFormatOverride?: DateFormatOverride | null,
+  defaultCurrency?: string | null,
 ): { rows: RawTransaction[]; errors: Array<{ row: number; message: string }> } {
   const parsed = parseCSV(csvText);
   const rows: RawTransaction[] = [];
@@ -313,7 +314,10 @@ export function csvToRawTransactions(
       amount,
       payee: row["Payee"] ?? "",
       category: row["Categorization"] ?? "",
-      currency: row["Currency"] ?? "CAD",
+      // FINLYNQ — honor a template/upload default currency when the file has no
+      // Currency column (or an empty cell). `||` (not `??`) so empty strings fall
+      // through. CAD stays the last-resort so no-default imports are unchanged.
+      currency: row["Currency"] || defaultCurrency || "CAD",
       note: row["Note"] ?? "",
       tags: row["Tags"] ?? "",
       quantity: row["Quantity"] ? parseFloat(row["Quantity"]) || undefined : undefined,
@@ -333,6 +337,7 @@ export function csvToRawTransactionsWithMapping(
   csvText: string,
   mapping: Record<string, string>,
   dateFormatOverride?: DateFormatOverride | null,
+  defaultCurrency?: string | null,
 ): { rows: RawTransaction[]; errors: Array<{ row: number; message: string }> } {
   const parsed = parseCSV(csvText);
   const rows: RawTransaction[] = [];
@@ -373,7 +378,12 @@ export function csvToRawTransactionsWithMapping(
       amount,
       payee: mapping["payee"] ? (row[mapping["payee"]] ?? "") : "",
       category: mapping["category"] ? (row[mapping["category"]] ?? "") : undefined,
-      currency: mapping["currency"] ? (row[mapping["currency"]] ?? "CAD") : "CAD",
+      // FINLYNQ — fall back to the template/upload default currency when no
+      // Currency column is mapped, or the mapped cell is empty. `||` so empty
+      // cells fall through; CAD stays the last-resort.
+      currency: mapping["currency"]
+        ? (row[mapping["currency"]] || defaultCurrency || "CAD")
+        : (defaultCurrency || "CAD"),
       note: mapping["note"] ? (row[mapping["note"]] ?? "") : undefined,
       tags: mapping["tags"] ? (row[mapping["tags"]] ?? "") : undefined,
       quantity: mapping["quantity"] ? (parseFloat(row[mapping["quantity"]] ?? "") || undefined) : undefined,

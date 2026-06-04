@@ -23,8 +23,16 @@ import { X, CheckCircle2, AlertCircle } from "lucide-react";
 import { MODES, type Mode } from "./modes";
 import { ReconcileUploadCard } from "@/components/reconcile/upload-card";
 import type { AccountOption } from "@/components/reconcile/preview-table";
-import { ColumnMappingDialog } from "@/app/(app)/import/components/column-mapping-dialog";
+import {
+  ColumnMappingDialog,
+  type ReparseResult,
+} from "@/app/(app)/import/components/column-mapping-dialog";
+import {
+  OfxConfirmDialog,
+  type OfxPreviewRow,
+} from "@/app/(app)/import/components/ofx-confirm-dialog";
 import type { ColumnMapping, ImportTemplate } from "@/lib/import-templates";
+import { autoDetectColumnMapping } from "@/lib/import-templates";
 import { formatCurrency } from "@/lib/currency";
 
 interface AfterUploadBullet {
@@ -99,6 +107,14 @@ interface UploadParams {
   skipFooterRows: number;
   dateFormatOverride: DateFormatOverrideUi;
   defaultCurrency: string | null;
+  /** §A (2026-06-04) — OFX/QFX payee source. Undefined for CSV. */
+  payeeSource?: "name" | "memo";
+  /** §B (2026-06-04) — set after the user confirmed the column mapping in the
+   *  dialog, so the route takes the parsed path instead of re-prompting. */
+  confirmedMapping?: boolean;
+  /** §A (2026-06-04) — set after the user confirmed the OFX/QFX field-mapping
+   *  preview, so the route stages instead of returning the preview again. */
+  confirmedImport?: boolean;
 }
 
 interface UploadResponse {
@@ -135,6 +151,12 @@ export function UploadDrawer({
   accountLabel,
   accountCurrency,
   policy,
+  ofxPayeeSource = "name",
+  // csvMappingMode is enforced server-side (the upload route reads the account
+  // column + per-user default to decide confirm-vs-silent). The drawer reads it
+  // so it can surface a reset affordance when the account is set to 'auto' —
+  // otherwise the preview never reappears and there's no way back from here.
+  csvMappingMode = "confirm",
   onUploaded,
 }: {
   open: boolean;
@@ -143,6 +165,14 @@ export function UploadDrawer({
   accountLabel: string;
   accountCurrency: string;
   policy: Mode;
+  /** §A (2026-06-04) — the bound account's saved OFX payee source. Seeds the
+   *  "Payee from: Name / Memo" radio on the card. */
+  ofxPayeeSource?: "name" | "memo";
+  /** §B (2026-06-04) — the bound account's CSV mapping mode. 'confirm' shows
+   *  the column-mapping confirm dialog before staging; 'auto' applies the
+   *  auto-detected mapping silently (the route enforces this — the prop is
+   *  used here only to seed the "Don't ask again" checkbox default state). */
+  csvMappingMode?: "confirm" | "auto";
   /** Called after a successful upload so the parent surface can refresh the
    *  policy-appropriate tab. The drawer stays open showing a result panel; the
    *  parent decides when to close it (the "View rows" button calls this). */
@@ -173,6 +203,52 @@ export function UploadDrawer({
   const [pendingParams, setPendingParams] = useState<Omit<
     UploadParams,
     "file" | "templateId"
+  > | null>(null);
+
+  // §A (2026-06-04) — the account's saved OFX payee source, mirrored locally so
+  // flipping the radio updates the seed immediately while the PATCH is in
+  // flight. Re-seeded from the prop when the account changes.
+  const [savedOfxPayeeSource, setSavedOfxPayeeSource] = useState<
+    "name" | "memo"
+  >(ofxPayeeSource);
+  useEffect(() => {
+    setSavedOfxPayeeSource(ofxPayeeSource);
+  }, [ofxPayeeSource]);
+
+  // Local mirror of the account's confirm/auto import mode so the in-drawer
+  // reset (visible when 'auto') updates immediately without a page refetch.
+  const [acctCsvMode, setAcctCsvMode] = useState<"confirm" | "auto">(
+    csvMappingMode,
+  );
+  useEffect(() => {
+    setAcctCsvMode(csvMappingMode);
+  }, [csvMappingMode]);
+
+  // §B (2026-06-04) — distinguishes the confirm-mapping dialog (the new
+  // csv-confirm-mapping 422) from the needs-mapping dialog so the dialog can
+  // show the "Don't ask again for this account" checkbox + an "Import with
+  // this mapping" affordance only in the confirm case.
+  const [mappingConfirmMode, setMappingConfirmMode] = useState(false);
+
+  // §A (2026-06-04) — OFX/QFX field-mapping preview dialog state (the
+  // `ofx-confirm` 422). Holds the parsed preview + the pending re-upload.
+  const [ofxDialogOpen, setOfxDialogOpen] = useState(false);
+  const [ofxSubmitting, setOfxSubmitting] = useState(false);
+  const [ofxPreview, setOfxPreview] = useState<{
+    fileName: string;
+    account: string;
+    currency: string;
+    format: "ofx" | "qfx";
+    rows: OfxPreviewRow[];
+    rowCount: number;
+    statementBalance: number | null;
+    statementBalanceDate: string | null;
+    payeeSource: "name" | "memo";
+  } | null>(null);
+  const [ofxPendingFile, setOfxPendingFile] = useState<File | null>(null);
+  const [ofxPendingParams, setOfxPendingParams] = useState<Omit<
+    UploadParams,
+    "file" | "payeeSource" | "confirmedImport"
   > | null>(null);
 
   const lockedAccount: AccountOption = useMemo(
@@ -239,6 +315,9 @@ export function UploadDrawer({
         skipFooterRows,
         dateFormatOverride,
         defaultCurrency,
+        payeeSource,
+        confirmedMapping,
+        confirmedImport,
       } = params;
       setError(null);
       setUploadLoading(true);
@@ -258,6 +337,13 @@ export function UploadDrawer({
           fd.append("dateFormatOverride", dateFormatOverride);
         }
         if (defaultCurrency) fd.append("defaultCurrency", defaultCurrency);
+        // §A — OFX/QFX payee source (server ignores it for CSV).
+        if (payeeSource) fd.append("payeeSource", payeeSource);
+        // §B — flag the re-fire after the user confirmed a column mapping so
+        // the route doesn't re-prompt (belt-and-suspenders alongside templateId).
+        if (confirmedMapping) fd.append("confirmedMapping", "1");
+        // §A — flag the re-fire after the user confirmed the OFX/QFX preview.
+        if (confirmedImport) fd.append("confirmedImport", "1");
 
         const res = await fetch("/api/import/staging/upload", {
           method: "POST",
@@ -265,14 +351,67 @@ export function UploadDrawer({
         });
         const json = await res.json();
         if (!res.ok) {
-          // 422 csv-needs-mapping → open the column-mapping dialog, save the
-          // mapping as a template, then re-fire the upload with the templateId.
+          // 422 ofx-confirm (§A) → open the OFX/QFX field-mapping preview.
           if (
             res.status === 422 &&
             json &&
             typeof json === "object" &&
-            json.type === "csv-needs-mapping"
+            json.type === "ofx-confirm"
           ) {
+            setOfxPreview({
+              fileName:
+                typeof json.fileName === "string" && json.fileName
+                  ? json.fileName
+                  : file.name,
+              account: typeof json.account === "string" ? json.account : accountLabel,
+              currency:
+                typeof json.currency === "string" ? json.currency : accountCurrency,
+              format: json.format === "qfx" ? "qfx" : "ofx",
+              rows: Array.isArray(json.rows) ? (json.rows as OfxPreviewRow[]) : [],
+              rowCount:
+                typeof json.rowCount === "number"
+                  ? json.rowCount
+                  : Array.isArray(json.rows)
+                    ? json.rows.length
+                    : 0,
+              statementBalance:
+                typeof json.statementBalance === "number"
+                  ? json.statementBalance
+                  : null,
+              statementBalanceDate:
+                typeof json.statementBalanceDate === "string"
+                  ? json.statementBalanceDate
+                  : null,
+              payeeSource: json.payeeSource === "memo" ? "memo" : "name",
+            });
+            setOfxPendingFile(file);
+            setOfxPendingParams({
+              accountId,
+              tolerance,
+              templateId,
+              statementBalance,
+              skipHeaderRows,
+              skipFooterRows,
+              dateFormatOverride,
+              defaultCurrency,
+            });
+            setOfxDialogOpen(true);
+            setUploadLoading(false);
+            return;
+          }
+          // 422 csv-needs-mapping OR csv-confirm-mapping → open the
+          // column-mapping dialog. needs-mapping: nothing matched, user must
+          // build the mapping. confirm-mapping (§B): a mapping was detected
+          // but the account is in 'confirm' mode, so pre-fill it for review.
+          // Both flow through the same dialog → save as template → re-fire.
+          if (
+            res.status === 422 &&
+            json &&
+            typeof json === "object" &&
+            (json.type === "csv-needs-mapping" ||
+              json.type === "csv-confirm-mapping")
+          ) {
+            setMappingConfirmMode(json.type === "csv-confirm-mapping");
             setMappingHeaders(Array.isArray(json.headers) ? json.headers : []);
             setMappingSampleRows(
               Array.isArray(json.sampleRows) ? json.sampleRows : [],
@@ -292,6 +431,7 @@ export function UploadDrawer({
               skipFooterRows,
               dateFormatOverride,
               defaultCurrency,
+              payeeSource,
             });
             setMappingDialogOpen(true);
             setUploadLoading(false);
@@ -310,7 +450,55 @@ export function UploadDrawer({
         setUploadLoading(false);
       }
     },
-    [accountId, onUploaded],
+    [accountId, accountLabel, accountCurrency, onUploaded],
+  );
+
+  // §A/§B (2026-06-04) — persist a per-account import preference. Fire-and-
+  // forget: a failed PATCH just means the next upload re-asks/re-defaults; we
+  // don't block the upload on it.
+  const patchImportPrefs = useCallback(
+    async (prefs: {
+      ofxPayeeSource?: "name" | "memo";
+      csvMappingMode?: "confirm" | "auto";
+    }) => {
+      try {
+        await fetch(`/api/accounts/${accountId}/import-prefs`, {
+          method: "PATCH",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify(prefs),
+        });
+      } catch {
+        // ignore — non-blocking persistence
+      }
+    },
+    [accountId],
+  );
+
+  // Re-detect columns for the column-mapping dialog when the user changes the
+  // skip count. Uses the read-only /api/import/preview (noTemplate) so it
+  // returns fresh headers/sample/suggestion for the trimmed file WITHOUT
+  // staging any rows. Falls back to a client-side auto-detect when the trimmed
+  // file now parses canonically (preview returns no suggestion in that case).
+  const handleReparse = useCallback(
+    async (skipHeaderRows: number, skipFooterRows: number): Promise<ReparseResult> => {
+      if (!pendingFile) throw new Error("No file to re-read");
+      const fd = new FormData();
+      fd.append("file", pendingFile);
+      fd.append("noTemplate", "1");
+      fd.append("skipHeaderRows", String(skipHeaderRows));
+      fd.append("skipFooterRows", String(skipFooterRows));
+      const res = await fetch("/api/import/preview", { method: "POST", body: fd });
+      const data = await res.json();
+      if (!res.ok) throw new Error(data.error ?? `HTTP ${res.status}`);
+      const headers: string[] = Array.isArray(data.headers) ? data.headers : [];
+      const sampleRows: Record<string, string>[] = Array.isArray(data.sampleRows)
+        ? data.sampleRows
+        : [];
+      const suggestedMapping: ColumnMapping | null =
+        data.suggestedMapping ?? autoDetectColumnMapping(headers) ?? null;
+      return { headers, sampleRows, suggestedMapping };
+    },
+    [pendingFile],
   );
 
   const handleMappingConfirm = useCallback(
@@ -318,28 +506,43 @@ export function UploadDrawer({
       mapping: ColumnMapping;
       defaultAccount: string | null;
       templateName: string;
+      skipHeaderRows: number;
+      skipFooterRows: number;
+      defaultCurrency: string | null;
+      dateFormatOverride: string | null;
+      headers: string[];
+      /** §B — "Don't ask again for this account" → flip csv_mapping_mode to
+       *  'auto' so subsequent uploads to this account apply silently. */
+      dontAskAgain?: boolean;
     }) => {
       if (!pendingFile || !pendingParams) {
         setMappingDialogOpen(false);
         return;
       }
       setMappingSubmitting(true);
+      // §B — persist the per-account auto-vs-ask choice before re-firing
+      // (fire-and-forget). The radio is a true setting: 'auto' applies silently
+      // next time, 'confirm' keeps showing the preview.
+      void patchImportPrefs({
+        csvMappingMode: params.dontAskAgain ? "auto" : "confirm",
+      });
       try {
+        // The dialog's skip / date-format / currency / headers WIN over the
+        // upload card's values — the user set them here after seeing the
+        // columns, so they're authoritative for both the saved template and
+        // the re-fired upload.
         const tplRes = await fetch("/api/import/templates", {
           method: "POST",
           headers: { "Content-Type": "application/json" },
           body: JSON.stringify({
             name: params.templateName,
-            fileHeaders: mappingHeaders,
+            fileHeaders: params.headers,
             columnMapping: params.mapping,
             defaultAccount: params.defaultAccount ?? undefined,
-            skipHeaderRows: pendingParams.skipHeaderRows,
-            skipFooterRows: pendingParams.skipFooterRows,
-            dateFormatOverride:
-              pendingParams.dateFormatOverride === "auto"
-                ? null
-                : pendingParams.dateFormatOverride,
-            defaultCurrency: pendingParams.defaultCurrency,
+            skipHeaderRows: params.skipHeaderRows,
+            skipFooterRows: params.skipFooterRows,
+            dateFormatOverride: params.dateFormatOverride,
+            defaultCurrency: params.defaultCurrency,
           }),
         });
         const saved = await tplRes.json();
@@ -365,10 +568,14 @@ export function UploadDrawer({
           tolerance: carried.tolerance,
           templateId: saved.id as number,
           statementBalance: carried.statementBalance,
-          skipHeaderRows: carried.skipHeaderRows,
-          skipFooterRows: carried.skipFooterRows,
-          dateFormatOverride: carried.dateFormatOverride,
-          defaultCurrency: carried.defaultCurrency,
+          skipHeaderRows: params.skipHeaderRows,
+          skipFooterRows: params.skipFooterRows,
+          dateFormatOverride: (params.dateFormatOverride ?? "auto") as DateFormatOverrideUi,
+          defaultCurrency: params.defaultCurrency,
+          payeeSource: carried.payeeSource,
+          // The saved template takes the parsed path; the flag is belt-and-
+          // suspenders so the route never re-prompts on this re-fire.
+          confirmedMapping: true,
         });
       } catch (err) {
         setError(err instanceof Error ? err.message : "Failed to save template");
@@ -377,7 +584,45 @@ export function UploadDrawer({
         setMappingSubmitting(false);
       }
     },
-    [pendingFile, pendingParams, mappingHeaders, submitUpload],
+    [pendingFile, pendingParams, submitUpload, patchImportPrefs],
+  );
+
+  // §A — the user confirmed the OFX/QFX field-mapping preview. Persist the
+  // chosen payee source (+ flip to 'auto' if they opted out of future prompts),
+  // then re-upload with confirmedImport=1 so the route stages this time.
+  const handleOfxConfirm = useCallback(
+    async (confirmParams: {
+      payeeSource: "name" | "memo";
+      dontAskAgain: boolean;
+    }) => {
+      if (!ofxPendingFile || !ofxPendingParams) {
+        setOfxDialogOpen(false);
+        return;
+      }
+      setOfxSubmitting(true);
+      // Persist the chosen payee source + the per-account auto-vs-ask choice.
+      setSavedOfxPayeeSource(confirmParams.payeeSource);
+      void patchImportPrefs({
+        ofxPayeeSource: confirmParams.payeeSource,
+        csvMappingMode: confirmParams.dontAskAgain ? "auto" : "confirm",
+      });
+      const file = ofxPendingFile;
+      const carried = ofxPendingParams;
+      setOfxDialogOpen(false);
+      setOfxPendingFile(null);
+      setOfxPendingParams(null);
+      try {
+        await submitUpload({
+          ...carried,
+          file,
+          payeeSource: confirmParams.payeeSource,
+          confirmedImport: true,
+        });
+      } finally {
+        setOfxSubmitting(false);
+      }
+    },
+    [ofxPendingFile, ofxPendingParams, submitUpload, patchImportPrefs],
   );
 
   const templateOptions = useMemo(
@@ -493,11 +738,38 @@ export function UploadDrawer({
             </div>
           ) : (
             <>
+              {acctCsvMode === "auto" && (
+                <div className="rounded-md border border-amber-200 bg-amber-50/60 dark:bg-amber-950/10 px-3 py-2.5 text-xs">
+                  <p className="font-medium text-amber-800 dark:text-amber-300">
+                    This account imports automatically
+                  </p>
+                  <p className="mt-0.5 text-muted-foreground">
+                    No field-mapping preview is shown — rows are staged silently
+                    using the detected mapping.
+                  </p>
+                  <Button
+                    size="sm"
+                    variant="outline"
+                    className="mt-2 h-7"
+                    onClick={() => {
+                      setAcctCsvMode("confirm");
+                      void patchImportPrefs({ csvMappingMode: "confirm" });
+                    }}
+                  >
+                    Switch to confirm-first
+                  </Button>
+                </div>
+              )}
               <ReconcileUploadCard
                 accounts={[lockedAccount]}
                 templates={templateOptions}
                 loading={uploadLoading}
                 lockedAccount={lockedAccount}
+                ofxPayeeSource={savedOfxPayeeSource}
+                onOfxPayeeSourceChange={(value) => {
+                  setSavedOfxPayeeSource(value);
+                  void patchImportPrefs({ ofxPayeeSource: value });
+                }}
                 onUpload={(params) => void submitUpload(params)}
               />
               {error && (
@@ -548,6 +820,7 @@ export function UploadDrawer({
             setPendingFile(null);
             setPendingParams(null);
             setUploadLoading(false);
+            setMappingConfirmMode(false);
           }
         }}
         fileName={mappingFileName}
@@ -555,9 +828,39 @@ export function UploadDrawer({
         sampleRows={mappingSampleRows}
         suggestedMapping={mappingSuggested}
         accounts={accountNames}
+        onReparse={handleReparse}
         onConfirm={handleMappingConfirm}
         submitting={mappingSubmitting}
+        // §B — in confirm mode the dialog is pre-filled with a DETECTED mapping
+        // (not a blank one); show the "Don't ask again for this account"
+        // checkbox + confirm-tailored copy.
+        confirmMode={mappingConfirmMode}
       />
+
+      {ofxPreview && (
+        <OfxConfirmDialog
+          open={ofxDialogOpen}
+          onOpenChange={(o) => {
+            setOfxDialogOpen(o);
+            if (!o) {
+              setOfxPendingFile(null);
+              setOfxPendingParams(null);
+              setUploadLoading(false);
+            }
+          }}
+          fileName={ofxPreview.fileName}
+          account={ofxPreview.account}
+          currency={ofxPreview.currency}
+          format={ofxPreview.format}
+          rows={ofxPreview.rows}
+          rowCount={ofxPreview.rowCount}
+          statementBalance={ofxPreview.statementBalance}
+          statementBalanceDate={ofxPreview.statementBalanceDate}
+          initialPayeeSource={ofxPreview.payeeSource}
+          submitting={ofxSubmitting}
+          onConfirm={(p) => void handleOfxConfirm(p)}
+        />
+      )}
     </>
   );
 }

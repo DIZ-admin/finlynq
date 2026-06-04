@@ -59,6 +59,14 @@ export interface CsvPipelineRequest {
   skipFooterRows?: number;
   dateFormatOverride?: DateFormatOverride | null;
   /**
+   * FINLYNQ — default currency stamped on rows whose source has no Currency
+   * column (or an empty cell). When unset, callers that resolve a saved
+   * template fall back to the template's own `defaultCurrency`; otherwise the
+   * parser keeps its "CAD" last-resort. Distinct from `anchorCurrency` (which
+   * only labels balance anchors).
+   */
+  defaultCurrency?: string | null;
+  /**
    * When true, step 3 (auto-match a saved template by header overlap) is
    * skipped. The pipeline still runs step 2 (canonical headers) and step 4
    * (column-mapping dialog) — this only disables the silent template
@@ -72,6 +80,17 @@ export interface CsvPipelineRequest {
    * currency so anchors land in the bank-side display unit.
    */
   anchorCurrency?: string | null;
+  /**
+   * Statement-upload field-mapping §B (2026-06-04). When true, the silent
+   * auto-apply steps (2 canonical headers, 3 saved-template match, 3.5
+   * auto-detect direct) return a `kind: "auto-detected"` result carrying the
+   * computed mapping + sample rows INSTEAD of committing — the route surfaces
+   * it for user confirmation before staging. Default false preserves today's
+   * silent behavior for `/api/import/preview` and every other caller. An
+   * explicit `templateId` always short-circuits to the parsed path (step 1)
+   * regardless of this flag — a confirmed/edited mapping the user re-fires.
+   */
+  confirmAutoMapping?: boolean;
 }
 
 /** Per-day bank balance anchor extracted from a CSV's Balance column.
@@ -101,6 +120,24 @@ export type CsvPipelineResult =
       suggestedMapping: ColumnMapping | null;
     }
   | {
+      // Statement-upload field-mapping §B (2026-06-04). Returned ONLY when
+      // `confirmAutoMapping: true` and an auto-apply step (2 / 3 / 3.5) would
+      // otherwise have silently committed. The route surfaces the detected
+      // mapping for confirmation before staging. The user re-fires with an
+      // explicit templateId / mapping to take the parsed path.
+      kind: "auto-detected";
+      /** The mapping the auto-apply step computed. */
+      mapping: ColumnMapping;
+      /** Which auto-apply step produced it. */
+      source: "canonical" | "template" | "auto-detect";
+      /** Set when `source === "template"` — the matched saved template. */
+      templateId?: number;
+      headers: string[];
+      sampleRows: Record<string, string>[];
+      /** Estimated number of data rows (header excluded). */
+      rowCount: number;
+    }
+  | {
       kind: "template-not-found";
       templateId: number;
     };
@@ -128,8 +165,10 @@ export async function parseCsvWithFallback(
     skipHeaderRows = 0,
     skipFooterRows = 0,
     dateFormatOverride = null,
+    defaultCurrency = null,
     skipAutoMatchTemplate = false,
     anchorCurrency = null,
+    confirmAutoMapping = false,
   } = req;
   const anchorCcy = anchorCurrency ?? "CAD";
   // Apply header/footer trim BEFORE any header detection so the trim
@@ -155,19 +194,35 @@ export async function parseCsvWithFallback(
       return { kind: "template-not-found", templateId };
     }
     const tpl = deserializeTemplate(tplRow);
-    const mapped = parseWithMapping(text, tpl.columnMapping, tpl.defaultAccount ?? null, dateFormatOverride);
+    // FINLYNQ — apply the template's OWN stored skip + default currency when the
+    // request didn't pass explicit values, so re-uploading via a saved template
+    // honors its persisted parser knobs. Read the RAW `req.` values (the
+    // destructured locals are 0/null-defaulted) so "not passed" ≠ "passed as 0".
+    const effSkipH = req.skipHeaderRows ?? tpl.skipHeaderRows ?? 0;
+    const effSkipF = req.skipFooterRows ?? tpl.skipFooterRows ?? 0;
+    const effCurrency = req.defaultCurrency ?? tpl.defaultCurrency ?? null;
+    const effDateFmt = req.dateFormatOverride ?? tpl.dateFormatOverride ?? null;
+    const tplText = trimCsvRows(req.text, effSkipH, effSkipF);
+    const tplHeaders = extractCsvHeaders(tplText);
+    const mapped = parseWithMapping(
+      tplText,
+      tpl.columnMapping,
+      tpl.defaultAccount ?? null,
+      effDateFmt,
+      effCurrency,
+    );
     const filled = applyDefaultAccount(mapped.rows, defaultAccountName);
     const anchors = extractBalanceAnchors(
-      text,
+      tplText,
       tpl.columnMapping,
-      dateFormatOverride,
+      effDateFmt,
       anchorCcy,
     );
     return {
       kind: "parsed",
       rows: filled,
       errors: mapped.errors,
-      headers,
+      headers: tplHeaders,
       appliedTemplateId: tpl.id,
       anchors,
     };
@@ -190,7 +245,7 @@ export async function parseCsvWithFallback(
   // Merchant, Memo, Narrative) gets picked up. Files that genuinely
   // have no payee at all (e.g. Quicken raw exports) still succeed at
   // step 2 because auto-detect returns null for them.
-  const canonical = csvToRawTransactions(text, dateFormatOverride);
+  const canonical = csvToRawTransactions(text, dateFormatOverride, defaultCurrency);
   if (canonical.rows.length > 0) {
     const auto = autoDetectColumnMapping(headers);
     const allPayeesEmpty = canonical.rows.every(
@@ -200,6 +255,21 @@ export async function parseCsvWithFallback(
     const shouldFallthroughForPayee = allPayeesEmpty && autoFindsPayee;
 
     if (!shouldFallthroughForPayee) {
+      // §B confirm gate: surface the canonical mapping for review instead of
+      // committing silently. The canonical reader keys on the literal
+      // `Date`/`Amount`/`Payee`/`Account` columns; auto-detect reconstructs
+      // that mapping (plus any synonym Balance column) for the dialog.
+      if (confirmAutoMapping) {
+        const canonicalMapping = auto ?? canonicalFallbackMapping(headers);
+        return {
+          kind: "auto-detected",
+          mapping: canonicalMapping,
+          source: "canonical",
+          headers,
+          sampleRows: parseCSV(text).slice(0, 5),
+          rowCount: estimateRowCount(text),
+        };
+      }
       const filled = applyDefaultAccount(canonical.rows, defaultAccountName);
       // Canonical path has no explicit ColumnMapping; reuse auto-detect to
       // find a Balance column when present. Falls back to no anchors when
@@ -230,18 +300,39 @@ export async function parseCsvWithFallback(
   const templates: ImportTemplate[] = allTemplates.map(deserializeTemplate);
   const best = skipAutoMatchTemplate ? null : findBestTemplate(headers, templates);
   if (best) {
+    // FINLYNQ — apply the matched template's default currency + date format
+    // (request override first). Skip-fallback for step 3 is deferred:
+    // `headers`/`findBestTemplate` are computed on the request-skip-trimmed
+    // text, so re-trimming post-match could shift which rows parse. Currency
+    // and date format have no such ordering hazard.
+    const effCurrency = req.defaultCurrency ?? best.template.defaultCurrency ?? null;
+    const effDateFmt = req.dateFormatOverride ?? best.template.dateFormatOverride ?? null;
     const mapped = parseWithMapping(
       text,
       best.template.columnMapping,
       best.template.defaultAccount ?? null,
-      dateFormatOverride,
+      effDateFmt,
+      effCurrency,
     );
     if (mapped.rows.length > 0) {
+      // §B confirm gate: a high-confidence template match is pre-filled for
+      // one-click accept rather than applied silently.
+      if (confirmAutoMapping) {
+        return {
+          kind: "auto-detected",
+          mapping: best.template.columnMapping,
+          source: "template",
+          templateId: best.template.id,
+          headers,
+          sampleRows: parseCSV(text).slice(0, 5),
+          rowCount: estimateRowCount(text),
+        };
+      }
       const filled = applyDefaultAccount(mapped.rows, defaultAccountName);
       const anchors = extractBalanceAnchors(
         text,
         best.template.columnMapping,
-        dateFormatOverride,
+        effDateFmt,
         anchorCcy,
       );
       return {
@@ -279,8 +370,22 @@ export async function parseCsvWithFallback(
       directAuto,
       null,
       dateFormatOverride,
+      defaultCurrency,
     );
     if (mapped.rows.length > 0) {
+      // §B confirm gate: this is exactly the guess that's most worth
+      // confirming (it picks the payee column from the synonym list, which
+      // can bind the wrong column when a file has both Memo and Description).
+      if (confirmAutoMapping) {
+        return {
+          kind: "auto-detected",
+          mapping: directAuto,
+          source: "auto-detect",
+          headers,
+          sampleRows: parseCSV(text).slice(0, 5),
+          rowCount: estimateRowCount(text),
+        };
+      }
       const filled = applyDefaultAccount(mapped.rows, defaultAccountName);
       const anchors = extractBalanceAnchors(
         text,
@@ -310,17 +415,55 @@ export async function parseCsvWithFallback(
   };
 }
 
+/**
+ * §B (2026-06-04) — best-effort mapping for the canonical-headers case when
+ * `autoDetectColumnMapping` returned null. The canonical reader keys on the
+ * literal `Date`/`Amount`/`Payee`/`Account`/… header names, so reflect any
+ * that are present so the confirm dialog isn't blank.
+ */
+function canonicalFallbackMapping(headers: string[]): ColumnMapping {
+  const has = (name: string) =>
+    headers.find((h) => h.trim().toLowerCase() === name.toLowerCase());
+  const mapping: ColumnMapping = {
+    date: has("Date") ?? "",
+    amount: has("Amount") ?? "",
+  };
+  const payee = has("Payee");
+  if (payee) mapping.payee = payee;
+  const account = has("Account");
+  if (account) mapping.account = account;
+  const category = has("Category");
+  if (category) mapping.category = category;
+  const currency = has("Currency");
+  if (currency) mapping.currency = currency;
+  const note = has("Note");
+  if (note) mapping.note = note;
+  const tags = has("Tags");
+  if (tags) mapping.tags = tags;
+  const balance = has("Balance");
+  if (balance) mapping.balance = balance;
+  return mapping;
+}
+
+/** §B (2026-06-04) — count data rows (header excluded) for the confirm
+ *  dialog's "N rows" hint. */
+function estimateRowCount(text: string): number {
+  return parseCSV(text).length;
+}
+
 /** Parse a CSV with a column mapping and apply a template-level default account. */
 function parseWithMapping(
   text: string,
   mapping: ColumnMapping,
   defaultAccount: string | null,
   dateFormatOverride?: DateFormatOverride | null,
+  defaultCurrency?: string | null,
 ): { rows: RawTransaction[]; errors: ParseError[] } {
   const result = csvToRawTransactionsWithMapping(
     text,
     mapping as unknown as Record<string, string>,
     dateFormatOverride,
+    defaultCurrency,
   );
   if (defaultAccount) {
     result.rows = result.rows.map((r) => ({

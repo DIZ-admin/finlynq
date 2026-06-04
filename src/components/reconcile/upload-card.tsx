@@ -37,6 +37,9 @@ export type DateFormatOverrideUi =
   | "MM/DD/YYYY"
   | "YYYY-MM-DD";
 
+/** §A (2026-06-04) — which OFX/QFX field populates the payee. */
+export type OfxPayeeSourceUi = "name" | "memo";
+
 interface Props {
   accounts: AccountOption[];
   templates?: TemplateOption[];
@@ -46,6 +49,14 @@ interface Props {
    *  the destination account is already chosen by the surface. The standalone
    *  /import/reconcile caller leaves this undefined and keeps the picker. */
   lockedAccount?: AccountOption | null;
+  /** §A (2026-06-04) — the bound account's saved OFX payee source. When set,
+   *  the card renders a "Payee from: Name / Memo" radio defaulting to it
+   *  (OFX/QFX uploads only — the server ignores this for CSV). Undefined =>
+   *  hide the radio (standalone /import/reconcile caller). */
+  ofxPayeeSource?: OfxPayeeSourceUi;
+  /** Called when the user flips the OFX payee-source radio, so the parent can
+   *  persist it to the bound account (PATCH /api/accounts/[id]/import-prefs). */
+  onOfxPayeeSourceChange?: (value: OfxPayeeSourceUi) => void;
   onUpload: (params: {
     file: File;
     accountId: number | null;
@@ -60,6 +71,9 @@ interface Props {
     skipFooterRows: number;
     dateFormatOverride: DateFormatOverrideUi;
     defaultCurrency: string | null;
+    /** §A (2026-06-04) — OFX/QFX payee source for THIS upload. Server
+     *  ignores it for CSV. Undefined when the radio isn't shown. */
+    payeeSource?: OfxPayeeSourceUi;
   }) => void;
 }
 
@@ -70,12 +84,22 @@ export function ReconcileUploadCard({
   templates = [],
   loading,
   lockedAccount,
+  ofxPayeeSource,
+  // §A (2026-06-04) — the visible Name/Memo radio was replaced by the
+  // OfxConfirmDialog preview (the drawer persists the choice there), so this
+  // callback is no longer wired to a card control. Kept in Props for the
+  // drawer's call-site typecheck.
   onUpload,
 }: Props) {
   const [selectedAccountId, setSelectedAccountId] = useState<string>("");
   const [selectedTemplateId, setSelectedTemplateId] = useState<string>("");
   const [tolerance, setTolerance] = useState<string>("3");
   const [statementBalance, setStatementBalance] = useState<string>("");
+  // §A (2026-06-04) — the OFX/QFX payee-source choice now lives in the
+  // OfxConfirmDialog preview (the drawer persists it). The card just forwards
+  // the bound account's saved value as the initial upload hint; for a 'confirm'
+  // account the route ignores it and returns the preview, and the dialog's
+  // choice wins on re-fire. For an 'auto' account this saved value is applied.
 
   // FINLYNQ-54 parser knobs. The panel is <details>-collapsed by default;
   // defaults preserve the pre-FINLYNQ-54 behavior end-to-end.
@@ -193,6 +217,14 @@ export function ReconcileUploadCard({
         </div>
       </div>
 
+      {ofxPayeeSource && (
+        <p className="rounded-md border bg-muted/20 px-3 py-2 text-[11px] text-muted-foreground">
+          For OFX/QFX statements you&apos;ll get a preview to confirm how rows map
+          (and pick whether the Payee comes from the Name or Memo field) before
+          they&apos;re imported.
+        </p>
+      )}
+
       <FileDropZone
         accept={ACCEPT}
         disabled={loading}
@@ -227,6 +259,8 @@ export function ReconcileUploadCard({
             skipFooterRows: Number.isNaN(skipF) ? 0 : Math.max(0, Math.min(100, skipF)),
             dateFormatOverride,
             defaultCurrency: defaultCurrency || null,
+            // §A — only meaningful for OFX/QFX; server ignores it for CSV.
+            payeeSource: ofxPayeeSource,
           });
         }}
       />

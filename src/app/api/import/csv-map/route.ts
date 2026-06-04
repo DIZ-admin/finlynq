@@ -1,6 +1,7 @@
 import { NextRequest, NextResponse } from "next/server";
-import { csvToRawTransactionsWithMapping, extractCsvHeaders } from "@/lib/csv-parser";
+import { csvToRawTransactionsWithMapping, extractCsvHeaders, trimCsvRows } from "@/lib/csv-parser";
 import { previewImport } from "@/lib/import-pipeline";
+import { parseCsvImportKnobs } from "@/lib/external-import/parsers/import-knobs";
 import { requireAuth } from "@/lib/auth/require-auth";
 import { safeErrorMessage } from "@/lib/validate";
 import { sourceTagFor } from "@/lib/tx-source";
@@ -24,12 +25,27 @@ export async function POST(request: NextRequest) {
       return NextResponse.json({ error: "date and amount mappings are required" }, { status: 400 });
     }
 
-    const text = await file.text();
+    // FINLYNQ — parser knobs from the column-mapping dialog's "Import options":
+    // trim junk header/footer rows BEFORE header detection + parsing so the
+    // preview matches what the user mapped against, and stamp the chosen default
+    // currency on rows that have no Currency column.
+    const knobs = parseCsvImportKnobs(formData);
+    if (knobs.error) {
+      return NextResponse.json({ error: knobs.error }, { status: 400 });
+    }
+
+    const rawText = await file.text();
+    const text = trimCsvRows(rawText, knobs.skipHeaderRows ?? 0, knobs.skipFooterRows ?? 0);
 
     // Also return headers for template saving
     const headers = extractCsvHeaders(text);
 
-    const { rows, errors: parseErrors } = csvToRawTransactionsWithMapping(text, mapping);
+    const { rows, errors: parseErrors } = csvToRawTransactionsWithMapping(
+      text,
+      mapping,
+      knobs.dateFormatOverride,
+      knobs.defaultCurrency,
+    );
 
     // Apply default account if no account column mapped
     let processedRows = defaultAccount
