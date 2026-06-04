@@ -105,16 +105,6 @@ export default function ImportSettingsPage() {
           </a>
           .
         </p>
-        <p className="text-xs text-muted-foreground mt-1">
-          Looking for the old upload page? It&apos;s temporarily preserved at{" "}
-          <a
-            href="/import/classic"
-            className="underline hover:text-foreground font-mono"
-          >
-            /import/classic
-          </a>{" "}
-          while the new flow is validated.
-        </p>
       </div>
 
       <Tabs defaultValue="templates">

@@ -350,6 +350,7 @@ function ImportPageInner() {
             policy={policy}
             onLensChange={onLensChange}
             accountId={account.id}
+            isInvestment={account.isInvestment ?? false}
           />
         </div>
         <div className="mt-3">
