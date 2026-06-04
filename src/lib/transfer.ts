@@ -1691,6 +1691,18 @@ type SqlPool = {
   connect(): Promise<SqlClient>;
 };
 
+/**
+ * Single adapter-boundary cast (FINLYNQ-114). The pg `Pool` and the local
+ * structural `SqlPool` describe the same runtime object (both expose
+ * `connect()`), but the pg-shim `Pool` type and `SqlPool` aren't nominally
+ * related. Previously every `withClient`/`withTx` callsite cast inline
+ * ("pool as unknown as SqlPool") — 11 copies of the same cast. Hoisting it
+ * here keeps the cast in ONE place; callers pass `asSqlPool(pool)`.
+ */
+function asSqlPool(pool: Pool): SqlPool {
+  return pool as unknown as SqlPool;
+}
+
 async function withClient<T>(pool: SqlPool, fn: (c: SqlClient) => Promise<T>): Promise<T> {
   const client = await pool.connect();
   try {
@@ -1732,7 +1744,7 @@ export async function loadTransferPairViaSql(
   if (by.linkId) {
     resolvedLinkId = by.linkId;
   } else if (by.transactionId != null) {
-    const r = await withClient(pool as unknown as SqlPool, (c) =>
+    const r = await withClient(asSqlPool(pool), (c) =>
       c.query<{ link_id: string | null }>(
         `SELECT link_id FROM transactions WHERE id = $1 AND user_id = $2 LIMIT 1`,
         [by.transactionId, userId],
@@ -1769,7 +1781,7 @@ export async function loadTransferPairViaSql(
   // at the JS boundary. The Drizzle path elsewhere in this file is already
   // Phase-4-safe; this raw-SQL fallback (used as a Postgres-only path) was
   // missed in PR #131.
-  const rs = await withClient(pool as unknown as SqlPool, (c) =>
+  const rs = await withClient(asSqlPool(pool), (c) =>
     c.query<Row>(
       `SELECT t.id, t.date, t.account_id, a.name_ct AS account_name_ct, a.currency AS account_currency,
               t.category_id, c.name_ct AS category_name_ct, c.type AS category_type,
@@ -1959,7 +1971,7 @@ export async function createTransferPairViaSql(
 
   const date = opts.date ?? todayISO();
 
-  const accountsRows = await withClient(pool as unknown as SqlPool, (c) =>
+  const accountsRows = await withClient(asSqlPool(pool), (c) =>
     c.query<{ id: number; name: string | null; currency: string | null }>(
       `SELECT id, name, currency FROM accounts
         WHERE user_id = $1 AND id = ANY($2::int[])`,
@@ -2035,7 +2047,7 @@ export async function createTransferPairViaSql(
         ? opts.destHoldingName.trim()
         : trimmedName;
     const fromHoldingId = await findHoldingIdViaSql(
-      pool as unknown as SqlPool,
+      asSqlPool(pool),
       userId,
       dek,
       fromAcct.id,
@@ -2054,7 +2066,7 @@ export async function createTransferPairViaSql(
     // Cash sleeve here, which silently masked typos and surfaced a raw
     // 23505 duplicate-key error when a partial-cash row already existed.
     const toHoldingId = await findHoldingIdViaSql(
-      pool as unknown as SqlPool,
+      asSqlPool(pool),
       userId,
       dek,
       toAcct.id,
@@ -2102,7 +2114,7 @@ export async function createTransferPairViaSql(
   // mapped to a friendly tool error by the MCP wrapper. The Drizzle/HTTP
   // path additionally accepts `fromHoldingId` / `toHoldingId` cash pins,
   // validated against the leg's account ownership before use.
-  if (opts.fromHoldingId != null && !(await holdingBelongsToAccountViaSql(pool as unknown as SqlPool, userId, opts.fromHoldingId, fromAcct.id))) {
+  if (opts.fromHoldingId != null && !(await holdingBelongsToAccountViaSql(asSqlPool(pool), userId, opts.fromHoldingId, fromAcct.id))) {
     return {
       ok: false,
       code: "holding-not-found",
@@ -2110,7 +2122,7 @@ export async function createTransferPairViaSql(
       side: "source",
     };
   }
-  if (opts.toHoldingId != null && !(await holdingBelongsToAccountViaSql(pool as unknown as SqlPool, userId, opts.toHoldingId, toAcct.id))) {
+  if (opts.toHoldingId != null && !(await holdingBelongsToAccountViaSql(asSqlPool(pool), userId, opts.toHoldingId, toAcct.id))) {
     return {
       ok: false,
       code: "holding-not-found",
@@ -2130,7 +2142,7 @@ export async function createTransferPairViaSql(
   let fromTransactionId = 0;
   let toTransactionId = 0;
   try {
-    await withTx(pool as unknown as SqlPool, async (client) => {
+    await withTx(asSqlPool(pool), async (client) => {
       const categoryId = await resolveTransferCategoryIdViaSql(client, userId, dek);
 
       // Issue #94: quantity may come from in-kind path or cash-pin path.
@@ -2408,7 +2420,7 @@ export async function updateTransferPairViaSql(
     return { ok: false, code: "same-account", message: "From and to accounts must differ for a cash transfer" };
   }
 
-  const accountsRows = await withClient(pool as unknown as SqlPool, (c) =>
+  const accountsRows = await withClient(asSqlPool(pool), (c) =>
     c.query<{ id: number; name: string | null; currency: string | null }>(
       `SELECT id, name, currency FROM accounts
         WHERE user_id = $1 AND id = ANY($2::int[])`,
@@ -2484,7 +2496,7 @@ export async function updateTransferPairViaSql(
   const enc = (v: string) => (dek ? encryptField(dek, v) : v);
 
   try {
-    await withTx(pool as unknown as SqlPool, async (client) => {
+    await withTx(asSqlPool(pool), async (client) => {
       // Issue #28: every UPDATE bumps updated_at. `source` stays untouched
       // (INSERT-only). Both legs of the transfer pair get the same bump.
       await client.query(
@@ -2564,7 +2576,7 @@ export async function deleteTransferPairViaSql(
     await reverseHook(userId, pair.source.id);
     await reverseHook(userId, pair.destination.id);
   }
-  const result = await withClient(pool as unknown as SqlPool, (c) =>
+  const result = await withClient(asSqlPool(pool), (c) =>
     c.query(
       `DELETE FROM transactions WHERE user_id = $1 AND link_id = $2`,
       [userId, pair.linkId],

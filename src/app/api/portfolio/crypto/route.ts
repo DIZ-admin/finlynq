@@ -7,6 +7,7 @@ import { validateBody, safeErrorMessage } from "@/lib/validate";
 import { requireAuth } from "@/lib/auth/require-auth";
 import { requireEncryption } from "@/lib/auth/require-encryption";
 import { buildNameFields, decryptNamedRows } from "@/lib/crypto/encrypted-columns";
+import { isCryptoSymbol } from "@/lib/fx/supported-currencies";
 
 export async function GET(request: NextRequest) {
   const auth = await requireAuth(request); if (!auth.authenticated) return auth.response;
@@ -35,18 +36,9 @@ export async function GET(request: NextRequest) {
     }) as Array<typeof allRaw[number] & { name: string | null; symbol: string | null; accountName: string | null }>;
 
     // Filter to crypto holdings
-    const CRYPTO_SYMBOLS = new Set([
-      "BTC", "ETH", "SOL", "ADA", "XRP", "DOGE", "AAVE", "ATOM", "AVAX",
-      "CRV", "FTM", "HBAR", "LINK", "LTC", "MATIC", "POL", "DOT", "XLM",
-      "UNI", "YFI", "SNX", "BNB", "SHIB", "ARB", "OP", "APT", "SUI",
-      "NEAR", "FIL", "ICP", "ALGO", "XTZ", "EOS", "SAND", "MANA", "AXS", "S",
-    ]);
-
     const cryptoHoldings = allHoldings.filter((h) => {
       if (h.isCrypto === 1) return true;
-      if (!h.symbol) return false;
-      const base = String(h.symbol).toUpperCase().split("-")[0];
-      return CRYPTO_SYMBOLS.has(base);
+      return isCryptoSymbol(h.symbol);
     });
 
     // Fetch prices from CoinGecko

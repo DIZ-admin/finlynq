@@ -18,7 +18,7 @@ import { OnboardingWizard } from "@/components/onboarding-wizard";
 import { QuickImport } from "./_components/quick-import";
 import { IncomeExpenseChart } from "./_components/income-expense-chart";
 import { SpendingCategoryChart } from "./_components/spending-category-chart";
-import { NetWorthChart } from "./_components/net-worth-chart";
+import { NetWorthHistoryChart } from "@/components/net-worth-history-chart";
 import { AvailableToSpend } from "./_components/available-to-spend";
 import { InsightsSection } from "./_components/insights-section";
 import { useDevMode } from "@/hooks/use-dev-mode";
@@ -377,6 +377,16 @@ export default function DashboardPage() {
       </div>
 
       {/* ============================================
+          ROW 2.5 — Net Worth Over Time (always visible)
+          Accurate merged series: cash live from transactions + investments
+          from stored snapshots; latest point matches the hero above.
+          plan/net-worth-over-time.md Part A.
+          ============================================ */}
+      <motion.div variants={itemVariants}>
+        <NetWorthHistoryChart />
+      </motion.div>
+
+      {/* ============================================
           ROW 3 — Action Center + Weekly Recap + Quick Import
           ============================================ */}
       <div className="grid grid-cols-1 lg:grid-cols-3 gap-5">
@@ -396,7 +406,6 @@ export default function DashboardPage() {
           </div>
           <div className="grid grid-cols-1 lg:grid-cols-3 gap-5">
             <AvailableToSpend income={lastMonthIncome} expenses={lastMonthExpenses} currency={apiDisplayCurrency} />
-            <NetWorthChart data={netWorthData} />
           </div>
           <InsightsSection currency={apiDisplayCurrency} />
         </>

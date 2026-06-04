@@ -37,7 +37,7 @@ import {
 } from "../src/lib/unrealized-pnl";
 import { resolveTxAmountsCore } from "../src/lib/currency-conversion";
 import { roundMoney, roundFxRate } from "../src/lib/money";
-import { deriveTxWriteWarnings } from "../src/lib/queries";
+import { deriveTxWriteWarnings, createTransaction } from "../src/lib/queries";
 import {
   createTransferPair,
   updateTransferPair,
@@ -49,6 +49,7 @@ import {
   invalidateUser as invalidateUserTxCache,
   getUserTransactions,
 } from "../src/lib/mcp/user-tx-cache";
+import { markSnapshotsDirty } from "../src/lib/portfolio/snapshots/dirty";
 import {
   applyLotEffectsForTx,
   buildLotContext,
@@ -100,6 +101,7 @@ import {
 import { decryptStaged, encryptStaged } from "../src/lib/crypto/staging-envelope";
 import { calculateFinancialHealth } from "../src/lib/financial-health";
 import { getHoldingsValueByAccount } from "../src/lib/holdings-value";
+import { isCashLegRow } from "../src/lib/portfolio/aggregation-predicates";
 import { computeGoalProgress } from "../src/lib/goals-progress";
 import { sourceTagFor, isFormatTag, type FormatTag } from "../src/lib/tx-source";
 import { validateSignVsCategory } from "../src/lib/transactions/sign-category-invariant";
@@ -1109,11 +1111,12 @@ function accumulate(
   // sell). The discriminator is `kind IN ('buy_cash_leg', 'sell_cash_leg')`;
   // legacy pre-Phase-2 cash legs (kind NULL, amount=0) are caught by the
   // fallback `trade_link_id IS NOT NULL AND amount = 0`.
-  const tradeLinkId = r.trade_link_id ?? null;
-  const kind = (r.kind ?? null) as string | null;
-  const isPairedCashLeg =
-    kind === "buy_cash_leg" || kind === "sell_cash_leg" ||
-    (tradeLinkId != null && amt === 0);
+  // FINLYNQ-106: the #128 paired cash-leg skip now lives in ONE place
+  // (src/lib/portfolio/aggregation-predicates.ts) shared with the two SQL
+  // aggregators (holdings-value.ts + /api/portfolio/overview). `amt` is the
+  // already-coerced Number(r.amount); pass it through so the legacy
+  // `amount = 0` fallback matches identically to the SQL form.
+  const isPairedCashLeg = isCashLegRow({ kind: r.kind ?? null, tradeLinkId: r.trade_link_id ?? null, amount: amt });
   if (isPairedCashLeg) {
     // Paired cash-leg sibling — contributes neither buy nor sell here.
     // (Cash-sleeve qty is tracked separately via SUM(quantity) per
@@ -2925,15 +2928,38 @@ export function registerPgTools(
       const persistedEnteredAmount = roundMoney(resolved.enteredAmount, resolved.enteredCurrency);
       const persistedAmount = roundMoney(resolved.amount, resolved.currency);
 
-      // Issue #28: stamp source explicitly + return audit timestamps so
-      // the AI assistant can verify the write landed and self-attributed.
-      // Issue #96: trade_link_id stamped from validated `tradeLinkId` arg
-      // (NULL when absent — legacy / unpaired rows).
-      const result = await q(db, sql`
-        INSERT INTO transactions (user_id, date, account_id, category_id, currency, amount, entered_currency, entered_amount, entered_fx_rate, payee, note, tags, portfolio_holding_id, quantity, source, trade_link_id)
-        VALUES (${userId}, ${txDate}, ${acct.id}, ${catId}, ${resolved.currency}, ${persistedAmount}, ${resolved.enteredCurrency}, ${persistedEnteredAmount}, ${resolved.enteredFxRate}, ${encPayee}, ${encNote}, ${encTags}, ${resolvedHoldingId}, ${quantity ?? null}, ${'mcp_http'}, ${tradeLinkId ?? null})
-        RETURNING id, created_at, updated_at, source, trade_link_id
-      `);
+      // FINLYNQ-108 — route the write through the shared domain helper
+      // `createTransaction` (the same path REST `POST /api/transactions`
+      // uses) instead of a raw `INSERT INTO transactions`. In the HTTP MCP
+      // context the `db` handle passed to registerPgTools IS `@/db` (see
+      // src/app/api/mcp/route.ts), the same module-level Drizzle proxy
+      // `createTransaction` writes through, so this produces a byte-identical
+      // row to the previous raw INSERT — same columns, same encrypted payee/
+      // note/tags, same rounded amounts, same `source='mcp_http'`, same
+      // `trade_link_id`. The audit trio (`source`/`created_at`/`updated_at`)
+      // and the investment-account FK guard now live in ONE place rather than
+      // being re-asserted here. Issue #28 / #96 semantics preserved.
+      const created = await createTransaction(
+        userId,
+        {
+          date: txDate,
+          accountId: Number(acct.id),
+          categoryId: catId,
+          currency: resolved.currency,
+          amount: persistedAmount,
+          enteredCurrency: resolved.enteredCurrency,
+          enteredAmount: persistedEnteredAmount,
+          enteredFxRate: resolved.enteredFxRate,
+          payee: encPayee,
+          note: encNote,
+          tags: encTags,
+          portfolioHoldingId: resolvedHoldingId,
+          quantity: quantity ?? null,
+          tradeLinkId: tradeLinkId ?? null,
+          source: "mcp_http",
+        },
+        dek,
+      );
 
       invalidateUserTxCache(userId);
 
@@ -2943,7 +2969,7 @@ export function registerPgTools(
       if (resolvedHoldingId != null && quantity != null && quantity !== 0) {
         const lotCtx = await buildLotContext(userId, dek);
         const lotTx: TxRowForLots = {
-          id: result[0]?.id,
+          id: created?.id,
           userId,
           date: txDate,
           amount: persistedAmount,
@@ -2959,14 +2985,18 @@ export function registerPgTools(
         };
         await applyLotEffectsForTx(lotTx, lotCtx);
       }
+      // Snapshot history is stale from this date forward for investment rows.
+      if (resolvedHoldingId != null) {
+        await markSnapshotsDirty(userId, txDate);
+      }
       return text({
         success: true,
         data: {
-          transactionId: result[0]?.id,
-          createdAt: result[0]?.created_at,
-          updatedAt: result[0]?.updated_at,
-          source: result[0]?.source,
-          tradeLinkId: result[0]?.trade_link_id ?? null,
+          transactionId: created?.id,
+          createdAt: created?.createdAt,
+          updatedAt: created?.updatedAt,
+          source: created?.source,
+          tradeLinkId: created?.tradeLinkId ?? null,
           resolvedAccount: resolvedAccountInfo,
           resolvedCategory,
           resolvedHolding,
@@ -3400,12 +3430,37 @@ export function registerPgTools(
           // are rounded so SUM(t.amount) stops drifting.
           const persistedEnteredAmount = roundMoney(resolved.enteredAmount, resolved.enteredCurrency);
           const persistedAmount = roundMoney(resolved.amount, resolved.currency);
-          const insRows = await q(db, sql`
-            INSERT INTO transactions (user_id, date, account_id, category_id, currency, amount, entered_currency, entered_amount, entered_fx_rate, payee, note, tags, portfolio_holding_id, quantity, source, trade_link_id)
-            VALUES (${userId}, ${txDate}, ${acct.id}, ${catId}, ${resolved.currency}, ${persistedAmount}, ${resolved.enteredCurrency}, ${persistedEnteredAmount}, ${resolved.enteredFxRate}, ${encPayee}, ${encNote}, ${encTags}, ${rowHoldingId}, ${t.quantity ?? null}, ${'mcp_http'}, ${rowTradeLinkId})
-            RETURNING id
-          `);
-          const newTxId = insRows[0]?.id != null ? Number(insRows[0].id) : null;
+          // FINLYNQ-108 — route through the shared `createTransaction` helper
+          // (same path REST uses) instead of a raw `INSERT INTO transactions`.
+          // The HTTP MCP `db` IS `@/db`, so this writes the identical row:
+          // same columns, encrypted payee/note/tags, rounded amounts,
+          // `source='mcp_http'`, `trade_link_id`. NOTE: per-row lot wiring +
+          // markSnapshotsDirty are intentionally NOT added here — the bulk
+          // path never had them (audit-invariants lots-write-hook baseline
+          // exception), so omitting them preserves behavior exactly. Wiring
+          // them is the separate Phase-1 follow-up.
+          const insRow = await createTransaction(
+            userId,
+            {
+              date: txDate,
+              accountId: Number(acct.id),
+              categoryId: catId,
+              currency: resolved.currency,
+              amount: persistedAmount,
+              enteredCurrency: resolved.enteredCurrency,
+              enteredAmount: persistedEnteredAmount,
+              enteredFxRate: resolved.enteredFxRate,
+              payee: encPayee,
+              note: encNote,
+              tags: encTags,
+              portfolioHoldingId: rowHoldingId,
+              quantity: t.quantity ?? null,
+              tradeLinkId: rowTradeLinkId,
+              source: "mcp_http",
+            },
+            dek,
+          );
+          const newTxId = insRow?.id != null ? Number(insRow.id) : null;
           if (newTxId != null) {
             committed.push({
               newTransactionId: newTxId,
@@ -4228,15 +4283,37 @@ export function registerPgTools(
         const encTags = encryptField(dek, `source:record_trade,trade-link:${transferResult.linkId}`);
         // Issue #28: stamp source explicitly. Fee leg shares the trade's
         // surface attribution.
-        const feeIns = await q(db, sql`
-          INSERT INTO transactions (user_id, date, account_id, category_id, currency, amount, entered_currency, entered_amount, entered_fx_rate, payee, note, tags, portfolio_holding_id, quantity, source)
-          VALUES (${userId}, ${txDate}, ${acct.id}, NULL, ${acctCurrency}, ${-feeAmountAcct}, ${tradeCurrency}, ${-feeAmountTrade}, ${fx}, ${encPayee}, ${encNote}, ${encTags}, ${cashHoldingId}, NULL, ${'mcp_http'})
-          RETURNING id
-        `);
-        feeTxId = Number(feeIns[0]?.id ?? 0) || null;
+        // FINLYNQ-108 — route the fee leg through the shared `createTransaction`
+        // helper (same path REST + record_transaction use). Single uncategorized
+        // (`category_id = NULL`) expense row on the cash sleeve; identical to the
+        // prior raw INSERT (encrypted payee/note/tags, rounded amounts,
+        // `source='mcp_http'`). The HTTP MCP `db` IS `@/db`.
+        const feeIns = await createTransaction(
+          userId,
+          {
+            date: txDate,
+            accountId: Number(acct.id),
+            categoryId: null,
+            currency: acctCurrency,
+            amount: -feeAmountAcct,
+            enteredCurrency: tradeCurrency,
+            enteredAmount: -feeAmountTrade,
+            enteredFxRate: fx,
+            payee: encPayee,
+            note: encNote,
+            tags: encTags,
+            portfolioHoldingId: cashHoldingId,
+            quantity: null,
+            source: "mcp_http",
+          },
+          dek,
+        );
+        feeTxId = Number(feeIns?.id ?? 0) || null;
       }
 
       invalidateUserTxCache(userId);
+      // Snapshot history is stale from this trade date forward — auto-rebuild.
+      await markSnapshotsDirty(userId, txDate);
       return text({
         success: true,
         data: {
@@ -5899,7 +5976,15 @@ export function registerPgTools(
         const sellQty = Number(m.sell_qty ?? 0);
         const sellAmt = Number(m.sell_amount ?? 0);
         const divs = Number(m.dividends ?? 0);
-        const remainingQty = buyQty - sellQty;
+        // Position qty = UNSKIPPED net Σ(quantity) (aggregateHoldings'
+        // `net_quantity`, accumulated for every row BEFORE the #128 cash-leg
+        // skip). Using buyQty - sellQty here is skip-aware and drops a cash
+        // sleeve's own buy_cash_leg/sell_cash_leg from its balance (showed Cash
+        // USD at 700k when the true balance was 0). For non-cash-sleeve holdings
+        // net_quantity == buyQty - sellQty (no-op). Mirrors
+        // get_portfolio_performance_v2 + holdings-value.ts. avgCost/realizedGain
+        // stay on the skip-aware buy/sell tallies.
+        const remainingQty = Number(m.net_quantity ?? (buyQty - sellQty));
         const avgCost = buyQty > 0 ? buyAmt / buyQty : null;
         const costBasis = avgCost !== null && remainingQty > 0 ? remainingQty * avgCost : null;
         const realizedGain = avgCost !== null ? sellAmt - (sellQty * avgCost) : 0;
@@ -6498,6 +6583,12 @@ export function registerPgTools(
       };
 
       let buyQty = 0, buyAmt = 0, sellQty = 0, sellAmt = 0, divAmt = 0;
+      // Position qty = UNSKIPPED net Σ(quantity), accumulated for EVERY row
+      // (incl. paired cash legs). The #128 cash-leg skip below applies to the
+      // buy/sell (realized-gain) tallies ONLY — using buyQty - sellQty for
+      // position qty drops a cash sleeve's own buy_cash_leg/sell_cash_leg from
+      // its balance. For non-cash-sleeve holdings netQty == buyQty - sellQty.
+      let netQty = 0;
       const purchases: typeof txns = [];
       const sales: typeof txns = [];
       const dividends: typeof txns = [];
@@ -6530,6 +6621,7 @@ export function registerPgTools(
         // rationale.
         const tradeLinkId = t.trade_link_id ?? null;
         const kind = (t.kind ?? null) as string | null;
+        netQty += qty;
         const isPairedCashLeg =
           kind === "buy_cash_leg" || kind === "sell_cash_leg" ||
           (tradeLinkId != null && amt === 0);
@@ -6572,7 +6664,9 @@ export function registerPgTools(
       }
 
       const avgCost = buyQty > 0 ? buyAmt / buyQty : null;
-      const remainingQty = buyQty - sellQty;
+      // Position qty = UNSKIPPED net Σ(quantity) — see netQty declaration above.
+      // avgCost / realizedGain stay on the skip-aware buy/sell tallies.
+      const remainingQty = netQty;
       const costBasis = avgCost !== null && remainingQty > 0 ? remainingQty * avgCost : null;
       const realizedGain = avgCost !== null ? sellAmt - (sellQty * avgCost) : 0;
       const totalReturn = realizedGain + divAmt; // no live price = no unrealized

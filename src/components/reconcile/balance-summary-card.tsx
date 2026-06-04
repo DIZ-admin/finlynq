@@ -19,6 +19,7 @@
 
 import { Card, CardContent } from "@/components/ui/card";
 import { CheckCircle2, AlertTriangle, Info } from "lucide-react";
+import { formatCurrency } from "@/lib/currency";
 
 export interface BalanceSummary {
   accountId: number;
@@ -41,15 +42,7 @@ interface BalanceSummaryCardProps {
 }
 
 function fmt(value: number, currency: string): string {
-  try {
-    return new Intl.NumberFormat("en-US", {
-      style: "currency",
-      currency,
-      currencyDisplay: "narrowSymbol",
-    }).format(value);
-  } catch {
-    return `${value.toFixed(2)} ${currency}`;
-  }
+  return formatCurrency(value, currency);
 }
 
 export function BalanceSummaryCard({

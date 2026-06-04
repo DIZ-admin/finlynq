@@ -57,4 +57,12 @@ export async function register() {
     // eslint-disable-next-line no-console
     console.error("[instrumentation] failed to register portfolio-snapshots cron:", err);
   }
+
+  // Note: there is intentionally NO background snapshot-drain cron. Post Stream
+  // D Phase 4 holding symbols are encrypted, so a DEK-less background job can't
+  // price investment holdings (it would write $1/unit garbage and clobber good
+  // snapshots). Auto-rebuild after a back-dated investment edit is instead a
+  // DEK-bearing self-heal on chart load (src/app/api/net-worth-history) plus
+  // the manual "Rebuild investment history" button. The portfolio_snapshot_dirty
+  // marker is the work-list both consume. plan/net-worth-over-time.md Part B.
 }

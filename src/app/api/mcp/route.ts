@@ -13,7 +13,7 @@
  */
 
 import { NextRequest, NextResponse } from "next/server";
-import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
+import { McpServer, type RegisteredTool } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { WebStandardStreamableHTTPServerTransport } from "@modelcontextprotocol/sdk/server/webStandardStreamableHttp.js";
 import { db } from "@/db";
 import { requireAuth } from "@/lib/auth/require-auth";
@@ -43,6 +43,19 @@ const ALLOWED_ORIGIN_HOSTS = new Set([
   "windsurf.dev",
   "codeium.com",
 ]);
+
+/**
+ * Narrow view of an `McpServer` whose `tool(...)` method is writable, so the
+ * per-request OAuth-scope filter can wrap it (FINLYNQ-114 — replaces the old
+ * untyped `server.tool` monkey-patch). The wrapped method returns `undefined`
+ * for out-of-scope tools (the SDK callers in `registerPgTools` ignore the
+ * return value, so a no-op registration is safe). `McpServer.tool` is a
+ * read-only overloaded method in the SDK types, so we cast through this
+ * single, named interface at the patch site instead of an untyped escape.
+ */
+interface ScopeFilterableServer {
+  tool(name: string, ...args: unknown[]): RegisteredTool | undefined;
+}
 
 function isAllowedOrigin(origin: string | null): boolean {
   if (!origin) return true;
@@ -164,10 +177,11 @@ export async function POST(request: NextRequest) {
 
   const scopeString = "scope" in auth.context ? auth.context.scope : DEFAULT_SCOPE;
   const scopeSet = parseScope(scopeString);
-  // eslint-disable-next-line @typescript-eslint/no-explicit-any
-  const originalTool = (server as any).tool.bind(server);
-  // eslint-disable-next-line @typescript-eslint/no-explicit-any
-  (server as any).tool = (name: string, ...args: unknown[]) => {
+  // The SDK types `tool` as a read-only overloaded method, so reach it through
+  // a single named interface (ScopeFilterableServer) rather than `any`.
+  const scopable = server as unknown as ScopeFilterableServer;
+  const originalTool = scopable.tool.bind(server);
+  scopable.tool = (name: string, ...args: unknown[]) => {
     if (!isToolAllowedForScope(name, scopeSet)) {
       return undefined;
     }

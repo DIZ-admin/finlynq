@@ -5,23 +5,12 @@ import { alias } from "drizzle-orm/pg-core";
 import { fetchMultipleQuotes, aggregatePortfolioExposure, getEtfRegionBreakdown, getEtfSectorBreakdown, getEtfTopHoldings, getAvailableEtfSymbols, autoSeedEtfIfMissing } from "@/lib/price-service";
 import { getCryptoPrices, symbolToCoinGeckoId } from "@/lib/crypto-service";
 import { getLatestFxRate, convertCurrency, getDisplayCurrency, getRate } from "@/lib/fx-service";
-import { isSupportedCurrency, isMetalCurrency } from "@/lib/fx/supported-currencies";
+import { isMetalCurrency, isCryptoSymbol, isCurrencyCodeSymbol } from "@/lib/fx/supported-currencies";
 import { requireAuth } from "@/lib/auth/require-auth";
 import { getDEK } from "@/lib/crypto/dek-cache";
 import { decryptNamedRows } from "@/lib/crypto/encrypted-columns";
 import { resolveDividendsCategoryId } from "@/lib/dividends-category";
-
-const CRYPTO_SYMBOLS = new Set([
-  "BTC", "ETH", "SOL", "ADA", "XRP", "DOGE", "AAVE", "ATOM", "AVAX",
-  "CRV", "FTM", "HBAR", "LINK", "LTC", "MATIC", "POL", "DOT", "XLM",
-  "UNI", "YFI", "SNX", "BNB", "SHIB", "ARB", "OP", "APT", "SUI",
-  "NEAR", "FIL", "ICP", "ALGO", "XTZ", "EOS", "SAND", "MANA", "AXS", "S",
-]);
-
-function isCryptoSymbol(symbol: string): boolean {
-  const base = symbol.toUpperCase().split("-")[0];
-  return CRYPTO_SYMBOLS.has(base);
-}
+import { cashLegSkipSql } from "@/lib/portfolio/aggregation-predicates";
 
 export async function GET(request: NextRequest) {
   const auth = await requireAuth(request);
@@ -45,11 +34,8 @@ export async function GET(request: NextRequest) {
       if (Array.isArray(parsed)) activeCurrencies = parsed.map((s: string) => s.toUpperCase());
     } catch { /* fall through */ }
   }
-  const isCurrencyCodeSymbol = (sym: string | null | undefined): boolean => {
-    if (!sym) return false;
-    const s = sym.trim().toUpperCase();
-    return /^[A-Z]{3,4}$/.test(s) && (isSupportedCurrency(s) || activeCurrencies.includes(s));
-  };
+  const symbolIsCash = (sym: string | null | undefined): boolean =>
+    isCurrencyCodeSymbol(sym, activeCurrencies);
 
   // 1. Get all holdings with account info. Stream D Phase 4: plaintext
   // name/symbol/accountName columns dropped; read ciphertext only and
@@ -89,13 +75,13 @@ export async function GET(request: NextRequest) {
     if (h.isCrypto === 1) return false;
     if (!h.symbol) return false;
     if (isCryptoSymbol(h.symbol)) return false;
-    if (isCurrencyCodeSymbol(h.symbol)) return false; // cash, not a stock
+    if (symbolIsCash(h.symbol)) return false; // cash, not a stock
     return true;
   });
   const cashHoldings = holdings.filter(h => {
     if (h.isCrypto === 1) return false;
     if (!h.symbol) return true;
-    return isCurrencyCodeSymbol(h.symbol);
+    return symbolIsCash(h.symbol);
   });
 
   // 3. Fetch stock/ETF prices from Yahoo Finance
@@ -159,6 +145,7 @@ export async function GET(request: NextRequest) {
     totalBuyAmount: number;       // in HOLDING'S currency, after FX normalization
     totalSellQty: number;
     totalSellAmount: number;      // in HOLDING'S currency
+    netQty: number;               // UNSKIPPED Σ(quantity) — position qty (see below)
     dividendsReceived: number;    // in HOLDING'S currency
     firstPurchaseDate: string | null;
   };
@@ -172,6 +159,7 @@ export async function GET(request: NextRequest) {
     totalBuyAmountInEntered: number;
     totalSellQty: number;
     totalSellAmountInEntered: number;
+    delta: number;                // UNSKIPPED Σ(quantity) in this bucket
     dividendsInEntered: number;
     firstPurchaseDate: string | null;
   };
@@ -231,24 +219,37 @@ export async function GET(request: NextRequest) {
       ELSE ABS(COALESCE(${schema.transactions.enteredAmount}, ${schema.transactions.amount}))
     END
   `;
+  // Issue #128 (Phase 2 update, 2026-05-26): exclude paired cash-leg rows from
+  // BOTH the buy- and sell-side aggregations. Under the Phase 2 sign convention
+  // (2026-05-25), `buy_cash_leg` / `sell_cash_leg` rows on the cash sleeve carry
+  // non-zero amount + non-zero quantity, so the original predicate
+  // `tradeLinkId IS NOT NULL AND amount = 0` no longer matches them. Without
+  // this fix, the cash sleeve's realized-gain calc picks up phantom buys
+  // (sell_cash_leg qty>0) and phantom sells (buy_cash_leg qty<0). The predicate
+  // is a union of the explicit `kind` discriminator (Phase 2+) and the legacy
+  // `amount=0` fallback for un-tagged pre-migration rows. FINLYNQ-106: this is
+  // now the SHARED helper, identical to the one holdings-value.ts imports — so
+  // the two SQL aggregators can no longer drift.
+  const skipCashLeg = cashLegSkipSql({
+    kind: schema.transactions.kind,
+    tradeLinkId: schema.transactions.tradeLinkId,
+    amount: schema.transactions.amount,
+  });
   const fkAggRows = await db
     .select({
       portfolioHoldingId: schema.transactions.portfolioHoldingId,
       enteredCurrency: effectiveEnteredCurrency,
-      // Issue #128 (Phase 2 update, 2026-05-26): exclude paired cash-leg
-      // rows from BOTH the buy- and sell-side aggregations. Under the
-      // Phase 2 sign convention (2026-05-25), `buy_cash_leg` / `sell_cash_leg`
-      // rows on the cash sleeve carry non-zero amount + non-zero quantity,
-      // so the original predicate `tradeLinkId IS NOT NULL AND amount = 0`
-      // no longer matches them. Without this fix, the cash sleeve's
-      // realized-gain calc picks up phantom buys (sell_cash_leg qty>0) and
-      // phantom sells (buy_cash_leg qty<0). Predicate is a union of the
-      // explicit `kind` discriminator (Phase 2+) and the legacy `amount=0`
-      // fallback for un-tagged pre-migration rows.
-      totalBuyQty: sql<number>`COALESCE(SUM(CASE WHEN COALESCE(${schema.transactions.quantity}, 0) > 0 AND NOT (${schema.transactions.kind} IN ('buy_cash_leg', 'sell_cash_leg') OR (${schema.transactions.tradeLinkId} IS NOT NULL AND ${schema.transactions.amount} = 0)) THEN ${schema.transactions.quantity} ELSE 0 END), 0)::float8`,
-      totalBuyAmountInEntered: sql<number>`COALESCE(SUM(CASE WHEN COALESCE(${schema.transactions.quantity}, 0) > 0 AND NOT (${schema.transactions.kind} IN ('buy_cash_leg', 'sell_cash_leg') OR (${schema.transactions.tradeLinkId} IS NOT NULL AND ${schema.transactions.amount} = 0)) THEN ${effectiveBuyAmount} ELSE 0 END), 0)::float8`,
-      totalSellQty: sql<number>`COALESCE(SUM(CASE WHEN COALESCE(${schema.transactions.quantity}, 0) < 0 AND NOT (${schema.transactions.kind} IN ('buy_cash_leg', 'sell_cash_leg') OR (${schema.transactions.tradeLinkId} IS NOT NULL AND ${schema.transactions.amount} = 0)) THEN ABS(${schema.transactions.quantity}) ELSE 0 END), 0)::float8`,
-      totalSellAmountInEntered: sql<number>`COALESCE(SUM(CASE WHEN COALESCE(${schema.transactions.quantity}, 0) < 0 AND NOT (${schema.transactions.kind} IN ('buy_cash_leg', 'sell_cash_leg') OR (${schema.transactions.tradeLinkId} IS NOT NULL AND ${schema.transactions.amount} = 0)) THEN ABS(COALESCE(${schema.transactions.enteredAmount}, ${schema.transactions.amount})) ELSE 0 END), 0)::float8`,
+      totalBuyQty: sql<number>`COALESCE(SUM(CASE WHEN COALESCE(${schema.transactions.quantity}, 0) > 0 AND NOT ${skipCashLeg} THEN ${schema.transactions.quantity} ELSE 0 END), 0)::float8`,
+      totalBuyAmountInEntered: sql<number>`COALESCE(SUM(CASE WHEN COALESCE(${schema.transactions.quantity}, 0) > 0 AND NOT ${skipCashLeg} THEN ${effectiveBuyAmount} ELSE 0 END), 0)::float8`,
+      totalSellQty: sql<number>`COALESCE(SUM(CASE WHEN COALESCE(${schema.transactions.quantity}, 0) < 0 AND NOT ${skipCashLeg} THEN ABS(${schema.transactions.quantity}) ELSE 0 END), 0)::float8`,
+      totalSellAmountInEntered: sql<number>`COALESCE(SUM(CASE WHEN COALESCE(${schema.transactions.quantity}, 0) < 0 AND NOT ${skipCashLeg} THEN ABS(COALESCE(${schema.transactions.enteredAmount}, ${schema.transactions.amount})) ELSE 0 END), 0)::float8`,
+      // Position quantity is the UNSKIPPED net Σ(quantity). The #128/FINLYNQ-106
+      // cash-leg skip above applies to the buy/sell (realized-gain) tallies
+      // ONLY — NOT to position qty. A buy_cash_leg/sell_cash_leg lands on the
+      // cash SLEEVE holding, so deriving qty from `buyQty - sellQty` (skip-aware)
+      // drops the sleeve's own cash flows from its balance (showed Cash USD at
+      // $700k when the true balance was $0). Mirrors holdings-value.ts `delta`.
+      delta: sql<number>`COALESCE(SUM(${schema.transactions.quantity}), 0)::float8`,
       dividendsInEntered: dividendsCategoryId !== null
         ? sql<number>`COALESCE(SUM(CASE WHEN ${schema.transactions.categoryId} = ${dividendsCategoryId} THEN COALESCE(${schema.transactions.enteredAmount}, ${schema.transactions.amount}) ELSE 0 END), 0)::float8`
         : sql<number>`0::float8`,
@@ -293,6 +294,7 @@ export async function GET(request: NextRequest) {
       totalBuyAmountInEntered: Number(r.totalBuyAmountInEntered),
       totalSellQty: Number(r.totalSellQty),
       totalSellAmountInEntered: Number(r.totalSellAmountInEntered),
+      delta: Number(r.delta),
       dividendsInEntered: Number(r.dividendsInEntered),
       firstPurchaseDate: r.firstPurchaseDate,
     });
@@ -311,6 +313,7 @@ export async function GET(request: NextRequest) {
       totalBuyAmount: 0,
       totalSellQty: 0,
       totalSellAmount: 0,
+      netQty: 0,
       dividendsReceived: 0,
       firstPurchaseDate: null,
     };
@@ -320,6 +323,9 @@ export async function GET(request: NextRequest) {
       out.totalBuyAmount += b.totalBuyAmountInEntered * fx;
       out.totalSellQty += b.totalSellQty;
       out.totalSellAmount += b.totalSellAmountInEntered * fx;
+      // Position qty is currency-agnostic (a share/unit count) — sum the raw
+      // net deltas across buckets with NO FX conversion.
+      out.netQty += b.delta;
       out.dividendsReceived += b.dividendsInEntered * fx;
       if (b.firstPurchaseDate) {
         if (!out.firstPurchaseDate || b.firstPurchaseDate < out.firstPurchaseDate) {
@@ -354,7 +360,12 @@ export async function GET(request: NextRequest) {
     const sellAmt = a.totalSellAmount;
     const divs = a.dividendsReceived;
     const avgCost = buyQty > 0 ? buyAmt / buyQty : null;
-    const remainingQty = buyQty - sellQty;
+    // Position qty = UNSKIPPED net Σ(quantity), NOT buyQty - sellQty (which is
+    // skip-aware and drops a cash sleeve's own buy_cash_leg/sell_cash_leg). For
+    // any non-cash-sleeve holding netQty == buyQty - sellQty, so this is a
+    // strict no-op for stocks; it only corrects cash sleeves with trade legs.
+    // avgCost / realizedGain stay on the skip-aware buy/sell tallies.
+    const remainingQty = a.netQty;
     const costBasis = avgCost !== null && remainingQty > 0 ? remainingQty * avgCost : null;
     const realizedGain = avgCost !== null ? sellAmt - (sellQty * avgCost) : 0;
     const fpDate = a.firstPurchaseDate ?? null;
@@ -385,7 +396,7 @@ export async function GET(request: NextRequest) {
   const quoteCurrencyById = new Map<number, string>();
   for (const h of holdings) {
     const isCryptoH = h.isCrypto === 1 || (h.symbol ? isCryptoSymbol(h.symbol) : false);
-    const symbolIsCurrencyH = isCurrencyCodeSymbol(h.symbol);
+    const symbolIsCurrencyH = symbolIsCash(h.symbol);
     let qc = h.currency;
     if (isCryptoH) qc = "CAD";
     else if (symbolIsCurrencyH && h.symbol) {
@@ -436,7 +447,7 @@ export async function GET(request: NextRequest) {
 
   const enrichedHoldings = holdings.map(h => {
     const isCrypto = h.isCrypto === 1 || (h.symbol ? isCryptoSymbol(h.symbol) : false);
-    const symbolIsCurrency = isCurrencyCodeSymbol(h.symbol);
+    const symbolIsCurrency = symbolIsCash(h.symbol);
     const isEtf = h.symbol && !symbolIsCurrency ? (getEtfRegionBreakdown(h.symbol) !== null) : false;
 
     let assetType: AssetType = "cash";
@@ -550,6 +561,14 @@ export async function GET(request: NextRequest) {
       ? (totalReturn / lifetimeCostBasis) * 100
       : null;
 
+    // Per-holding day-change in display currency = this holding's contribution
+    // to summary.dayChangeDisplay (change-per-unit × qty, FX-converted). Null
+    // when there's no live change to show (mirrors the holdingsWithChange
+    // filter used for the portfolio total below).
+    const dayChangeDisplay = changePct !== null && marketValueDisplay !== null
+      ? Math.round(convertCurrency((change ?? 0) * (quantity ?? 1), fxRate) * 100) / 100
+      : null;
+
     return {
       id: h.id,
       accountId: h.accountId,
@@ -561,6 +580,7 @@ export async function GET(request: NextRequest) {
       price,
       change,
       changePct,
+      dayChangeDisplay,
       quoteCurrency,
       marketCap,
       image,

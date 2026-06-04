@@ -1,5 +1,5 @@
 import { db, schema, getDialect } from "@/db";
-import { eq, and, gte, lte, desc, sql, asc, inArray } from "drizzle-orm";
+import { eq, and, gte, lte, desc, sql, asc, inArray, isNotNull } from "drizzle-orm";
 import type { SQL, AnyColumn } from "drizzle-orm";
 import { requireHoldingForInvestmentAccount } from "@/lib/investment-account";
 import type { TransactionSource } from "@/lib/tx-source";
@@ -335,7 +335,12 @@ export async function getTransactionCount(userId: string, filters?: TxSortFilter
 export async function createTransaction(userId: string, data: {
   date: string;
   accountId: number;
-  categoryId: number;
+  // Nullable: MCP `record_transaction` / `bulk_record_transactions` write
+  // uncategorized rows (`category_id = NULL`) when no category resolves and
+  // the account isn't an investment account. The REST POST route always
+  // supplies a number, so `null` here is a widening that doesn't change its
+  // behavior. The DB column is nullable (schema-pg.ts:76).
+  categoryId: number | null;
   currency?: string;
   amount?: number;
   // Phase 2 of the currency rework — entered/account trilogy. The route
@@ -345,14 +350,24 @@ export async function createTransaction(userId: string, data: {
   enteredCurrency?: string | null;
   enteredAmount?: number | null;
   enteredFxRate?: number | null;
-  quantity?: number;
+  quantity?: number | null;
   portfolioHoldingId?: number | null;
-  note?: string;
-  payee?: string;
-  tags?: string;
+  // Nullable: the MCP HTTP write path (FINLYNQ-108) passes already-encrypted
+  // payee/note/tags whose ternary fallback can be `null` under a cold DEK.
+  // REST passes encrypted strings; the columns are nullable text.
+  note?: string | null;
+  payee?: string | null;
+  tags?: string | null;
   isBusiness?: number;
   splitPerson?: string;
   splitRatio?: number;
+  // Issue #96 multi-currency trade-pair linker. Server-generated UUID stamped
+  // into `trade_link_id`. REST never passes it (the column defaults NULL);
+  // FINLYNQ-108 routes MCP HTTP record_transaction/bulk_record_transactions
+  // through this helper, and those pass a validated/minted UUID here so the
+  // cost-basis aggregators can pair the cash + stock legs. Distinct from the
+  // transfer-pair `link_id`.
+  tradeLinkId?: string | null;
   // Audit-source attribution (issue #28). Defaults to 'manual' when the
   // caller doesn't pass one — the UI POST handler relies on the default,
   // every other writer (import/MCP/connector/sample-data/restore) sets
@@ -824,4 +839,195 @@ export async function getNetWorthOverTime(userId: string) {
     .groupBy(monthExpr(transactions.date), accounts.currency)
     .orderBy(monthExpr(transactions.date))
     .all();
+}
+
+// ─── Net-worth / balance over time (plan/net-worth-over-time.md Part A) ──────
+//
+// Accurate merged series: cash/liability accounts computed live from
+// `transactions`, investment accounts read from stored `portfolio_snapshots`.
+// These two helpers feed the pure `buildNetWorthHistory` core; FX + the live
+// today-override happen in /api/net-worth-history.
+
+/**
+ * Per-day, per-currency cash delta for NON-investment accounts (optionally a
+ * single account). Investment accounts are excluded so their buy/sell legs
+ * (which net to ~0) never get summed as a "balance" — their value comes from
+ * snapshots instead. Returns deltas over ALL history (the cumulative on any
+ * grid day needs every delta before the window). Archived accounts are
+ * excluded to mirror the dashboard hero's account set.
+ */
+export async function getCashDailyDeltas(userId: string, accountId?: number) {
+  const conditions = [
+    eq(transactions.userId, userId),
+    eq(accounts.isInvestment, false),
+    eq(accounts.archived, false),
+  ];
+  if (accountId != null) conditions.push(eq(transactions.accountId, accountId));
+  return db
+    .select({
+      date: transactions.date,
+      currency: accounts.currency,
+      delta: sql<number>`COALESCE(SUM(${transactions.amount}), 0)`,
+    })
+    .from(transactions)
+    .innerJoin(accounts, eq(transactions.accountId, accounts.id))
+    .where(and(...conditions))
+    .groupBy(transactions.date, accounts.currency)
+    .orderBy(asc(transactions.date))
+    .all();
+}
+
+/**
+ * Per-account portfolio snapshot rows in [from, to], for INVESTMENT accounts
+ * only. Pass `from="1900-01-01"` so the first grid day always has a
+ * nearest-at-or-before value to carry forward. NEVER returns the
+ * whole-portfolio NULL aggregate row (that would double-count against the
+ * per-account sum the chart builds).
+ *
+ * The `accounts.is_investment = true` join is load-bearing: `buildDailySnapshot`
+ * writes a per-account snapshot for ANY account with holdings — including a
+ * misconfigured `is_investment=false` account that still has holdings (e.g. the
+ * demo's Brokerage). Such an account is summed by `getCashDailyDeltas`
+ * (`is_investment=false`), so without this filter its snapshots would ALSO land
+ * in the investment pass → double-counting. Partitioning both passes on the
+ * same `is_investment` flag the dashboard hero uses keeps them disjoint and the
+ * latest point equal to the hero.
+ */
+export async function getInvestmentSnapshotsInRange(
+  userId: string,
+  from: string,
+  to: string,
+  accountId?: number,
+) {
+  const conditions = [
+    eq(schema.portfolioSnapshots.userId, userId),
+    gte(schema.portfolioSnapshots.snapDate, from),
+    lte(schema.portfolioSnapshots.snapDate, to),
+    eq(accounts.isInvestment, true),
+  ];
+  if (accountId != null) {
+    conditions.push(eq(schema.portfolioSnapshots.accountId, accountId));
+  } else {
+    conditions.push(isNotNull(schema.portfolioSnapshots.accountId));
+  }
+  return db
+    .select({
+      accountId: schema.portfolioSnapshots.accountId,
+      snapDate: schema.portfolioSnapshots.snapDate,
+      marketValue: schema.portfolioSnapshots.marketValue,
+      currency: schema.portfolioSnapshots.currency,
+    })
+    .from(schema.portfolioSnapshots)
+    .innerJoin(accounts, eq(schema.portfolioSnapshots.accountId, accounts.id))
+    .where(and(...conditions))
+    .orderBy(asc(schema.portfolioSnapshots.snapDate))
+    .all();
+}
+
+/**
+ * Per-ACCOUNT per-day cash delta (is_investment=false, archived=false). Mirror
+ * of {@link getCashDailyDeltas} grouped by account_id so the cash-snapshot
+ * builder can keep a separate running cumulative per account (each account has
+ * exactly one currency, carried on the row). plan/net-worth-cash-snapshots.md
+ * Phase 2.
+ */
+export async function getCashDailyDeltasByAccount(userId: string, accountId?: number) {
+  const conditions = [
+    eq(transactions.userId, userId),
+    eq(accounts.isInvestment, false),
+    eq(accounts.archived, false),
+  ];
+  if (accountId != null) conditions.push(eq(transactions.accountId, accountId));
+  return db
+    .select({
+      accountId: transactions.accountId,
+      currency: accounts.currency,
+      date: transactions.date,
+      delta: sql<number>`COALESCE(SUM(${transactions.amount}), 0)`,
+    })
+    .from(transactions)
+    .innerJoin(accounts, eq(transactions.accountId, accounts.id))
+    .where(and(...conditions))
+    .groupBy(transactions.accountId, accounts.currency, transactions.date)
+    .orderBy(asc(transactions.date))
+    .all();
+}
+
+/**
+ * Stored CASH snapshots in [from, to] — the cash-side mirror of
+ * {@link getInvestmentSnapshotsInRange}. Filters `is_investment=false`,
+ * `archived=false`, and `source='cash'` (defense-in-depth: source + the
+ * is_investment partition keep this disjoint from the investment reader, which
+ * filters `is_investment=true`). NEVER returns the whole-portfolio NULL
+ * aggregate (the cash builder never writes one, and the inner join on a NULL
+ * account_id wouldn't match anyway — the explicit isNotNull is belt-and-braces).
+ * plan/net-worth-cash-snapshots.md Phase 2.
+ */
+export async function getCashSnapshotsInRange(
+  userId: string,
+  from: string,
+  to: string,
+  accountId?: number,
+) {
+  const conditions = [
+    eq(schema.portfolioSnapshots.userId, userId),
+    gte(schema.portfolioSnapshots.snapDate, from),
+    lte(schema.portfolioSnapshots.snapDate, to),
+    eq(accounts.isInvestment, false),
+    eq(accounts.archived, false),
+    eq(schema.portfolioSnapshots.source, "cash"),
+  ];
+  if (accountId != null) {
+    conditions.push(eq(schema.portfolioSnapshots.accountId, accountId));
+  } else {
+    conditions.push(isNotNull(schema.portfolioSnapshots.accountId));
+  }
+  return db
+    .select({
+      accountId: schema.portfolioSnapshots.accountId,
+      snapDate: schema.portfolioSnapshots.snapDate,
+      marketValue: schema.portfolioSnapshots.marketValue,
+      currency: schema.portfolioSnapshots.currency,
+    })
+    .from(schema.portfolioSnapshots)
+    .innerJoin(accounts, eq(schema.portfolioSnapshots.accountId, accounts.id))
+    .where(and(...conditions))
+    .orderBy(asc(schema.portfolioSnapshots.snapDate))
+    .all();
+}
+
+/**
+ * Cheap staleness fingerprint over the user's CASH (is_investment=false,
+ * archived=false) transactions: the newest create/update instant plus the row
+ * count. `count` is load-bearing — a DELETE leaves max-updated untouched, so
+ * only the count drop reveals it. Mirrors the exact filter the cash builder
+ * reads through so archiving an account (which removes its txns from the set)
+ * flips the count and triggers a rebuild that drops its snapshots.
+ * plan/net-worth-cash-snapshots.md Phase 2.
+ */
+export async function getCashTxFingerprint(
+  userId: string,
+): Promise<{ maxUpdated: Date | null; count: number }> {
+  const rows = await db
+    .select({
+      maxUpdated: sql<
+        Date | string | null
+      >`GREATEST(MAX(${transactions.createdAt}), MAX(${transactions.updatedAt}))`,
+      count: sql<number>`COUNT(*)`,
+    })
+    .from(transactions)
+    .innerJoin(accounts, eq(transactions.accountId, accounts.id))
+    .where(
+      and(
+        eq(transactions.userId, userId),
+        eq(accounts.isInvestment, false),
+        eq(accounts.archived, false),
+      ),
+    )
+    .all();
+  const r = rows[0];
+  const raw = r?.maxUpdated ?? null;
+  const maxUpdated =
+    raw == null ? null : raw instanceof Date ? raw : new Date(String(raw));
+  return { maxUpdated, count: Number(r?.count ?? 0) };
 }

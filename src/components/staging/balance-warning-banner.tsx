@@ -14,6 +14,7 @@ import { useState } from "react";
 import { Card, CardContent } from "@/components/ui/card";
 import { Button } from "@/components/ui/button";
 import { AlertTriangle, ChevronDown, ChevronUp } from "lucide-react";
+import { formatCurrency } from "@/lib/currency";
 
 export interface BalanceWarning {
   date: string;
@@ -31,15 +32,7 @@ interface BalanceWarningBannerProps {
 }
 
 function fmt(value: number, currency: string | null): string {
-  try {
-    return new Intl.NumberFormat("en-US", {
-      style: "currency",
-      currency: currency ?? "USD",
-      currencyDisplay: "narrowSymbol",
-    }).format(value);
-  } catch {
-    return `${value.toFixed(2)} ${currency ?? ""}`.trim();
-  }
+  return formatCurrency(value, currency ?? "USD");
 }
 
 export function BalanceWarningBanner({

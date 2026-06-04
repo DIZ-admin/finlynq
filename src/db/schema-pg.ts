@@ -454,6 +454,11 @@ export const feedback = pgTable(
     appVersion: text("app_version"), // 'web' | mobile version string
     status: text("status").notNull().default("new"), // 'new' | 'triaged' | 'resolved'
     adminNote: text("admin_note"),
+    // Two-sided read tracking for the reply thread. NULL = never opened.
+    // unread-for-user = admin message newer than userLastReadAt;
+    // unread-for-admin = user message newer than adminLastReadAt.
+    userLastReadAt: timestamp("user_last_read_at", { withTimezone: true }),
+    adminLastReadAt: timestamp("admin_last_read_at", { withTimezone: true }),
     createdAt: timestamp("created_at", { withTimezone: true }).notNull().defaultNow(),
     updatedAt: timestamp("updated_at", { withTimezone: true }).notNull().defaultNow(),
   },
@@ -461,6 +466,24 @@ export const feedback = pgTable(
     index("feedback_status_idx").on(t.status, t.createdAt),
     index("feedback_user_idx").on(t.userId),
   ],
+);
+
+// Reply-thread messages. feedback.message is the immutable SEED (NOT stored
+// here — see the 20260611 migration). Each row is one follow-up from the user
+// or the admin. Plaintext, same rationale as feedback.message.
+export const feedbackMessages = pgTable(
+  "feedback_messages",
+  {
+    id: serial("id").primaryKey(),
+    feedbackId: integer("feedback_id")
+      .notNull()
+      .references(() => feedback.id, { onDelete: "cascade" }),
+    authorRole: text("author_role").notNull(), // 'user' | 'admin'
+    authorId: text("author_id").notNull(),
+    body: text("body").notNull(),
+    createdAt: timestamp("created_at", { withTimezone: true }).notNull().defaultNow(),
+  },
+  (t) => [index("feedback_messages_thread_idx").on(t.feedbackId, t.createdAt)],
 );
 
 export const subscriptions = pgTable("subscriptions", {
@@ -1526,6 +1549,42 @@ export const portfolioSnapshots = pgTable("portfolio_snapshots", {
   gapsFilled: boolean("gaps_filled").notNull().default(false),
   source: text("source").notNull().default("cron"),
   createdAt: timestamp("created_at", { withTimezone: true }).notNull().defaultNow(),
+});
+
+// ─── portfolio_snapshot_dirty — auto-rebuild work queue (2026-06-02)
+//
+// One row per user with stale snapshot history. The nightly snapshot cron is
+// forward-only (writes only today), so a back-dated investment edit leaves
+// history stale. Every investment-affecting tx write stamps this row
+// (markSnapshotsDirty) co-located with invalidateUser; the snapshot-drain cron
+// re-materializes `[from_date, today]` and clears rows whose marked_at is
+// unchanged (writes arriving mid-rebuild bump marked_at and survive to the
+// next tick). `from_date` is the earliest affected date, coalesced via LEAST.
+// plan/net-worth-over-time.md Part B.
+export const portfolioSnapshotDirty = pgTable("portfolio_snapshot_dirty", {
+  userId: text("user_id").primaryKey(),
+  fromDate: text("from_date").notNull(),
+  markedAt: timestamp("marked_at", { withTimezone: true }).notNull().defaultNow(),
+});
+
+// ─── portfolio_cash_snapshot_meta — cash-snapshot staleness watermark (2026-06-13)
+//
+// The "Net Worth Over Time" chart stores per-account daily CASH balances in
+// portfolio_snapshots (source='cash', is_investment=false accounts) at each
+// day's historical FX rate. Unlike the investment side, the cash side needs no
+// DEK, so it's kept fresh by a real background cron + a DEK-free chart-load
+// self-heal. `created_at` on portfolio_snapshots isn't bumped on re-UPSERT, so
+// this per-user row is the watermark instead: a fingerprint of the user's cash
+// transactions (max updated-time + row count, the latter catching DELETEs)
+// captured at build time, plus the 'to' date the build covered.
+// isCashStale() compares a live fingerprint against this row.
+// plan/net-worth-cash-snapshots.md Phase 1.
+export const portfolioCashSnapshotMeta = pgTable("portfolio_cash_snapshot_meta", {
+  userId: text("user_id").primaryKey(),
+  txMaxUpdated: timestamp("tx_max_updated", { withTimezone: true }),
+  txCount: integer("tx_count").notNull().default(0),
+  builtThrough: text("built_through"),
+  builtAt: timestamp("built_at", { withTimezone: true }).notNull().defaultNow(),
 });
 
 // ─── portfolio_legacy_realized_gain_snapshot — pre-cutover avg-cost gain

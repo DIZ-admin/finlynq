@@ -1,9 +1,39 @@
-export function formatCurrency(amount: number, currency: string = "CAD"): string {
+/**
+ * Custom symbols for the "dollar family" so CAD renders as `C$` and USD as the
+ * bare `$`. `Intl.NumberFormat` can only produce `$` / `CA$` / `CAD` for CAD —
+ * never `C$` — so the dollar currencies are formatted as plain decimals with a
+ * hand-picked symbol prefix. Every other currency keeps its native Intl symbol
+ * (EUR → €, GBP → £, JPY → ¥, …).
+ */
+const DOLLAR_SYMBOLS: Record<string, string> = {
+  USD: "$",
+  CAD: "C$",
+  AUD: "A$",
+  NZD: "NZ$",
+  HKD: "HK$",
+  SGD: "S$",
+  MXN: "MX$",
+};
+
+export function formatCurrency(
+  amount: number,
+  currency: string = "USD",
+  opts?: { decimals?: number }
+): string {
+  const decimals = opts?.decimals ?? 2;
+  const symbol = DOLLAR_SYMBOLS[currency];
+  if (symbol) {
+    const num = new Intl.NumberFormat("en-CA", {
+      minimumFractionDigits: decimals,
+      maximumFractionDigits: decimals,
+    }).format(Math.abs(amount));
+    return `${amount < 0 ? "-" : ""}${symbol}${num}`;
+  }
   return new Intl.NumberFormat("en-CA", {
     style: "currency",
     currency,
-    minimumFractionDigits: 2,
-    maximumFractionDigits: 2,
+    minimumFractionDigits: decimals,
+    maximumFractionDigits: decimals,
   }).format(amount);
 }
 

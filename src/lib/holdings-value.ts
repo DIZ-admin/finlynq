@@ -14,35 +14,14 @@ import { db, schema } from "@/db";
 import { and, eq, isNotNull, lte, ne, sql } from "drizzle-orm";
 import { alias } from "drizzle-orm/pg-core";
 import { fetchMultipleQuotes, fetchMultipleQuotesAtDate } from "@/lib/price-service";
-import { getCryptoPrices, symbolToCoinGeckoId } from "@/lib/crypto-service";
+import { getCryptoSpotPrices, getCryptoPricesAtDate, symbolToCoinGeckoId } from "@/lib/crypto-service";
 import { getLatestFxRate, getRate } from "@/lib/fx-service";
-import { isSupportedCurrency, isMetalCurrency } from "@/lib/fx/supported-currencies";
+import { isMetalCurrency, isCryptoSymbol, isCurrencyCodeSymbol } from "@/lib/fx/supported-currencies";
 import { decryptNamedRows } from "@/lib/crypto/encrypted-columns";
+import { cashLegSkipSql } from "@/lib/portfolio/aggregation-predicates";
 
 function todayISO(): string {
   return new Date().toISOString().split("T")[0];
-}
-
-const CRYPTO_SYMBOLS = new Set([
-  "BTC", "ETH", "SOL", "ADA", "XRP", "DOGE", "AAVE", "ATOM", "AVAX",
-  "CRV", "FTM", "HBAR", "LINK", "LTC", "MATIC", "POL", "DOT", "XLM",
-  "UNI", "YFI", "SNX", "BNB", "SHIB", "ARB", "OP", "APT", "SUI",
-  "NEAR", "FIL", "ICP", "ALGO", "XTZ", "EOS", "SAND", "MANA", "AXS", "S",
-]);
-
-function isCrypto(symbol: string | null): boolean {
-  if (!symbol) return false;
-  return CRYPTO_SYMBOLS.has(symbol.toUpperCase().split("-")[0]);
-}
-
-// A holding whose symbol IS a currency code (CAD, USD, EUR, XAU, …)
-// represents a foreign-cash position, NOT a stock. Yahoo would return
-// data for unrelated tickers ("CAD" → Cadiz Inc on NASDAQ) that inflate
-// market value by 100×+. Mirrors the same check in /api/portfolio/overview.
-function isCurrencyCodeSymbol(sym: string | null | undefined): boolean {
-  if (!sym) return false;
-  const s = sym.trim().toUpperCase();
-  return /^[A-Z]{3,4}$/.test(s) && isSupportedCurrency(s);
 }
 
 export type AccountHoldingsValue = {
@@ -133,6 +112,22 @@ export async function getHoldingsValueByAccount(
       ELSE ABS(COALESCE(${schema.transactions.enteredAmount}, ${schema.transactions.amount}))
     END
   `;
+  // Issue #128 (FINLYNQ-106, 2026-06-03): exclude paired cash-leg rows from the
+  // buy- and sell-side COST-BASIS tallies. The shared predicate (single source
+  // in aggregation-predicates.ts) is the same one /api/portfolio/overview bakes
+  // into its SUM(CASE…) — before this both aggregators silently disagreed (the
+  // overview route carried the skip, this one didn't). NOTE: applied to the
+  // cost-basis CASE expressions only, NOT to `delta` (net qty). A cash-leg row
+  // lands on the cash-SLEEVE holding (kind=buy_cash_leg/sell_cash_leg →
+  // portfolio_holding_id = the sleeve), never on a stock holding, so for stock
+  // holdings the skip is a no-op; for cash sleeves (priced at 1) the cost basis
+  // falls back to market value either way, so this is behavior-preserving while
+  // pinning parity with overview + MCP accumulate().
+  const skipCashLeg = cashLegSkipSql({
+    kind: schema.transactions.kind,
+    tradeLinkId: schema.transactions.tradeLinkId,
+    amount: schema.transactions.amount,
+  });
   const fkAggRows = await db
     .select({
       portfolioHoldingId: schema.transactions.portfolioHoldingId,
@@ -144,9 +139,9 @@ export async function getHoldingsValueByAccount(
           ELSE 0
         END
       ), 0)::float8`,
-      totalBuyQty: sql<number>`COALESCE(SUM(CASE WHEN COALESCE(${schema.transactions.quantity}, 0) > 0 THEN ${schema.transactions.quantity} ELSE 0 END), 0)::float8`,
-      totalBuyAmountInEntered: sql<number>`COALESCE(SUM(CASE WHEN COALESCE(${schema.transactions.quantity}, 0) > 0 THEN ${effectiveBuyAmount} ELSE 0 END), 0)::float8`,
-      totalSellQty: sql<number>`COALESCE(SUM(CASE WHEN COALESCE(${schema.transactions.quantity}, 0) < 0 THEN ABS(${schema.transactions.quantity}) ELSE 0 END), 0)::float8`,
+      totalBuyQty: sql<number>`COALESCE(SUM(CASE WHEN COALESCE(${schema.transactions.quantity}, 0) > 0 AND NOT ${skipCashLeg} THEN ${schema.transactions.quantity} ELSE 0 END), 0)::float8`,
+      totalBuyAmountInEntered: sql<number>`COALESCE(SUM(CASE WHEN COALESCE(${schema.transactions.quantity}, 0) > 0 AND NOT ${skipCashLeg} THEN ${effectiveBuyAmount} ELSE 0 END), 0)::float8`,
+      totalSellQty: sql<number>`COALESCE(SUM(CASE WHEN COALESCE(${schema.transactions.quantity}, 0) < 0 AND NOT ${skipCashLeg} THEN ABS(${schema.transactions.quantity}) ELSE 0 END), 0)::float8`,
     })
     .from(schema.transactions)
     .innerJoin(
@@ -203,7 +198,7 @@ export async function getHoldingsValueByAccount(
   // == today use the regular live-quote endpoint; for past dates use
   // the historical chart endpoint.
   const stockSymbols = holdings
-    .filter(h => h.symbol && !isCrypto(h.symbol) && h.isCrypto !== 1 && !isCurrencyCodeSymbol(h.symbol))
+    .filter(h => h.symbol && !isCryptoSymbol(h.symbol) && h.isCrypto !== 1 && !isCurrencyCodeSymbol(h.symbol))
     .map(h => h.symbol!);
   const quotes = stockSymbols.length > 0
     ? (isToday
@@ -211,15 +206,30 @@ export async function getHoldingsValueByAccount(
         : await fetchMultipleQuotesAtDate(stockSymbols, asOfDate))
     : new Map();
 
-  const cgIds: string[] = [];
+  // Cache-first crypto prices (price-only). Pass both the CoinGecko coin id AND
+  // the holding's base symbol so the returned price re-keys to the symbol
+  // `cryptoByUpperSymbol` looks up by. For TODAY use getCryptoSpotPrices (live,
+  // cached); for a PAST snapshot date use getCryptoPricesAtDate so crypto is
+  // valued at its HISTORICAL price (mirrors the stock fetchMultipleQuotesAtDate
+  // branch above) instead of today's price. Both read price_cache first, so a
+  // multi-day snapshot rebuild makes ~1 CoinGecko call per coin.
+  const cgPairs: Array<{ coinId: string; symbol: string }> = [];
+  const seenCg = new Set<string>();
   for (const h of holdings) {
-    if (h.isCrypto === 1 || isCrypto(h.symbol)) {
+    if (h.isCrypto === 1 || isCryptoSymbol(h.symbol)) {
       const base = (h.symbol ?? "").toUpperCase().split("-")[0];
-      const cg = symbolToCoinGeckoId(base);
-      if (cg && !cgIds.includes(cg)) cgIds.push(cg);
+      const cg = base ? symbolToCoinGeckoId(base) : null;
+      if (cg && !seenCg.has(cg)) {
+        seenCg.add(cg);
+        cgPairs.push({ coinId: cg, symbol: base });
+      }
     }
   }
-  const cryptoPrices = cgIds.length > 0 ? await getCryptoPrices(cgIds) : [];
+  const cryptoPrices = cgPairs.length === 0
+    ? []
+    : isToday
+      ? await getCryptoSpotPrices(cgPairs)
+      : await getCryptoPricesAtDate(cgPairs, asOfDate);
   const cryptoByUpperSymbol = new Map(cryptoPrices.map(p => [p.symbol.toUpperCase(), p]));
 
   // Accumulate market value per accountId, converting holding currency -> account currency via FX
@@ -270,7 +280,7 @@ export async function getHoldingsValueByAccount(
       }
     } else if (h.symbol) {
       // Symbol-priced holding (stock, ETF, crypto).
-      if (h.isCrypto === 1 || isCrypto(h.symbol)) {
+      if (h.isCrypto === 1 || isCryptoSymbol(h.symbol)) {
         const cp = cryptoByUpperSymbol.get(h.symbol.toUpperCase().split("-")[0]);
         if (cp) {
           price = cp.price;
