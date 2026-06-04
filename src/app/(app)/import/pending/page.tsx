@@ -13,9 +13,12 @@
  * URL state: `?id=<batchId>&account=<accountId>`. Both update via
  * history.replaceState so tab close + reopen restores state.
  *
- * Rebuilt in Phase 2 of FINLYNQ-56. Phase 3 will wire the four match
- * actions (auto-match accept, manual link/unlink, skip, flag-missing)
- * on top of this scaffold.
+ * FINLYNQ-118 Phase 4: the data fetching is in `_hooks/use-staged.ts`
+ * (useStagedImports / useStagedDetail / useBankLedger) and the visible
+ * surfaces are in `_components/` (StagedListView / BankPane / StagedPane /
+ * UnboundPickerPane). The page keeps the tightly-coupled orchestration —
+ * openId / selected / the match-action callbacks / the highlight
+ * neighborhoods — verbatim. Behaviour-preserving; no fetch-timing change.
  */
 
 import {
@@ -25,136 +28,33 @@ import {
   useMemo,
   useState,
 } from "react";
-import Link from "next/link";
 import { useSearchParams } from "next/navigation";
 import { Card, CardContent } from "@/components/ui/card";
-import { Button, buttonVariants } from "@/components/ui/button";
-import { Badge } from "@/components/ui/badge";
-import {
-  ArrowLeft,
-  ArrowRight,
-  Inbox,
-  Mail,
-  Upload,
-  Clock,
-  Check,
-  X,
-  RefreshCw,
-  Info,
-} from "lucide-react";
-import {
-  Dialog,
-  DialogContent,
-  DialogDescription,
-  DialogFooter,
-  DialogHeader,
-  DialogTitle,
-} from "@/components/ui/dialog";
-import { Sparkles } from "lucide-react";
+import { Button } from "@/components/ui/button";
+import { Info } from "lucide-react";
 import { ReconciliationCallout } from "@/components/staging/reconciliation-callout";
 import {
   type StagedEditableRow,
-  type AccountOption as EditorAccountOption,
-  type HoldingOption,
 } from "@/components/staging/staged-row-editor";
 import { UnresolvedCategoriesBanner } from "@/components/staging/unresolved-categories-banner";
-import {
-  BalanceWarningBanner,
-  type BalanceWarning,
-} from "@/components/staging/balance-warning-banner";
+import { BalanceWarningBanner } from "@/components/staging/balance-warning-banner";
 import { AccountSelector, type AccountOption } from "@/components/import/reconcile/account-selector";
 import { TwoPaneLayout } from "@/components/import/reconcile/two-pane-layout";
 import { safeName } from "@/lib/safe-name";
-import { FilePane } from "@/components/import/reconcile/file-pane";
-import { DbPane, type DbTransactionRow } from "@/components/import/reconcile/db-pane";
+import { type DbTransactionRow } from "@/components/import/reconcile/db-pane";
 import {
-  UnboundImportPicker,
-  type PickerAccount,
-  type PickerTemplate,
-} from "@/components/staging/unbound-import-picker";
-import {
-  SuggestionsGroup,
   type SuggestionDisplay,
 } from "@/components/import/reconcile/suggestions-group";
 import { ConfirmDeleteBankRow } from "@/components/reconcile/confirm-delete-bank-row";
-import { Link as LinkIcon, Flag, X as XIcon, Trash2 } from "lucide-react";
+import { Link as LinkIcon, X as XIcon } from "lucide-react";
 
-interface StagedRow {
-  id: string;
-  source: string;
-  fromAddress: string | null;
-  subject: string | null;
-  receivedAt: string;
-  totalRowCount: number;
-  duplicateCount: number;
-  expiresAt: string;
-  originalFilename?: string | null;
-  fileFormat?: string | null;
-}
-
-interface ParsedAnchorRow {
-  date: string;
-  balance: number;
-  currency?: string;
-  source?: string;
-}
-
-interface StagedDetail {
-  staged: StagedRow & {
-    status: string;
-    originalFilename?: string | null;
-    fileFormat?: string | null;
-    statementBalance?: number | null;
-    statementBalanceDate?: string | null;
-    statementCurrency?: string | null;
-    boundAccountId?: number | null;
-    dateRangeStart?: string | null;
-    dateRangeEnd?: string | null;
-    /** 2026-05-24 — anchors parsed from the file's Balance column.
-     *  Same shape persisted to staged_imports.parsed_anchors. */
-    parsedAnchors?: ParsedAnchorRow[] | null;
-    /** 2026-05-28 — fallback metadata captured when an email-import CSV
-     *  attachment didn't template-match at parse time. Backs the
-     *  UnboundImportPicker. Both null for upload-path imports and for
-     *  email imports whose CSV did match a template. */
-    headers?: string[] | null;
-    sampleRows?: Array<Record<string, string>> | null;
-  };
-  rows: StagedEditableRow[];
-  reconciliation?: {
-    currentBalance: number | null;
-    projectedBalance: number | null;
-    pendingDelta: number | null;
-    boundAccountCurrency: string | null;
-  };
-  suggestedMatches?: Array<{
-    stagedRowId: string;
-    transactionId: number;
-    confidence: "exact" | "fuzzy";
-  }>;
-  /** 2026-05-24 — bank balance pre-flight mismatches. Empty array =
-   *  every anchor in the batch lines up with the running total. */
-  balanceWarnings?: BalanceWarning[];
-  /** 2026-05-28 — populated by the GET when bound_account_id IS NULL AND
-   *  headers IS NOT NULL. Lets the UnboundImportPicker render template
-   *  + account dropdowns without extra round-trips. */
-  pickerCandidates?: {
-    accounts: PickerAccount[];
-    templates: PickerTemplate[];
-  } | null;
-}
-
-function daysUntil(iso: string): number {
-  const ms = new Date(iso).getTime() - Date.now();
-  return Math.max(0, Math.ceil(ms / (24 * 60 * 60 * 1000)));
-}
-
-/** Shift a YYYY-MM-DD by N days (positive or negative). */
-function shiftDays(date: string, days: number): string {
-  const d = new Date(date + "T00:00:00Z");
-  d.setUTCDate(d.getUTCDate() + days);
-  return d.toISOString().split("T")[0];
-}
+import { type StagedDetail, shiftDays } from "./_types";
+import { useStagedImports, useStagedDetail, useBankLedger } from "./_hooks/use-staged";
+import { StagedListView } from "./_components/staged-list-view";
+import { ReconcileHeader } from "./_components/reconcile-header";
+import { BankPane } from "./_components/bank-pane";
+import { StagedPane } from "./_components/staged-pane";
+import { UnboundPickerPane } from "./_components/unbound-picker-pane";
 
 export default function PendingImportsPage() {
   return (
@@ -165,23 +65,24 @@ export default function PendingImportsPage() {
 }
 
 function PendingImportsPageInner() {
-  const [list, setList] = useState<StagedRow[] | null>(null);
-  const [loading, setLoading] = useState(true);
-  const [error, setError] = useState<string | null>(null);
+  const { list, loading, error, loadList } = useStagedImports();
   const [openId, setOpenId] = useState<string | null>(null);
-  const [detail, setDetail] = useState<StagedDetail | null>(null);
-  const [detailLoading, setDetailLoading] = useState(false);
+  const {
+    detail,
+    setDetail,
+    detailLoading,
+    setDetailLoading,
+    accounts,
+    holdings,
+    loadDetail,
+  } = useStagedDetail();
   const [selected, setSelected] = useState<Set<string>>(new Set());
   const [acting, setActing] = useState(false);
   const [toast, setToast] = useState<{ type: "success" | "error"; msg: string } | null>(null);
-  const [accounts, setAccounts] = useState<EditorAccountOption[]>([]);
-  const [holdings, setHoldings] = useState<HoldingOption[]>([]);
   const [expandedRows, setExpandedRows] = useState<Set<string>>(new Set());
   const [unresolved, setUnresolved] = useState<{ rowIds: string[]; payees: string[] } | null>(null);
   // FINLYNQ-56 — two-pane state.
   const [accountId, setAccountId] = useState<number | null>(null);
-  const [dbRows, setDbRows] = useState<DbTransactionRow[]>([]);
-  const [dbRowsLoading, setDbRowsLoading] = useState(false);
   // Phase 3 — match-action state.
   // Local-only set of rejected suggestion pairs ("stagedRowId:transactionId").
   // Per sub-item FINLYNQ-71 the reject is intentionally NOT persisted —
@@ -225,93 +126,31 @@ function PendingImportsPageInner() {
     linkedTransactionCount: number;
   } | null>(null);
 
-  const loadList = useCallback(async () => {
-    setLoading(true);
-    setError(null);
-    try {
-      const res = await fetch("/api/import/staged");
-      const data = await res.json();
-      if (!res.ok) throw new Error(data.error || "Failed to load");
-      setList(data);
-    } catch (e) {
-      setError(e instanceof Error ? e.message : "Failed to load");
-    } finally {
-      setLoading(false);
-    }
+  const onLedgerError = useCallback((msg: string) => {
+    setToast({ type: "error", msg });
   }, []);
+  const { dbRows, setDbRows, dbRowsLoading } = useBankLedger(accountId, onLedgerError);
 
-  useEffect(() => {
-    loadList();
-  }, [loadList]);
-
-  const openDetail = useCallback(async (id: string) => {
-    setOpenId(id);
-    setDetail(null);
-    setDetailLoading(true);
-    setExpandedRows(new Set());
-    try {
-      const [detailRes, acctRes, holdRes] = await Promise.all([
-        fetch(`/api/import/staged/${id}`),
-        fetch("/api/accounts"),
-        fetch("/api/portfolio"),
-      ]);
-      const data: StagedDetail = await detailRes.json();
-      if (!detailRes.ok) {
-        throw new Error((data as unknown as { error?: string }).error || "Failed to load");
-      }
-      setDetail(data);
-      setSelected(
-        new Set(
-          data.rows
-            .filter((r) => !r.isDuplicate && r.reconcileState !== "skipped_duplicate")
-            .map((r) => r.id),
-        ),
-      );
-      if (acctRes.ok) {
-        const acctRaw = (await acctRes.json()) as Array<{
-          id: number;
-          name: string | null;
-          currency: string;
-          isInvestment?: boolean;
-        }>;
-        setAccounts(
-          acctRaw
-            .filter((a) => a.name != null)
-            .map((a) => ({
-              id: a.id,
-              name: a.name as string,
-              currency: a.currency,
-              isInvestment: Boolean(a.isInvestment),
-            })),
+  const openDetail = useCallback(
+    async (id: string) => {
+      setOpenId(id);
+      setExpandedRows(new Set());
+      try {
+        const data = await loadDetail(id);
+        setSelected(
+          new Set(
+            data.rows
+              .filter((r) => !r.isDuplicate && r.reconcileState !== "skipped_duplicate")
+              .map((r) => r.id),
+          ),
         );
+      } catch (e) {
+        setToast({ type: "error", msg: e instanceof Error ? e.message : "Failed to load" });
+        setOpenId(null);
       }
-      if (holdRes.ok) {
-        const holdRaw = (await holdRes.json()) as Array<{
-          id: number;
-          name: string | null;
-          symbol: string | null;
-          accountId: number | null;
-          currency: string;
-        }>;
-        setHoldings(
-          holdRaw
-            .filter((h) => h.name != null)
-            .map((h) => ({
-              id: h.id,
-              name: h.name as string,
-              symbol: h.symbol,
-              accountId: h.accountId,
-              currency: h.currency,
-            })),
-        );
-      }
-    } catch (e) {
-      setToast({ type: "error", msg: e instanceof Error ? e.message : "Failed to load" });
-      setOpenId(null);
-    } finally {
-      setDetailLoading(false);
-    }
-  }, []);
+    },
+    [loadDetail],
+  );
 
   const closeDetail = useCallback(() => {
     setOpenId(null);
@@ -328,7 +167,7 @@ function PendingImportsPageInner() {
       url.searchParams.delete("account");
       window.history.replaceState({}, "", url.toString());
     }
-  }, []);
+  }, [setDetail, setDbRows]);
 
   const searchParams = useSearchParams();
   useEffect(() => {
@@ -417,58 +256,6 @@ function PendingImportsPageInner() {
   // the helper alive avoids an unused-import warning.
   void shiftDays;
 
-  // Fetch the bank-side ledger for the selected account whenever the
-  // selection changes. Two-ledger refactor (2026-05-22): the left pane
-  // now shows the continuous `bank_transactions` history (no date
-  // window) — previously this fetched live `transactions` rows in a
-  // ±7d window via /api/transactions/reconciliation. The window param
-  // is dropped; the bank ledger is the truthful "continuous statement
-  // from the bank side" view per the refactor.
-  useEffect(() => {
-    if (!accountId) {
-      setDbRows([]);
-      return;
-    }
-    let cancelled = false;
-    setDbRowsLoading(true);
-    const params = new URLSearchParams({
-      accountId: String(accountId),
-    });
-    fetch(`/api/import/bank-ledger?${params.toString()}`)
-      .then((res) =>
-        res.json().then((data) => ({ ok: res.ok, status: res.status, data })),
-      )
-      .then(({ ok, status, data }) => {
-        if (cancelled) return;
-        if (!ok) {
-          const msg =
-            status === 423
-              ? data?.message ||
-                "Your session needs to be unlocked. Reload and sign in again."
-              : data?.error || "Failed to load bank ledger";
-          setToast({ type: "error", msg });
-          setDbRows([]);
-          return;
-        }
-        setDbRows(Array.isArray(data?.data?.transactions) ? data.data.transactions : []);
-      })
-      .catch((e) => {
-        if (cancelled) return;
-        setToast({
-          type: "error",
-          msg: e instanceof Error ? e.message : "Failed to load",
-        });
-        setDbRows([]);
-      })
-      .finally(() => {
-        if (cancelled) return;
-        setDbRowsLoading(false);
-      });
-    return () => {
-      cancelled = true;
-    };
-  }, [accountId]);
-
   // Filter staged rows to the currently-selected account. Empty
   // accountName matches every account (legacy rows pre-FINLYNQ-58 where
   // boundAccountId was set but the row didn't carry an accountName).
@@ -551,7 +338,7 @@ function PendingImportsPageInner() {
         rows: d.rows.map((x) => (x.id === updated.id ? updated : x)),
       };
     });
-  }, []);
+  }, [setDetail]);
 
   // ─── Phase 3 — match-action helpers ──────────────────────────────────────
 
@@ -607,7 +394,7 @@ function PendingImportsPageInner() {
         setBusyKey(null);
       }
     },
-    [openId],
+    [openId, setDetail],
   );
 
   /** Mirror the back-reference on a DB row in local state so the
@@ -625,7 +412,7 @@ function PendingImportsPageInner() {
         ),
       );
     },
-    [],
+    [setDbRows],
   );
 
   const updateDbRowFlag = useCallback(
@@ -636,7 +423,7 @@ function PendingImportsPageInner() {
         ),
       );
     },
-    [],
+    [setDbRows],
   );
 
   const acceptSuggestion = useCallback(
@@ -974,7 +761,7 @@ function PendingImportsPageInner() {
         setBusyKey(null);
       }
     },
-    [dbRows],
+    [dbRows, setDbRows],
   );
 
   // FINLYNQ-56 Phase 4 — live "After approval" balance. The projection
@@ -1017,7 +804,7 @@ function PendingImportsPageInner() {
     // ledger UUID (r.id). The auto-match suggestion carries the system-
     // side transactionId, so we key the lookup map by linkedTransactionId.
     // Rows without a linked transaction (bank-only history) are skipped.
-    const dbByTxId = new Map<number, typeof dbRows[number]>();
+    const dbByTxId = new Map<number, DbTransactionRow>();
     for (const r of dbRows) {
       if (r.linkedTransactionId != null) dbByTxId.set(r.linkedTransactionId, r);
     }
@@ -1126,7 +913,7 @@ function PendingImportsPageInner() {
     } catch {
       /* best-effort */
     }
-  }, [openId]);
+  }, [openId, setDetail]);
 
   // FINLYNQ-88 — manual "Re-apply rules" button. Operates over the whole
   // batch (no per-row scope) so the user can refresh rule effects after
@@ -1189,244 +976,33 @@ function PendingImportsPageInner() {
   // List view — no open batch.
   if (!openId) {
     return (
-      <div className="space-y-6">
-        <div className="flex items-center gap-3">
-          <Link
-            href="/import"
-            className="text-sm text-muted-foreground hover:text-foreground inline-flex items-center gap-1"
-          >
-            <ArrowLeft className="h-4 w-4" />
-            Back to Import
-          </Link>
-        </div>
-
-        <div className="flex items-start justify-between gap-4">
-          <div>
-            <h1 className="text-2xl font-bold tracking-tight">Pending Imports</h1>
-            <p className="text-sm text-muted-foreground mt-0.5">
-              Transactions from email forwards or file uploads (CSV / OFX /
-              QFX), waiting for your review. Rows auto-expire after 60 days.
-            </p>
-          </div>
-          <Button variant="outline" size="sm" onClick={loadList} disabled={loading}>
-            <RefreshCw className={`h-4 w-4 mr-1.5 ${loading ? "animate-spin" : ""}`} />
-            Refresh
-          </Button>
-        </div>
-
-        {toast && (
-          <Card
-            className={
-              toast.type === "success"
-                ? "border-emerald-200 bg-emerald-50/30"
-                : "border-rose-200 bg-rose-50/30"
-            }
-          >
-            <CardContent className="py-3 text-sm">{toast.msg}</CardContent>
-          </Card>
-        )}
-
-        {error && (
-          <Card className="border-rose-200 bg-rose-50/30">
-            <CardContent className="py-3 text-sm text-rose-700">{error}</CardContent>
-          </Card>
-        )}
-
-        {loading && !list && (
-          <Card>
-            <CardContent className="py-8 text-sm text-muted-foreground text-center">
-              Loading…
-            </CardContent>
-          </Card>
-        )}
-
-        {list && list.length === 0 && (
-          <Card>
-            <CardContent className="py-12 text-center space-y-3">
-              <Inbox className="h-10 w-10 text-muted-foreground mx-auto" />
-              <div>
-                <p className="text-sm font-medium">Nothing pending</p>
-                <p className="text-xs text-muted-foreground mt-1">
-                  Upload a CSV/OFX/QFX statement at{" "}
-                  <Link href="/import/reconcile" className="underline">
-                    Import → Reconciliation
-                  </Link>
-                  , or forward a bank statement to your import address — both
-                  land here for review.
-                </p>
-              </div>
-              <Link href="/import" className="inline-block">
-                <Button variant="outline" size="sm">
-                  View import options
-                </Button>
-              </Link>
-            </CardContent>
-          </Card>
-        )}
-
-        {list && list.length > 0 && (
-          <div className="space-y-3">
-            {list.map((row) => {
-              const isUpload = row.source === "upload";
-              const Icon = isUpload ? Upload : Mail;
-              const headline = isUpload
-                ? row.originalFilename || "Uploaded file"
-                : row.subject || "(no subject)";
-              const subline = isUpload
-                ? `${(row.fileFormat ?? "file").toUpperCase()} upload · ${new Date(
-                    row.receivedAt,
-                  ).toLocaleString()}`
-                : `from ${row.fromAddress || "(unknown)"} · received ${new Date(
-                    row.receivedAt,
-                  ).toLocaleString()}`;
-              return (
-                <Card
-                  key={row.id}
-                  className="cursor-pointer hover:border-primary/50 transition-colors"
-                  onClick={() => openDetail(row.id)}
-                >
-                  <CardContent className="py-4">
-                    <div className="flex items-start justify-between gap-4">
-                      <div className="flex-1 min-w-0">
-                        <div className="flex items-center gap-2 mb-1">
-                          <Icon className="h-4 w-4 text-muted-foreground shrink-0" />
-                          <p className="text-sm font-medium truncate">{headline}</p>
-                        </div>
-                        <p className="text-xs text-muted-foreground truncate">{subline}</p>
-                      </div>
-                      <div className="flex items-center gap-2 shrink-0">
-                        <Badge variant="outline" className="font-mono">
-                          {row.totalRowCount} {row.totalRowCount === 1 ? "row" : "rows"}
-                        </Badge>
-                        {row.duplicateCount > 0 && (
-                          <Badge
-                            variant="outline"
-                            className="bg-amber-50 text-amber-700 border-amber-200"
-                          >
-                            {row.duplicateCount} dupe{row.duplicateCount === 1 ? "" : "s"}
-                          </Badge>
-                        )}
-                        <Badge variant="outline" className="bg-muted/60 text-xs">
-                          <Clock className="h-3 w-3 mr-1" />
-                          {daysUntil(row.expiresAt)}d left
-                        </Badge>
-                      </div>
-                    </div>
-                  </CardContent>
-                </Card>
-              );
-            })}
-          </div>
-        )}
-      </div>
+      <StagedListView
+        list={list}
+        loading={loading}
+        error={error}
+        toast={toast}
+        loadList={loadList}
+        openDetail={openDetail}
+      />
     );
   }
 
   // Two-pane reconciliation view — batch open.
   return (
     <div className="space-y-4 flex flex-col h-[calc(100vh-8rem)]">
-      <div className="flex items-start justify-between gap-4">
-        <div>
-          <button
-            type="button"
-            onClick={closeDetail}
-            className="text-sm text-muted-foreground hover:text-foreground inline-flex items-center gap-1 mb-2"
-          >
-            <ArrowLeft className="h-4 w-4" />
-            Back to Pending Imports
-          </button>
-          <h1 className="text-xl font-semibold tracking-tight">
-            {detail
-              ? detail.staged.source === "upload"
-                ? detail.staged.originalFilename || "Uploaded file"
-                : detail.staged.subject || "(no subject)"
-              : "Loading…"}
-          </h1>
-          {detail && (
-            <p className="text-xs text-muted-foreground mt-0.5">
-              {detail.staged.source === "upload" && detail.staged.fileFormat
-                ? `${detail.staged.fileFormat.toUpperCase()} upload`
-                : `From ${detail.staged.fromAddress || "(unknown)"}`}
-              {" · "}
-              {detail.rows.length} {detail.rows.length === 1 ? "row" : "rows"}
-              {detail.staged.dateRangeStart && detail.staged.dateRangeEnd && (
-                <>
-                  {" · "}
-                  {detail.staged.dateRangeStart} → {detail.staged.dateRangeEnd}
-                </>
-              )}
-            </p>
-          )}
-        </div>
-        <div className="flex gap-2">
-          <Link
-            href={
-              accountId != null
-                ? `/reconcile?account=${accountId}`
-                : "/reconcile"
-            }
-            className={buttonVariants({ variant: "outline" })}
-          >
-            Open reconciliation
-            <ArrowRight className="h-4 w-4 ml-1.5" />
-          </Link>
-          <Button
-            variant="outline"
-            onClick={() => setReapplyModalOpen(true)}
-            disabled={acting || reapplying}
-            title="Re-apply all active rules over every row in this batch"
-          >
-            <Sparkles className="h-4 w-4 mr-1.5" />
-            Re-apply rules
-          </Button>
-          <Button
-            variant="ghost"
-            onClick={reject}
-            disabled={acting}
-            className="text-rose-700 hover:text-rose-800 hover:bg-rose-50"
-          >
-            <X className="h-4 w-4 mr-1.5" />
-            Discard all
-          </Button>
-          <Button onClick={approve} disabled={acting || selected.size === 0}>
-            <Check className="h-4 w-4 mr-1.5" />
-            Send to bank ledger {selected.size > 0 && `(${selected.size})`}
-          </Button>
-        </div>
-      </div>
-
-      {/* FINLYNQ-88 — Re-apply rules confirmation modal. */}
-      <Dialog open={reapplyModalOpen} onOpenChange={setReapplyModalOpen}>
-        <DialogContent className="sm:max-w-md">
-          <DialogHeader>
-            <DialogTitle>Re-apply rules?</DialogTitle>
-            <DialogDescription className="space-y-3 pt-2">
-              <span className="block">
-                This re-applies all active rules to every row in this batch. It
-                may overwrite manual edits to payee, category, tags, type, or
-                account on matched rows.
-              </span>
-              <span className="block">
-                Rows you&apos;ve already linked to existing transactions and
-                rows marked as duplicates are skipped.
-              </span>
-            </DialogDescription>
-          </DialogHeader>
-          <DialogFooter>
-            <Button
-              variant="ghost"
-              onClick={() => setReapplyModalOpen(false)}
-              disabled={reapplying}
-            >
-              Cancel
-            </Button>
-            <Button onClick={reapplyRules} disabled={reapplying}>
-              <Sparkles className="h-4 w-4 mr-1.5" />
-              {reapplying ? "Re-applying…" : "Re-apply"}
-            </Button>
-          </DialogFooter>
-        </DialogContent>
-      </Dialog>
+      <ReconcileHeader
+        detail={detail}
+        accountId={accountId}
+        acting={acting}
+        reapplying={reapplying}
+        selectedCount={selected.size}
+        reapplyModalOpen={reapplyModalOpen}
+        setReapplyModalOpen={setReapplyModalOpen}
+        closeDetail={closeDetail}
+        reapplyRules={reapplyRules}
+        reject={reject}
+        approve={approve}
+      />
 
       {toast && (
         <Card
@@ -1530,160 +1106,32 @@ function PendingImportsPageInner() {
           // at parse time so per-account split would be empty. Render the
           // template/account picker INSTEAD of the panes; on bind, reload
           // detail and the panes render normally with populated account_name.
-          <UnboundImportPicker
-            stagedImportId={detail.staged.id}
-            headers={detail.staged.headers}
-            sampleRows={detail.staged.sampleRows ?? []}
-            accounts={detail.pickerCandidates.accounts}
-            templates={detail.pickerCandidates.templates}
-            fromAddress={detail.staged.fromAddress ?? null}
-            subject={detail.staged.subject ?? null}
-            totalRowCount={detail.staged.totalRowCount ?? detail.rows.length}
-            onBound={async () => {
-              // Reload detail so the picker disappears (server stops
-              // sending pickerCandidates after boundAccountId is set)
-              // and the panes render with the now-bound rows.
-              if (openId) {
-                setDetailLoading(true);
-                try {
-                  const resp = await fetch(`/api/import/staged/${openId}`);
-                  if (resp.ok) {
-                    const data = await resp.json();
-                    setDetail(data);
-                  }
-                } finally {
-                  setDetailLoading(false);
-                }
-              }
-            }}
+          <UnboundPickerPane
+            detail={detail as StagedDetail & { pickerCandidates: NonNullable<StagedDetail["pickerCandidates"]> }}
+            openId={openId}
+            setDetail={setDetail}
+            setDetailLoading={setDetailLoading}
           />
         ) : detail ? (
           <TwoPaneLayout
             leftLabel="Bank ledger (continuous)"
             left={
-              <DbPane
-                rows={dbRows}
-                loading={dbRowsLoading}
-                onRowClick={onDbRowClick}
+              <BankPane
+                dbRows={dbRows}
+                dbRowsLoading={dbRowsLoading}
+                onDbRowClick={onDbRowClick}
                 highlightedBankIds={highlightedBankIds}
-                rowActions={(r) => {
-                  // In link-mode: show a Pick button on rows that aren't
-                  // already linked to a DIFFERENT staged row. The staged
-                  // row being linked may itself already be the back-ref
-                  // (re-linking), which we allow.
-                  const eligibleForLink =
-                    !r.linkedStagedRowId ||
-                    r.linkedStagedRowId === linkMode?.stagedRowId;
-                  const linkBusy = busyKey === `link:${linkMode?.stagedRowId}`;
-                  // Two-ledger refactor (2026-05-22): link / flag actions
-                  // target the system-side transaction. Bank-only rows
-                  // (linkedTransactionId == null) can't be linked / flagged
-                  // — they're historical bank entries without a current
-                  // system-side row.
-                  const txId = r.linkedTransactionId;
-                  const deleteBusy = busyKey === `bank-delete:${r.id}`;
-                  // Per-row bank delete (2026-05-27) — always available
-                  // alongside the link/flag affordances.
-                  const deleteBtn = (
-                    <Button
-                      size="sm"
-                      variant="ghost"
-                      onClick={() => void deleteBankRow(r.id, null)}
-                      disabled={deleteBusy}
-                      title="Delete this bank-ledger row"
-                      aria-label="Delete bank row"
-                      className="h-7 w-7 p-0 text-muted-foreground hover:text-rose-700"
-                    >
-                      <Trash2 className="h-3.5 w-3.5" />
-                    </Button>
-                  );
-                  if (linkMode) {
-                    if (!eligibleForLink) {
-                      return (
-                        <div className="flex items-center justify-end gap-1">
-                          <span className="text-[10px] text-muted-foreground italic">
-                            already linked
-                          </span>
-                          {deleteBtn}
-                        </div>
-                      );
-                    }
-                    if (txId == null) {
-                      return (
-                        <div className="flex items-center justify-end gap-1">
-                          <span className="text-[10px] text-muted-foreground italic">
-                            bank-only
-                          </span>
-                          {deleteBtn}
-                        </div>
-                      );
-                    }
-                    return (
-                      <div className="flex items-center justify-end gap-1">
-                        <Button
-                          size="sm"
-                          variant="outline"
-                          onClick={() => completeLink(txId)}
-                          disabled={linkBusy}
-                          className="h-7 px-2"
-                        >
-                          <Check className="h-3.5 w-3.5 mr-1" />
-                          Pick
-                        </Button>
-                        {deleteBtn}
-                      </div>
-                    );
-                  }
-                  if (txId == null) {
-                    // Bank-only history row — flag actions don't apply,
-                    // but delete still does.
-                    return (
-                      <div className="flex items-center justify-end gap-1">
-                        {deleteBtn}
-                      </div>
-                    );
-                  }
-                  // Default mode: flag / unflag toggle + delete.
-                  const flagBusy =
-                    busyKey === `flag:${txId}` || busyKey === `unflag:${txId}`;
-                  if (r.reconciliationFlag) {
-                    return (
-                      <div className="flex items-center justify-end gap-1">
-                        <Button
-                          size="sm"
-                          variant="ghost"
-                          onClick={() => unflagDbRow(txId)}
-                          disabled={flagBusy}
-                          className="h-7 px-2 text-rose-700"
-                          title="Remove 'missing from statement' flag"
-                        >
-                          <XIcon className="h-3.5 w-3.5" />
-                        </Button>
-                        {deleteBtn}
-                      </div>
-                    );
-                  }
-                  return (
-                    <div className="flex items-center justify-end gap-1">
-                      <Button
-                        size="sm"
-                        variant="ghost"
-                        onClick={() => flagDbRow(txId)}
-                        disabled={flagBusy}
-                        className="h-7 px-2 text-muted-foreground hover:text-rose-700"
-                        title="Mark as missing from this statement"
-                      >
-                        <Flag className="h-3.5 w-3.5" />
-                      </Button>
-                      {deleteBtn}
-                    </div>
-                  );
-                }}
+                linkMode={linkMode}
+                busyKey={busyKey}
+                deleteBankRow={deleteBankRow}
+                completeLink={completeLink}
+                flagDbRow={flagDbRow}
+                unflagDbRow={unflagDbRow}
               />
             }
             rightLabel="From the file (staged)"
             right={
-              <FilePane
+              <StagedPane
                 stagedImportId={detail.staged.id}
                 rows={filteredStagedRows}
                 selected={selected}
@@ -1693,82 +1141,18 @@ function PendingImportsPageInner() {
                 onToggleSelect={toggleSelect}
                 onToggleExpand={toggleExpanded}
                 onRowUpdated={onRowUpdated}
-                onRowClick={onStagedRowClick}
+                onStagedRowClick={onStagedRowClick}
                 highlightedStagedIds={highlightedStagedIds}
                 anchorsByDate={stagedAnchorsByDate}
-                header={
-                  displaySuggestions.length > 0 && (
-                    <SuggestionsGroup
-                      suggestions={displaySuggestions}
-                      onAccept={acceptSuggestion}
-                      onReject={rejectSuggestion}
-                      busyId={
-                        busyKey?.startsWith("accept:")
-                          ? busyKey.replace(/^accept:/, "")
-                          : null
-                      }
-                    />
-                  )
-                }
-                rowActions={(r) => {
-                  const linkBusy = busyKey === `link:${r.id}`;
-                  const skipBusy =
-                    busyKey === `skip:${r.id}` || busyKey === `unskip:${r.id}`;
-                  const unlinkBusy = busyKey === `unlink:${r.id}`;
-                  if (r.reconcileState === "linked") {
-                    return (
-                      <Button
-                        size="sm"
-                        variant="ghost"
-                        onClick={() => unlinkStagedRow(r.id)}
-                        disabled={unlinkBusy}
-                        className="h-7 px-2 text-muted-foreground"
-                        title="Unlink"
-                      >
-                        <XIcon className="h-3.5 w-3.5" />
-                      </Button>
-                    );
-                  }
-                  if (r.reconcileState === "skipped_duplicate") {
-                    return (
-                      <Button
-                        size="sm"
-                        variant="ghost"
-                        onClick={() => unskipStagedRow(r.id)}
-                        disabled={skipBusy}
-                        className="h-7 px-2 text-muted-foreground"
-                        title="Un-skip"
-                      >
-                        <RefreshCw className="h-3.5 w-3.5" />
-                      </Button>
-                    );
-                  }
-                  // Default state — show Link + Skip.
-                  return (
-                    <div className="flex items-center gap-1 justify-end">
-                      <Button
-                        size="sm"
-                        variant="ghost"
-                        onClick={() => beginLink(r.id)}
-                        disabled={linkBusy || linkMode != null}
-                        className="h-7 px-2"
-                        title="Link to a DB row"
-                      >
-                        <LinkIcon className="h-3.5 w-3.5" />
-                      </Button>
-                      <Button
-                        size="sm"
-                        variant="ghost"
-                        onClick={() => skipStagedRow(r.id)}
-                        disabled={skipBusy}
-                        className="h-7 px-2 text-muted-foreground"
-                        title="Mark as already imported"
-                      >
-                        <XIcon className="h-3.5 w-3.5" />
-                      </Button>
-                    </div>
-                  );
-                }}
+                displaySuggestions={displaySuggestions}
+                acceptSuggestion={acceptSuggestion}
+                rejectSuggestion={rejectSuggestion}
+                busyKey={busyKey}
+                linkMode={linkMode}
+                beginLink={beginLink}
+                skipStagedRow={skipStagedRow}
+                unskipStagedRow={unskipStagedRow}
+                unlinkStagedRow={unlinkStagedRow}
               />
             }
           />
