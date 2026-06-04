@@ -1,5 +1,11 @@
 import { describe, it, expect } from "vitest";
-import { parseCSV, csvToRawTransactions, parseAmount, normalizeDate } from "@/lib/csv-parser";
+import {
+  parseCSV,
+  csvToRawTransactions,
+  csvToRawTransactionsWithMapping,
+  parseAmount,
+  normalizeDate,
+} from "@/lib/csv-parser";
 
 describe("parseCSV", () => {
   it("parses a simple CSV into records", () => {
@@ -123,6 +129,76 @@ not-a-date,Checking,50,Store`;
     expect(rows).toHaveLength(2);
     expect(rows[0].amount).toBe(1500);
     expect(rows[1].amount).toBe(-42.99);
+  });
+});
+
+describe("default currency fallback", () => {
+  it("stamps the provided default currency when no Currency column exists", () => {
+    const csv = `Date,Account,Amount,Payee
+2024-01-15,Checking,50,Store`;
+    const { rows } = csvToRawTransactions(csv, undefined, "USD");
+    expect(rows[0].currency).toBe("USD");
+  });
+
+  it("keeps CAD as the last-resort when no default is passed", () => {
+    const csv = `Date,Account,Amount,Payee
+2024-01-15,Checking,50,Store`;
+    const { rows } = csvToRawTransactions(csv);
+    expect(rows[0].currency).toBe("CAD");
+  });
+
+  it("a present Currency column still wins over the default", () => {
+    const csv = `Date,Account,Amount,Payee,Currency
+2024-01-15,Checking,50,Store,GBP`;
+    const { rows } = csvToRawTransactions(csv, undefined, "USD");
+    expect(rows[0].currency).toBe("GBP");
+  });
+
+  it("mapped: falls back to default when no currency column is mapped", () => {
+    const csv = `When,Who,Value
+2024-01-15,Store,50`;
+    const { rows } = csvToRawTransactionsWithMapping(
+      csv,
+      { date: "When", amount: "Value", payee: "Who" },
+      undefined,
+      "EUR",
+    );
+    expect(rows[0].currency).toBe("EUR");
+  });
+
+  it("mapped: a non-empty mapped Currency cell wins over the default", () => {
+    const csv = `When,Who,Value,Ccy
+2024-01-15,Store,50,JPY`;
+    const { rows } = csvToRawTransactionsWithMapping(
+      csv,
+      { date: "When", amount: "Value", payee: "Who", currency: "Ccy" },
+      undefined,
+      "EUR",
+    );
+    expect(rows[0].currency).toBe("JPY");
+  });
+
+  it("mapped: an empty mapped Currency cell falls through to the default", () => {
+    const csv = `When,Who,Value,Ccy
+2024-01-15,Store,50,`;
+    const { rows } = csvToRawTransactionsWithMapping(
+      csv,
+      { date: "When", amount: "Value", payee: "Who", currency: "Ccy" },
+      undefined,
+      "EUR",
+    );
+    expect(rows[0].currency).toBe("EUR");
+  });
+
+  it("mapped: no default + no currency column still yields CAD", () => {
+    const csv = `When,Who,Value
+2024-01-15,Store,50`;
+    const { rows } = csvToRawTransactionsWithMapping(csv, {
+      date: "When",
+      amount: "Value",
+      payee: "Who",
+    });
+    expect(rows[0].currency).toBe("CAD");
   });
 });
 

@@ -23,8 +23,12 @@ import { X, CheckCircle2, AlertCircle } from "lucide-react";
 import { MODES, type Mode } from "./modes";
 import { ReconcileUploadCard } from "@/components/reconcile/upload-card";
 import type { AccountOption } from "@/components/reconcile/preview-table";
-import { ColumnMappingDialog } from "@/app/(app)/import/components/column-mapping-dialog";
+import {
+  ColumnMappingDialog,
+  type ReparseResult,
+} from "@/app/(app)/import/components/column-mapping-dialog";
 import type { ColumnMapping, ImportTemplate } from "@/lib/import-templates";
+import { autoDetectColumnMapping } from "@/lib/import-templates";
 import { formatCurrency } from "@/lib/currency";
 
 interface AfterUploadBullet {
@@ -313,11 +317,42 @@ export function UploadDrawer({
     [accountId, onUploaded],
   );
 
+  // Re-detect columns for the column-mapping dialog when the user changes the
+  // skip count. Uses the read-only /api/import/preview (noTemplate) so it
+  // returns fresh headers/sample/suggestion for the trimmed file WITHOUT
+  // staging any rows. Falls back to a client-side auto-detect when the trimmed
+  // file now parses canonically (preview returns no suggestion in that case).
+  const handleReparse = useCallback(
+    async (skipHeaderRows: number, skipFooterRows: number): Promise<ReparseResult> => {
+      if (!pendingFile) throw new Error("No file to re-read");
+      const fd = new FormData();
+      fd.append("file", pendingFile);
+      fd.append("noTemplate", "1");
+      fd.append("skipHeaderRows", String(skipHeaderRows));
+      fd.append("skipFooterRows", String(skipFooterRows));
+      const res = await fetch("/api/import/preview", { method: "POST", body: fd });
+      const data = await res.json();
+      if (!res.ok) throw new Error(data.error ?? `HTTP ${res.status}`);
+      const headers: string[] = Array.isArray(data.headers) ? data.headers : [];
+      const sampleRows: Record<string, string>[] = Array.isArray(data.sampleRows)
+        ? data.sampleRows
+        : [];
+      const suggestedMapping: ColumnMapping | null =
+        data.suggestedMapping ?? autoDetectColumnMapping(headers) ?? null;
+      return { headers, sampleRows, suggestedMapping };
+    },
+    [pendingFile],
+  );
+
   const handleMappingConfirm = useCallback(
     async (params: {
       mapping: ColumnMapping;
       defaultAccount: string | null;
       templateName: string;
+      skipHeaderRows: number;
+      skipFooterRows: number;
+      defaultCurrency: string | null;
+      headers: string[];
     }) => {
       if (!pendingFile || !pendingParams) {
         setMappingDialogOpen(false);
@@ -325,21 +360,24 @@ export function UploadDrawer({
       }
       setMappingSubmitting(true);
       try {
+        // The dialog's skip / currency / headers WIN over the upload card's
+        // values — the user set them here after seeing the columns, so they're
+        // authoritative for both the saved template and the re-fired upload.
         const tplRes = await fetch("/api/import/templates", {
           method: "POST",
           headers: { "Content-Type": "application/json" },
           body: JSON.stringify({
             name: params.templateName,
-            fileHeaders: mappingHeaders,
+            fileHeaders: params.headers,
             columnMapping: params.mapping,
             defaultAccount: params.defaultAccount ?? undefined,
-            skipHeaderRows: pendingParams.skipHeaderRows,
-            skipFooterRows: pendingParams.skipFooterRows,
+            skipHeaderRows: params.skipHeaderRows,
+            skipFooterRows: params.skipFooterRows,
             dateFormatOverride:
               pendingParams.dateFormatOverride === "auto"
                 ? null
                 : pendingParams.dateFormatOverride,
-            defaultCurrency: pendingParams.defaultCurrency,
+            defaultCurrency: params.defaultCurrency,
           }),
         });
         const saved = await tplRes.json();
@@ -365,10 +403,10 @@ export function UploadDrawer({
           tolerance: carried.tolerance,
           templateId: saved.id as number,
           statementBalance: carried.statementBalance,
-          skipHeaderRows: carried.skipHeaderRows,
-          skipFooterRows: carried.skipFooterRows,
+          skipHeaderRows: params.skipHeaderRows,
+          skipFooterRows: params.skipFooterRows,
           dateFormatOverride: carried.dateFormatOverride,
-          defaultCurrency: carried.defaultCurrency,
+          defaultCurrency: params.defaultCurrency,
         });
       } catch (err) {
         setError(err instanceof Error ? err.message : "Failed to save template");
@@ -377,7 +415,7 @@ export function UploadDrawer({
         setMappingSubmitting(false);
       }
     },
-    [pendingFile, pendingParams, mappingHeaders, submitUpload],
+    [pendingFile, pendingParams, submitUpload],
   );
 
   const templateOptions = useMemo(
@@ -555,6 +593,7 @@ export function UploadDrawer({
         sampleRows={mappingSampleRows}
         suggestedMapping={mappingSuggested}
         accounts={accountNames}
+        onReparse={handleReparse}
         onConfirm={handleMappingConfirm}
         submitting={mappingSubmitting}
       />

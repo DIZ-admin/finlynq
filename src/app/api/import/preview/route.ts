@@ -10,6 +10,7 @@ import { sourceTagFor, type FormatTag } from "@/lib/tx-source";
 import { requireAuth } from "@/lib/auth/require-auth";
 import { safeErrorMessage } from "@/lib/validate";
 import { parseCsvWithFallback } from "@/lib/external-import/parsers/csv-pipeline";
+import { parseCsvImportKnobs } from "@/lib/external-import/parsers/import-knobs";
 import { detectInvestmentFileFormat } from "@/lib/external-import/parsers/detect";
 import { parseOfxToCanonical } from "@/lib/external-import/parsers/ofx";
 import { parseQfxToCanonical } from "@/lib/external-import/parsers/qfx";
@@ -39,11 +40,21 @@ export async function POST(request: NextRequest) {
     const ext = file.name.split(".").pop()?.toLowerCase();
 
     if (ext === "csv") {
+      // FINLYNQ — parser knobs from the column-mapping dialog's "Import options"
+      // (skip header/footer rows + default currency). Powers live re-detection
+      // and stamps the right currency on the previewed rows.
+      const knobs = parseCsvImportKnobs(formData);
+      if (knobs.error) {
+        return NextResponse.json({ error: knobs.error }, { status: 400 });
+      }
       const text = await file.text();
       const result = await parseCsvWithFallback({
         text,
         userId,
         templateId,
+        skipHeaderRows: knobs.skipHeaderRows,
+        skipFooterRows: knobs.skipFooterRows,
+        defaultCurrency: knobs.defaultCurrency,
         skipAutoMatchTemplate: noTemplate,
       });
       if (result.kind === "template-not-found") {
@@ -52,6 +63,9 @@ export async function POST(request: NextRequest) {
         const fallback = await parseCsvWithFallback({
           text,
           userId,
+          skipHeaderRows: knobs.skipHeaderRows,
+          skipFooterRows: knobs.skipFooterRows,
+          defaultCurrency: knobs.defaultCurrency,
           skipAutoMatchTemplate: noTemplate,
         });
         return await respondWithCsvResult(fallback, file.name, userId, auth.context.dek ?? undefined);

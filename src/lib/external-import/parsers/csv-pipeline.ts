@@ -59,6 +59,14 @@ export interface CsvPipelineRequest {
   skipFooterRows?: number;
   dateFormatOverride?: DateFormatOverride | null;
   /**
+   * FINLYNQ — default currency stamped on rows whose source has no Currency
+   * column (or an empty cell). When unset, callers that resolve a saved
+   * template fall back to the template's own `defaultCurrency`; otherwise the
+   * parser keeps its "CAD" last-resort. Distinct from `anchorCurrency` (which
+   * only labels balance anchors).
+   */
+  defaultCurrency?: string | null;
+  /**
    * When true, step 3 (auto-match a saved template by header overlap) is
    * skipped. The pipeline still runs step 2 (canonical headers) and step 4
    * (column-mapping dialog) — this only disables the silent template
@@ -128,6 +136,7 @@ export async function parseCsvWithFallback(
     skipHeaderRows = 0,
     skipFooterRows = 0,
     dateFormatOverride = null,
+    defaultCurrency = null,
     skipAutoMatchTemplate = false,
     anchorCurrency = null,
   } = req;
@@ -155,10 +164,25 @@ export async function parseCsvWithFallback(
       return { kind: "template-not-found", templateId };
     }
     const tpl = deserializeTemplate(tplRow);
-    const mapped = parseWithMapping(text, tpl.columnMapping, tpl.defaultAccount ?? null, dateFormatOverride);
+    // FINLYNQ — apply the template's OWN stored skip + default currency when the
+    // request didn't pass explicit values, so re-uploading via a saved template
+    // honors its persisted parser knobs. Read the RAW `req.` values (the
+    // destructured locals are 0/null-defaulted) so "not passed" ≠ "passed as 0".
+    const effSkipH = req.skipHeaderRows ?? tpl.skipHeaderRows ?? 0;
+    const effSkipF = req.skipFooterRows ?? tpl.skipFooterRows ?? 0;
+    const effCurrency = req.defaultCurrency ?? tpl.defaultCurrency ?? null;
+    const tplText = trimCsvRows(req.text, effSkipH, effSkipF);
+    const tplHeaders = extractCsvHeaders(tplText);
+    const mapped = parseWithMapping(
+      tplText,
+      tpl.columnMapping,
+      tpl.defaultAccount ?? null,
+      dateFormatOverride,
+      effCurrency,
+    );
     const filled = applyDefaultAccount(mapped.rows, defaultAccountName);
     const anchors = extractBalanceAnchors(
-      text,
+      tplText,
       tpl.columnMapping,
       dateFormatOverride,
       anchorCcy,
@@ -167,7 +191,7 @@ export async function parseCsvWithFallback(
       kind: "parsed",
       rows: filled,
       errors: mapped.errors,
-      headers,
+      headers: tplHeaders,
       appliedTemplateId: tpl.id,
       anchors,
     };
@@ -190,7 +214,7 @@ export async function parseCsvWithFallback(
   // Merchant, Memo, Narrative) gets picked up. Files that genuinely
   // have no payee at all (e.g. Quicken raw exports) still succeed at
   // step 2 because auto-detect returns null for them.
-  const canonical = csvToRawTransactions(text, dateFormatOverride);
+  const canonical = csvToRawTransactions(text, dateFormatOverride, defaultCurrency);
   if (canonical.rows.length > 0) {
     const auto = autoDetectColumnMapping(headers);
     const allPayeesEmpty = canonical.rows.every(
@@ -230,11 +254,17 @@ export async function parseCsvWithFallback(
   const templates: ImportTemplate[] = allTemplates.map(deserializeTemplate);
   const best = skipAutoMatchTemplate ? null : findBestTemplate(headers, templates);
   if (best) {
+    // FINLYNQ — apply the matched template's default currency (request override
+    // first). Skip-fallback for step 3 is deferred: `headers`/`findBestTemplate`
+    // are computed on the request-skip-trimmed text, so re-trimming post-match
+    // could shift which rows parse. Currency has no such ordering hazard.
+    const effCurrency = req.defaultCurrency ?? best.template.defaultCurrency ?? null;
     const mapped = parseWithMapping(
       text,
       best.template.columnMapping,
       best.template.defaultAccount ?? null,
       dateFormatOverride,
+      effCurrency,
     );
     if (mapped.rows.length > 0) {
       const filled = applyDefaultAccount(mapped.rows, defaultAccountName);
@@ -279,6 +309,7 @@ export async function parseCsvWithFallback(
       directAuto,
       null,
       dateFormatOverride,
+      defaultCurrency,
     );
     if (mapped.rows.length > 0) {
       const filled = applyDefaultAccount(mapped.rows, defaultAccountName);
@@ -316,11 +347,13 @@ function parseWithMapping(
   mapping: ColumnMapping,
   defaultAccount: string | null,
   dateFormatOverride?: DateFormatOverride | null,
+  defaultCurrency?: string | null,
 ): { rows: RawTransaction[]; errors: ParseError[] } {
   const result = csvToRawTransactionsWithMapping(
     text,
     mapping as unknown as Record<string, string>,
     dateFormatOverride,
+    defaultCurrency,
   );
   if (defaultAccount) {
     result.rows = result.rows.map((r) => ({

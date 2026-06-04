@@ -305,7 +305,7 @@ export async function POST(request: NextRequest) {
       templateId,
       userId,
       defaultAccountName,
-      { skipHeaderRows, skipFooterRows, dateFormatOverride },
+      { skipHeaderRows, skipFooterRows, dateFormatOverride, defaultCurrency },
       boundAccountCurrency,
     );
     if ("status" in parseResult) {
@@ -845,6 +845,7 @@ async function parseStatement(
     skipHeaderRows: number;
     skipFooterRows: number;
     dateFormatOverride: DateFormatOverride | null;
+    defaultCurrency: string | null;
   },
   boundAccountCurrency: string | null,
 ): Promise<ParseSuccess | ParseFailure> {
@@ -858,6 +859,7 @@ async function parseStatement(
       skipHeaderRows: knobs.skipHeaderRows,
       skipFooterRows: knobs.skipFooterRows,
       dateFormatOverride: knobs.dateFormatOverride,
+      defaultCurrency: knobs.defaultCurrency,
       anchorCurrency: boundAccountCurrency,
     });
     if (result.kind === "template-not-found") {
