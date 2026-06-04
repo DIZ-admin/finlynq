@@ -1,6 +1,6 @@
 # apiHandler rollout checklist (FINLYNQ-107 → FINLYNQ-116)
 
-**Status:** `apiHandler` shipped + the `/api/portfolio/operations/*` group migrated as the proof-of-pattern (2026-06-03). The broad rollout of the remaining ~113 hand-rolled-try/catch routes is the deferred follow-up tracked as **FINLYNQ-116** (`postponed`, `relates_to` FINLYNQ-107). This file enumerates the remaining work so the increment is explicitly partial.
+**Status:** `apiHandler` shipped + the `/api/portfolio/operations/*` group migrated as the proof-of-pattern (2026-06-03); `notifications` + `holding-accounts` migrated as **FINLYNQ-116** increment 1 (2026-06-04). The broad rollout of the remaining ~111 hand-rolled-try/catch routes continues incrementally under **FINLYNQ-116** (`relates_to` FINLYNQ-107). This file enumerates the remaining work so each increment is explicitly partial.
 
 ## What `apiHandler` is
 
