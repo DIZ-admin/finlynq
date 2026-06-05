@@ -40,6 +40,9 @@ interface BatchRow {
   anchorCount: number;
   currentRowCount: number;
   hasLinkedTransactions: boolean;
+  /** Source staged import — drives the click-through back to the staging
+   *  two-pane review. Null for simplified/auto batches (no staged import). */
+  stagedImportId: string | null;
 }
 
 interface ConfirmState {
@@ -64,10 +67,10 @@ export function RecentUploadsPanel({
   title?: string;
   /** Empty-state copy when the account has no loaded batches yet. */
   emptyLabel?: string;
-  /** Clicking a batch row calls this. The /import page wires it to switch to
-   *  the existing Reconcile screen (where the imported transactions show on
-   *  the left). When unset, the row is non-interactive. */
-  onOpenBatch?: (batch: BatchRow) => void;
+  /** Clicking a batch row calls this with the batch's source staged_import_id
+   *  (null for simplified/auto). The surface re-opens the staging two-pane
+   *  review for that import. When unset, the row is non-interactive. */
+  onOpenBatch?: (stagedImportId: string | null) => void;
 }) {
   const [collapsed, setCollapsed] = useState(false);
   const [batches, setBatches] = useState<BatchRow[]>([]);
@@ -226,9 +229,9 @@ export function RecentUploadsPanel({
                       {onOpenBatch ? (
                         <button
                           type="button"
-                          onClick={() => onOpenBatch(b)}
+                          onClick={() => onOpenBatch(b.stagedImportId)}
                           className="min-w-0 flex-1 text-left hover:opacity-80"
-                          title="Open the bank-ledger / reconcile view for this account"
+                          title="Open the staging review for this import"
                         >
                           {meta}
                         </button>

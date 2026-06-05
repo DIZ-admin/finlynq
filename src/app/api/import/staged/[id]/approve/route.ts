@@ -58,7 +58,7 @@
 
 import { NextRequest, NextResponse } from "next/server";
 import { db, schema } from "@/db";
-import { and, eq, asc, inArray } from "drizzle-orm";
+import { and, eq, asc, inArray, ne } from "drizzle-orm";
 import { requireEncryption } from "@/lib/auth/require-encryption";
 import { decryptStaged } from "@/lib/crypto/staging-envelope";
 import { tryDecryptField } from "@/lib/crypto/envelope";
@@ -419,19 +419,34 @@ export async function POST(
     }
   }
 
-  // ─── Cleanup: delete materialized staged rows + mark import approved ────
+  // ─── Mark materialized rows imported (KEEP them) + maybe mark approved ──
+  //
+  // 2026-06-05: materialized rows are no longer DELETED. They're flipped to
+  // row_status='approved' and KEPT so the staged two-pane review keeps showing
+  // them on the file (right) side — highlighted as "imported" — instead of
+  // vanishing. The user (or the "Loaded into the bank ledger" click) re-opens
+  // the same review screen and sees what was pushed. Re-sending is safe: these
+  // rows are excluded from the approve selection client-side, and
+  // upsertBankTransaction is idempotent (ON CONFLICT) if one slips through.
   if (materializedRowIds.size > 0) {
     await db
-      .delete(schema.stagedTransactions)
+      .update(schema.stagedTransactions)
+      .set({ rowStatus: "approved" })
       .where(inArray(schema.stagedTransactions.id, Array.from(materializedRowIds)));
   }
-  // If there are no remaining staged_transactions for this import, mark
-  // the import as approved. Otherwise leave it pending so the user can
-  // come back and address the failed/skipped rows.
+  // If no rows still need action (every row is now 'approved'), mark the
+  // import approved so it leaves the pending list. Rows are kept either way
+  // — an 'approved' import still carries its imported staged_transactions so
+  // the review screen can be re-opened from the Loaded section. Skipped /
+  // failed rows keep row_status='pending', so the batch stays pending until
+  // the user resolves them.
   const remaining = await db
     .select({ id: schema.stagedTransactions.id })
     .from(schema.stagedTransactions)
-    .where(eq(schema.stagedTransactions.stagedImportId, id))
+    .where(and(
+      eq(schema.stagedTransactions.stagedImportId, id),
+      ne(schema.stagedTransactions.rowStatus, "approved"),
+    ))
     .limit(1)
     .all();
   if (remaining.length === 0) {

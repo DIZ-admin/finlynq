@@ -44,10 +44,11 @@ export function StagedListView({
    *  the pending list. Null in route mode (cross-account /import/pending) —
    *  the Loaded section is suppressed there since it needs a single account. */
   accountScope?: number | null;
-  /** Clicking a loaded (already-processed) batch calls this — the /import page
-   *  routes it to the Reconcile tab (the existing bank-ledger ↔ transactions
-   *  view, which shows the imported transactions on its left). */
-  onOpenLoadedBatch?: () => void;
+  /** Clicking a loaded (already-processed) batch calls this with the batch's
+   *  source `staged_import_id` (null for simplified/auto batches). The surface
+   *  re-opens the staging two-pane review for that import — where the imported
+   *  rows persist, highlighted. */
+  onOpenLoadedBatch?: (stagedImportId: string | null) => void;
 }) {
   // Summary over the (already account-filtered by the parent) pending list.
   // "Rows to load" = the rows that will materialize into the bank ledger on
@@ -274,7 +275,7 @@ export function StagedListView({
             title="Loaded into the bank ledger"
             emptyLabel="No imports have been loaded into the bank ledger for this account yet."
             onChange={loadList}
-            onOpenBatch={onOpenLoadedBatch ? () => onOpenLoadedBatch() : undefined}
+            onOpenBatch={onOpenLoadedBatch}
           />
         </div>
       )}
