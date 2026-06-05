@@ -1,5 +1,5 @@
 /**
- * DEK-bearing email-inbox sweep (Epic B5).
+ * DEK-bearing email-inbox sweep + shared record path (Epic B5 / C1).
  *
  * Runs with the user's DEK in scope (login / MFA-verify / demo / Email-tab
  * GET). Two passes:
@@ -9,23 +9,16 @@
  *            encryption_tier). Mirrors upgradeStagingEncryption; per-row
  *            try/catch + optimistic WHERE so concurrent sweeps are safe.
  *
- *   Pass B — for each `needs_review` BODY row: load its staged candidate, match
- *            the user's email-import rules (decrypted), and when exactly the
- *            top-priority rule resolves an account:
- *              - recompute import_hash with the RESOLVED accountId (never the
- *                accountId=0 staged sentinel),
- *              - dedup against bank_transactions (checkDuplicates) →
- *                duplicate_skipped on a hit,
- *              - mode='auto' + a category + clean guards → promote to the bank
- *                ledger (upsertBankTransaction) + materialize a `transactions`
- *                row + a primary `transaction_bank_links` row + invalidateUser
- *                → auto_recorded,
- *              - otherwise stay needs_review (the tab pre-fills the account).
+ *   Pass B — for each high-confidence `needs_review` BODY row: match the user's
+ *            email-import rules (decrypted). A matching `mode='auto'` rule
+ *            delegates to `recordEmailInboxRow` (recompute account-bound hash →
+ *            dedup → materialize); a `mode='review'` match just stamps the
+ *            resolved rule and stays needs_review (the tab pre-fills); no match
+ *            stays needs_review.
  *
- * Idempotent: a row that's already auto_recorded/duplicate_skipped is skipped;
- * re-running on a needs_review row that still matches nothing is a cheap no-op.
- * Per-user in-flight lock prevents a login + tab-GET double-fire from
- * double-recording (belt-and-braces with the bank-ledger ON CONFLICT).
+ * `recordEmailInboxRow` is the SINGLE materialize path — the auto-sweep AND the
+ * manual "Record" click in the Email tab both call it, so the dedup +
+ * sign/investment/ownership guards + bank-ledger promotion can't diverge.
  *
  * Auto-record is gated on a SENDER/SUBJECT RULE MATCH — the v1 anti-spoof
  * posture (Mailpit doesn't verify SPF/DKIM). Without a matching auto-rule an
@@ -49,6 +42,12 @@ export interface ProcessInboxResult {
   duplicateSkipped: number;
   needsReview: number;
   failed: number;
+}
+
+export interface RecordEmailResult {
+  status: "recorded" | "duplicate" | "not_found" | "invalid";
+  transactionId?: number;
+  reason?: string;
 }
 
 // Per-user in-flight guard (HMR-safe via globalThis), mirrors tryBeginRebuild.
@@ -78,8 +77,7 @@ export function enqueueProcessPendingInbox(userId: string, dek: Buffer): void {
   });
 }
 
-/** Awaitable form (production callers use the enqueue wrapper; the Email-tab
- *  GET awaits so the list reflects the sweep). */
+/** Awaitable form (the Email-tab GET awaits so the list reflects the sweep). */
 export async function processPendingInboxEmails(
   userId: string,
   dek: Buffer,
@@ -98,15 +96,12 @@ export async function processPendingInboxEmails(
 
     const rules = await loadActiveEmailRules(userId, dek);
 
-    // Process needs_review BODY rows (attachments stay user-bound at the tab /
-    // /import/pending; v1 auto-routes body only).
     const rows = await db
       .select({
         id: schema.emailInbox.id,
         fromAddress: schema.emailInbox.fromAddress,
         subject: schema.emailInbox.subject,
         encryptionTier: schema.emailInbox.encryptionTier,
-        stagedImportId: schema.emailInbox.stagedImportId,
         parseConfidence: schema.emailInbox.parseConfidence,
       })
       .from(schema.emailInbox)
@@ -123,14 +118,14 @@ export async function processPendingInboxEmails(
 
     for (const row of rows) {
       try {
-        const fromAddress = decodeInbox(row.encryptionTier, dek, row.fromAddress);
-        const subject = decodeInbox(row.encryptionTier, dek, row.subject);
-
         // Only HIGH-confidence candidates auto-record; low/unparseable stay.
         if (row.parseConfidence !== "high") {
           result.needsReview += 1;
           continue;
         }
+
+        const fromAddress = decodeInbox(row.encryptionTier, dek, row.fromAddress);
+        const subject = decodeInbox(row.encryptionTier, dek, row.subject);
 
         const rule = firstMatchingRule(rules, { fromAddress, subject });
         if (!rule) {
@@ -138,53 +133,9 @@ export async function processPendingInboxEmails(
           continue;
         }
 
-        // Load the staged candidate (date/amount/currency plaintext, payee
-        // encrypted tier-aware).
-        if (!row.stagedImportId) {
-          result.needsReview += 1;
-          continue;
-        }
-        const staged = await db
-          .select({
-            id: schema.stagedTransactions.id,
-            date: schema.stagedTransactions.date,
-            amount: schema.stagedTransactions.amount,
-            currency: schema.stagedTransactions.currency,
-            payee: schema.stagedTransactions.payee,
-            encryptionTier: schema.stagedTransactions.encryptionTier,
-          })
-          .from(schema.stagedTransactions)
-          .where(eq(schema.stagedTransactions.stagedImportId, row.stagedImportId))
-          .limit(1);
-        const cand = staged[0];
-        if (!cand) {
-          result.needsReview += 1;
-          continue;
-        }
-        const payee = decodeStaged(cand.encryptionTier, dek, cand.payee) ?? "";
-        const currency = (cand.currency ?? "USD").toUpperCase();
-
-        // Recompute the import_hash with the RESOLVED account (never the
-        // accountId=0 staged sentinel).
-        const hash = generateImportHash(cand.date, rule.accountId, cand.amount, payee);
-
-        // Dedup against the bank ledger.
-        const dup = await checkDuplicates([hash], userId);
-        if (dup.has(hash)) {
-          await db
-            .update(schema.emailInbox)
-            .set({ action: "duplicate_skipped", matchedRuleId: rule.id })
-            .where(eq(schema.emailInbox.id, row.id));
-          await markStagedRejected(row.stagedImportId, cand.id);
-          result.duplicateSkipped += 1;
-          continue;
-        }
-
-        // Decide whether we can auto-record. mode='review', no category, an
-        // investment account, or a sign-vs-category mismatch all fall back to
-        // needs_review (with the account resolved so the tab pre-fills).
-        const canAuto = await canAutoRecord(userId, dek, rule, cand.amount);
-        if (rule.mode !== "auto" || rule.categoryId == null || !canAuto.ok) {
+        if (rule.mode !== "auto" || rule.categoryId == null) {
+          // Resolve the rule but wait for a user click (review mode, or an
+          // auto rule with no category). Stamp the rule so the tab pre-fills.
           await db
             .update(schema.emailInbox)
             .set({ matchedRuleId: rule.id })
@@ -193,28 +144,15 @@ export async function processPendingInboxEmails(
           continue;
         }
 
-        const txId = await materialize({
-          userId,
-          dek,
+        const recorded = await recordEmailInboxRow(userId, dek, row.id, {
           accountId: rule.accountId,
           categoryId: rule.categoryId,
-          date: cand.date,
-          amount: cand.amount,
-          currency,
-          payee,
-          importHash: hash,
+          matchedRuleId: rule.id,
+          finalAction: "auto_recorded",
         });
-
-        await db
-          .update(schema.emailInbox)
-          .set({
-            action: "auto_recorded",
-            matchedRuleId: rule.id,
-            recordedTransactionId: txId,
-          })
-          .where(eq(schema.emailInbox.id, row.id));
-        await markStagedImported(row.stagedImportId, cand.id);
-        result.autoRecorded += 1;
+        if (recorded.status === "recorded") result.autoRecorded += 1;
+        else if (recorded.status === "duplicate") result.duplicateSkipped += 1;
+        else result.needsReview += 1;
       } catch (err) {
         result.failed += 1;
         console.warn("[inbox-sweep] row failed", {
@@ -227,6 +165,128 @@ export async function processPendingInboxEmails(
     endSweep(userId);
   }
   return result;
+}
+
+/**
+ * Materialize one body email into the ledger. Shared by the auto-sweep and the
+ * manual "Record" click. Loads the staged candidate, recomputes the import_hash
+ * with the resolved account, dedups against bank_transactions, runs the
+ * sign/investment/ownership guards, promotes to the bank ledger, and writes the
+ * categorized transaction + primary link. Updates the email_inbox action.
+ */
+export async function recordEmailInboxRow(
+  userId: string,
+  dek: Buffer,
+  inboxId: string,
+  opts: {
+    accountId: number;
+    categoryId: number | null;
+    matchedRuleId?: number | null;
+    finalAction: "auto_recorded" | "manually_recorded";
+  },
+): Promise<RecordEmailResult> {
+  const inboxRows = await db
+    .select({
+      id: schema.emailInbox.id,
+      sourceKind: schema.emailInbox.sourceKind,
+      stagedImportId: schema.emailInbox.stagedImportId,
+      action: schema.emailInbox.action,
+    })
+    .from(schema.emailInbox)
+    .where(and(eq(schema.emailInbox.id, inboxId), eq(schema.emailInbox.userId, userId)))
+    .limit(1);
+  const inbox = inboxRows[0];
+  if (!inbox) return { status: "not_found" };
+  if (inbox.sourceKind !== "body" || !inbox.stagedImportId) {
+    return { status: "invalid", reason: "not_a_body_email" };
+  }
+
+  // Stamp the matched rule early (a hint survives even a guard-fail).
+  if (opts.matchedRuleId != null) {
+    await db
+      .update(schema.emailInbox)
+      .set({ matchedRuleId: opts.matchedRuleId })
+      .where(eq(schema.emailInbox.id, inboxId));
+  }
+
+  if (opts.categoryId == null) return { status: "invalid", reason: "no_category" };
+
+  const staged = await db
+    .select({
+      id: schema.stagedTransactions.id,
+      date: schema.stagedTransactions.date,
+      amount: schema.stagedTransactions.amount,
+      currency: schema.stagedTransactions.currency,
+      payee: schema.stagedTransactions.payee,
+      encryptionTier: schema.stagedTransactions.encryptionTier,
+    })
+    .from(schema.stagedTransactions)
+    .where(eq(schema.stagedTransactions.stagedImportId, inbox.stagedImportId))
+    .limit(1);
+  const cand = staged[0];
+  if (!cand) return { status: "invalid", reason: "no_candidate" };
+  const payee = decodeStaged(cand.encryptionTier, dek, cand.payee) ?? "";
+  const currency = (cand.currency ?? "USD").toUpperCase();
+
+  const guard = await checkGuards(userId, dek, opts.accountId, opts.categoryId, cand.amount);
+  if (!guard.ok) return { status: "invalid", reason: guard.reason };
+
+  const hash = generateImportHash(cand.date, opts.accountId, cand.amount, payee);
+  const dup = await checkDuplicates([hash], userId);
+  if (dup.has(hash)) {
+    await db
+      .update(schema.emailInbox)
+      .set({ action: "duplicate_skipped" })
+      .where(eq(schema.emailInbox.id, inboxId));
+    await markStagedRejected(inbox.stagedImportId, cand.id);
+    return { status: "duplicate" };
+  }
+
+  const txId = await materialize({
+    userId,
+    dek,
+    accountId: opts.accountId,
+    categoryId: opts.categoryId,
+    date: cand.date,
+    amount: cand.amount,
+    currency,
+    payee,
+    importHash: hash,
+  });
+
+  await db
+    .update(schema.emailInbox)
+    .set({ action: opts.finalAction, recordedTransactionId: txId })
+    .where(eq(schema.emailInbox.id, inboxId));
+  await markStagedImported(inbox.stagedImportId, cand.id);
+  return { status: "recorded", transactionId: txId };
+}
+
+/** Mark an inbox row discarded (user dismissed it) + reject its staged copy. */
+export async function discardEmailInboxRow(
+  userId: string,
+  inboxId: string,
+): Promise<boolean> {
+  const rows = await db
+    .select({
+      id: schema.emailInbox.id,
+      stagedImportId: schema.emailInbox.stagedImportId,
+    })
+    .from(schema.emailInbox)
+    .where(and(eq(schema.emailInbox.id, inboxId), eq(schema.emailInbox.userId, userId)))
+    .limit(1);
+  if (!rows[0]) return false;
+  await db
+    .update(schema.emailInbox)
+    .set({ action: "discarded" })
+    .where(eq(schema.emailInbox.id, inboxId));
+  if (rows[0].stagedImportId) {
+    await db
+      .update(schema.stagedImports)
+      .set({ status: "rejected" })
+      .where(eq(schema.stagedImports.id, rows[0].stagedImportId));
+  }
+  return true;
 }
 
 // ─── Pass A: encryption upgrade ──────────────────────────────────────────────
@@ -269,7 +329,6 @@ async function upgradeInboxEncryption(userId: string, dek: Buffer): Promise<numb
         .where(
           and(
             eq(schema.emailInbox.id, r.id),
-            // Optimistic guard — concurrent sweep already flipped this row.
             eq(schema.emailInbox.encryptionTier, "service"),
           ),
         );
@@ -299,7 +358,6 @@ async function materialize(args: {
 }): Promise<number> {
   const { userId, dek, accountId, categoryId, date, amount, currency, payee, importHash } = args;
 
-  // Promote to the bank ledger first (content-immutable, dedup source of truth).
   const { id: bankTxId } = await upsertBankTransaction(dek, {
     userId,
     accountId,
@@ -312,7 +370,6 @@ async function materialize(args: {
     source: "import",
   });
 
-  // Materialize the categorized transaction + primary link in one DB tx.
   const txId = await db.transaction(async (tx) => {
     const txRow = await tx
       .insert(schema.transactions)
@@ -328,7 +385,6 @@ async function materialize(args: {
         tags: "",
         importHash,
         bankTransactionId: bankTxId,
-        // Email import → ledger materialization.
         source: "import",
       })
       .returning({ id: schema.transactions.id });
@@ -348,38 +404,33 @@ async function materialize(args: {
   return txId;
 }
 
-async function canAutoRecord(
+async function checkGuards(
   userId: string,
   dek: Buffer,
-  rule: { accountId: number; categoryId: number | null },
+  accountId: number,
+  categoryId: number,
   amount: number,
-): Promise<{ ok: boolean }> {
-  if (rule.categoryId == null) return { ok: false };
-
+): Promise<{ ok: boolean; reason?: string }> {
   // Investment-account guard — the body surface doesn't collect a holding.
   const acct = await db
     .select({ isInvestment: schema.accounts.isInvestment })
     .from(schema.accounts)
-    .where(
-      and(eq(schema.accounts.id, rule.accountId), eq(schema.accounts.userId, userId)),
-    )
+    .where(and(eq(schema.accounts.id, accountId), eq(schema.accounts.userId, userId)))
     .limit(1);
-  if (!acct[0] || acct[0].isInvestment) return { ok: false };
+  if (!acct[0]) return { ok: false, reason: "account_not_found" };
+  if (acct[0].isInvestment) return { ok: false, reason: "investment_account" };
 
   // Cross-tenant FK guard on the category.
   const cat = await db
     .select({ id: schema.categories.id })
     .from(schema.categories)
-    .where(
-      and(eq(schema.categories.id, rule.categoryId), eq(schema.categories.userId, userId)),
-    )
+    .where(and(eq(schema.categories.id, categoryId), eq(schema.categories.userId, userId)))
     .limit(1);
-  if (!cat[0]) return { ok: false };
+  if (!cat[0]) return { ok: false, reason: "category_not_found" };
 
-  // Sign-vs-category — same enforcement as /approve. Mismatch → fall back to
-  // needs_review so the user can pick a different category.
-  const violation = await validateSignVsCategoryById(userId, dek, rule.categoryId, amount);
-  if (violation) return { ok: false };
+  // Sign-vs-category — same enforcement as /approve.
+  const violation = await validateSignVsCategoryById(userId, dek, categoryId, amount);
+  if (violation) return { ok: false, reason: "sign_category_mismatch" };
 
   return { ok: true };
 }
@@ -433,3 +484,6 @@ function decodeStaged(tier: string | null, dek: Buffer, value: string | null): s
     return null;
   }
 }
+
+// Exported for the Email-tab list/detail routes (tier-aware field decrypt).
+export { decodeInbox, decodeStaged };
