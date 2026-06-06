@@ -20,6 +20,8 @@
 import { db, schema } from "@/db";
 import { sql, and, eq, lt, gt, isNotNull, isNull, or } from "drizzle-orm";
 import { convertToAccountCurrency } from "@/lib/currency-conversion";
+import { computeReportingFields } from "@/lib/fx/reporting-amount";
+import { getDisplayCurrency } from "@/lib/fx-service";
 
 export type SettleResult = { settled: number; failed: number; errors: string[] };
 
@@ -95,6 +97,87 @@ export async function settleFutureFxRates(): Promise<SettleResult> {
   return { settled, failed, errors };
 }
 
+/**
+ * Re-rate the STORED reporting_amount (currency rework Phase 3) for rows that
+ * were future-dated at entry. At write time a future-dated row's reporting
+ * amount is computed against today's spot (no rate exists for a future day);
+ * once the date arrives the true historical rate is available. Unlike the
+ * self-heal (which only fires on NULL / currency-mismatch rows), a future-dated
+ * row already carries a stored value in the right currency, so only this cron
+ * catches the rate drift.
+ *
+ * Candidate set mirrors the entered-settle query (date arrived AND was
+ * post-dated at entry) but does NOT require entered_currency != currency — the
+ * reporting leg drifts whenever account currency != display currency,
+ * regardless of the entered leg. Best-effort + idempotent (skips rows whose
+ * rate hasn't materially changed).
+ */
+export async function settleFutureReportingRates(): Promise<SettleResult> {
+  const today = new Date().toISOString().split("T")[0];
+
+  const candidates = await db
+    .select({
+      id: schema.transactions.id,
+      userId: schema.transactions.userId,
+      date: schema.transactions.date,
+      currency: schema.transactions.currency,
+      amount: schema.transactions.amount,
+      reportingCurrency: schema.transactions.reportingCurrency,
+      reportingRate: schema.transactions.reportingRate,
+    })
+    .from(schema.transactions)
+    .where(and(
+      lt(schema.transactions.date, sql`(${today}::date + INTERVAL '1 day')::text`),
+      sql`${schema.transactions.date}::date > ${schema.transactions.enteredAt}::date`,
+    ));
+
+  let settled = 0;
+  let failed = 0;
+  const errors: string[] = [];
+  const dispCache = new Map<string, string>();
+
+  for (const row of candidates) {
+    try {
+      let disp = dispCache.get(row.userId);
+      if (!disp) {
+        disp = (await getDisplayCurrency(row.userId)).toUpperCase();
+        dispCache.set(row.userId, disp);
+      }
+      const r = await computeReportingFields({
+        userId: row.userId,
+        accountCurrency: row.currency,
+        amount: row.amount ?? 0,
+        date: row.date,
+        reportingCurrency: disp,
+      });
+      if (!r) continue; // rate still unresolved — wait for the next sweep
+      // Skip if already stored in the right currency at an unchanged rate.
+      if (
+        row.reportingCurrency === r.reportingCurrency &&
+        row.reportingRate != null &&
+        Math.abs(r.reportingRate - row.reportingRate) < 1e-9
+      ) {
+        continue;
+      }
+      await db
+        .update(schema.transactions)
+        .set({
+          reportingCurrency: r.reportingCurrency,
+          reportingRate: r.reportingRate,
+          reportingAmount: r.reportingAmount,
+          updatedAt: sql`NOW()`,
+        })
+        .where(eq(schema.transactions.id, row.id));
+      settled++;
+    } catch (err) {
+      failed++;
+      errors.push(`tx ${row.id}: ${err instanceof Error ? err.message : String(err)}`);
+    }
+  }
+
+  return { settled, failed, errors };
+}
+
 let timer: NodeJS.Timeout | null = null;
 
 /**
@@ -108,6 +191,10 @@ export function startSettleFutureFxTimer(): void {
     settleFutureFxRates().catch((err) => {
       // eslint-disable-next-line no-console
       console.error("[settle-future-fx] sweep failed:", err);
+    });
+    settleFutureReportingRates().catch((err) => {
+      // eslint-disable-next-line no-console
+      console.error("[settle-future-fx] reporting sweep failed:", err);
     });
   }, ONE_DAY);
   if (timer.unref) timer.unref();

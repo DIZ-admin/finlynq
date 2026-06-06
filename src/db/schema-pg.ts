@@ -97,12 +97,26 @@ export const transactions = pgTable("transactions", {
   // Phase 2 of the currency rework — entered/account/reporting trilogy.
   // entered_* fields capture what the user actually typed (the trade) and
   // the FX rate used to convert at entry time. Locked at write time so
-  // historical balances are stable when rates move. Reporting currency is
-  // computed at view time and not stored. Soft-fallback reads via
+  // historical balances are stable when rates move. Soft-fallback reads via
   // normalizeTxRow() in src/lib/queries.ts handle un-backfilled rows.
   enteredCurrency: text("entered_currency"),
   enteredAmount: doublePrecision("entered_amount"),
   enteredFxRate: doublePrecision("entered_fx_rate"),
+  // Phase 3 of the currency rework (2026-06-06) — the REPORTING leg is now
+  // STORED (was "computed at view time and not stored"). reporting_amount is
+  // `amount` (account currency) converted to the user's display/reporting
+  // currency at THIS row's `date` historical rate, locked at write time.
+  // Flow reports (trends / yoy / income-statement income+expense /
+  // tax-summary) SUM it directly instead of converting at today's rate.
+  // reporting_currency records which currency it's in; when the user switches
+  // display currency a background job (recomputeReportingAmounts) re-derives
+  // every row at historical rates. Reports fall back to on-the-fly conversion
+  // of `amount` for rows where reporting_currency != the current display
+  // currency or the value is NULL (un-backfilled / future-dated). See
+  // src/lib/fx/reporting-amount.ts.
+  reportingCurrency: text("reporting_currency"),
+  reportingAmount: doublePrecision("reporting_amount"),
+  reportingRate: doublePrecision("reporting_rate"),
   // entered_at is when the row was created — used to detect future-dated
   // entries that the nightly cron should re-rate once their date arrives.
   // NOT a creation timestamp; the FX cron is the only consumer. The new
@@ -1703,6 +1717,24 @@ export const portfolioSnapshotDirty = pgTable("portfolio_snapshot_dirty", {
   userId: text("user_id").primaryKey(),
   fromDate: text("from_date").notNull(),
   markedAt: timestamp("marked_at", { withTimezone: true }).notNull().defaultNow(),
+});
+
+// ─── reporting_recompute_status — currency-switch recompute progress (2026-06-06)
+//
+// Phase 3 of the currency rework. When a user switches their display/reporting
+// currency, recomputeReportingAmounts() re-derives every transaction's
+// reporting_amount at historical rates into the new currency. This one-row-per-
+// user table drives the progress toast on the Settings page: `total`/`done` are
+// bumped as the job batches through rows, `finished_at` is set when complete.
+// `GET /api/settings/reporting-currency/recompute/status` reads it. Best-effort
+// progress only — reports stay correct via the on-the-fly fallback regardless.
+export const reportingRecomputeStatus = pgTable("reporting_recompute_status", {
+  userId: text("user_id").primaryKey(),
+  targetCurrency: text("target_currency").notNull(),
+  total: integer("total").notNull().default(0),
+  done: integer("done").notNull().default(0),
+  startedAt: timestamp("started_at", { withTimezone: true }).notNull().defaultNow(),
+  finishedAt: timestamp("finished_at", { withTimezone: true }),
 });
 
 // ─── portfolio_cash_snapshot_meta — cash-snapshot staleness watermark (2026-06-13)

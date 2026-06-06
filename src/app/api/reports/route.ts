@@ -5,6 +5,7 @@ import { requireAuth } from "@/lib/auth/require-auth";
 import { getDEK } from "@/lib/crypto/dek-cache";
 import { decryptName } from "@/lib/crypto/encrypted-columns";
 import { getRateMap, convertWithRateMap, getDisplayCurrency } from "@/lib/fx-service";
+import { selfHealReportingAmounts } from "@/lib/fx/reporting-amount";
 import {
   computeAllAccountsUnrealizedPnL,
   summarizeUnrealizedPnL,
@@ -23,6 +24,29 @@ export async function GET(request: NextRequest) {
 
   const rateMap = await getRateMap(displayCurrency, userId);
 
+  // Currency rework Phase 3 — flow reports (income-statement income/expense +
+  // tax-summary) prefer the STORED per-row historical reporting_amount, falling
+  // back to on-the-fly current-rate conversion for rows not yet (re)computed
+  // into the current display currency. Balance-sheet intentionally stays on the
+  // current-rate path below (a balance sheet is a point-in-time current value).
+  const displayUpper = displayCurrency.toUpperCase();
+  void selfHealReportingAmounts(userId, displayUpper);
+  const convertGroup = (row: {
+    currency: string | null;
+    reportingCurrency: string | null;
+    totalAmount: number | null;
+    totalReporting: number | null;
+  }): number => {
+    if (
+      row.reportingCurrency &&
+      row.reportingCurrency.toUpperCase() === displayUpper &&
+      row.totalReporting != null
+    ) {
+      return row.totalReporting;
+    }
+    return convertWithRateMap(row.totalAmount ?? 0, row.currency ?? displayUpper, rateMap);
+  };
+
   if (type === "income-statement") {
     const conditions = [
       eq(schema.transactions.userId, userId),
@@ -40,13 +64,15 @@ export async function GET(request: NextRequest) {
         categoryGroup: schema.categories.group,
         categoryNameCt: schema.categories.nameCt,
         currency: schema.transactions.currency,
+        reportingCurrency: schema.transactions.reportingCurrency,
         total: sql<number>`SUM(${schema.transactions.amount})`,
+        totalReporting: sql<number | null>`SUM(${schema.transactions.reportingAmount})`,
         count: sql<number>`COUNT(*)`,
       })
       .from(schema.transactions)
       .leftJoin(schema.categories, eq(schema.transactions.categoryId, schema.categories.id))
       .where(and(...conditions))
-      .groupBy(schema.categories.id, schema.categories.type, schema.categories.group, schema.categories.nameCt, schema.transactions.currency)
+      .groupBy(schema.categories.id, schema.categories.type, schema.categories.group, schema.categories.nameCt, schema.transactions.currency, schema.transactions.reportingCurrency)
       .orderBy(schema.categories.type, schema.categories.group)
       .all();
 
@@ -58,7 +84,12 @@ export async function GET(request: NextRequest) {
       const catGroup = row.categoryGroup ?? "";
       const catName = decryptName(row.categoryNameCt, dek, null) ?? "";
       const key = row.categoryId ?? `null:${catType}:${catGroup}:${catName}`;
-      const converted = convertWithRateMap(row.total, row.currency, rateMap);
+      const converted = convertGroup({
+        currency: row.currency,
+        reportingCurrency: row.reportingCurrency,
+        totalAmount: row.total,
+        totalReporting: row.totalReporting,
+      });
       const existing = categoryTotals.get(key);
       if (existing) {
         existing.total += converted;
@@ -197,7 +228,9 @@ export async function GET(request: NextRequest) {
         categoryGroup: schema.categories.group,
         categoryNameCt: schema.categories.nameCt,
         currency: schema.transactions.currency,
+        reportingCurrency: schema.transactions.reportingCurrency,
         total: sql<number>`SUM(${schema.transactions.amount})`,
+        totalReporting: sql<number | null>`SUM(${schema.transactions.reportingAmount})`,
       })
       .from(schema.transactions)
       .leftJoin(schema.categories, eq(schema.transactions.categoryId, schema.categories.id))
@@ -209,7 +242,7 @@ export async function GET(request: NextRequest) {
           sql`${schema.categories.type} IN ('I', 'E')`
         )
       )
-      .groupBy(schema.categories.id, schema.categories.group, schema.categories.nameCt, schema.transactions.currency)
+      .groupBy(schema.categories.id, schema.categories.group, schema.categories.nameCt, schema.transactions.currency, schema.transactions.reportingCurrency)
       .all();
 
     // Aggregate across currencies per category â€” keyed on categoryId.
@@ -218,7 +251,12 @@ export async function GET(request: NextRequest) {
       const group = r.categoryGroup ?? "";
       const category = decryptName(r.categoryNameCt, dek, null) ?? "";
       const key = r.categoryId ?? `null:${group}:${category}`;
-      const converted = convertWithRateMap(r.total, r.currency, rateMap);
+      const converted = convertGroup({
+        currency: r.currency,
+        reportingCurrency: r.reportingCurrency,
+        totalAmount: r.total,
+        totalReporting: r.totalReporting,
+      });
       const existing = categoryTotals.get(key);
       if (existing) {
         existing.total += converted;

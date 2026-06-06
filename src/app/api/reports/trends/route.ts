@@ -1,9 +1,11 @@
-﻿import { NextRequest, NextResponse } from "next/server";
+import { NextRequest, NextResponse } from "next/server";
 import { db, schema } from "@/db";
 import { sql, and, gte, lte, eq } from "drizzle-orm";
 import { requireAuth } from "@/lib/auth/require-auth";
 import { getDEK } from "@/lib/crypto/dek-cache";
 import { decryptName } from "@/lib/crypto/encrypted-columns";
+import { getDisplayCurrency, getRateMap, convertWithRateMap } from "@/lib/fx-service";
+import { selfHealReportingAmounts } from "@/lib/fx/reporting-amount";
 
 type Period = "daily" | "weekly" | "monthly" | "quarterly";
 type GroupBy = "category" | "group";
@@ -53,9 +55,36 @@ export async function GET(request: NextRequest) {
   const groupBy = (params.get("groupBy") ?? "category") as GroupBy;
   const isBusiness = params.get("business") === "true";
 
+  // Currency rework Phase 3 — convert to the display currency. Prefer the
+  // STORED per-row historical reporting_amount; fall back to on-the-fly
+  // current-rate conversion of `amount` for rows not yet (re)computed into the
+  // current display currency. A guarded background recompute backfills them.
+  const displayCurrency = (await getDisplayCurrency(userId, params.get("currency"))).toUpperCase();
+  const rateMap = await getRateMap(displayCurrency, userId);
+  void selfHealReportingAmounts(userId, displayCurrency);
+
+  const convertGroup = (row: {
+    currency: string | null;
+    reportingCurrency: string | null;
+    totalAmount: number | null;
+    totalReporting: number | null;
+  }): number => {
+    if (
+      row.reportingCurrency &&
+      row.reportingCurrency.toUpperCase() === displayCurrency &&
+      row.totalReporting != null
+    ) {
+      return row.totalReporting;
+    }
+    return convertWithRateMap(row.totalAmount ?? 0, row.currency ?? displayCurrency, rateMap);
+  };
+
   const periodCol = periodExpr(period);
 
-  // Time-series: income vs expenses per period
+  // Time-series: income vs expenses per period. Grouped by currency +
+  // reporting_currency so each (period, type, currency) slice can be resolved
+  // independently (stored reporting_amount when it matches the display
+  // currency, else a fallback conversion of the raw amount).
   const conditions = [
     eq(schema.transactions.userId, userId),
     gte(schema.transactions.date, startDate),
@@ -68,12 +97,15 @@ export async function GET(request: NextRequest) {
     .select({
       period: periodCol,
       categoryType: schema.categories.type,
-      total: sql<number>`SUM(${schema.transactions.amount})`,
+      currency: schema.transactions.currency,
+      reportingCurrency: schema.transactions.reportingCurrency,
+      totalAmount: sql<number>`SUM(${schema.transactions.amount})`,
+      totalReporting: sql<number | null>`SUM(${schema.transactions.reportingAmount})`,
     })
     .from(schema.transactions)
     .leftJoin(schema.categories, eq(schema.transactions.categoryId, schema.categories.id))
     .where(and(...conditions))
-    .groupBy(periodCol, schema.categories.type)
+    .groupBy(periodCol, schema.categories.type, schema.transactions.currency, schema.transactions.reportingCurrency)
     .orderBy(periodCol)
     .all();
 
@@ -83,8 +115,9 @@ export async function GET(request: NextRequest) {
     const key = row.period;
     if (!periodMap.has(key)) periodMap.set(key, { income: 0, expenses: 0 });
     const entry = periodMap.get(key)!;
-    if (row.categoryType === "I") entry.income += row.total;
-    else if (row.categoryType === "E") entry.expenses += Math.abs(row.total);
+    const val = convertGroup(row);
+    if (row.categoryType === "I") entry.income += val;
+    else if (row.categoryType === "E") entry.expenses += Math.abs(val);
   }
 
   const timeseries = Array.from(periodMap.entries())
@@ -100,7 +133,9 @@ export async function GET(request: NextRequest) {
   // Breakdown by category or group per period.
   // For category-mode: group on categories.id (stable through Phase-3 NULL)
   // and decrypt name_ct after the SQL aggregation. Group-mode keeps using
-  // the plaintext `categories.group` column (unencrypted).
+  // the plaintext `categories.group` column (unencrypted). Both add
+  // currency + reporting_currency to the grouping so each slice converts
+  // independently (see convertGroup).
   const isCategoryMode = groupBy !== "group";
 
   const breakdownRows = isCategoryMode
@@ -111,7 +146,10 @@ export async function GET(request: NextRequest) {
           categoryId: schema.categories.id,
           categoryNameCt: schema.categories.nameCt,
           categoryGroup: schema.categories.group,
-          total: sql<number>`SUM(${schema.transactions.amount})`,
+          currency: schema.transactions.currency,
+          reportingCurrency: schema.transactions.reportingCurrency,
+          totalAmount: sql<number>`SUM(${schema.transactions.amount})`,
+          totalReporting: sql<number | null>`SUM(${schema.transactions.reportingAmount})`,
           count: sql<number>`COUNT(*)`,
         })
         .from(schema.transactions)
@@ -123,6 +161,8 @@ export async function GET(request: NextRequest) {
           schema.categories.nameCt,
           schema.categories.type,
           schema.categories.group,
+          schema.transactions.currency,
+          schema.transactions.reportingCurrency,
         )
         .orderBy(periodCol, schema.categories.type, schema.categories.group)
         .all()
@@ -133,13 +173,16 @@ export async function GET(request: NextRequest) {
           categoryId: sql<number | null>`NULL`,
           categoryNameCt: sql<string | null>`NULL`,
           categoryGroup: schema.categories.group,
-          total: sql<number>`SUM(${schema.transactions.amount})`,
+          currency: schema.transactions.currency,
+          reportingCurrency: schema.transactions.reportingCurrency,
+          totalAmount: sql<number>`SUM(${schema.transactions.amount})`,
+          totalReporting: sql<number | null>`SUM(${schema.transactions.reportingAmount})`,
           count: sql<number>`COUNT(*)`,
         })
         .from(schema.transactions)
         .leftJoin(schema.categories, eq(schema.transactions.categoryId, schema.categories.id))
         .where(and(...conditions))
-        .groupBy(periodCol, schema.categories.group, schema.categories.type)
+        .groupBy(periodCol, schema.categories.group, schema.categories.type, schema.transactions.currency, schema.transactions.reportingCurrency)
         .orderBy(periodCol, schema.categories.type, schema.categories.group)
         .all();
 
@@ -160,7 +203,8 @@ export async function GET(request: NextRequest) {
     const target = row.categoryType === "I" ? incomeGroups : expenseGroups;
     if (!target.has(name)) target.set(name, { group: catGroup, total: 0, count: 0, periods: {} });
     const entry = target.get(name)!;
-    const amt = row.categoryType === "E" ? Math.abs(row.total) : row.total;
+    const converted = convertGroup(row);
+    const amt = row.categoryType === "E" ? Math.abs(converted) : converted;
     entry.total += amt;
     entry.count += Number(row.count);
     entry.periods[row.period] = (entry.periods[row.period] ?? 0) + amt;
@@ -187,6 +231,7 @@ export async function GET(request: NextRequest) {
     groupBy,
     startDate,
     endDate,
+    displayCurrency,
     timeseries,
     income: mapToArray(incomeGroups),
     expenses: mapToArray(expenseGroups),

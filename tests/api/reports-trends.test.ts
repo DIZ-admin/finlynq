@@ -17,13 +17,22 @@ vi.mock("@/db", () => ({
     get: (_t, prop) => mockDbChain[prop as string] ?? vi.fn().mockReturnValue(mockDbChain),
   }),
   schema: {
-    transactions: { id: "id", date: "date", amount: "amount", categoryId: "categoryId", currency: "currency" },
+    transactions: { id: "id", date: "date", amount: "amount", categoryId: "categoryId", currency: "currency", reportingCurrency: "reportingCurrency", reportingAmount: "reportingAmount", userId: "userId" },
     categories: { id: "id", type: "type", group: "group", name: "name" },
   },
 }));
 
 vi.mock("@/lib/auth/require-auth", () => ({
   requireAuth: vi.fn(async () => ({ authenticated: true, context: { userId: "default", method: "passphrase" as const, mfaVerified: false, dek: Buffer.alloc(32, 0xaa), sessionId: "test-session-jti" } })),
+}));
+// Phase 3 — the trends route now FX-converts (display currency + rate map) and
+// fires a fire-and-forget reporting self-heal. Mock the fx-service so the route
+// doesn't hit the real settings/rate lookups; selfHeal is best-effort (its mock
+// db chain has no `.limit`, which it swallows) so no extra stub is needed.
+vi.mock("@/lib/fx-service", () => ({
+  getRateMap: vi.fn(async () => new Map([["CAD", 1]])),
+  convertWithRateMap: vi.fn((amount: number) => amount),
+  getDisplayCurrency: vi.fn(async (_userId: string, override: string | null) => override ?? "CAD"),
 }));
 vi.mock("drizzle-orm", () => ({
   eq: vi.fn(), and: vi.fn(), gte: vi.fn(), lte: vi.fn(), sql: vi.fn(),

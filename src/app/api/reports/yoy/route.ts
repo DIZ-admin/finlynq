@@ -1,9 +1,11 @@
-﻿import { NextRequest, NextResponse } from "next/server";
+import { NextRequest, NextResponse } from "next/server";
 import { db, schema } from "@/db";
 import { sql, and, gte, lte, eq } from "drizzle-orm";
 import { requireAuth } from "@/lib/auth/require-auth";
 import { getDEK } from "@/lib/crypto/dek-cache";
 import { decryptName } from "@/lib/crypto/encrypted-columns";
+import { getDisplayCurrency, getRateMap, convertWithRateMap } from "@/lib/fx-service";
+import { selfHealReportingAmounts } from "@/lib/fx/reporting-amount";
 
 export async function GET(request: NextRequest) {
   const auth = await requireAuth(request); if (!auth.authenticated) return auth.response;
@@ -17,17 +19,43 @@ export async function GET(request: NextRequest) {
   const year1 = parseInt(params.get("year1") ?? String(currentYear - 1), 10);
   const year2 = parseInt(params.get("year2") ?? String(currentYear), 10);
 
-  // Category comparison for each year â€” keyed on categories.id so Phase-3
+  // Currency rework Phase 3 — convert to the display currency, preferring the
+  // STORED per-row historical reporting_amount with an on-the-fly fallback.
+  const displayCurrency = (await getDisplayCurrency(userId, params.get("currency"))).toUpperCase();
+  const rateMap = await getRateMap(displayCurrency, userId);
+  void selfHealReportingAmounts(userId, displayCurrency);
+
+  const convertGroup = (row: {
+    currency: string | null;
+    reportingCurrency: string | null;
+    totalAmount: number | null;
+    totalReporting: number | null;
+  }): number => {
+    if (
+      row.reportingCurrency &&
+      row.reportingCurrency.toUpperCase() === displayCurrency &&
+      row.totalReporting != null
+    ) {
+      return row.totalReporting;
+    }
+    return convertWithRateMap(row.totalAmount ?? 0, row.currency ?? displayCurrency, rateMap);
+  };
+
+  // Category comparison for each year — keyed on categories.id so Phase-3
   // NULL plaintext doesn't collapse every category into a single bucket.
+  // Grouped by currency + reporting_currency so each slice converts
+  // independently; converted slices are re-aggregated per category.
   async function getCategoryTotals(year: number) {
-    // Stream D Phase 4 â€” plaintext name dropped.
     const rows = await db
       .select({
         categoryId: schema.categories.id,
         categoryNameCt: schema.categories.nameCt,
         categoryType: schema.categories.type,
         categoryGroup: schema.categories.group,
-        total: sql<number>`SUM(${schema.transactions.amount})`,
+        currency: schema.transactions.currency,
+        reportingCurrency: schema.transactions.reportingCurrency,
+        totalAmount: sql<number>`SUM(${schema.transactions.amount})`,
+        totalReporting: sql<number | null>`SUM(${schema.transactions.reportingAmount})`,
       })
       .from(schema.transactions)
       .leftJoin(schema.categories, eq(schema.transactions.categoryId, schema.categories.id))
@@ -38,24 +66,52 @@ export async function GET(request: NextRequest) {
           lte(schema.transactions.date, `${year}-12-31`)
         )
       )
-      .groupBy(schema.categories.id, schema.categories.nameCt, schema.categories.type, schema.categories.group)
+      .groupBy(
+        schema.categories.id,
+        schema.categories.nameCt,
+        schema.categories.type,
+        schema.categories.group,
+        schema.transactions.currency,
+        schema.transactions.reportingCurrency,
+      )
       .all();
-    return rows.map((r) => ({
-      categoryId: r.categoryId,
-      categoryName: decryptName(r.categoryNameCt, dek, null) ?? "",
-      categoryType: r.categoryType,
-      categoryGroup: r.categoryGroup,
-      total: r.total,
-    }));
+    const byCat = new Map<string | number, {
+      categoryId: number | null;
+      categoryName: string;
+      categoryType: string | null;
+      categoryGroup: string | null;
+      total: number;
+    }>();
+    for (const r of rows) {
+      const categoryName = decryptName(r.categoryNameCt, dek, null) ?? "";
+      const key = r.categoryId ?? `null:${r.categoryType}:${categoryName}`;
+      const converted = convertGroup(r);
+      const ex = byCat.get(key);
+      if (ex) {
+        ex.total += converted;
+      } else {
+        byCat.set(key, {
+          categoryId: r.categoryId,
+          categoryName,
+          categoryType: r.categoryType,
+          categoryGroup: r.categoryGroup,
+          total: converted,
+        });
+      }
+    }
+    return Array.from(byCat.values());
   }
 
-  // Monthly totals for each year
+  // Monthly totals for each year (converted to display currency per slice)
   async function getMonthlyTotals(year: number) {
-    return await db
+    const rows = await db
       .select({
         month: sql<string>`SUBSTR(${schema.transactions.date}, 6, 2)`,
         categoryType: schema.categories.type,
-        total: sql<number>`SUM(${schema.transactions.amount})`,
+        currency: schema.transactions.currency,
+        reportingCurrency: schema.transactions.reportingCurrency,
+        totalAmount: sql<number>`SUM(${schema.transactions.amount})`,
+        totalReporting: sql<number | null>`SUM(${schema.transactions.reportingAmount})`,
       })
       .from(schema.transactions)
       .leftJoin(schema.categories, eq(schema.transactions.categoryId, schema.categories.id))
@@ -67,8 +123,14 @@ export async function GET(request: NextRequest) {
           sql`${schema.categories.type} IN ('I', 'E')`
         )
       )
-      .groupBy(sql`SUBSTR(${schema.transactions.date}, 6, 2)`, schema.categories.type)
+      .groupBy(
+        sql`SUBSTR(${schema.transactions.date}, 6, 2)`,
+        schema.categories.type,
+        schema.transactions.currency,
+        schema.transactions.reportingCurrency,
+      )
       .all();
+    return rows.map((r) => ({ month: r.month, categoryType: r.categoryType, total: convertGroup(r) }));
   }
 
   const cat1 = await getCategoryTotals(year1);
@@ -100,7 +162,7 @@ export async function GET(request: NextRequest) {
   // Build monthly comparison
   const monthNames = ["Jan", "Feb", "Mar", "Apr", "May", "Jun", "Jul", "Aug", "Sep", "Oct", "Nov", "Dec"];
 
-  function buildMonthMap(rows: typeof monthly1) {
+  function buildMonthMap(rows: { month: string; categoryType: string | null; total: number }[]) {
     const map: Record<string, { income: number; expenses: number }> = {};
     for (const row of rows) {
       const m = row.month;
@@ -125,5 +187,5 @@ export async function GET(request: NextRequest) {
     };
   });
 
-  return NextResponse.json({ year1, year2, categories, monthly });
+  return NextResponse.json({ year1, year2, displayCurrency, categories, monthly });
 }
