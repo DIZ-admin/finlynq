@@ -36,6 +36,7 @@ import { ModePicker } from "../components/inbox/ModePicker";
 import {
   MODE_META,
   buildSuggestionByBank,
+  buildDuplicateByBank,
   isMode,
   resolveSuggestedCategoryId,
   unlinkedBankRows,
@@ -212,9 +213,16 @@ export default function InboxScreen() {
     () => buildSuggestionByBank(snapshot, categoryNameById),
     [snapshot, categoryNameById],
   );
+  // Possible ledger duplicates — bank rows the server match engine paired with
+  // an existing UNLINKED ledger tx. Surfaced as "Link to existing vs Keep
+  // separate" in the card; takes priority over the rule suggestion.
+  const duplicateByBank = useMemo(() => buildDuplicateByBank(snapshot), [snapshot]);
+  // Exclude possible duplicates from the bulk "Approve all" set — it must not
+  // blindly mint a second ledger entry for a row that matches an existing tx
+  // (web parity, 2026-06-04). The user resolves those one-by-one.
   const suggestedUnlinked = useMemo(
-    () => unlinked.filter((b) => suggestionByBank.has(b.id)),
-    [unlinked, suggestionByBank],
+    () => unlinked.filter((b) => suggestionByBank.has(b.id) && !duplicateByBank.has(b.id)),
+    [unlinked, suggestionByBank, duplicateByBank],
   );
 
   // ─── Account / lens switching ───────────────────────────────────────────
@@ -343,6 +351,32 @@ export default function InboxScreen() {
       );
     },
     [fetchSnapshot],
+  );
+
+  /** Resolve a possible duplicate by linking the bank row to the matched
+   *  existing ledger transaction (no new tx created). */
+  const linkExisting = useCallback(
+    async (bankId: string) => {
+      const dup = duplicateByBank.get(bankId);
+      if (!dup) return;
+      setBusyBankId(bankId);
+      setActionError(null);
+      try {
+        const res = await endpoints.linkReconcile(dup.transactionId, bankId);
+        if (res.success) {
+          await fetchSnapshot({ silent: true });
+        } else {
+          setActionError(res.error);
+        }
+      } catch (e) {
+        const detail = e instanceof Error ? `${e.name}: ${e.message}` : String(e);
+        logger.error("inbox", "link existing threw", { detail });
+        setActionError("Cannot connect to server");
+      } finally {
+        setBusyBankId(null);
+      }
+    },
+    [duplicateByBank, fetchSnapshot],
   );
 
   const onApproveAll = useCallback(async () => {
@@ -571,12 +605,14 @@ export default function InboxScreen() {
             lens={activeLens}
             rows={unlinked}
             suggestionByBank={suggestionByBank}
+            duplicateByBank={duplicateByBank}
             busyBankId={busyBankId}
             bulkBusy={bulkBusy}
             suggestedCount={suggestedUnlinked.length}
             onPrimary={onPrimary}
             onChooseCategory={(bankId) => setPickerBankId(bankId)}
             onDelete={onDelete}
+            onLinkExisting={linkExisting}
             onApproveAll={onApproveAll}
           />
         ) : (

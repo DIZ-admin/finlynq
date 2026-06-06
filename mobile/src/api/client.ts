@@ -650,6 +650,18 @@ export const endpoints = {
     );
   },
 
+  // Resolve a possible ledger duplicate by linking the bank row to the matched
+  // existing transaction (no new tx created). POST /api/reconcile/links is
+  // ENVELOPED ({success,data}) on 2xx — request() passes it through, so
+  // res.success reflects the link. Cross-tenant / unknown id → bare 404
+  // { error } (collapsed to res.error). linkType defaults to 'extra'
+  // server-side (non-destructive; never touches the FK mirror).
+  linkReconcile: (transactionId: number, bankTransactionId: string) =>
+    api.post<{ linkId?: number }>("/api/reconcile/links", {
+      transactionId,
+      bankTransactionId,
+    }),
+
   // Commit one bank row → ledger with a chosen category (Approve-each lens).
   // Bare structured error `{ error, code? }` on 4xx (sign-vs-category /
   // investment-account guards) — use the structured-error-aware helper so the

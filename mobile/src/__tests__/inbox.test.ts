@@ -2,6 +2,7 @@ import {
   unlinkedBankRows,
   reconciledRows,
   buildSuggestionByBank,
+  buildDuplicateByBank,
   resolveSuggestedCategoryId,
   isMode,
   MODE_META,
@@ -37,9 +38,9 @@ const snap: ReconcileSuggestions = {
     20: { id: 20, date: "2026-05-02", amount: -25, currency: "CAD", payee: "Coffee", categoryName: "Dining", categoryType: "E" },
   },
   bankTransactions: {
-    b1: { id: "b1", date: "2026-04-30", amount: -50, currency: "CAD", payee: "HYDRO ONE", accountId: 1, suggestedCategoryId: null },
-    b2: { id: "b2", date: "2026-05-02", amount: -25, currency: "CAD", payee: "STARBUCKS", accountId: 1, suggestedCategoryId: null },
-    b3: { id: "b3", date: "2026-05-05", amount: -12, currency: "CAD", payee: "NETFLIX", accountId: 1, suggestedCategoryId: 7 },
+    b1: { id: "b1", date: "2026-04-30", amount: -50, currency: "CAD", payee: "HYDRO ONE", accountId: 1, suggestedCategoryId: null, duplicateOfTransactionId: null },
+    b2: { id: "b2", date: "2026-05-02", amount: -25, currency: "CAD", payee: "STARBUCKS", accountId: 1, suggestedCategoryId: null, duplicateOfTransactionId: null },
+    b3: { id: "b3", date: "2026-05-05", amount: -12, currency: "CAD", payee: "NETFLIX", accountId: 1, suggestedCategoryId: 7, duplicateOfTransactionId: null },
   },
 };
 
@@ -98,6 +99,48 @@ describe("buildSuggestionByBank", () => {
     });
     // b1 has neither a suggestion nor a suggestedCategoryId
     expect(map.has("b1")).toBe(false);
+  });
+});
+
+describe("buildDuplicateByBank", () => {
+  it("returns an empty map when no bank row flags a duplicate", () => {
+    expect(buildDuplicateByBank(snap).size).toBe(0);
+  });
+  it("returns [] for a null snapshot", () => {
+    expect(buildDuplicateByBank(null).size).toBe(0);
+  });
+  it("maps a flagged bank row to the existing ledger tx snapshot", () => {
+    const dupSnap: ReconcileSuggestions = {
+      ...snap,
+      transactions: {
+        ...snap.transactions,
+        77: { id: 77, date: "2026-05-04", amount: -99, currency: "CAD", payee: "Rent", categoryName: "Housing", categoryType: "E" },
+      },
+      bankTransactions: {
+        ...snap.bankTransactions,
+        b9: { id: "b9", date: "2026-05-05", amount: -99, currency: "CAD", payee: "RENT CO", accountId: 1, suggestedCategoryId: null, duplicateOfTransactionId: 77 },
+      },
+    };
+    const map = buildDuplicateByBank(dupSnap);
+    expect(map.get("b9")).toEqual({
+      transactionId: 77,
+      txPayee: "Rent",
+      txDate: "2026-05-04",
+      txAmount: -99,
+      txCurrency: "CAD",
+    });
+    // Rows that don't flag a duplicate stay out of the map.
+    expect(map.has("b1")).toBe(false);
+  });
+  it("drops a flag whose referenced tx snapshot is missing (defensive)", () => {
+    const orphan: ReconcileSuggestions = {
+      ...snap,
+      bankTransactions: {
+        ...snap.bankTransactions,
+        b8: { id: "b8", date: "2026-05-06", amount: -5, currency: "CAD", payee: "X", accountId: 1, suggestedCategoryId: null, duplicateOfTransactionId: 999 },
+      },
+    };
+    expect(buildDuplicateByBank(orphan).has("b8")).toBe(false);
   });
 });
 

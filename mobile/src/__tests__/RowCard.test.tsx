@@ -1,5 +1,5 @@
 import React from "react";
-import { render } from "@testing-library/react-native";
+import { render, fireEvent } from "@testing-library/react-native";
 import { ThemeContext } from "../theme";
 import type { Theme } from "../theme";
 import { lightColors } from "../theme/colors";
@@ -52,5 +52,34 @@ describe("RowCard", () => {
     );
     expect(getByText("Categorize")).toBeTruthy();
     expect(getByText("No match — choose a category")).toBeTruthy();
+  });
+
+  it("warns + offers Link to existing / Keep separate when a duplicate is flagged", () => {
+    const onLinkExisting = jest.fn();
+    const { getByText, queryByText } = renderWithTheme(
+      <RowCard
+        bank={bank}
+        suggestion={{ kind: "create", categoryId: 7, categoryName: "Dining" }}
+        duplicate={{
+          transactionId: 42,
+          txPayee: "Coffee Shop",
+          txDate: "2026-05-01",
+          txAmount: -25.5,
+          txCurrency: "CAD",
+        }}
+        busy={false}
+        onPrimary={() => {}}
+        onChooseCategory={() => {}}
+        onDelete={() => {}}
+        onLinkExisting={onLinkExisting}
+      />,
+    );
+    expect(getByText(/Possible duplicate of an existing transaction/)).toBeTruthy();
+    expect(getByText("Link to existing")).toBeTruthy();
+    expect(getByText("Keep separate")).toBeTruthy();
+    // The plain one-tap Approve is replaced by the duplicate-resolution choice.
+    expect(queryByText("Approve")).toBeNull();
+    fireEvent.press(getByText("Link to existing"));
+    expect(onLinkExisting).toHaveBeenCalledTimes(1);
   });
 });

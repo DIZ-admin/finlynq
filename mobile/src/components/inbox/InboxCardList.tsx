@@ -10,35 +10,46 @@ import { View, Text, TouchableOpacity, StyleSheet } from "react-native";
 import { useTheme } from "../../theme";
 import { Icon } from "../icon";
 import { RowCard } from "./RowCard";
-import type { CardSuggestion } from "../../lib/inbox";
+import type { CardSuggestion, CardDuplicate } from "../../lib/inbox";
 import type { AccountMode, ReconcileBankSnapshot } from "../../../../shared/types";
 
 export function InboxCardList({
   lens,
   rows,
   suggestionByBank,
+  duplicateByBank,
   busyBankId,
   bulkBusy,
   suggestedCount,
   onPrimary,
   onChooseCategory,
   onDelete,
+  onLinkExisting,
   onApproveAll,
 }: {
   /** 'approve' or 'auto' — only used for the empty-state + bulk-action copy. */
   lens: AccountMode;
   rows: ReconcileBankSnapshot[];
   suggestionByBank: Map<string, CardSuggestion>;
+  /** Per-bank-row possible-ledger-duplicate map. A hit overrides the
+   *  suggestion in the card (Link to existing vs Keep separate). */
+  duplicateByBank: Map<string, CardDuplicate>;
   busyBankId: string | null;
   bulkBusy: boolean;
   suggestedCount: number;
   onPrimary: (bankId: string) => void;
   onChooseCategory: (bankId: string) => void;
   onDelete: (bankId: string) => void;
+  /** Link a possible-duplicate bank row to its matched existing tx. */
+  onLinkExisting: (bankId: string) => void;
   /** Approve-each only — bulk-approve every suggested row. */
   onApproveAll?: () => void;
 }) {
   const { colors } = useTheme();
+  const duplicateCount = rows.reduce(
+    (n, b) => n + (duplicateByBank.has(b.id) ? 1 : 0),
+    0,
+  );
 
   if (rows.length === 0) {
     return (
@@ -62,6 +73,9 @@ export function InboxCardList({
         <Text style={[styles.count, { color: colors.mutedForeground }]}>
           {rows.length} row{rows.length === 1 ? "" : "s"} waiting
           {suggestedCount > 0 ? ` · ${suggestedCount} with a suggestion` : ""}
+          {duplicateCount > 0
+            ? ` · ${duplicateCount} possible duplicate${duplicateCount === 1 ? "" : "s"}`
+            : ""}
         </Text>
         {lens === "approve" && suggestedCount > 0 && onApproveAll && (
           <TouchableOpacity
@@ -82,10 +96,12 @@ export function InboxCardList({
           key={b.id}
           bank={{ id: b.id, date: b.date, amount: b.amount, currency: b.currency, payee: b.payee }}
           suggestion={suggestionByBank.get(b.id) ?? null}
+          duplicate={duplicateByBank.get(b.id) ?? null}
           busy={busyBankId === b.id || bulkBusy}
           onPrimary={() => onPrimary(b.id)}
           onChooseCategory={() => onChooseCategory(b.id)}
           onDelete={() => onDelete(b.id)}
+          onLinkExisting={() => onLinkExisting(b.id)}
         />
       ))}
     </View>

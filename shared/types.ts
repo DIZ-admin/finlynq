@@ -1010,6 +1010,15 @@ export interface ReconcileBankSnapshot {
   payee: string | null;
   accountId: number;
   suggestedCategoryId: number | null;
+  /** A pre-existing UNLINKED ledger transaction this bank row appears to
+   *  duplicate (exact import_hash, or identical amount within the date
+   *  tolerance — the strict, per-row signal, NOT the loose `suggestions`
+   *  fuzzy layer). null = none. Set by the server match engine on every
+   *  bank snapshot. Drives the "Possible duplicate · Link to existing vs
+   *  Keep separate" choice on the Approve-each / Auto-pilot cards so the
+   *  inbox never silently mints a second ledger entry (web parity,
+   *  2026-06-04). */
+  duplicateOfTransactionId: number | null;
 }
 
 /**

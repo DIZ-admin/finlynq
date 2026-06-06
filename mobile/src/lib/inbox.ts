@@ -25,6 +25,18 @@ export type CardSuggestion =
     }
   | { kind: "create"; categoryId: number; categoryName: string };
 
+/** A pre-existing UNLINKED ledger transaction this bank row appears to
+ *  duplicate. When present the RowCard warns + offers "Link to existing"
+ *  instead of a one-tap approve that would mint a second ledger entry.
+ *  Mirrors web RowCardDuplicate (src/components/inbox/row-card.tsx). */
+export interface CardDuplicate {
+  transactionId: number;
+  txPayee: string | null;
+  txDate: string;
+  txAmount: number;
+  txCurrency: string;
+}
+
 export interface ReconciledRow {
   link: ReconcileLink;
   bank: ReconcileBankSnapshot;
@@ -95,6 +107,35 @@ export function buildSuggestionByBank(
         categoryName: categoryName(b.suggestedCategoryId),
       });
     }
+  }
+  return map;
+}
+
+/**
+ * Build the per-bank-row "possible ledger duplicate" map. A bank row maps to
+ * the existing UNLINKED ledger tx the server match engine flagged it as
+ * duplicating (`bankTransactions[id].duplicateOfTransactionId`). Mirrors web
+ * InboxToApproveTab.duplicateByBank — the card surfaces a "Link to existing
+ * vs Keep separate" choice instead of a one-tap approve that would mint a
+ * second ledger entry (web parity, 2026-06-04). Drops rows whose referenced
+ * tx snapshot is missing (defensive).
+ */
+export function buildDuplicateByBank(
+  snap: ReconcileSuggestions | null,
+): Map<string, CardDuplicate> {
+  const map = new Map<string, CardDuplicate>();
+  if (!snap) return map;
+  for (const b of Object.values(snap.bankTransactions)) {
+    if (b.duplicateOfTransactionId == null) continue;
+    const tx = snap.transactions[b.duplicateOfTransactionId];
+    if (!tx) continue;
+    map.set(b.id, {
+      transactionId: tx.id,
+      txPayee: tx.payee,
+      txDate: tx.date,
+      txAmount: tx.amount,
+      txCurrency: tx.currency,
+    });
   }
   return map;
 }

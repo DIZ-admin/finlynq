@@ -49,6 +49,7 @@ import {
   Eye,
   Inbox,
   Link2,
+  AlertTriangle,
   type LucideIcon,
 } from "lucide-react-native";
 
@@ -101,6 +102,7 @@ export const Icons = {
   shield: ShieldCheck,
   eye: Eye,
   link: Link2,
+  alert: AlertTriangle,
 } satisfies Record<string, LucideIcon>;
 
 export type IconName = keyof typeof Icons;
