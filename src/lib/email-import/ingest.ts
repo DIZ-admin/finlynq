@@ -97,6 +97,13 @@ export async function ingestInboundEmail(
         receivedDate: opts.receivedDate,
       });
       results.push({ to: route.address, category: "import", note });
+    } else if (route.category === "discard") {
+      // Import-shaped but no user in this env (expired/rotated token or spam to
+      // a guessed address the relay forwarded). Write NOTHING and report a 2xx
+      // so the DevManager relay deletes the Mailpit copy. Idempotent: a re-push
+      // of the same message_id just discards again (no row, no-op). No bounce,
+      // no admin notify.
+      results.push({ to: route.address, category: "discard" });
     } else {
       await storeIncomingEmail({
         category: route.category as "mailbox" | "trash",
