@@ -874,12 +874,19 @@ export async function getSpendingByCategoryAndCurrency(userId: string, startDate
     .all();
 }
 
+// Currency rework Phase 3 — return per-(month, type, currency, reporting_currency)
+// slices so the dashboard route can convert each slice to the display currency
+// (stored reporting_amount when it matches, else an on-the-fly fallback) before
+// aggregating. Dashboard-only caller. See src/app/api/dashboard/route.ts.
 export async function getIncomeVsExpenses(userId: string, startDate: string, endDate: string) {
   return db
     .select({
       month: monthExpr(transactions.date),
       type: categories.type,
-      total: sql<number>`SUM(${transactions.amount})`,
+      currency: transactions.currency,
+      reportingCurrency: transactions.reportingCurrency,
+      totalAmount: sql<number>`SUM(${transactions.amount})`,
+      totalReporting: sql<number | null>`SUM(${transactions.reportingAmount})`,
     })
     .from(transactions)
     .leftJoin(categories, eq(transactions.categoryId, categories.id))
@@ -891,8 +898,37 @@ export async function getIncomeVsExpenses(userId: string, startDate: string, end
         sql`${categories.type} IN ('E', 'I')`
       )
     )
-    .groupBy(monthExpr(transactions.date), categories.type)
+    .groupBy(monthExpr(transactions.date), categories.type, transactions.currency, transactions.reportingCurrency)
     .orderBy(monthExpr(transactions.date))
+    .all();
+}
+
+// Currency rework Phase 3 — dashboard spending-by-category with per-currency +
+// reporting slices so the route can convert to the display currency. Distinct
+// from getSpendingByCategory (left raw for the budget-rollover internal caller).
+export async function getSpendingByCategoryWithReporting(userId: string, startDate: string, endDate: string) {
+  return db
+    .select({
+      categoryId: categories.id,
+      categoryNameCt: categories.nameCt,
+      categoryGroup: categories.group,
+      categoryType: categories.type,
+      currency: transactions.currency,
+      reportingCurrency: transactions.reportingCurrency,
+      totalAmount: sql<number>`SUM(${transactions.amount})`,
+      totalReporting: sql<number | null>`SUM(${transactions.reportingAmount})`,
+    })
+    .from(transactions)
+    .leftJoin(categories, eq(transactions.categoryId, categories.id))
+    .where(
+      and(
+        eq(transactions.userId, userId),
+        gte(transactions.date, startDate),
+        lte(transactions.date, endDate),
+        eq(categories.type, "E")
+      )
+    )
+    .groupBy(categories.id, categories.nameCt, categories.group, categories.type, transactions.currency, transactions.reportingCurrency)
     .all();
 }
 
