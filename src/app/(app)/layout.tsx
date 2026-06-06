@@ -4,6 +4,7 @@ import { DonationBanner } from "@/components/donation-banner";
 import { AnnouncementBanner } from "@/components/announcement-banner";
 import { CurrencyProvider } from "@/components/currency-provider";
 import { DropdownOrderProvider } from "@/components/dropdown-order-provider";
+import { ReportingRecomputeIndicator } from "@/components/reporting-recompute-indicator";
 
 export default function AppLayout({ children }: { children: React.ReactNode }) {
   return (
@@ -13,6 +14,7 @@ export default function AppLayout({ children }: { children: React.ReactNode }) {
         <div className="relative flex min-h-screen flex-col">
           <DonationBanner />
           <AnnouncementBanner />
+          <ReportingRecomputeIndicator />
           <div className="flex flex-1">
             <Nav />
             <main className="flex-1 overflow-auto pb-16 md:pb-0 bg-dot-pattern ambient-glow">

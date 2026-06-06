@@ -34,5 +34,6 @@ export async function GET(request: NextRequest) {
     done: s?.done ?? 0,
     finished: s?.finishedAt != null,
     startedAt: s?.startedAt ?? null,
+    finishedAt: s?.finishedAt ?? null,
   });
 }

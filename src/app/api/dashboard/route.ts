@@ -6,6 +6,7 @@ import {
   getNetWorthOverTime,
 } from "@/lib/queries";
 import { getRateMap, convertWithRateMap, getDisplayCurrency } from "@/lib/fx-service";
+import { selfHealReportingAmounts } from "@/lib/fx/reporting-amount";
 import { getHoldingsValueByAccount } from "@/lib/holdings-value";
 import { requireAuth } from "@/lib/auth/require-auth";
 import { getDEK } from "@/lib/crypto/dek-cache";
@@ -23,6 +24,13 @@ export async function GET(request: NextRequest) {
   const params = request.nextUrl.searchParams;
   const displayCurrency = await getDisplayCurrency(userId, params.get("currency"));
   const includeArchived = params.get("includeArchived") === "1";
+
+  // Currency rework Phase 3 — the dashboard is the post-login landing page, so
+  // proactively backfill any transaction whose stored reporting_amount is
+  // missing/stale (fire-and-forget, guarded, DEK-free). This warms the data
+  // before the user opens Reports. The dashboard itself doesn't read
+  // reporting_amount; this is purely a backfill trigger.
+  void selfHealReportingAmounts(userId, displayCurrency.toUpperCase());
 
   try {
     const now = new Date();
