@@ -17,72 +17,64 @@
  */
 
 import { useEffect, useState } from "react";
-import { usePathname } from "next/navigation";
 import { Loader2, CheckCircle2 } from "lucide-react";
 
 type View = { running: boolean; target: string; done: number; total: number } | null;
 
-const TRIGGER_PATHS = ["/dashboard", "/reports"];
 const DONE_FLASH_MS = 8000;
+const IDLE_POLL_MS = 5000; // catch a job within ~5s of it starting (any source)
+const RUN_POLL_MS = 1500; // tighter cadence while a job is in flight / flashing done
 
 export function ReportingRecomputeIndicator() {
   const [view, setView] = useState<View>(null);
-  const pathname = usePathname();
 
   useEffect(() => {
     let alive = true;
     let timer: ReturnType<typeof setTimeout> | null = null;
 
-    // Hoisted function declaration so the poll loop can re-schedule itself
-    // (a self-referencing useCallback trips the React Compiler TDZ rule).
-    async function check() {
-      if (timer) {
-        clearTimeout(timer);
-        timer = null;
-      }
+    // Self-scheduling poll. Continuous (cheap single-row read) so it reliably
+    // catches a recompute regardless of which page/source kicked it — a
+    // dashboard/reports self-heal or a Settings currency switch — without a
+    // race against when the job actually starts. Hoisted function declaration
+    // so it can re-schedule itself (a self-referencing useCallback trips the
+    // React Compiler TDZ rule).
+    async function poll() {
+      let next = IDLE_POLL_MS;
       try {
         const res = await fetch("/api/settings/reporting-currency/status");
         if (!alive) return;
-        if (!res.ok) {
-          setView(null);
-          return;
-        }
-        const s = await res.json();
-        if (!alive) return;
-        const now = Date.now();
-        const started = s.startedAt ? Date.parse(s.startedAt) : 0;
-        const finishedAt = s.finishedAt ? Date.parse(s.finishedAt) : 0;
-        const running =
-          s.inFlight === true || (!s.finished && started > 0 && now - started < 5 * 60 * 1000);
-        const recentlyDone = !!s.finished && finishedAt > 0 && now - finishedAt < DONE_FLASH_MS;
-        const target = s.targetCurrency ?? "";
+        if (res.ok) {
+          const s = await res.json();
+          const now = Date.now();
+          const started = s.startedAt ? Date.parse(s.startedAt) : 0;
+          const finishedAt = s.finishedAt ? Date.parse(s.finishedAt) : 0;
+          const running =
+            s.inFlight === true || (!s.finished && started > 0 && now - started < 5 * 60 * 1000);
+          const recentlyDone = !!s.finished && finishedAt > 0 && now - finishedAt < DONE_FLASH_MS;
+          const target = s.targetCurrency ?? "";
 
-        if (running) {
-          setView({ running: true, target, done: s.done ?? 0, total: s.total ?? 0 });
-          timer = setTimeout(check, 1500);
-        } else if (recentlyDone) {
-          setView({ running: false, target, done: s.done ?? 0, total: s.total ?? 0 });
-          timer = setTimeout(() => {
-            if (alive) setView(null);
-          }, DONE_FLASH_MS - (now - finishedAt));
-        } else {
-          setView(null);
+          if (running) {
+            setView({ running: true, target, done: s.done ?? 0, total: s.total ?? 0 });
+            next = RUN_POLL_MS;
+          } else if (recentlyDone) {
+            setView({ running: false, target, done: s.done ?? 0, total: s.total ?? 0 });
+            next = RUN_POLL_MS;
+          } else {
+            setView(null);
+          }
         }
       } catch {
-        if (alive) setView(null);
+        /* keep polling at idle cadence */
       }
+      if (alive) timer = setTimeout(poll, next);
     }
 
-    const isTrigger = TRIGGER_PATHS.some((p) => pathname === p || pathname.startsWith(p + "/"));
-    // On a trigger page, wait briefly so the page's self-heal can start the job
-    // before we poll; elsewhere check immediately (catches a switch in progress).
-    const kickoff = setTimeout(check, isTrigger ? 1200 : 0);
+    poll();
     return () => {
       alive = false;
-      clearTimeout(kickoff);
       if (timer) clearTimeout(timer);
     };
-  }, [pathname]);
+  }, []);
 
   if (!view) return null;
 
