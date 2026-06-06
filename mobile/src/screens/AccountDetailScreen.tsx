@@ -74,8 +74,14 @@ export default function AccountDetailScreen({ route, navigation }: Props) {
     if (isFocused) loadDetail();
   }, [isFocused, loadDetail]);
 
-  const value = account.convertedBalance ?? account.balance;
-  const currency = account.displayCurrency ?? account.currency;
+  // Big number = the account's NATIVE balance (matches the accounts list).
+  const currency = account.currency;
+  const value = account.balance;
+  // Grayed sub-line = the display-currency translation. Hide it when there's
+  // nothing to convert or the account is already in the display currency.
+  const subCurrency = account.displayCurrency ?? account.currency;
+  const showConverted =
+    account.convertedBalance != null && account.currency !== subCurrency;
   // Prefer the freshly-loaded detail name (reflects edits) over the route param.
   const heroName = detail
     ? safeAccountName({ id: detail.id, name: detail.name, alias: detail.alias })
@@ -208,6 +214,11 @@ export default function AccountDetailScreen({ route, navigation }: Props) {
             <Text style={[styles.heroValue, { color: colors.foreground }]}>
               {formatCurrency(value, currency, { decimals: 2 })}
             </Text>
+            {showConverted && (
+              <Text style={[styles.heroValueSub, { color: colors.mutedForeground }]}>
+                {formatCurrency(account.convertedBalance!, subCurrency, { decimals: 2 })}
+              </Text>
+            )}
             {account.isInvestment && (account.holdingsValue ?? 0) !== 0 && (
               <Text style={[styles.holdingsHint, { color: colors.mutedForeground }]}>
                 Market value (holdings) ·{" "}
@@ -353,6 +364,7 @@ const styles = StyleSheet.create({
   accountName: { fontSize: 18, fontWeight: "700" },
   accountMeta: { fontSize: 13, marginTop: 4 },
   heroValue: { fontSize: 32, fontWeight: "800", marginTop: 12, fontVariant: ["tabular-nums"] },
+  heroValueSub: { fontSize: 15, fontWeight: "600", marginTop: 2, fontVariant: ["tabular-nums"] },
   holdingsHint: { fontSize: 12, marginTop: 4 },
   reconcileBtn: {
     flexDirection: "row",
