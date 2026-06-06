@@ -34,6 +34,8 @@ import { upsertBankTransaction } from "@/lib/bank-ledger";
 import { validateSignVsCategoryById } from "@/lib/transactions/sign-category-invariant";
 import { invalidateUser } from "@/lib/mcp/user-tx-cache";
 import { loadActiveEmailRules, firstMatchingRule } from "@/lib/email-rules/load";
+import { applyEmailTransform, type EmailTransform } from "@/lib/email-import/apply-transform";
+import { htmlToText } from "@/lib/email-import/parse-body";
 
 export interface ProcessInboxResult {
   scanned: number;
@@ -101,6 +103,9 @@ export async function processPendingInboxEmails(
         id: schema.emailInbox.id,
         fromAddress: schema.emailInbox.fromAddress,
         subject: schema.emailInbox.subject,
+        bodyText: schema.emailInbox.bodyText,
+        bodyHtml: schema.emailInbox.bodyHtml,
+        stagedImportId: schema.emailInbox.stagedImportId,
         encryptionTier: schema.emailInbox.encryptionTier,
         parseConfidence: schema.emailInbox.parseConfidence,
       })
@@ -126,8 +131,31 @@ export async function processPendingInboxEmails(
 
         const fromAddress = decodeInbox(row.encryptionTier, dek, row.fromAddress);
         const subject = decodeInbox(row.encryptionTier, dek, row.subject);
+        // body / payee / amount for the new condition fields.
+        const bodyText = decodeInbox(row.encryptionTier, dek, row.bodyText);
+        const bodyHtml = decodeInbox(row.encryptionTier, dek, row.bodyHtml);
+        const body =
+          bodyText && bodyText.trim() ? bodyText : bodyHtml ? htmlToText(bodyHtml) : "";
 
-        const rule = firstMatchingRule(rules, { fromAddress, subject });
+        let payee: string | null = null;
+        let amount: number | null = null;
+        if (row.stagedImportId) {
+          const cand = await db
+            .select({
+              amount: schema.stagedTransactions.amount,
+              payee: schema.stagedTransactions.payee,
+              encryptionTier: schema.stagedTransactions.encryptionTier,
+            })
+            .from(schema.stagedTransactions)
+            .where(eq(schema.stagedTransactions.stagedImportId, row.stagedImportId))
+            .limit(1);
+          if (cand[0]) {
+            amount = cand[0].amount;
+            payee = decodeStaged(cand[0].encryptionTier, dek, cand[0].payee);
+          }
+        }
+
+        const rule = firstMatchingRule(rules, { fromAddress, subject, body, payee, amount });
         if (!rule) {
           result.needsReview += 1;
           continue;
@@ -149,6 +177,11 @@ export async function processPendingInboxEmails(
           categoryId: rule.categoryId,
           matchedRuleId: rule.id,
           finalAction: "auto_recorded",
+          transform: {
+            flipSign: rule.flipSign,
+            dateSource: rule.dateSource,
+            payeeOverride: rule.payeeOverride,
+          },
         });
         if (recorded.status === "recorded") result.autoRecorded += 1;
         else if (recorded.status === "duplicate") result.duplicateSkipped += 1;
@@ -183,6 +216,8 @@ export async function recordEmailInboxRow(
     categoryId: number | null;
     matchedRuleId?: number | null;
     finalAction: "auto_recorded" | "manually_recorded";
+    /** Rule mapping + per-email manual overrides applied before hash/materialize. */
+    transform?: EmailTransform;
   },
 ): Promise<RecordEmailResult> {
   const inboxRows = await db
@@ -191,6 +226,7 @@ export async function recordEmailInboxRow(
       sourceKind: schema.emailInbox.sourceKind,
       stagedImportId: schema.emailInbox.stagedImportId,
       action: schema.emailInbox.action,
+      receivedAt: schema.emailInbox.receivedAt,
     })
     .from(schema.emailInbox)
     .where(and(eq(schema.emailInbox.id, inboxId), eq(schema.emailInbox.userId, userId)))
@@ -225,13 +261,25 @@ export async function recordEmailInboxRow(
     .limit(1);
   const cand = staged[0];
   if (!cand) return { status: "invalid", reason: "no_candidate" };
-  const payee = decodeStaged(cand.encryptionTier, dek, cand.payee) ?? "";
+  const rawPayee = decodeStaged(cand.encryptionTier, dek, cand.payee) ?? "";
   const currency = (cand.currency ?? "USD").toUpperCase();
 
-  const guard = await checkGuards(userId, dek, opts.accountId, opts.categoryId, cand.amount);
+  // Apply the rule mapping (flip-sign / date-source / payee-rename) + any
+  // per-email manual overrides BEFORE guards/hash/materialize, so the bank
+  // ledger + dedup key on exactly what the user records.
+  const receivedDate = inbox.receivedAt
+    ? inbox.receivedAt.toISOString().slice(0, 10)
+    : null;
+  const eff = applyEmailTransform(
+    { date: cand.date, amount: cand.amount, payee: rawPayee },
+    opts.transform ?? {},
+    receivedDate,
+  );
+
+  const guard = await checkGuards(userId, dek, opts.accountId, opts.categoryId, eff.amount);
   if (!guard.ok) return { status: "invalid", reason: guard.reason };
 
-  const hash = generateImportHash(cand.date, opts.accountId, cand.amount, payee);
+  const hash = generateImportHash(eff.date, opts.accountId, eff.amount, eff.payee);
   const dup = await checkDuplicates([hash], userId);
   if (dup.has(hash)) {
     await db
@@ -247,10 +295,10 @@ export async function recordEmailInboxRow(
     dek,
     accountId: opts.accountId,
     categoryId: opts.categoryId,
-    date: cand.date,
-    amount: cand.amount,
+    date: eff.date,
+    amount: eff.amount,
     currency,
-    payee,
+    payee: eff.payee,
     importHash: hash,
   });
 

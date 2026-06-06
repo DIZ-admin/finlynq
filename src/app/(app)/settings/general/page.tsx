@@ -9,29 +9,77 @@
  * legacy /settings deep-link from /transactions also lands here.
  */
 
-import { useState } from "react";
+import { useState, useCallback } from "react";
 import { Card, CardContent, CardHeader, CardTitle, CardDescription } from "@/components/ui/card";
 import { Label } from "@/components/ui/label";
 import { Badge } from "@/components/ui/badge";
+import { Button } from "@/components/ui/button";
 import { Select, SelectContent, SelectItem, SelectTrigger, SelectValue } from "@/components/ui/select";
-import { Settings2, Shield, Database } from "lucide-react";
+import {
+  Dialog,
+  DialogContent,
+  DialogHeader,
+  DialogTitle,
+  DialogDescription,
+  DialogFooter,
+} from "@/components/ui/dialog";
+import { Settings2, Shield, Database, Loader2 } from "lucide-react";
 import { useDisplayCurrency } from "@/components/currency-provider";
 import { SUPPORTED_FIAT_CURRENCIES, currencyLabel } from "@/lib/fx/supported-currencies";
 import { FxOverridesSection } from "@/components/fx-overrides-section";
 import { ActiveCurrenciesSection } from "@/components/active-currencies-section";
 
+type RecomputeState = { active: boolean; target: string; done: number; total: number; finished: boolean };
+
 export default function GeneralSettingsPage() {
   const { displayCurrency, setDisplayCurrency } = useDisplayCurrency();
   const [currencyError, setCurrencyError] = useState("");
+  // Pending currency awaiting confirmation (Phase 3: switching re-derives every
+  // transaction's stored reporting amount at historical rates).
+  const [pendingCurrency, setPendingCurrency] = useState<string | null>(null);
+  const [recompute, setRecompute] = useState<RecomputeState | null>(null);
 
-  async function handleCurrencyChange(val: string | null) {
-    const v = (val ?? "CAD").toUpperCase();
+  // Poll the recompute status so the toast/banner reflects the background job.
+  const pollStatus = useCallback((target: string) => {
+    setRecompute({ active: true, target, done: 0, total: 0, finished: false });
+    const deadline = Date.now() + 3 * 60 * 1000; // safety cap
+    const tick = async () => {
+      try {
+        const res = await fetch("/api/settings/reporting-currency/status");
+        if (res.ok) {
+          const s = await res.json();
+          const finished = (!!s.finished && !s.inFlight) || Date.now() > deadline;
+          setRecompute({ active: true, target, done: s.done ?? 0, total: s.total ?? 0, finished });
+          if (finished) {
+            setTimeout(() => setRecompute((r) => (r ? { ...r, active: false } : r)), 3500);
+            return;
+          }
+        }
+      } catch {
+        /* keep polling */
+      }
+      setTimeout(tick, 1500);
+    };
+    setTimeout(tick, 800);
+  }, []);
+
+  // Step 1: the Select fires this. We don't apply yet — open a confirm dialog.
+  function handleCurrencySelect(val: string | null) {
+    const v = (val ?? "USD").toUpperCase();
+    if (v === displayCurrency.toUpperCase()) return;
     setCurrencyError("");
+    setPendingCurrency(v);
+  }
+
+  // Step 2: user confirmed — apply + kick the background recompute.
+  async function confirmCurrencyChange() {
+    const v = pendingCurrency;
+    setPendingCurrency(null);
+    if (!v) return;
     try {
       await setDisplayCurrency(v);
-      // Migrate any leftover localStorage value from the pre-2026-04-27 client
-      // so two tabs don't disagree until the next reload.
       try { localStorage.removeItem("pf-currency"); } catch {}
+      pollStatus(v);
     } catch (e: unknown) {
       const msg = e instanceof Error ? e.message : "Failed to save display currency";
       setCurrencyError(msg);
@@ -67,7 +115,7 @@ export default function GeneralSettingsPage() {
                 Per-row amounts (transactions, holdings) keep their entered currency.
               </p>
             </div>
-            <Select value={displayCurrency} onValueChange={handleCurrencyChange}>
+            <Select value={displayCurrency} onValueChange={handleCurrencySelect}>
               <SelectTrigger className="w-40"><SelectValue /></SelectTrigger>
               <SelectContent>
                 {SUPPORTED_FIAT_CURRENCIES.map((c) => (
@@ -81,8 +129,45 @@ export default function GeneralSettingsPage() {
           {currencyError ? (
             <p className="text-sm text-destructive">{currencyError}</p>
           ) : null}
+          {recompute?.active ? (
+            <div className="flex items-center gap-2 rounded-lg bg-muted/60 px-3 py-2 text-xs text-muted-foreground">
+              {recompute.finished ? (
+                <span className="text-emerald-600">
+                  Reports updated to {recompute.target}.
+                </span>
+              ) : (
+                <>
+                  <Loader2 className="h-3.5 w-3.5 animate-spin" />
+                  <span>
+                    Recalculating reports in {recompute.target} at historical rates
+                    {recompute.total > 0 ? ` (${recompute.done}/${recompute.total})` : "…"}
+                  </span>
+                </>
+              )}
+            </div>
+          ) : null}
         </CardContent>
       </Card>
+
+      {/* Confirm currency switch — re-derives every stored reporting amount. */}
+      <Dialog open={pendingCurrency != null} onOpenChange={(o) => { if (!o) setPendingCurrency(null); }}>
+        <DialogContent>
+          <DialogHeader>
+            <DialogTitle>Switch display currency to {pendingCurrency}?</DialogTitle>
+            <DialogDescription>
+              This recalculates all your reports into {pendingCurrency} using each
+              transaction&apos;s historical exchange rate. It runs in the background;
+              your reports stay usable while it finishes.
+            </DialogDescription>
+          </DialogHeader>
+          <DialogFooter>
+            <Button variant="outline" onClick={() => setPendingCurrency(null)}>
+              Cancel
+            </Button>
+            <Button onClick={confirmCurrencyChange}>Switch to {pendingCurrency}</Button>
+          </DialogFooter>
+        </DialogContent>
+      </Dialog>
 
       <ActiveCurrenciesSection />
 

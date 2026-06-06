@@ -97,12 +97,26 @@ export const transactions = pgTable("transactions", {
   // Phase 2 of the currency rework — entered/account/reporting trilogy.
   // entered_* fields capture what the user actually typed (the trade) and
   // the FX rate used to convert at entry time. Locked at write time so
-  // historical balances are stable when rates move. Reporting currency is
-  // computed at view time and not stored. Soft-fallback reads via
+  // historical balances are stable when rates move. Soft-fallback reads via
   // normalizeTxRow() in src/lib/queries.ts handle un-backfilled rows.
   enteredCurrency: text("entered_currency"),
   enteredAmount: doublePrecision("entered_amount"),
   enteredFxRate: doublePrecision("entered_fx_rate"),
+  // Phase 3 of the currency rework (2026-06-06) — the REPORTING leg is now
+  // STORED (was "computed at view time and not stored"). reporting_amount is
+  // `amount` (account currency) converted to the user's display/reporting
+  // currency at THIS row's `date` historical rate, locked at write time.
+  // Flow reports (trends / yoy / income-statement income+expense /
+  // tax-summary) SUM it directly instead of converting at today's rate.
+  // reporting_currency records which currency it's in; when the user switches
+  // display currency a background job (recomputeReportingAmounts) re-derives
+  // every row at historical rates. Reports fall back to on-the-fly conversion
+  // of `amount` for rows where reporting_currency != the current display
+  // currency or the value is NULL (un-backfilled / future-dated). See
+  // src/lib/fx/reporting-amount.ts.
+  reportingCurrency: text("reporting_currency"),
+  reportingAmount: doublePrecision("reporting_amount"),
+  reportingRate: doublePrecision("reporting_rate"),
   // entered_at is when the row was created — used to detect future-dated
   // entries that the nightly cron should re-rate once their date arrives.
   // NOT a creation timestamp; the FX cron is the only consumer. The new
@@ -1297,12 +1311,19 @@ export const emailImportRules = pgTable(
       .references(() => users.id, { onDelete: "cascade" }),
     // Display name — user-DEK encrypted (v1:).
     name: text("name").notNull(),
-    // 'sender' (matches from_address) | 'subject' — CHECK in SQL.
-    matchType: text("match_type").notNull(),
-    // 'contains' | 'exact' | 'regex' — CHECK in SQL.
-    matchOp: text("match_op").notNull(),
-    // The needle — user-DEK encrypted (v1:). Decrypted before matching.
-    matchValue: text("match_value").notNull(),
+    // 2026-06-17 — multi-condition AND group: { all: EmailCondition[] }. Source
+    // of truth going forward; text-field string values user-DEK encrypted (v1:),
+    // numeric amount thresholds plaintext (src/lib/email-rules/crypto.ts). NULL
+    // ⇒ read the flat match_type/op/value fallback (pre-migration rows).
+    conditions: jsonb("conditions"),
+    // Legacy flat match — FROZEN back-compat fallback (NOT NULL dropped in the
+    // 20260617 migration; new rows leave these NULL and use `conditions`).
+    // 'sender'|'subject' — CHECK in SQL (passes on NULL).
+    matchType: text("match_type"),
+    // 'contains' | 'exact' | 'regex'.
+    matchOp: text("match_op"),
+    // The needle — user-DEK encrypted (v1:).
+    matchValue: text("match_value"),
     accountId: integer("account_id")
       .notNull()
       .references(() => accounts.id, { onDelete: "cascade" }),
@@ -1311,6 +1332,14 @@ export const emailImportRules = pgTable(
     }),
     // 'auto' (auto-record) | 'review' (resolve account, wait for a click).
     mode: text("mode").notNull().default("auto"),
+    // 2026-06-16 — v1 transforms applied in the single materialize path before
+    // the account-bound import_hash + ledger write. flip_sign / date_source are
+    // plaintext knobs (used by the record path, no secrecy value). payee_override
+    // is free-text → user-DEK encrypted (v1:) like name/match_value
+    // (src/lib/email-rules/crypto.ts).
+    flipSign: boolean("flip_sign").notNull().default(false),
+    dateSource: text("date_source").notNull().default("parsed"), // 'parsed' | 'received'
+    payeeOverride: text("payee_override"), // nullable, encrypted
     isActive: boolean("is_active").notNull().default(true),
     priority: integer("priority").notNull().default(0),
     createdAt: timestamp("created_at", { withTimezone: true })
@@ -1695,6 +1724,24 @@ export const portfolioSnapshotDirty = pgTable("portfolio_snapshot_dirty", {
   userId: text("user_id").primaryKey(),
   fromDate: text("from_date").notNull(),
   markedAt: timestamp("marked_at", { withTimezone: true }).notNull().defaultNow(),
+});
+
+// ─── reporting_recompute_status — currency-switch recompute progress (2026-06-06)
+//
+// Phase 3 of the currency rework. When a user switches their display/reporting
+// currency, recomputeReportingAmounts() re-derives every transaction's
+// reporting_amount at historical rates into the new currency. This one-row-per-
+// user table drives the progress toast on the Settings page: `total`/`done` are
+// bumped as the job batches through rows, `finished_at` is set when complete.
+// `GET /api/settings/reporting-currency/recompute/status` reads it. Best-effort
+// progress only — reports stay correct via the on-the-fly fallback regardless.
+export const reportingRecomputeStatus = pgTable("reporting_recompute_status", {
+  userId: text("user_id").primaryKey(),
+  targetCurrency: text("target_currency").notNull(),
+  total: integer("total").notNull().default(0),
+  done: integer("done").notNull().default(0),
+  startedAt: timestamp("started_at", { withTimezone: true }).notNull().defaultNow(),
+  finishedAt: timestamp("finished_at", { withTimezone: true }),
 });
 
 // ─── portfolio_cash_snapshot_meta — cash-snapshot staleness watermark (2026-06-13)

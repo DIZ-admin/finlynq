@@ -2,10 +2,11 @@ import { NextRequest, NextResponse } from "next/server";
 import {
   getAccountBalances,
   getIncomeVsExpenses,
-  getSpendingByCategory,
+  getSpendingByCategoryWithReporting,
   getNetWorthOverTime,
 } from "@/lib/queries";
 import { getRateMap, convertWithRateMap, getDisplayCurrency } from "@/lib/fx-service";
+import { selfHealReportingAmounts } from "@/lib/fx/reporting-amount";
 import { getHoldingsValueByAccount } from "@/lib/holdings-value";
 import { requireAuth } from "@/lib/auth/require-auth";
 import { getDEK } from "@/lib/crypto/dek-cache";
@@ -23,6 +24,13 @@ export async function GET(request: NextRequest) {
   const params = request.nextUrl.searchParams;
   const displayCurrency = await getDisplayCurrency(userId, params.get("currency"));
   const includeArchived = params.get("includeArchived") === "1";
+
+  // Currency rework Phase 3 — the dashboard is the post-login landing page, so
+  // proactively backfill any transaction whose stored reporting_amount is
+  // missing/stale (fire-and-forget, guarded, DEK-free). This warms the data
+  // before the user opens Reports. The dashboard itself doesn't read
+  // reporting_amount; this is purely a backfill trigger.
+  void selfHealReportingAmounts(userId, displayCurrency.toUpperCase());
 
   try {
     const now = new Date();
@@ -80,8 +88,63 @@ export async function GET(request: NextRequest) {
       };
     });
 
-    const incomeVsExpenses = await getIncomeVsExpenses(userId, startDate, endDate);
-    const spendingByCategory = await getSpendingByCategory(userId, startDate, endDate);
+    // Currency rework Phase 3 — income/expense + spending are flow figures, so
+    // convert each (currency, reporting_currency) slice to the display currency
+    // (stored historical reporting_amount when it matches, else an on-the-fly
+    // current-rate fallback) and re-aggregate to the shapes the client expects.
+    const displayUpper = displayCurrency.toUpperCase();
+    const convertGroup = (row: {
+      currency: string | null;
+      reportingCurrency: string | null;
+      totalAmount: number | null;
+      totalReporting: number | null;
+    }): number => {
+      if (
+        row.reportingCurrency &&
+        row.reportingCurrency.toUpperCase() === displayUpper &&
+        row.totalReporting != null
+      ) {
+        return row.totalReporting;
+      }
+      return convertWithRateMap(row.totalAmount ?? 0, row.currency ?? displayUpper, rateMap);
+    };
+
+    const iveSlices = await getIncomeVsExpenses(userId, startDate, endDate);
+    const iveMap = new Map<string, { month: string; type: string | null; total: number }>();
+    for (const r of iveSlices) {
+      const key = `${r.month}|${r.type}`;
+      const cur = iveMap.get(key) ?? { month: r.month, type: r.type, total: 0 };
+      cur.total += convertGroup(r);
+      iveMap.set(key, cur);
+    }
+    const incomeVsExpenses = Array.from(iveMap.values())
+      .map((r) => ({ ...r, total: Math.round(r.total * 100) / 100 }))
+      .sort((a, b) => a.month.localeCompare(b.month));
+
+    const spendSlices = await getSpendingByCategoryWithReporting(userId, startDate, endDate);
+    const spendMap = new Map<string | number, {
+      categoryId: number | null;
+      categoryNameCt: string | null;
+      categoryGroup: string | null;
+      categoryType: string | null;
+      total: number;
+    }>();
+    for (const r of spendSlices) {
+      const key = r.categoryId ?? `null:${r.categoryGroup}`;
+      const cur = spendMap.get(key) ?? {
+        categoryId: r.categoryId,
+        categoryNameCt: r.categoryNameCt,
+        categoryGroup: r.categoryGroup,
+        categoryType: r.categoryType,
+        total: 0,
+      };
+      cur.total += convertGroup(r);
+      spendMap.set(key, cur);
+    }
+    const spendingByCategory = Array.from(spendMap.values())
+      .map((r) => ({ ...r, total: Math.round(r.total * 100) / 100 }))
+      .sort((a, b) => a.total - b.total);
+
     const netWorthRaw = await getNetWorthOverTime(userId);
 
     // Consolidate net worth across currencies into display currency

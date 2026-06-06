@@ -4,6 +4,8 @@ import type { SQL, AnyColumn } from "drizzle-orm";
 import { requireHoldingForInvestmentAccount } from "@/lib/investment-account";
 import type { TransactionSource } from "@/lib/tx-source";
 import type { SortableColumnId } from "@/lib/transactions/columns";
+import { computeReportingFields } from "@/lib/fx/reporting-amount";
+import { getDisplayCurrency } from "@/lib/fx-service";
 
 const { accounts, categories, transactions, portfolioHoldings, budgets, budgetTemplates } = schema;
 
@@ -350,6 +352,12 @@ export async function createTransaction(userId: string, data: {
   enteredCurrency?: string | null;
   enteredAmount?: number | null;
   enteredFxRate?: number | null;
+  // Currency rework Phase 3 — historical reporting amount (account currency →
+  // display currency at this row's date). Computed below when not supplied; a
+  // caller may pass precomputed values to skip the lookup.
+  reportingCurrency?: string | null;
+  reportingAmount?: number | null;
+  reportingRate?: number | null;
   quantity?: number | null;
   portfolioHoldingId?: number | null;
   // Nullable: the MCP HTTP write path (FINLYNQ-108) passes already-encrypted
@@ -385,7 +393,28 @@ export async function createTransaction(userId: string, data: {
   // body; this helper no longer rejects the row, so the `dek` parameter is
   // kept only for the legacy two-arg call shape and is unused here.
   void dek;
-  return db.insert(transactions).values({ ...data, userId }).returning().get();
+  // Currency rework Phase 3 — lock the historical reporting amount at write
+  // time so flow reports SUM a stored value. Best-effort: computeReportingFields
+  // never throws and returns null on an unresolved rate, so a reporting-leg miss
+  // can't block the ledger write (the self-heal + cron backfill NULLs later).
+  let reportingFields = {};
+  if (data.reportingAmount == null && data.amount != null && data.currency) {
+    const r = await computeReportingFields({
+      userId,
+      accountCurrency: data.currency,
+      amount: data.amount,
+      date: data.date,
+      reportingCurrency: await getDisplayCurrency(userId),
+    });
+    if (r) {
+      reportingFields = {
+        reportingCurrency: r.reportingCurrency,
+        reportingAmount: r.reportingAmount,
+        reportingRate: r.reportingRate,
+      };
+    }
+  }
+  return db.insert(transactions).values({ ...data, ...reportingFields, userId }).returning().get();
 }
 
 export async function updateTransaction(id: number, userId: string, data: Partial<{
@@ -397,6 +426,9 @@ export async function updateTransaction(id: number, userId: string, data: Partia
   enteredCurrency: string | null;
   enteredAmount: number | null;
   enteredFxRate: number | null;
+  reportingCurrency: string | null;
+  reportingAmount: number | null;
+  reportingRate: number | null;
   quantity: number;
   portfolioHoldingId: number | null;
   note: string;
@@ -437,13 +469,51 @@ export async function updateTransaction(id: number, userId: string, data: Partia
       await requireHoldingForInvestmentAccount(userId, resultingAccountId, resultingHoldingId);
     }
   }
+  // Currency rework Phase 3 — recompute the historical reporting amount when
+  // the amount / currency / date changed. Best-effort (never throws; leaves
+  // columns untouched on an unresolved rate — self-heal / cron backfill).
+  // Skipped when the caller already supplied an explicit reportingAmount.
+  let reportingFields: Partial<{
+    reportingCurrency: string | null;
+    reportingAmount: number | null;
+    reportingRate: number | null;
+  }> = {};
+  const touchesReporting =
+    data.reportingAmount === undefined &&
+    (data.amount !== undefined || data.currency !== undefined || data.date !== undefined);
+  if (touchesReporting) {
+    const cur = await db
+      .select({ date: transactions.date, currency: transactions.currency, amount: transactions.amount })
+      .from(transactions)
+      .where(and(eq(transactions.id, id), eq(transactions.userId, userId)))
+      .get();
+    const date = data.date ?? cur?.date;
+    const currency = data.currency ?? cur?.currency;
+    const amount = data.amount ?? cur?.amount;
+    if (date && currency && amount != null) {
+      const r = await computeReportingFields({
+        userId,
+        accountCurrency: currency,
+        amount,
+        date,
+        reportingCurrency: await getDisplayCurrency(userId),
+      });
+      if (r) {
+        reportingFields = {
+          reportingCurrency: r.reportingCurrency,
+          reportingAmount: r.reportingAmount,
+          reportingRate: r.reportingRate,
+        };
+      }
+    }
+  }
   // Audit-trio (issue #28): every UPDATE bumps updated_at = NOW(). `source`
   // is INSERT-only and intentionally NOT spread into `data`. The Partial<>
   // input type above doesn't include `source`, so a future caller adding it
   // here would be a type error.
   return db
     .update(transactions)
-    .set({ ...data, updatedAt: sql`NOW()` })
+    .set({ ...data, ...reportingFields, updatedAt: sql`NOW()` })
     .where(and(eq(transactions.id, id), eq(transactions.userId, userId)))
     .returning()
     .get();
@@ -804,12 +874,19 @@ export async function getSpendingByCategoryAndCurrency(userId: string, startDate
     .all();
 }
 
+// Currency rework Phase 3 — return per-(month, type, currency, reporting_currency)
+// slices so the dashboard route can convert each slice to the display currency
+// (stored reporting_amount when it matches, else an on-the-fly fallback) before
+// aggregating. Dashboard-only caller. See src/app/api/dashboard/route.ts.
 export async function getIncomeVsExpenses(userId: string, startDate: string, endDate: string) {
   return db
     .select({
       month: monthExpr(transactions.date),
       type: categories.type,
-      total: sql<number>`SUM(${transactions.amount})`,
+      currency: transactions.currency,
+      reportingCurrency: transactions.reportingCurrency,
+      totalAmount: sql<number>`SUM(${transactions.amount})`,
+      totalReporting: sql<number | null>`SUM(${transactions.reportingAmount})`,
     })
     .from(transactions)
     .leftJoin(categories, eq(transactions.categoryId, categories.id))
@@ -821,8 +898,37 @@ export async function getIncomeVsExpenses(userId: string, startDate: string, end
         sql`${categories.type} IN ('E', 'I')`
       )
     )
-    .groupBy(monthExpr(transactions.date), categories.type)
+    .groupBy(monthExpr(transactions.date), categories.type, transactions.currency, transactions.reportingCurrency)
     .orderBy(monthExpr(transactions.date))
+    .all();
+}
+
+// Currency rework Phase 3 — dashboard spending-by-category with per-currency +
+// reporting slices so the route can convert to the display currency. Distinct
+// from getSpendingByCategory (left raw for the budget-rollover internal caller).
+export async function getSpendingByCategoryWithReporting(userId: string, startDate: string, endDate: string) {
+  return db
+    .select({
+      categoryId: categories.id,
+      categoryNameCt: categories.nameCt,
+      categoryGroup: categories.group,
+      categoryType: categories.type,
+      currency: transactions.currency,
+      reportingCurrency: transactions.reportingCurrency,
+      totalAmount: sql<number>`SUM(${transactions.amount})`,
+      totalReporting: sql<number | null>`SUM(${transactions.reportingAmount})`,
+    })
+    .from(transactions)
+    .leftJoin(categories, eq(transactions.categoryId, categories.id))
+    .where(
+      and(
+        eq(transactions.userId, userId),
+        gte(transactions.date, startDate),
+        lte(transactions.date, endDate),
+        eq(categories.type, "E")
+      )
+    )
+    .groupBy(categories.id, categories.nameCt, categories.group, categories.type, transactions.currency, transactions.reportingCurrency)
     .all();
 }
 
