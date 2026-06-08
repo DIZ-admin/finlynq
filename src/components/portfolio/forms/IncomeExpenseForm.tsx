@@ -13,7 +13,7 @@
  */
 
 import { useEffect, useMemo, useState } from "react";
-import { useRouter, useSearchParams } from "next/navigation";
+import { useRouter } from "next/navigation";
 import Link from "next/link";
 import {
   Card,
@@ -32,54 +32,19 @@ import {
   SelectTrigger,
   SelectValue,
 } from "@/components/ui/select";
-
-interface AccountRow {
-  id: number;
-  name: string | null;
-  currency: string;
-  alias?: string | null;
-  type?: string | null;
-  isInvestment?: boolean;
-}
-
-interface HoldingRow {
-  id: number;
-  accountId: number;
-  name: string | null;
-  symbol: string | null;
-  currency: string;
-  isCrypto: boolean | number;
-  isCash: boolean | number;
-  currentShares: number;
-  accountName: string | null;
-}
-
-interface CategoryRow {
-  id: number;
-  name: string | null;
-  type?: string | null;
-  group?: string | null;
-}
-
-function todayISO(): string {
-  return new Date().toISOString().slice(0, 10);
-}
+import { todayISO } from "@/lib/utils/date";
+import { useEditId } from "@/lib/hooks/useEditId";
+import { usePortfolioFormData } from "@/lib/hooks/usePortfolioFormData";
+import { useAccountHoldingSelection } from "@/lib/hooks/useAccountHoldingSelection";
 
 type Direction = "income" | "expense";
 
 export default function IncomeExpenseForm() {
   const router = useRouter();
-  const searchParams = useSearchParams();
-  const editIdParam = searchParams.get("editId");
-  const editId = editIdParam ? Number(editIdParam) : null;
-  const isEdit =
-    editId != null && Number.isFinite(editId) && editId > 0;
+  const { editId, isEdit } = useEditId();
 
-  const [accounts, setAccounts] = useState<AccountRow[]>([]);
-  const [holdings, setHoldings] = useState<HoldingRow[]>([]);
-  const [categories, setCategories] = useState<CategoryRow[]>([]);
-  const [loading, setLoading] = useState(true);
-  const [loadError, setLoadError] = useState<string | null>(null);
+  const { accounts, holdings, categories, loading, loadError, editData } =
+    usePortfolioFormData({ editId, opType: "income-expense", includeCategories: true });
 
   const [accountId, setAccountId] = useState<string>("");
   const [currency, setCurrency] = useState<string>("");
@@ -106,113 +71,27 @@ export default function IncomeExpenseForm() {
   );
 
   useEffect(() => {
-    let cancelled = false;
-    Promise.all([
-      fetch("/api/accounts").then((r) => r.json()),
-      fetch("/api/portfolio").then((r) => r.json()),
-      // Categories are optional — swallow errors so the form still loads.
-      fetch("/api/categories")
-        .then((r) => (r.ok ? r.json() : []))
-        .catch(() => []),
-    ])
-      .then(([acc, holds, cats]) => {
-        if (cancelled) return;
-        setAccounts(Array.isArray(acc) ? acc : []);
-        setHoldings(Array.isArray(holds) ? holds : []);
-        setCategories(Array.isArray(cats) ? cats : []);
-      })
-      .catch((e: unknown) => {
-        if (cancelled) return;
-        setLoadError(e instanceof Error ? e.message : "Failed to load data");
-      })
-      .finally(() => {
-        if (!cancelled) setLoading(false);
-      });
-    return () => {
-      cancelled = true;
-    };
-  }, []);
+    if (!editData) return;
+    if (editData.accountId != null) setAccountId(String(editData.accountId));
+    if (editData.currency) setCurrency(editData.currency as string);
+    if (typeof editData.amount === "number") {
+      setDirection(editData.amount < 0 ? "expense" : "income");
+      setAmount(String(Math.abs(editData.amount)));
+    }
+    if (editData.relatedHoldingId != null)
+      setRelatedHoldingId(String(editData.relatedHoldingId));
+    // Editing an existing row: keep its category exactly as-is via the
+    // manual picker — don't re-infer a preset and silently re-tag.
+    setIncomeType("other");
+    if (editData.categoryId != null) setCategoryId(String(editData.categoryId));
+    if (editData.date) setDate(editData.date as string);
+    setPayee((editData.payee as string) ?? "");
+    setNote((editData.note as string) ?? "");
+    setTags((editData.tags as string) ?? "");
+  }, [editData]);
 
-  // Load existing operation data on mount when editId is present.
-  useEffect(() => {
-    if (!isEdit) return;
-    let cancelled = false;
-    fetch(`/api/portfolio/operations/load?id=${editId}`)
-      .then(async (r) => {
-        if (cancelled) return;
-        const json: {
-          error?: string;
-          data?: {
-            op?: string;
-            accountId?: number;
-            currency?: string;
-            amount?: number;
-            relatedHoldingId?: number | null;
-            categoryId?: number | null;
-            date?: string;
-            payee?: string | null;
-            note?: string | null;
-            tags?: string | null;
-          };
-        } = await r.json().catch(() => ({}));
-        if (cancelled) return;
-        if (!r.ok) {
-          setLoadError(
-            json.error ?? `Failed to load edit data (${r.status})`,
-          );
-          return;
-        }
-        const d = json.data;
-        if (!d) {
-          setLoadError("Failed to load edit data (empty response)");
-          return;
-        }
-        if (d.op !== "income-expense") {
-          setLoadError(
-            `This edit link is for "${d.op}" — use that form instead.`,
-          );
-          return;
-        }
-        if (d.accountId != null) setAccountId(String(d.accountId));
-        if (d.currency) setCurrency(d.currency);
-        if (typeof d.amount === "number") {
-          setDirection(d.amount < 0 ? "expense" : "income");
-          setAmount(String(Math.abs(d.amount)));
-        }
-        if (d.relatedHoldingId != null)
-          setRelatedHoldingId(String(d.relatedHoldingId));
-        // Editing an existing row: keep its category exactly as-is via the
-        // manual picker — don't re-infer a preset and silently re-tag.
-        setIncomeType("other");
-        if (d.categoryId != null) setCategoryId(String(d.categoryId));
-        if (d.date) setDate(d.date);
-        setPayee(d.payee ?? "");
-        setNote(d.note ?? "");
-        setTags(d.tags ?? "");
-      })
-      .catch((e: unknown) => {
-        if (cancelled) return;
-        setLoadError(
-          e instanceof Error ? e.message : "Failed to load edit data",
-        );
-      });
-    return () => {
-      cancelled = true;
-    };
-  }, [editId, isEdit]);
-
-  const investmentAccounts = useMemo(
-    () => accounts.filter((a) => a.isInvestment === true),
-    [accounts],
-  );
-
-  const selectedAccount = useMemo(
-    () =>
-      accountId
-        ? investmentAccounts.find((a) => String(a.id) === accountId) ?? null
-        : null,
-    [accountId, investmentAccounts],
-  );
+  const { investmentAccounts, selectedAccount, accountHoldings } =
+    useAccountHoldingSelection(accounts, holdings, accountId);
 
   // Source currency list from cash sleeves on the selected account.
   const cashSleeves = useMemo(
@@ -220,16 +99,6 @@ export default function IncomeExpenseForm() {
       selectedAccount
         ? holdings.filter(
             (h) => h.accountId === selectedAccount.id && !!h.isCash,
-          )
-        : [],
-    [holdings, selectedAccount],
-  );
-
-  const accountHoldings = useMemo(
-    () =>
-      selectedAccount
-        ? holdings.filter(
-            (h) => h.accountId === selectedAccount.id && !h.isCash,
           )
         : [],
     [holdings, selectedAccount],

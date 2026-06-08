@@ -20,6 +20,7 @@
 
 import { sql } from "drizzle-orm";
 import { nameLookup } from "./crypto/encrypted-columns";
+import { normalizeDbRows } from "./db-utils";
 
 // eslint-disable-next-line @typescript-eslint/no-explicit-any
 type DbLike = { execute: (q: ReturnType<typeof sql>) => Promise<any> };
@@ -51,16 +52,7 @@ export async function resolveDividendsCategoryId(
         AND name_lookup = ${lookup}
       LIMIT 1
     `);
-    // Normalize result shape (pg drivers return { rows: [...] }, some adapters
-    // return the array directly).
-    let rows: Array<{ id: number }> = [];
-    if (result && typeof result === "object") {
-      if ("rows" in result && Array.isArray((result as { rows: unknown }).rows)) {
-        rows = (result as { rows: Array<{ id: number }> }).rows;
-      } else if (Array.isArray(result)) {
-        rows = result as Array<{ id: number }>;
-      }
-    }
+    const rows = normalizeDbRows<{ id: number }>(result);
     if (rows.length > 0) {
       return Number(rows[0].id);
     }

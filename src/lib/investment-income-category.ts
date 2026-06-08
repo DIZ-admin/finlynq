@@ -24,6 +24,7 @@
 
 import { sql } from "drizzle-orm";
 import { nameLookup, encryptName } from "./crypto/encrypted-columns";
+import { normalizeDbRows } from "./db-utils";
 
 // eslint-disable-next-line @typescript-eslint/no-explicit-any
 type DbLike = { execute: (q: ReturnType<typeof sql>) => Promise<any> };
@@ -64,14 +65,6 @@ export const INCOME_CATEGORY_CREATE_TYPE: Record<InvestmentIncomeKind, "I" | "E"
 
 const CREATE_GROUP = "Investments";
 
-// eslint-disable-next-line @typescript-eslint/no-explicit-any
-function normalizeRows(result: any): Array<{ id: number }> {
-  if (result && typeof result === "object") {
-    if ("rows" in result && Array.isArray(result.rows)) return result.rows;
-    if (Array.isArray(result)) return result;
-  }
-  return [];
-}
 
 async function findByName(
   db: DbLike,
@@ -85,7 +78,7 @@ async function findByName(
     WHERE user_id = ${userId} AND name_lookup = ${lookup}
     LIMIT 1
   `);
-  const rows = normalizeRows(result);
+  const rows = normalizeDbRows(result);
   return rows.length > 0 ? Number(rows[0].id) : null;
 }
 
@@ -122,7 +115,7 @@ export async function resolveOrCreateInvestmentIncomeCategory(
       VALUES (${userId}, ${type}, ${CREATE_GROUP}, ${ct}, ${lookup})
       RETURNING id
     `);
-    const rows = normalizeRows(inserted);
+    const rows = normalizeDbRows(inserted);
     if (rows.length > 0) return Number(rows[0].id);
   } catch {
     // Likely a (user_id, name_lookup) unique race — fall through and re-resolve.

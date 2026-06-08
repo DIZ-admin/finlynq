@@ -5,13 +5,14 @@
  * raw SQL so they work with either the pg or neon-http drivers.
  *
  * Row extraction: `db.execute()` returns `{ rows: [...] }` for pg/neon.
- * We normalise via `rows()` helper below.
+ * We normalise via `normalizeDbRows()` from src/lib/db-utils.
  */
 
 import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { sql, inArray } from "drizzle-orm";
 import { z } from "zod";
 import { stagedTransactions } from "../src/db/schema-pg";
+import { normalizeDbRows } from "../src/lib/db-utils";
 import { decryptField, encryptField } from "../src/lib/crypto/envelope";
 import { maybeDecryptFileBytes } from "../src/lib/crypto/file-envelope";
 import { encryptName, nameLookup } from "../src/lib/crypto/encrypted-columns";
@@ -123,20 +124,8 @@ type DbLike = { execute: (q: ReturnType<typeof sql>) => Promise<any> };
 
 // ─── helpers ──────────────────────────────────────────────────────────────────
 
-function rows(result: unknown): Row[] {
-  if (result && typeof result === "object") {
-    // pg / neon: { rows: [...] }
-    if ("rows" in result && Array.isArray((result as { rows: unknown }).rows)) {
-      return (result as { rows: Row[] }).rows;
-    }
-    // drizzle-orm result arrays (some adapters return the array directly)
-    if (Array.isArray(result)) return result as Row[];
-  }
-  return [];
-}
-
 async function q(db: DbLike, query: ReturnType<typeof sql>): Promise<Row[]> {
-  return rows(await db.execute(query));
+  return normalizeDbRows<Row>(await db.execute(query));
 }
 
 // ─── Idempotency-key in-flight mutex (M-1, SECURITY_REVIEW 2026-05-06) ──────

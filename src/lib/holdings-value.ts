@@ -19,10 +19,7 @@ import { getLatestFxRate, getRate } from "@/lib/fx-service";
 import { isMetalCurrency, isCryptoSymbol, isCurrencyCodeSymbol } from "@/lib/fx/supported-currencies";
 import { decryptNamedRows } from "@/lib/crypto/encrypted-columns";
 import { cashLegSkipSql } from "@/lib/portfolio/aggregation-predicates";
-
-function todayISO(): string {
-  return new Date().toISOString().split("T")[0];
-}
+import { todayISO } from "@/lib/utils/date";
 
 export type AccountHoldingsValue = {
   accountId: number;

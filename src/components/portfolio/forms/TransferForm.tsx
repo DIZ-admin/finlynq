@@ -14,7 +14,7 @@
  */
 
 import { useEffect, useMemo, useState } from "react";
-import { useRouter, useSearchParams } from "next/navigation";
+import { useRouter } from "next/navigation";
 import Link from "next/link";
 import {
   Card,
@@ -33,44 +33,17 @@ import {
   SelectTrigger,
   SelectValue,
 } from "@/components/ui/select";
-
-interface AccountRow {
-  id: number;
-  name: string | null;
-  currency: string;
-  alias?: string | null;
-  type?: string | null;
-  isInvestment?: boolean;
-}
-
-interface HoldingRow {
-  id: number;
-  accountId: number;
-  name: string | null;
-  symbol: string | null;
-  currency: string;
-  isCrypto: boolean | number;
-  isCash: boolean | number;
-  currentShares: number;
-  accountName: string | null;
-}
-
-function todayISO(): string {
-  return new Date().toISOString().slice(0, 10);
-}
+import { todayISO } from "@/lib/utils/date";
+import { useEditId } from "@/lib/hooks/useEditId";
+import { usePortfolioFormData } from "@/lib/hooks/usePortfolioFormData";
+import { useAccountHoldingSelection } from "@/lib/hooks/useAccountHoldingSelection";
 
 export default function TransferForm() {
   const router = useRouter();
-  const searchParams = useSearchParams();
-  const editIdParam = searchParams.get("editId");
-  const editId = editIdParam ? Number(editIdParam) : null;
-  const isEdit =
-    editId != null && Number.isFinite(editId) && editId > 0;
+  const { editId, isEdit } = useEditId();
 
-  const [accounts, setAccounts] = useState<AccountRow[]>([]);
-  const [holdings, setHoldings] = useState<HoldingRow[]>([]);
-  const [loading, setLoading] = useState(true);
-  const [loadError, setLoadError] = useState<string | null>(null);
+  const { accounts, holdings, loading, loadError, editData } =
+    usePortfolioFormData({ editId, opType: "transfer" });
 
   const [sourceAccountId, setSourceAccountId] = useState<string>("");
   const [destAccountId, setDestAccountId] = useState<string>("");
@@ -88,115 +61,25 @@ export default function TransferForm() {
   );
 
   useEffect(() => {
-    let cancelled = false;
-    Promise.all([
-      fetch("/api/accounts").then((r) => r.json()),
-      fetch("/api/portfolio").then((r) => r.json()),
-    ])
-      .then(([acc, holds]) => {
-        if (cancelled) return;
-        setAccounts(Array.isArray(acc) ? acc : []);
-        setHoldings(Array.isArray(holds) ? holds : []);
-      })
-      .catch((e: unknown) => {
-        if (cancelled) return;
-        setLoadError(e instanceof Error ? e.message : "Failed to load data");
-      })
-      .finally(() => {
-        if (!cancelled) setLoading(false);
-      });
-    return () => {
-      cancelled = true;
-    };
-  }, []);
+    if (!editData) return;
+    if (editData.sourceAccountId != null) setSourceAccountId(String(editData.sourceAccountId));
+    if (editData.destAccountId != null) setDestAccountId(String(editData.destAccountId));
+    if (editData.holdingId != null) setHoldingId(String(editData.holdingId));
+    if (editData.qty != null) setQty(String(editData.qty));
+    if (editData.date) setDate(editData.date as string);
+    setPayee((editData.payee as string) ?? "");
+    setNote((editData.note as string) ?? "");
+  }, [editData]);
 
-  // Load existing operation data on mount when editId is present.
-  useEffect(() => {
-    if (!isEdit) return;
-    let cancelled = false;
-    fetch(`/api/portfolio/operations/load?id=${editId}`)
-      .then(async (r) => {
-        if (cancelled) return;
-        const json: {
-          error?: string;
-          data?: {
-            op?: string;
-            sourceAccountId?: number;
-            destAccountId?: number;
-            holdingId?: number;
-            qty?: number;
-            date?: string;
-            payee?: string | null;
-            note?: string | null;
-          };
-        } = await r.json().catch(() => ({}));
-        if (cancelled) return;
-        if (!r.ok) {
-          setLoadError(
-            json.error ?? `Failed to load edit data (${r.status})`,
-          );
-          return;
-        }
-        const d = json.data;
-        if (!d) {
-          setLoadError("Failed to load edit data (empty response)");
-          return;
-        }
-        if (d.op !== "transfer") {
-          setLoadError(
-            `This edit link is for "${d.op}" — use that form instead.`,
-          );
-          return;
-        }
-        if (d.sourceAccountId != null)
-          setSourceAccountId(String(d.sourceAccountId));
-        if (d.destAccountId != null)
-          setDestAccountId(String(d.destAccountId));
-        if (d.holdingId != null) setHoldingId(String(d.holdingId));
-        if (d.qty != null) setQty(String(d.qty));
-        if (d.date) setDate(d.date);
-        setPayee(d.payee ?? "");
-        setNote(d.note ?? "");
-      })
-      .catch((e: unknown) => {
-        if (cancelled) return;
-        setLoadError(
-          e instanceof Error ? e.message : "Failed to load edit data",
-        );
-      });
-    return () => {
-      cancelled = true;
-    };
-  }, [editId, isEdit]);
-
-  const investmentAccounts = useMemo(
-    () => accounts.filter((a) => a.isInvestment === true),
-    [accounts],
-  );
-
-  const sourceAccount = useMemo(
-    () =>
-      sourceAccountId
-        ? investmentAccounts.find((a) => String(a.id) === sourceAccountId) ??
-          null
-        : null,
-    [sourceAccountId, investmentAccounts],
-  );
+  const {
+    investmentAccounts,
+    selectedAccount: sourceAccount,
+    accountHoldings: sourceHoldings,
+  } = useAccountHoldingSelection(accounts, holdings, sourceAccountId);
 
   const destAccountOptions = useMemo(
-    () =>
-      investmentAccounts.filter((a) => String(a.id) !== sourceAccountId),
+    () => investmentAccounts.filter((a) => String(a.id) !== sourceAccountId),
     [investmentAccounts, sourceAccountId],
-  );
-
-  const sourceHoldings = useMemo(
-    () =>
-      sourceAccount
-        ? holdings.filter(
-            (h) => h.accountId === sourceAccount.id && !h.isCash,
-          )
-        : [],
-    [holdings, sourceAccount],
   );
 
   const selectedHolding = useMemo(

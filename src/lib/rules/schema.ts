@@ -20,8 +20,7 @@
  * See living doc (post-ship): pf-app/docs/transaction-rules-v2.md
  */
 import { z } from "zod";
-
-const StringOp = z.enum(["contains", "exact", "regex"]);
+import { StringOp } from "@/lib/schemas/rule-primitives";
 const AmountOp = z.enum(["gt", "lt", "eq"]);
 const SetOp = z.enum(["is", "is_not"]);
 

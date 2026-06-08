@@ -16,6 +16,8 @@
 
 import { db, schema } from "@/db";
 import { and, eq, desc, gte, lte, isNull, or, sql } from "drizzle-orm";
+import { todayISO } from "@/lib/utils/date";
+import { round2 } from "@/lib/currency-conversion";
 import {
   SUPPORTED_CURRENCIES,
   isCryptoCurrency,
@@ -124,7 +126,6 @@ const FALLBACK_RATE_TO_USD: Record<string, number> = {
 // the fallback path rather than `unknown currency`.
 for (const k of Object.keys(FALLBACK_RATE_TO_USD)) FALLBACK_CURRENCY_SET.add(k);
 
-const todayISO = (): string => new Date().toISOString().split("T")[0];
 
 /**
  * Resolve the display currency for an API request.
@@ -611,7 +612,7 @@ export async function fetchFxRate(from: string, to: string): Promise<number | nu
 }
 
 export function convertCurrency(amount: number, rate: number): number {
-  return Math.round(amount * rate * 100) / 100;
+  return round2(amount * rate);
 }
 
 export async function getConsolidatedBalances(
