@@ -24,7 +24,8 @@
 import { NextRequest, NextResponse } from "next/server";
 import { db, schema } from "@/db";
 import { and, desc, eq, inArray, count } from "drizzle-orm";
-import { requireAuth } from "@/lib/auth/require-auth";
+import { requireEncryption } from "@/lib/auth/require-encryption";
+import { decryptStagingMeta } from "@/lib/crypto/staging-metadata";
 
 export const dynamic = "force-dynamic";
 
@@ -32,9 +33,12 @@ const DEFAULT_LIMIT = 20;
 const MAX_LIMIT = 100;
 
 export async function GET(request: NextRequest) {
-  const auth = await requireAuth(request);
-  if (!auth.authenticated) return auth.response;
-  const { userId } = auth.context;
+  // FINLYNQ-120 — bank_upload_batches.filename is now encrypted in-place;
+  // decrypting it needs the session DEK, so this read upgrades to
+  // requireEncryption (was requireAuth). The panel is a web-only login surface.
+  const auth = await requireEncryption(request);
+  if (!auth.ok) return auth.response;
+  const { userId, dek } = auth;
 
   const url = new URL(request.url);
   const accountIdRaw = url.searchParams.get("accountId");
@@ -59,6 +63,8 @@ export async function GET(request: NextRequest) {
       source: schema.bankUploadBatches.source,
       mode: schema.bankUploadBatches.mode,
       filename: schema.bankUploadBatches.filename,
+      // FINLYNQ-120 — drives the per-row tier branch for the filename decrypt.
+      encryptionTier: schema.bankUploadBatches.encryptionTier,
       uploadedAt: schema.bankUploadBatches.uploadedAt,
       rowCount: schema.bankUploadBatches.rowCount,
       anchorCount: schema.bankUploadBatches.anchorCount,
@@ -122,7 +128,8 @@ export async function GET(request: NextRequest) {
       accountId: b.accountId,
       source: b.source,
       mode: b.mode,
-      filename: b.filename,
+      // FINLYNQ-120 — decrypt tier-aware (mixed tiers expected mid-upgrade).
+      filename: decryptStagingMeta(b.filename, b.encryptionTier, dek),
       uploadedAt: b.uploadedAt,
       rowCount: b.rowCount,
       anchorCount: b.anchorCount,

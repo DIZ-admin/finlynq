@@ -50,6 +50,7 @@ import { and, eq, inArray } from "drizzle-orm";
 import { requireEncryption } from "@/lib/auth/require-encryption";
 import { decryptName } from "@/lib/crypto/encrypted-columns";
 import { encryptField, tryDecryptField } from "@/lib/crypto/envelope";
+import { encryptStagingMeta } from "@/lib/crypto/staging-metadata";
 import {
   generateImportHash,
   checkDuplicates,
@@ -874,7 +875,10 @@ export async function POST(request: NextRequest) {
         statementPeriodEnd,
         boundAccountId: accountId,
         fileFormat: parseResult.format,
-        originalFilename: file.name,
+        // FINLYNQ-120 — web upload carries a session DEK, so filename lands at
+        // USER tier (v1:). fromAddress/subject/sampleRows are null on this path.
+        originalFilename: encryptStagingMeta(file.name, "user", dek),
+        encryptionTier: "user",
         // FINLYNQ-54 parser knobs — persisted so the F-53E merge flow can
         // read them back. Defaults match pre-FINLYNQ-54 behavior.
         skipHeaderRows,

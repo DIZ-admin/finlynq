@@ -388,7 +388,7 @@ export async function POST(request: NextRequest) {
       const BATCH_MODES = new Set(["simplified", "detailed"]);
       const remappedBatches = d.bankUploadBatches
         .map((row) => {
-          const { id: _id, userId: _uid, accountId, source: rawSrc, mode: rawMode, templateId: _tpl, stagedImportId: _si, ...rest } = row;
+          const { id: _id, userId: _uid, accountId, source: rawSrc, mode: rawMode, templateId: _tpl, stagedImportId: _si, filename: rawFilename, encryptionTier: _tier, ...rest } = row;
           if (accountId == null) return null;
           const newAccountId = accountIdMap.get(accountId as number);
           if (newAccountId == null) {
@@ -404,6 +404,12 @@ export async function POST(request: NextRequest) {
             accountId: newAccountId,
             source: src,
             mode,
+            // FINLYNQ-120 - the backup ships filename as plaintext (export
+            // decrypts it). Re-encrypt under the restoring user's DEK and force
+            // user-tier, mirroring the bank_transactions restore below.
+            filename:
+              typeof rawFilename === "string" ? encryptField(dek, rawFilename) : null,
+            encryptionTier: "user",
             // template_id + staged_import_id are SET NULL on delete; we
             // drop them entirely on restore since template ids drift and
             // staged_imports rows aren't part of the backup payload today.

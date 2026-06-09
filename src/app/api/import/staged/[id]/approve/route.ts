@@ -67,6 +67,10 @@ import { and, eq, asc, inArray, ne } from "drizzle-orm";
 import { requireEncryption } from "@/lib/auth/require-encryption";
 import { decryptStaged } from "@/lib/crypto/staging-envelope";
 import { tryDecryptField } from "@/lib/crypto/envelope";
+import {
+  encryptStagingMeta,
+  decryptStagingMeta,
+} from "@/lib/crypto/staging-metadata";
 import { generateImportHash } from "@/lib/import-hash";
 import { upsertBankTransaction } from "@/lib/bank-ledger";
 import {
@@ -107,6 +111,8 @@ export async function POST(
       source: schema.stagedImports.source,
       fileFormat: schema.stagedImports.fileFormat,
       originalFilename: schema.stagedImports.originalFilename,
+      // FINLYNQ-120 — needed to tier-decrypt originalFilename (sv1: vs v1:).
+      encryptionTier: schema.stagedImports.encryptionTier,
       boundAccountId: schema.stagedImports.boundAccountId,
       parsedAnchors: schema.stagedImports.parsedAnchors,
       statementBalance: schema.stagedImports.statementBalance,
@@ -123,6 +129,17 @@ export async function POST(
   if (!staged) {
     return NextResponse.json({ error: "Not found or already processed" }, { status: 404 });
   }
+
+  // FINLYNQ-120 — staged.originalFilename is now encrypted (sv1: service-tier
+  // for email batches, v1: user-tier for uploads / post-sweep). Decrypt to
+  // plaintext once: it feeds bank_transactions.source_filenames (plaintext,
+  // out of scope) AND is re-encrypted under the user's DEK for the PERMANENT
+  // bank_upload_batches.filename column below.
+  const plainFilename = decryptStagingMeta(
+    staged.originalFilename,
+    staged.encryptionTier,
+    dek,
+  );
 
   // ─── Load staged_transactions ────────────────────────────────────────────
   const allRows = await db
@@ -313,7 +330,10 @@ export async function POST(
       templateId: null,
       source: sourceLabel,
       mode: "detailed",
-      filename: staged.originalFilename ?? null,
+      // FINLYNQ-120 — re-encrypt under the user's DEK (this route has one via
+      // requireEncryption). This row is permanent.
+      filename: encryptStagingMeta(plainFilename, "user", dek),
+      encryptionTier: "user",
       rowCount: resolved.length,
       anchorCount: dedupedAnchors.length,
       stagedImportId: staged.id,
@@ -353,7 +373,8 @@ export async function POST(
         tags: r.tags,
         accountName: r.accountName,
         source: "import",
-        filename: staged.originalFilename ?? null,
+        // Plaintext for source_filenames (out of FINLYNQ-120 scope).
+        filename: plainFilename,
         originalStagedImportId: staged.id,
         uploadBatchId: batchRow.id,
       });

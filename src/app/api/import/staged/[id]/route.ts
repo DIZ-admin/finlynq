@@ -16,6 +16,10 @@ import { requireAuth } from "@/lib/auth/require-auth";
 import { requireEncryption } from "@/lib/auth/require-encryption";
 import { decryptStaged } from "@/lib/crypto/staging-envelope";
 import { tryDecryptField } from "@/lib/crypto/envelope";
+import {
+  decryptStagingMeta,
+  decryptSampleRows,
+} from "@/lib/crypto/staging-metadata";
 import { getHoldingsValueByAccount } from "@/lib/holdings-value";
 import { getRate } from "@/lib/fx-service";
 import { findAutoMatches } from "@/lib/import/auto-match";
@@ -462,8 +466,24 @@ export async function GET(
     pickerCandidates = { accounts, templates };
   }
 
+  // FINLYNQ-120 — decrypt the import-level metadata fields tier-aware before
+  // returning. The internal computations above only touched unencrypted
+  // columns (boundAccountId / statementBalance / headers), so it's safe to
+  // override the four sensitive fields only on the response object.
+  const stagedDecrypted = {
+    ...staged,
+    fromAddress: decryptStagingMeta(staged.fromAddress, staged.encryptionTier, dek),
+    subject: decryptStagingMeta(staged.subject, staged.encryptionTier, dek),
+    originalFilename: decryptStagingMeta(
+      staged.originalFilename,
+      staged.encryptionTier,
+      dek,
+    ),
+    sampleRows: decryptSampleRows(staged.sampleRows, staged.encryptionTier, dek),
+  };
+
   return NextResponse.json({
-    staged,
+    staged: stagedDecrypted,
     rows: decryptedRows,
     reconciliation: {
       currentBalance,

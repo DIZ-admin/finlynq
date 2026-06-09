@@ -29,6 +29,12 @@ import { db, schema } from "@/db";
 import { and, eq } from "drizzle-orm";
 import { encryptField } from "@/lib/crypto/envelope";
 import { decryptStaged } from "@/lib/crypto/staging-envelope";
+import {
+  encryptStagingMeta,
+  encryptSampleRows,
+  decryptStagingMeta,
+  decryptSampleRows,
+} from "@/lib/crypto/staging-metadata";
 
 /**
  * Fire-and-forget wrapper. Schedules the upgrade on the next microtask so
@@ -51,6 +57,10 @@ export interface UpgradeStagingResult {
   failed: number;
   /** Two-ledger refactor (2026-05-22) — same shape, scoped to bank_transactions. */
   bankLedger?: { scanned: number; upgraded: number; failed: number };
+  /** FINLYNQ-120 — staged_imports metadata (from/subject/filename/sample_rows). */
+  stagedImportsMeta?: { scanned: number; upgraded: number; failed: number };
+  /** FINLYNQ-120 — bank_upload_batches.filename (permanent rows). */
+  uploadBatches?: { scanned: number; upgraded: number; failed: number };
 }
 
 /**
@@ -133,7 +143,129 @@ export async function upgradeStagingEncryption(
   // Per-row try/catch + optimistic WHERE guard mirrors the staging pass.
   const bankLedger = await upgradeBankLedgerEncryption(userId, dek);
 
-  return { scanned: rows.length, upgraded, failed, bankLedger };
+  // ─── FINLYNQ-120 — staged_imports metadata + bank_upload_batches.filename ──
+  // Same service→user flip for the staging-metadata columns the email webhook
+  // wrote at service-tier (and for any legacy plaintext rows from before this
+  // shipped). Each pass is per-row try/catch + optimistic WHERE guard.
+  const stagedImportsMeta = await upgradeStagedImportsMetaEncryption(userId, dek);
+  const uploadBatches = await upgradeUploadBatchEncryption(userId, dek);
+
+  return {
+    scanned: rows.length,
+    upgraded,
+    failed,
+    bankLedger,
+    stagedImportsMeta,
+    uploadBatches,
+  };
+}
+
+async function upgradeStagedImportsMetaEncryption(
+  userId: string,
+  dek: Buffer,
+): Promise<{ scanned: number; upgraded: number; failed: number }> {
+  const rows = await db
+    .select({
+      id: schema.stagedImports.id,
+      fromAddress: schema.stagedImports.fromAddress,
+      subject: schema.stagedImports.subject,
+      originalFilename: schema.stagedImports.originalFilename,
+      sampleRows: schema.stagedImports.sampleRows,
+      encryptionTier: schema.stagedImports.encryptionTier,
+    })
+    .from(schema.stagedImports)
+    .where(
+      and(
+        eq(schema.stagedImports.userId, userId),
+        eq(schema.stagedImports.encryptionTier, "service"),
+      ),
+    );
+
+  let upgraded = 0;
+  let failed = 0;
+
+  for (const r of rows) {
+    try {
+      // Decrypt at the CURRENT (service) tier, re-encrypt under the DEK.
+      const fromPt = decryptStagingMeta(r.fromAddress, "service", null);
+      const subjPt = decryptStagingMeta(r.subject, "service", null);
+      const filePt = decryptStagingMeta(r.originalFilename, "service", null);
+      const samplePt = decryptSampleRows(r.sampleRows, "service", null);
+
+      await db
+        .update(schema.stagedImports)
+        .set({
+          fromAddress: encryptStagingMeta(fromPt, "user", dek),
+          subject: encryptStagingMeta(subjPt, "user", dek),
+          originalFilename: encryptStagingMeta(filePt, "user", dek),
+          sampleRows: encryptSampleRows(samplePt, "user", dek),
+          encryptionTier: "user",
+        })
+        .where(
+          and(
+            eq(schema.stagedImports.id, r.id),
+            eq(schema.stagedImports.encryptionTier, "service"),
+          ),
+        );
+      upgraded++;
+    } catch (err) {
+      failed++;
+      console.warn("[staging-upgrade] staged_imports meta row failed", {
+        id: r.id,
+        err: err instanceof Error ? err.message : String(err),
+      });
+    }
+  }
+
+  return { scanned: rows.length, upgraded, failed };
+}
+
+async function upgradeUploadBatchEncryption(
+  userId: string,
+  dek: Buffer,
+): Promise<{ scanned: number; upgraded: number; failed: number }> {
+  const rows = await db
+    .select({
+      id: schema.bankUploadBatches.id,
+      filename: schema.bankUploadBatches.filename,
+    })
+    .from(schema.bankUploadBatches)
+    .where(
+      and(
+        eq(schema.bankUploadBatches.userId, userId),
+        eq(schema.bankUploadBatches.encryptionTier, "service"),
+      ),
+    );
+
+  let upgraded = 0;
+  let failed = 0;
+
+  for (const r of rows) {
+    try {
+      const filePt = decryptStagingMeta(r.filename, "service", null);
+      await db
+        .update(schema.bankUploadBatches)
+        .set({
+          filename: encryptStagingMeta(filePt, "user", dek),
+          encryptionTier: "user",
+        })
+        .where(
+          and(
+            eq(schema.bankUploadBatches.id, r.id),
+            eq(schema.bankUploadBatches.encryptionTier, "service"),
+          ),
+        );
+      upgraded++;
+    } catch (err) {
+      failed++;
+      console.warn("[staging-upgrade] bank_upload_batches row failed", {
+        id: r.id,
+        err: err instanceof Error ? err.message : String(err),
+      });
+    }
+  }
+
+  return { scanned: rows.length, upgraded, failed };
 }
 
 async function upgradeBankLedgerEncryption(

@@ -6,6 +6,7 @@ import { requireAuth } from "@/lib/auth/require-auth";
 import { getDEK } from "@/lib/crypto/dek-cache";
 import { tryDecryptField } from "@/lib/crypto/envelope";
 import { decryptStaged } from "@/lib/crypto/staging-envelope";
+import { decryptStagingMeta } from "@/lib/crypto/staging-metadata";
 import { safeErrorMessage } from "@/lib/validate";
 import { validatePasswordStrength } from "@/lib/auth/password-policy";
 
@@ -218,6 +219,21 @@ async function handleExport(request: NextRequest) {
     const decryptedBankTransactions = bankTransactions.map((b) =>
       decryptBankLedgerRow(dek, b as Record<string, unknown>, failures)
     );
+    // FINLYNQ-120 — bank_upload_batches.filename is now encrypted in-place
+    // (v1:/sv1: per encryptionTier). Decrypt to plaintext so the backup is
+    // portable across DEKs (mirrors the bank_transactions tier-aware decrypt).
+    const decryptedBankUploadBatches = bankUploadBatches.map((b) => {
+      const row = b as Record<string, unknown>;
+      const tier = String(row.encryptionTier ?? "user");
+      return {
+        ...row,
+        filename: decryptStagingMeta(
+          row.filename as string | null,
+          tier,
+          dek,
+        ),
+      };
+    });
 
     const dateStr = new Date().toISOString().slice(0, 10);
     const backup = {
@@ -234,7 +250,7 @@ async function handleExport(request: NextRequest) {
         bankTransactions: decryptedBankTransactions,
         transactionBankLinks,
         bankDailyBalances,
-        bankUploadBatches,
+        bankUploadBatches: decryptedBankUploadBatches,
         budgets,
         budgetTemplates,
         loans,

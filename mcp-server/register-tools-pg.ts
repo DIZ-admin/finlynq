@@ -9878,7 +9878,8 @@ export function registerPgTools(
           SELECT id, source, from_address, subject, received_at, expires_at,
                  total_row_count, duplicate_count, file_format, original_filename,
                  bound_account_id, statement_balance, statement_balance_date,
-                 statement_currency, statement_period_start, statement_period_end
+                 statement_currency, statement_period_start, statement_period_end,
+                 encryption_tier
           FROM staged_imports
           WHERE user_id = ${userId}
             AND status = ${filterStatus}
@@ -10002,17 +10003,20 @@ export function registerPgTools(
             }
           }
 
+          // FINLYNQ-120 — from_address / subject / original_filename are
+          // encrypted in-place; decode tier-aware before surfacing to Claude.
+          const importTier = String(i.encryption_tier ?? "service");
           return {
             id: i.id,
             source: i.source,
-            fromAddress: i.from_address,
-            subject: i.subject,
+            fromAddress: decodeStagedField(i.from_address as string | null, importTier),
+            subject: decodeStagedField(i.subject as string | null, importTier),
             receivedAt: i.received_at,
             expiresAt: i.expires_at,
             totalRowCount: Number(i.total_row_count ?? 0),
             duplicateCount: Number(i.duplicate_count ?? 0),
             fileFormat: i.file_format,
-            originalFilename: i.original_filename,
+            originalFilename: decodeStagedField(i.original_filename as string | null, importTier),
             boundAccountId: i.bound_account_id,
             statementBalance:
               i.statement_balance != null ? Number(i.statement_balance) : null,
@@ -10044,7 +10048,7 @@ export function registerPgTools(
                  status, total_row_count, duplicate_count, file_format,
                  original_filename, bound_account_id, statement_balance,
                  statement_balance_date, statement_currency,
-                 statement_period_start, statement_period_end
+                 statement_period_start, statement_period_end, encryption_tier
           FROM staged_imports
           WHERE id = ${stagedImportId} AND user_id = ${userId}
         `,
@@ -10094,19 +10098,21 @@ export function registerPgTools(
         };
       });
 
+      // FINLYNQ-120 — decode the import-level metadata tier-aware.
+      const stagedTier = String(staged.encryption_tier ?? "service");
       return dataResponse({
         staged: {
           id: staged.id,
           source: staged.source,
-          fromAddress: staged.from_address,
-          subject: staged.subject,
+          fromAddress: decodeStagedField(staged.from_address as string | null, stagedTier),
+          subject: decodeStagedField(staged.subject as string | null, stagedTier),
           receivedAt: staged.received_at,
           expiresAt: staged.expires_at,
           status: staged.status,
           totalRowCount: Number(staged.total_row_count ?? 0),
           duplicateCount: Number(staged.duplicate_count ?? 0),
           fileFormat: staged.file_format,
-          originalFilename: staged.original_filename,
+          originalFilename: decodeStagedField(staged.original_filename as string | null, stagedTier),
           boundAccountId: staged.bound_account_id,
           statementBalance:
             staged.statement_balance != null ? Number(staged.statement_balance) : null,
@@ -10584,7 +10590,8 @@ export function registerPgTools(
       const stagedRows = await q(
         db,
         sql`
-          SELECT id, source, file_format, status, original_filename FROM staged_imports
+          SELECT id, source, file_format, status, original_filename, encryption_tier
+          FROM staged_imports
           WHERE id = ${stagedImportId} AND user_id = ${userId}
         `,
       );
@@ -10593,6 +10600,13 @@ export function registerPgTools(
       if (String(staged.status) !== "pending") {
         return err("Staged import is not pending — already processed.");
       }
+      // FINLYNQ-120 — original_filename is encrypted in-place; decode to
+      // plaintext once before feeding it to the import pipeline (which stores
+      // it in bank_transactions.source_filenames, a plaintext column).
+      const stagedFilename = decodeStagedField(
+        staged.original_filename as string | null,
+        String(staged.encryption_tier ?? "service"),
+      );
 
       // Load all rows for the import; filter to selected ids.
       const allRows = await q(
@@ -10813,7 +10827,7 @@ export function registerPgTools(
             "import",
             {
               bankLedgerMode: "merge",
-              filename: (staged.original_filename as string | null) ?? null,
+              filename: stagedFilename,
               stagedImportId: String(staged.id),
             },
           );
@@ -10909,7 +10923,7 @@ export function registerPgTools(
               payee: aPayee,
               note: aNote || null,
               source: "import",
-              filename: (staged.original_filename as string | null) ?? null,
+              filename: stagedFilename,
               originalStagedImportId: String(staged.id),
             });
             aBankTxId = aResult.id;
@@ -10928,7 +10942,7 @@ export function registerPgTools(
               payee: bPayee,
               note: bNote || null,
               source: "import",
-              filename: (staged.original_filename as string | null) ?? null,
+              filename: stagedFilename,
               originalStagedImportId: String(staged.id),
             });
             bBankTxId = bResult.id;
@@ -11027,7 +11041,7 @@ export function registerPgTools(
               payee: stagedPayee,
               note: decodeStagedField(r.note as string | null, tier) || null,
               source: "import",
-              filename: (staged.original_filename as string | null) ?? null,
+              filename: stagedFilename,
               originalStagedImportId: String(staged.id),
             });
             stagedBankTxId = upsertResult.id;
@@ -11152,13 +11166,15 @@ export function registerPgTools(
         db,
         sql`
           SELECT id, source, file_format, original_filename, subject,
-                 total_row_count, status
+                 total_row_count, status, encryption_tier
           FROM staged_imports
           WHERE id = ${stagedImportId} AND user_id = ${userId}
         `,
       );
       if (!stagedRows.length) return err("Not found");
       const staged = stagedRows[0];
+      // FINLYNQ-120 — decode the encrypted metadata for the preview summary.
+      const rejectTier = String(staged.encryption_tier ?? "service");
 
       const tokenPayload = { stagedImportId };
 
@@ -11170,8 +11186,8 @@ export function registerPgTools(
             stagedImportId,
             source: staged.source,
             fileFormat: staged.file_format,
-            originalFilename: staged.original_filename,
-            subject: staged.subject,
+            originalFilename: decodeStagedField(staged.original_filename as string | null, rejectTier),
+            subject: decodeStagedField(staged.subject as string | null, rejectTier),
             rowCount: Number(staged.total_row_count ?? 0),
             status: staged.status,
           },

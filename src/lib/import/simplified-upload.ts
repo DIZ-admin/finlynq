@@ -28,6 +28,7 @@
 
 import { db, schema } from "@/db";
 import { upsertBankTransaction } from "@/lib/bank-ledger";
+import { encryptStagingMeta } from "@/lib/crypto/staging-metadata";
 import {
   upsertBankBalanceAnchors,
   type BalanceAnchor,
@@ -98,7 +99,12 @@ export async function simplifiedUpload(
       templateId,
       source,
       mode: "simplified",
-      filename,
+      // FINLYNQ-120 — bank_upload_batches rows are PERMANENT; encrypt the
+      // filename under the user's DEK (this path always has one). The
+      // plaintext filename still flows into bank_transactions.source_filenames
+      // below (out of FINLYNQ-120 scope — that column is unchanged).
+      filename: encryptStagingMeta(filename, "user", dek),
+      encryptionTier: "user",
       rowCount: rows.length,
       anchorCount: anchors.length,
     })

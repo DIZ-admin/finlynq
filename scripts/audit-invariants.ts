@@ -89,6 +89,14 @@
  *                                  drain re-materializes stale daily snapshots
  *                                  after a back-dated investment edit
  *                                  (plan/net-worth-over-time.md Part B).
+ *  12. staging-metadata-encrypted — every Drizzle write into staged_imports
+ *                                  (.values) or bank_upload_batches (.values)
+ *                                  must compute the sensitive metadata through
+ *                                  the staging-metadata helpers
+ *                                  (`encryptStagingMeta` / `encryptSampleRows`)
+ *                                  so from_address/subject/original_filename/
+ *                                  sample_rows + bank_upload_batches.filename
+ *                                  never land plaintext (FINLYNQ-120).
  *
  * Output:
  *   ALL INVARIANTS PASS                  (exit 0)
@@ -485,6 +493,23 @@ const INVARIANTS: InvariantConfig[] = [
     writeSite: /invalidateUser(?:TxCache)?\s*\(/,
     requiredHelper: /\bmarkSnapshotsDirty\s*\(/,
     helperName: "markSnapshotsDirty",
+  },
+  {
+    id: "staging-metadata-encrypted",
+    description:
+      "every write into staged_imports / bank_upload_batches must compute the sensitive metadata (from_address/subject/original_filename/sample_rows/filename) via the staging-metadata helpers so it never lands plaintext (FINLYNQ-120)",
+    fileGlobs: ["src/", "mcp-server/"],
+    // Real write-sites: a Drizzle `.insert(schema.stagedImports)` /
+    // `.insert(schema.bankUploadBatches)` OR a raw `INSERT INTO staged_imports`
+    // / `INSERT INTO bank_upload_batches`. (UPDATE-in-place of these columns
+    // happens only in the login sweep, which IS the helper site.)
+    writeSite:
+      /db\s*\.\s*insert\(\s*(?:schema\.)?stagedImports\s*\)|db\s*\.\s*insert\(\s*(?:schema\.)?bankUploadBatches\s*\)|INSERT\s+INTO\s+staged_imports\b|INSERT\s+INTO\s+bank_upload_batches\b/,
+    // Any staging-metadata encrypt helper, OR a bare encryptField (the
+    // backup-restore path re-encrypts filename under the user DEK directly).
+    requiredHelper:
+      /\b(?:encryptStagingMeta|encryptSampleRows|encryptField)\s*\(/,
+    helperName: "encryptStagingMeta / encryptSampleRows (or encryptField on restore)",
   },
 ];
 
