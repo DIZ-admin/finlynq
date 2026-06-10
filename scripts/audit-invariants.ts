@@ -97,6 +97,13 @@
  *                                  so from_address/subject/original_filename/
  *                                  sample_rows + bank_upload_batches.filename
  *                                  never land plaintext (FINLYNQ-120).
+ *  13. source-filenames-encrypted — the bank-ledger writer must encrypt each
+ *                                  bank_transactions.source_filenames element
+ *                                  at the row's tier (encryptStagingMeta)
+ *                                  before the ARRAY[…]::TEXT[] write, so
+ *                                  upload filenames (bank name / account
+ *                                  fragments / statement period) never land
+ *                                  plaintext (FINLYNQ-132).
  *
  * Output:
  *   ALL INVARIANTS PASS                  (exit 0)
@@ -510,6 +517,26 @@ const INVARIANTS: InvariantConfig[] = [
     requiredHelper:
       /\b(?:encryptStagingMeta|encryptSampleRows|encryptField)\s*\(/,
     helperName: "encryptStagingMeta / encryptSampleRows (or encryptField on restore)",
+  },
+  {
+    // FINLYNQ-132 — bank_transactions.source_filenames (TEXT[]) is the last
+    // plaintext PII leak on the bank ledger (filenames carry bank name /
+    // account fragments / statement period). The single writer builds the
+    // array inline as `ARRAY[${element}]::TEXT[]` in src/lib/bank-ledger.ts;
+    // the element MUST be encrypted at the row's tier (encryptStagingMeta:
+    // v1: user-DEK / sv1: PF_STAGING_KEY) before it lands. This guard is
+    // scoped to the single writer file so a raw `ARRAY[${row.filename}]::TEXT[]`
+    // (without the encrypt helper) fails the audit. The bare `import` of
+    // encryptStagingMeta does NOT satisfy requiredHelper — only the actual
+    // `encryptStagingMeta(` call does — so dropping the call bites cleanly.
+    id: "source-filenames-encrypted",
+    description:
+      "bank_transactions.source_filenames elements must be encrypted at the row's tier via encryptStagingMeta before the ARRAY[…]::TEXT[] write in bank-ledger.ts — never plaintext (FINLYNQ-132)",
+    fileGlobs: ["src/lib/bank-ledger.ts"],
+    // The single-element ARRAY[…]::TEXT[] constructor that binds the filename.
+    writeSite: /ARRAY\[\s*\$\{[^}]*\}\s*\]::TEXT\[\]/,
+    requiredHelper: /\bencryptStagingMeta\s*\(/,
+    helperName: "encryptStagingMeta (tier-aware filename encrypt)",
   },
 ];
 

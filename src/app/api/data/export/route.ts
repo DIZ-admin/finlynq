@@ -123,6 +123,34 @@ function decryptBankLedgerRow(
       }
     }
   }
+  // FINLYNQ-132 — source_filenames (TEXT[]) is encrypted per-element at the
+  // row's tier. Decrypt each element to plaintext for backup portability,
+  // branching on encryption_tier like the scalar fields above. decryptStagingMeta
+  // returns null on auth-tag failure / missing DEK (never leaks ciphertext);
+  // a decrypt miss drops that element and bumps the failure counter rather
+  // than embedding a v1:/sv1: envelope in the portable backup.
+  const filenames = out.sourceFilenames;
+  if (Array.isArray(filenames)) {
+    const decrypted: string[] = [];
+    for (const el of filenames) {
+      if (typeof el !== "string") continue;
+      try {
+        // decryptStagingMeta delegates to decryptStaged for service-tier,
+        // which THROWS on malformed sv1: ciphertext — guard so one bad
+        // element never aborts the whole export.
+        const pt = decryptStagingMeta(el, tier, dek);
+        if (pt == null) {
+          // Auth-tag failure or no DEK on a real envelope — drop + count.
+          if (el.startsWith("v1:") || el.startsWith("sv1:")) failures.count++;
+          continue;
+        }
+        decrypted.push(pt);
+      } catch {
+        failures.count++;
+      }
+    }
+    out.sourceFilenames = decrypted;
+  }
   return out;
 }
 

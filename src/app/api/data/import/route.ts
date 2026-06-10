@@ -468,6 +468,20 @@ export async function POST(request: NextRequest) {
             typeof rawBatchId === "string" && bankUploadBatchIdMap.has(rawBatchId)
               ? bankUploadBatchIdMap.get(rawBatchId)!
               : null;
+          // FINLYNQ-132 — source_filenames ships as PLAINTEXT in the portable
+          // export (decrypted by the export route for cross-DEK portability).
+          // Re-encrypt each element under the local user DEK so it lands at
+          // rest as v1: ciphertext, matching the forced encryption_tier='user'.
+          // A same-account backup may already carry v1: ciphertext; isEncrypted
+          // guards against double-wrapping. Null/non-string elements are dropped.
+          const rawFilenames = (rest as { sourceFilenames?: unknown }).sourceFilenames;
+          const reEncFilenames: string[] = Array.isArray(rawFilenames)
+            ? rawFilenames.flatMap((el) => {
+                if (typeof el !== "string" || el === "") return [];
+                const ct = isEncrypted(el) ? el : encryptField(dek, el);
+                return ct ? [ct] : [];
+              })
+            : [];
           const withFks = {
             ...rest,
             userId,
@@ -478,6 +492,7 @@ export async function POST(request: NextRequest) {
             // and the original-tier may have been mid-upgrade in the
             // source DB. Re-encrypt under the local user DEK below.
             encryptionTier: "user",
+            sourceFilenames: reEncFilenames,
             uploadBatchId: newBatchId,
           };
           return encryptRowFields(dek, withFks, BANK_TX_ENC_FIELDS);

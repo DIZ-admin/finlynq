@@ -279,6 +279,10 @@ async function upgradeBankLedgerEncryption(
       note: schema.bankTransactions.note,
       tags: schema.bankTransactions.tags,
       accountName: schema.bankTransactions.accountName,
+      // FINLYNQ-132 — source_filenames is encrypted per-element at the row's
+      // tier. Decrypt each service-tier element under PF_STAGING_KEY, re-encrypt
+      // under the user DEK alongside the scalar fields.
+      sourceFilenames: schema.bankTransactions.sourceFilenames,
     })
     .from(schema.bankTransactions)
     .where(
@@ -306,6 +310,19 @@ async function upgradeBankLedgerEncryption(
       const tagsCt = tagsPt != null ? encryptField(dek, tagsPt) : null;
       const acctCt = acctPt != null ? encryptField(dek, acctPt) : null;
 
+      // FINLYNQ-132 — re-encrypt each filename element service→user. decryptStaged
+      // passes legacy plaintext through unchanged; encryptField re-wraps under
+      // the DEK. Null/empty elements are dropped.
+      const filenamesCt: string[] = Array.isArray(r.sourceFilenames)
+        ? r.sourceFilenames.flatMap((el) => {
+            if (typeof el !== "string" || el === "") return [];
+            const pt = decryptStaged(el);
+            if (pt == null || pt === "") return [];
+            const ct = encryptField(dek, pt);
+            return ct ? [ct] : [];
+          })
+        : [];
+
       await db
         .update(schema.bankTransactions)
         .set({
@@ -313,6 +330,7 @@ async function upgradeBankLedgerEncryption(
           note: noteCt,
           tags: tagsCt,
           accountName: acctCt,
+          sourceFilenames: filenamesCt,
           encryptionTier: "user",
         })
         .where(
