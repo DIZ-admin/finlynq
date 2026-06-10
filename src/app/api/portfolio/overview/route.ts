@@ -794,12 +794,20 @@ export async function GET(request: NextRequest) {
       ]
     : namedStocks;
 
-  // 10. Gainers & losers (top movers by changePct)
+  // 10. Gainers & losers (top movers by absolute dollar value change)
+  // Rank by dayChangeDisplay (display-currency day change) so that holdings
+  // with the largest real-dollar impact surface first. Percentage is retained
+  // as a secondary display column but is NOT the ranking key.
+  // Tie-break: equal dayChangeDisplay → symbol alphabetically ascending.
   const movers = enrichedHoldings
-    .filter(h => h.changePct !== null && h.symbol)
-    .sort((a, b) => Math.abs(b.changePct!) - Math.abs(a.changePct!));
-  const topGainers = movers.filter(h => (h.changePct ?? 0) > 0).slice(0, 5);
-  const topLosers = movers.filter(h => (h.changePct ?? 0) < 0).slice(0, 5);
+    .filter(h => h.dayChangeDisplay !== null && h.symbol)
+    .sort((a, b) => {
+      const diff = Math.abs(b.dayChangeDisplay!) - Math.abs(a.dayChangeDisplay!);
+      if (diff !== 0) return diff;
+      return (a.symbol ?? "").localeCompare(b.symbol ?? "");
+    });
+  const topGainers = movers.filter(h => (h.dayChangeDisplay ?? 0) > 0).slice(0, 5);
+  const topLosers = movers.filter(h => (h.dayChangeDisplay ?? 0) < 0).slice(0, 5);
 
   // Add pctOfPortfolio to each holding
   const holdingsWithPct = enrichedHoldings.map(h => ({

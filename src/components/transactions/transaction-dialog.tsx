@@ -62,6 +62,14 @@ import {
 } from "lucide-react";
 import { labelForSource, type TransactionSource } from "@/lib/tx-source";
 import { safeName } from "@/lib/safe-name";
+import {
+  RuleEditorDialog,
+  type Category as RuleEditorCategory,
+  type Account as RuleEditorAccount,
+  type Holding as RuleEditorHolding,
+} from "@/components/rules/rule-editor-dialog";
+import { buildPayeeCategoryRule } from "@/lib/rules/build-payee-category-rule";
+import type { Condition, Action } from "@/lib/rules/schema";
 
 // ─── Public types ──────────────────────────────────────────────────────
 
@@ -188,6 +196,12 @@ export interface TransactionDialogProps {
   holdings: DialogHolding[];
   /** Mode discriminator. Unset = plain create. */
   initialState?: TransactionDialogInitialState | null;
+  /** FINLYNQ-125 — opt-in: when true AND the dialog is in new-entry
+   *  transaction mode with a payee + category set, offer an "Also create a
+   *  rule for next time" affordance (auto-create or seed the RuleEditorDialog).
+   *  Wired `true` only from the reconcile/import inbox tabs; the generic
+   *  /transactions dialog leaves it at the default (off). */
+  offerRuleSuggestion?: boolean;
   /** Invoked after a successful create or update (single tx OR transfer
    *  pair). For transfer mode, `savedTxId` is the debit leg id. */
   onSaved: (
@@ -280,6 +294,7 @@ export function TransactionDialog({
   categories,
   holdings,
   initialState,
+  offerRuleSuggestion = false,
   onSaved,
   onRequestDelete,
   onLinkedSiblingClick,
@@ -308,6 +323,14 @@ export function TransactionDialog({
   const [submitError, setSubmitError] = useState<{ message: string; currency?: string } | null>(null);
   const [linkedSiblings, setLinkedSiblings] = useState<DialogLinkedSibling[]>([]);
   const [transferDeleting, setTransferDeleting] = useState(false);
+
+  // ─── Rule suggestion (FINLYNQ-125) ──────────────────────────────────
+  // Opt-in via `offerRuleSuggestion` (reconcile/import only). The tx always
+  // saves + reconciles FIRST; the rule POST is best-effort and never blocks.
+  const [alsoCreateRule, setAlsoCreateRule] = useState(false);
+  const [ruleNotice, setRuleNotice] = useState<string | null>(null);
+  const [ruleEditorOpen, setRuleEditorOpen] = useState(false);
+  const [ruleSeed, setRuleSeed] = useState<{ payee: string; categoryId: number } | null>(null);
 
   // Edit context — derived from initialState. Held in a ref so async splits
   // fetch can match it on resolve.
@@ -472,6 +495,8 @@ export function TransactionDialog({
     setDestQuantityTouched(false);
     setTransferFxPreview({ state: "idle" });
     setLinkedSiblings([]);
+    setAlsoCreateRule(false);
+    setRuleNotice(null);
   }
 
   // Seed on the false→true `open` edge. Declared after the two seed helpers
@@ -659,9 +684,19 @@ export function TransactionDialog({
   }, [open, dialogMode, transferForm.fromAccountId, transferForm.toAccountId, transferForm.amount, transferForm.date, accounts]);
 
   // ─── Handlers ───────────────────────────────────────────────────────
-  async function handleSubmit(e: React.FormEvent) {
+  // FINLYNQ-125 — `ruleIntent` is driven by which submit path fired:
+  //   "none"      → plain create/update (default; /transactions + checkbox off)
+  //   "auto"      → checkbox ticked: best-effort POST /api/rules after save
+  //   "customize" → "Customize…": after save, open the seeded RuleEditorDialog
+  // The tx POST + splits + onSaved (reconcile link) ALWAYS complete first; the
+  // rule step is best-effort and never blocks the save/reconcile.
+  async function handleSubmit(
+    e: React.FormEvent,
+    ruleIntent: "none" | "auto" | "customize" = "none",
+  ) {
     e.preventDefault();
     setSubmitError(null);
+    setRuleNotice(null);
 
     if (!form.accountId) {
       setSubmitError({ message: "Pick an account" });
@@ -745,6 +780,47 @@ export function TransactionDialog({
         isTransfer: false,
       });
     }
+
+    // ─── Rule suggestion (FINLYNQ-125) ────────────────────────────────
+    // Runs ONLY after the tx save + reconcile link above succeeded. A failure
+    // here never unwinds the saved tx — at worst it leaves a soft amber notice
+    // and keeps the dialog open.
+    const trimmedPayee = form.payee.trim();
+    const catId = Number(form.categoryId);
+    if (ruleIntent === "customize" && trimmedPayee && catId > 0) {
+      setRuleSeed({ payee: trimmedPayee, categoryId: catId });
+      setRuleEditorOpen(true);
+      onOpenChange(false); // close main dialog; sibling editor opens as it closes
+      return;
+    }
+    if (ruleIntent === "auto" && trimmedPayee && catId > 0) {
+      try {
+        const ruleRes = await fetch("/api/rules", {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify(buildPayeeCategoryRule(trimmedPayee, catId)),
+        });
+        if (!ruleRes.ok) {
+          const data = await ruleRes.json().catch(() => ({}));
+          // Transaction is already saved; surface a soft notice and keep the
+          // dialog open so the user can retry "Customize…" if they want.
+          setRuleNotice(
+            data?.error
+              ? `Transaction saved, but the rule could not be created: ${data.error}`
+              : "Transaction saved, but the rule could not be created.",
+          );
+          return;
+        }
+      } catch (err) {
+        setRuleNotice(
+          err instanceof Error
+            ? `Transaction saved, but the rule could not be created: ${err.message}`
+            : "Transaction saved, but the rule could not be created.",
+        );
+        return;
+      }
+    }
+
     onOpenChange(false);
   }
 
@@ -938,8 +1014,46 @@ export function TransactionDialog({
   const splitRemaining = Math.abs(parseFloat(form.amount) || 0) - splitAllocated;
   const splitBalanced = Math.abs(splitRemaining) < 0.01;
 
+  // ─── Rule suggestion eligibility (FINLYNQ-125) ──────────────────────
+  // Render the affordance ONLY when explicitly opted-in AND in new-entry
+  // transaction mode with both a payee and a category set. Never in edit mode,
+  // transfer mode, or the generic /transactions dialog (prop defaults off).
+  const ruleSelectedCategory = useMemo(
+    () => categories.find((c) => String(c.id) === form.categoryId) ?? null,
+    [categories, form.categoryId],
+  );
+  const ruleEligible =
+    offerRuleSuggestion &&
+    dialogMode === "transaction" &&
+    !editId &&
+    form.payee.trim().length > 0 &&
+    !!ruleSelectedCategory;
+
+  // Map the dialog's FK lists into the RuleEditorDialog shapes once (no new
+  // fetch — the inbox tabs already pass these in full).
+  const ruleEditorCategories: RuleEditorCategory[] = useMemo(
+    () => categories.map((c) => ({ id: c.id, name: c.name, type: c.type, group: c.group })),
+    [categories],
+  );
+  const ruleEditorAccounts: RuleEditorAccount[] = useMemo(
+    () => accounts.map((a) => ({ id: a.id, name: a.name })),
+    [accounts],
+  );
+  const ruleEditorHoldings: RuleEditorHolding[] = useMemo(
+    () => holdings.map((h) => ({ id: h.id, name: h.name })),
+    [holdings],
+  );
+  const ruleSeedConditions: Condition[] = ruleSeed
+    ? [{ field: "payee", op: "contains", value: ruleSeed.payee }]
+    : [];
+  const ruleSeedActions: Action[] = ruleSeed
+    ? [{ kind: "set_category", categoryId: ruleSeed.categoryId }]
+    : [];
+  const ruleSeedName = ruleSeed ? `Match "${ruleSeed.payee.slice(0, 100)}"` : "";
+
   // ─── Render ─────────────────────────────────────────────────────────
   return (
+    <>
     <Dialog
       open={open}
       onOpenChange={(o) => {
@@ -991,7 +1105,10 @@ export function TransactionDialog({
         )}
 
         {dialogMode === "transaction" && (
-          <form onSubmit={handleSubmit} className="space-y-4">
+          <form
+            onSubmit={(e) => handleSubmit(e, ruleEligible && alsoCreateRule ? "auto" : "none")}
+            className="space-y-4"
+          >
             <div className="grid grid-cols-2 gap-4">
               <div className="space-y-1.5">
                 <Label>Date</Label>
@@ -1404,6 +1521,46 @@ export function TransactionDialog({
                 </div>
               );
             })()}
+
+            {/* Rule suggestion (FINLYNQ-125) — opt-in, new-entry tx mode only.
+                The tx saves + reconciles first; the rule is best-effort. */}
+            {ruleEligible && (
+              <div className="space-y-1.5 rounded-md border border-sky-200 dark:border-sky-900 bg-sky-50/40 dark:bg-sky-950/20 p-3">
+                <div className="flex items-center gap-2">
+                  <input
+                    type="checkbox"
+                    id="alsoCreateRule"
+                    checked={alsoCreateRule}
+                    onChange={(e) => setAlsoCreateRule(e.target.checked)}
+                    className="h-4 w-4 rounded border-input"
+                  />
+                  <Label htmlFor="alsoCreateRule" className="cursor-pointer">
+                    Also create a rule for next time
+                  </Label>
+                </div>
+                <p className="text-[11px] text-muted-foreground pl-6">
+                  Payee contains{" "}
+                  <span className="font-mono text-foreground">
+                    &ldquo;{form.payee.trim()}&rdquo;
+                  </span>{" "}
+                  → {ruleSelectedCategory?.name}
+                  {" · "}
+                  <button
+                    type="button"
+                    className="underline hover:no-underline text-sky-700 dark:text-sky-300"
+                    onClick={(e) => handleSubmit(e, "customize")}
+                  >
+                    Customize…
+                  </button>
+                </p>
+              </div>
+            )}
+
+            {ruleNotice && (
+              <div className="rounded-md border border-amber-300 bg-amber-50 dark:border-amber-800 dark:bg-amber-950/40 px-3 py-2 text-xs text-amber-800 dark:text-amber-300">
+                {ruleNotice}
+              </div>
+            )}
 
             <div className="flex gap-2">
               {editingTx && onRequestDelete && (
@@ -1903,5 +2060,44 @@ export function TransactionDialog({
         )}
       </DialogContent>
     </Dialog>
+
+    {/* Rule editor — SIBLING of the main dialog (NOT nested), so it opens as
+        the main dialog closes on the "Customize…" path. Nesting two base-ui
+        dialogs triggers stacking bugs (CLAUDE.md base-ui handoff). Seeded with
+        the same payee + category the user just chose; the user can refine
+        (exact vs contains, add conditions) before creating. */}
+    {ruleEditorOpen && ruleSeed && (
+      <RuleEditorDialog
+        initialName={ruleSeedName}
+        initialConditions={ruleSeedConditions}
+        initialActions={ruleSeedActions}
+        categories={ruleEditorCategories}
+        accounts={ruleEditorAccounts}
+        holdings={ruleEditorHoldings}
+        submitLabel="Create rule"
+        title="Create rule from this transaction"
+        onClose={() => {
+          setRuleEditorOpen(false);
+          setRuleSeed(null);
+        }}
+        onSubmit={async (payload) => {
+          try {
+            const res = await fetch("/api/rules", {
+              method: "POST",
+              headers: { "Content-Type": "application/json" },
+              body: JSON.stringify(payload),
+            });
+            if (!res.ok) {
+              const data = await res.json().catch(() => ({}));
+              return { ok: false, error: data?.error ?? "Rule creation failed" };
+            }
+            return { ok: true };
+          } catch (e) {
+            return { ok: false, error: e instanceof Error ? e.message : "Rule creation failed" };
+          }
+        }}
+      />
+    )}
+    </>
   );
 }

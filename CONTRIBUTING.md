@@ -46,6 +46,17 @@ Examples:
 - `fix(import): handle duplicate OFX transaction IDs`
 - `docs(readme): add self-hosting instructions`
 
+## Contributor License Agreement
+
+Finlynq uses a lightweight CLA, signed once via a PR comment. When you open
+your first pull request, the CLA bot will prompt you; signing covers all your
+future contributions.
+
+Why: you keep the copyright to your work, and the project stays AGPL-3.0. The
+CLA additionally lets the project owner license the codebase under other terms
+— this is what allows the managed finlynq.com service to fund development
+without splitting the codebase or gating features. Full text: [CLA.md](CLA.md).
+
 ## Areas Where Contributions Are Especially Welcome
 
 - Bank statement CSV/OFX parsers for different banks and regions

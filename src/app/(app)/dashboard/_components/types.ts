@@ -24,9 +24,19 @@ export type CategorySpend = {
 
 export type NetWorthPoint = { month: string; currency: string; cumulative: number };
 
+/** One ranked member in a tooltip breakdown (top-10 + "Other"). FINLYNQ-128. */
+export type BreakdownRow = { name: string; value: number };
+
+/** Per-month income/expense category breakdown, keyed by "YYYY-MM". */
+export type IncomeExpenseBreakdown = Record<
+  string,
+  { income: BreakdownRow[]; expenses: BreakdownRow[] }
+>;
+
 export type DashboardData = {
   balances: Balance[];
   incomeVsExpenses: IncomeExpense[];
+  incomeExpenseBreakdown?: IncomeExpenseBreakdown;
   spendingByCategory: CategorySpend[];
   netWorthOverTime: NetWorthPoint[];
   displayCurrency?: string;
@@ -84,7 +94,14 @@ export type WeeklyRecapData = {
   netWorthChange: number;
 };
 
-export type MonthlyData = { month: string; income: number; expenses: number };
+export type MonthlyData = {
+  month: string;
+  income: number;
+  expenses: number;
+  /** Per-category top-10 (+ "Other") breakdown for this month's tooltip. FINLYNQ-128. */
+  incomeBreakdown?: BreakdownRow[];
+  expenseBreakdown?: BreakdownRow[];
+};
 
 export type InsightsData = {
   anomalies: { category: string; currentMonth: number; average: number; percentAbove: number; severity: string }[];

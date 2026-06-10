@@ -13,7 +13,7 @@
  */
 
 import { useEffect, useMemo, useState } from "react";
-import { useRouter, useSearchParams } from "next/navigation";
+import { useRouter } from "next/navigation";
 import Link from "next/link";
 import {
   Card,
@@ -32,44 +32,17 @@ import {
   SelectTrigger,
   SelectValue,
 } from "@/components/ui/select";
-
-interface AccountRow {
-  id: number;
-  name: string | null;
-  currency: string;
-  alias?: string | null;
-  type?: string | null;
-  isInvestment?: boolean;
-}
-
-interface HoldingRow {
-  id: number;
-  accountId: number;
-  name: string | null;
-  symbol: string | null;
-  currency: string;
-  isCrypto: boolean | number;
-  isCash: boolean | number;
-  currentShares: number;
-  accountName: string | null;
-}
-
-function todayISO(): string {
-  return new Date().toISOString().slice(0, 10);
-}
+import { todayISO } from "@/lib/utils/date";
+import { useEditId } from "@/lib/hooks/useEditId";
+import { usePortfolioFormData } from "@/lib/hooks/usePortfolioFormData";
+import { useAccountHoldingSelection } from "@/lib/hooks/useAccountHoldingSelection";
 
 export default function FxConversionForm() {
   const router = useRouter();
-  const searchParams = useSearchParams();
-  const editIdParam = searchParams.get("editId");
-  const editId = editIdParam ? Number(editIdParam) : null;
-  const isEdit =
-    editId != null && Number.isFinite(editId) && editId > 0;
+  const { editId, isEdit } = useEditId();
 
-  const [accounts, setAccounts] = useState<AccountRow[]>([]);
-  const [holdings, setHoldings] = useState<HoldingRow[]>([]);
-  const [loading, setLoading] = useState(true);
-  const [loadError, setLoadError] = useState<string | null>(null);
+  const { accounts, holdings, loading, loadError, editData } =
+    usePortfolioFormData({ editId, opType: "fx-conversion" });
 
   const [accountId, setAccountId] = useState<string>("");
   const [fromCurrency, setFromCurrency] = useState<string>("");
@@ -90,110 +63,27 @@ export default function FxConversionForm() {
   );
 
   useEffect(() => {
-    let cancelled = false;
-    Promise.all([
-      fetch("/api/accounts").then((r) => r.json()),
-      fetch("/api/portfolio").then((r) => r.json()),
-    ])
-      .then(([acc, holds]) => {
-        if (cancelled) return;
-        setAccounts(Array.isArray(acc) ? acc : []);
-        setHoldings(Array.isArray(holds) ? holds : []);
-      })
-      .catch((e: unknown) => {
-        if (cancelled) return;
-        setLoadError(e instanceof Error ? e.message : "Failed to load data");
-      })
-      .finally(() => {
-        if (!cancelled) setLoading(false);
-      });
-    return () => {
-      cancelled = true;
-    };
-  }, []);
+    if (!editData) return;
+    if (editData.accountId != null) setAccountId(String(editData.accountId));
+    if (editData.fromCurrency) setFromCurrency(editData.fromCurrency as string);
+    if (editData.fromAmount != null) setFromAmount(String(editData.fromAmount));
+    if (editData.toCurrency) setToCurrency(editData.toCurrency as string);
+    if (editData.toAmount != null) setToAmount(String(editData.toAmount));
+    if (typeof editData.feeAmount === "number" && editData.feeAmount > 0) {
+      setFeeAmount(String(editData.feeAmount));
+      // feeOnSleeveCurrency is the form's authoritative field; fall back
+      // to feeCurrency if the load only returned the legacy name.
+      setFeeOnSleeveCurrency(
+        ((editData.feeOnSleeveCurrency ?? editData.feeCurrency) as string) ?? "",
+      );
+    }
+    if (editData.date) setDate(editData.date as string);
+    setPayee((editData.payee as string) ?? "");
+    setNote((editData.note as string) ?? "");
+  }, [editData]);
 
-  // Load existing operation data on mount when editId is present.
-  useEffect(() => {
-    if (!isEdit) return;
-    let cancelled = false;
-    fetch(`/api/portfolio/operations/load?id=${editId}`)
-      .then(async (r) => {
-        if (cancelled) return;
-        const json: {
-          error?: string;
-          data?: {
-            op?: string;
-            accountId?: number;
-            fromCurrency?: string;
-            fromAmount?: number;
-            toCurrency?: string;
-            toAmount?: number;
-            feeAmount?: number | null;
-            feeCurrency?: string | null;
-            feeOnSleeveCurrency?: string | null;
-            date?: string;
-            payee?: string | null;
-            note?: string | null;
-          };
-        } = await r.json().catch(() => ({}));
-        if (cancelled) return;
-        if (!r.ok) {
-          setLoadError(
-            json.error ?? `Failed to load edit data (${r.status})`,
-          );
-          return;
-        }
-        const d = json.data;
-        if (!d) {
-          setLoadError("Failed to load edit data (empty response)");
-          return;
-        }
-        if (d.op !== "fx-conversion") {
-          setLoadError(
-            `This edit link is for "${d.op}" — use that form instead.`,
-          );
-          return;
-        }
-        if (d.accountId != null) setAccountId(String(d.accountId));
-        if (d.fromCurrency) setFromCurrency(d.fromCurrency);
-        if (d.fromAmount != null) setFromAmount(String(d.fromAmount));
-        if (d.toCurrency) setToCurrency(d.toCurrency);
-        if (d.toAmount != null) setToAmount(String(d.toAmount));
-        if (d.feeAmount != null && d.feeAmount > 0) {
-          setFeeAmount(String(d.feeAmount));
-          // feeOnSleeveCurrency is the form's authoritative field; fall back
-          // to feeCurrency if the load only returned the legacy name.
-          setFeeOnSleeveCurrency(
-            d.feeOnSleeveCurrency ?? d.feeCurrency ?? "",
-          );
-        }
-        if (d.date) setDate(d.date);
-        setPayee(d.payee ?? "");
-        setNote(d.note ?? "");
-      })
-      .catch((e: unknown) => {
-        if (cancelled) return;
-        setLoadError(
-          e instanceof Error ? e.message : "Failed to load edit data",
-        );
-      });
-    return () => {
-      cancelled = true;
-    };
-  }, [editId, isEdit]);
-
-  const investmentAccounts = useMemo(
-    () => accounts.filter((a) => a.isInvestment === true),
-    [accounts],
-  );
-
-  const selectedAccount = useMemo(
-    () =>
-      accountId
-        ? investmentAccounts.find((a) => String(a.id) === accountId) ?? null
-        : null,
-    [accountId, investmentAccounts],
-  );
+  const { investmentAccounts, selectedAccount } =
+    useAccountHoldingSelection(accounts, holdings, accountId);
 
   const cashSleeves = useMemo(
     () =>

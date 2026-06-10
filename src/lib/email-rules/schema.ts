@@ -19,8 +19,7 @@
  */
 
 import { z } from "zod";
-
-const StringOp = z.enum(["contains", "exact", "regex"]);
+import { StringOp } from "@/lib/schemas/rule-primitives";
 const AmountOp = z.enum(["gt", "lt"]);
 
 const TextCondition = z.object({

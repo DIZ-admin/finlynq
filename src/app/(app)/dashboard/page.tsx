@@ -5,6 +5,7 @@ import Link from "next/link";
 import { useRouter } from "next/navigation";
 import { Card, CardContent } from "@/components/ui/card";
 import { formatCurrency } from "@/lib/currency";
+import { buildTxDrillUrl } from "@/lib/transactions/drill-url";
 import { Sparkline } from "@/components/sparkline";
 import { DollarSign, ArrowUpRight, ArrowDownRight, TrendingUp, CreditCard, Target, User, Upload, FileUp } from "lucide-react";
 import { motion } from "framer-motion";
@@ -180,7 +181,16 @@ export default function DashboardPage() {
     if (row.type === "E") entry.expenses = Math.abs(row.total);
     monthMap.set(row.month, entry);
   });
-  const incExpData = Array.from(monthMap.values()).slice(-12);
+  // FINLYNQ-128 — attach the per-category tooltip breakdown (keyed by the same
+  // "YYYY-MM" month) so the Income vs Expenses tooltip can show contributors.
+  const ieBreakdown = data.incomeExpenseBreakdown ?? {};
+  const incExpData = Array.from(monthMap.values())
+    .map((m) => ({
+      ...m,
+      incomeBreakdown: ieBreakdown[m.month]?.income,
+      expenseBreakdown: ieBreakdown[m.month]?.expenses,
+    }))
+    .slice(-12);
   const incExpLast6 = incExpData.slice(-6);
   const incomeSparkline = incExpLast6.map((d) => d.income);
   const expenseSparkline = incExpLast6.map((d) => d.expenses);
@@ -213,6 +223,23 @@ export default function DashboardPage() {
   const lastMonthIncome = incExpData.length > 0 ? incExpData[incExpData.length - 1].income : 0;
   const lastMonthExpenses = incExpData.length > 0 ? incExpData[incExpData.length - 1].expenses : 0;
   const availableToSpend = lastMonthIncome - lastMonthExpenses;
+
+  // FINLYNQ-130 — drill-through: the Monthly Income / Expenses tiles show the
+  // most-recent tracked month (incExpData is "YYYY-MM" sorted asc). Derive that
+  // month's [startDate, endDate] so the tile links into /transactions scoped to
+  // exactly the rows that produced the figure. Empty range ⇒ plain /transactions.
+  const lastMonthKey = incExpData.length > 0 ? incExpData[incExpData.length - 1].month : "";
+  const monthDrill = (() => {
+    const m = /^(\d{4})-(\d{2})$/.exec(lastMonthKey);
+    if (!m) return { startDate: "", endDate: "" };
+    const year = Number(m[1]);
+    const month = Number(m[2]); // 1-12
+    const startDate = `${m[1]}-${m[2]}-01`;
+    // Day 0 of the next month = last day of this month.
+    const last = new Date(Date.UTC(year, month, 0)).getUTCDate();
+    const endDate = `${m[1]}-${m[2]}-${String(last).padStart(2, "0")}`;
+    return { startDate, endDate };
+  })();
   const budgetSparkline = incExpLast6.map((d) => d.income - d.expenses);
 
   // Dev-mode: spending by category for charts
@@ -240,7 +267,7 @@ export default function DashboardPage() {
       iconBg: "bg-emerald-100 text-emerald-600 dark:bg-emerald-950/60 dark:text-emerald-400",
       sparkColor: "#10b981",
       sparkData: incomeSparkline,
-      href: "/transactions",
+      href: buildTxDrillUrl({ startDate: monthDrill.startDate, endDate: monthDrill.endDate }),
     },
     {
       label: "Monthly Expenses",
@@ -250,7 +277,7 @@ export default function DashboardPage() {
       iconBg: "bg-rose-100 text-rose-600 dark:bg-rose-950/60 dark:text-rose-400",
       sparkColor: "#f43f5e",
       sparkData: expenseSparkline,
-      href: "/transactions",
+      href: buildTxDrillUrl({ startDate: monthDrill.startDate, endDate: monthDrill.endDate }),
     },
     {
       label: "Budgets",
@@ -401,7 +428,7 @@ export default function DashboardPage() {
       {devMode && (
         <>
           <div className="grid grid-cols-1 lg:grid-cols-2 gap-5">
-            <IncomeExpenseChart data={incExpData} />
+            <IncomeExpenseChart data={incExpData} currency={apiDisplayCurrency} />
             <SpendingCategoryChart data={spendingData} currency={apiDisplayCurrency} />
           </div>
           <div className="grid grid-cols-1 lg:grid-cols-3 gap-5">

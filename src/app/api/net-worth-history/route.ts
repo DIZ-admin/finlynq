@@ -28,6 +28,9 @@ import {
 } from "@/lib/queries";
 import { getHoldingsValueByAccount, type AccountHoldingsValue } from "@/lib/holdings-value";
 import { logApiError } from "@/lib/validate";
+import { decryptName } from "@/lib/crypto/encrypted-columns";
+import { safeAccountName } from "@/lib/safe-name";
+import { rankBreakdown } from "@/lib/chart-breakdown";
 import {
   buildNetWorthHistory,
   type NetWorthPeriod,
@@ -197,7 +200,7 @@ export async function GET(request: NextRequest) {
       currency: r.currency,
     }));
 
-    const { series, hasInvestmentData, fxApproximation } = buildNetWorthHistory({
+    const { series: rawSeries, hasInvestmentData, fxApproximation } = buildNetWorthHistory({
       period,
       displayCurrency,
       rateMap,
@@ -206,6 +209,30 @@ export async function GET(request: NextRequest) {
       snapshots,
       liveInvestmentByAccount,
       today,
+    });
+
+    // FINLYNQ-128 — resolve each per-account breakdown entry to a display name
+    // (decrypt + safeAccountName fallback for a missing DEK) and rank it into a
+    // top-10 + "Other" residual so the tooltip can render it directly. The
+    // pure core stays name-free (no DEK); naming + ranking happen here.
+    const accountNameById = new Map<number, string>();
+    for (const b of balances) {
+      const name = decryptName((b as { accountNameCt?: string | null }).accountNameCt, dek, null);
+      const alias = decryptName((b as { aliasCt?: string | null }).aliasCt, dek, null);
+      accountNameById.set(b.accountId, safeAccountName({ id: b.accountId, name, alias }));
+    }
+    const series = rawSeries.map((p) => {
+      const named = p.breakdown.map((e) => ({
+        id: e.accountId,
+        name: accountNameById.get(e.accountId) ?? `Account #${e.accountId}`,
+        value: e.value,
+      }));
+      const { rows, other } = rankBreakdown(named, { maxMembers: 10 });
+      const breakdown = other ? [...rows, other] : rows;
+      // FINLYNQ-129 — the stacked "By account" view needs the FULL per-account
+      // members (with stable account ids) so the client can re-rank + stack on
+      // toggle. `breakdown` stays the pre-ranked top-10 + "Other" tooltip rows.
+      return { date: p.date, value: p.value, breakdown, members: named };
     });
 
     // Auto-rebuild stale investment history with the request DEK (a cron can't

@@ -13,7 +13,7 @@
  */
 
 import { useEffect, useMemo, useState } from "react";
-import { useRouter, useSearchParams } from "next/navigation";
+import { useRouter } from "next/navigation";
 import Link from "next/link";
 import {
   Card,
@@ -32,31 +32,10 @@ import {
   SelectTrigger,
   SelectValue,
 } from "@/components/ui/select";
-
-interface AccountRow {
-  id: number;
-  name: string | null;
-  currency: string;
-  alias?: string | null;
-  type?: string | null;
-  isInvestment?: boolean;
-}
-
-interface HoldingRow {
-  id: number;
-  accountId: number;
-  name: string | null;
-  symbol: string | null;
-  currency: string;
-  isCrypto: boolean | number;
-  isCash: boolean | number;
-  currentShares: number;
-  accountName: string | null;
-}
-
-function todayISO(): string {
-  return new Date().toISOString().slice(0, 10);
-}
+import { todayISO } from "@/lib/utils/date";
+import { useEditId } from "@/lib/hooks/useEditId";
+import { usePortfolioFormData } from "@/lib/hooks/usePortfolioFormData";
+import { useAccountHoldingSelection } from "@/lib/hooks/useAccountHoldingSelection";
 
 export default function SwapForm() {
   return <SwapCreateForm />;
@@ -64,15 +43,16 @@ export default function SwapForm() {
 
 function SwapCreateForm() {
   const router = useRouter();
-  const searchParams = useSearchParams();
-  const editIdParam = searchParams.get("editId");
-  const editId = editIdParam ? Number(editIdParam) : null;
-  const isEdit = editId != null && Number.isFinite(editId) && editId > 0;
+  const { editId, isEdit } = useEditId();
 
-  const [accounts, setAccounts] = useState<AccountRow[]>([]);
-  const [holdings, setHoldings] = useState<HoldingRow[]>([]);
-  const [loading, setLoading] = useState(true);
-  const [loadError, setLoadError] = useState<string | null>(null);
+  const { accounts, holdings, loading, loadError, editData } =
+    usePortfolioFormData({
+      editId,
+      opType: "swap",
+      opMismatchMessage: () =>
+        "This swap was created before the swap-edit migration and can't be loaded as a unit. " +
+        "Delete the sell + buy legs separately from the transactions list, then re-record the swap.",
+    });
 
   const [accountId, setAccountId] = useState<string>("");
   const [sourceHoldingId, setSourceHoldingId] = useState<string>("");
@@ -90,112 +70,21 @@ function SwapCreateForm() {
   const [submitError, setSubmitError] = useState<string | null>(null);
 
   useEffect(() => {
-    let cancelled = false;
-    Promise.all([
-      fetch("/api/accounts").then((r) => r.json()),
-      fetch("/api/portfolio").then((r) => r.json()),
-    ])
-      .then(([acc, holds]) => {
-        if (cancelled) return;
-        setAccounts(Array.isArray(acc) ? acc : []);
-        setHoldings(Array.isArray(holds) ? holds : []);
-      })
-      .catch((e: unknown) => {
-        if (cancelled) return;
-        setLoadError(e instanceof Error ? e.message : "Failed to load data");
-      })
-      .finally(() => {
-        if (!cancelled) setLoading(false);
-      });
-    return () => {
-      cancelled = true;
-    };
-  }, []);
+    if (!editData) return;
+    if (editData.accountId != null) setAccountId(String(editData.accountId));
+    if (editData.sourceHoldingId != null) setSourceHoldingId(String(editData.sourceHoldingId));
+    if (editData.destHoldingId != null) setDestHoldingId(String(editData.destHoldingId));
+    if (typeof editData.sourceQty === "number") setSourceQty(String(editData.sourceQty));
+    if (typeof editData.sourceProceeds === "number") setSourceProceeds(String(editData.sourceProceeds));
+    if (typeof editData.destQty === "number") setDestQty(String(editData.destQty));
+    if (typeof editData.destCost === "number") setDestCost(String(editData.destCost));
+    if (editData.date) setDate(editData.date as string);
+    setPayee((editData.payee as string) ?? "");
+    setNote((editData.note as string) ?? "");
+  }, [editData]);
 
-  useEffect(() => {
-    if (!isEdit) return;
-    let cancelled = false;
-    fetch(`/api/portfolio/operations/load?id=${editId}`)
-      .then(async (r) => {
-        if (cancelled) return;
-        const json: {
-          error?: string;
-          data?: {
-            op?: string;
-            accountId?: number;
-            sourceHoldingId?: number;
-            sourceQty?: number;
-            sourceProceeds?: number;
-            destHoldingId?: number;
-            destQty?: number;
-            destCost?: number;
-            date?: string;
-            payee?: string | null;
-            note?: string | null;
-          };
-        } = await r.json().catch(() => ({}));
-        if (cancelled) return;
-        if (!r.ok) {
-          setLoadError(json.error ?? `Failed to load edit data (${r.status})`);
-          return;
-        }
-        const d = json.data;
-        if (!d) {
-          setLoadError("Failed to load edit data (empty response)");
-          return;
-        }
-        if (d.op !== "swap") {
-          // Likely a pre-migration swap (no swap_link_id) — load returns
-          // the underlying buy/sell instead. Surface a clear notice.
-          setLoadError(
-            "This swap was created before the swap-edit migration and can't be loaded as a unit. " +
-              "Delete the sell + buy legs separately from the transactions list, then re-record the swap.",
-          );
-          return;
-        }
-        if (d.accountId != null) setAccountId(String(d.accountId));
-        if (d.sourceHoldingId != null) setSourceHoldingId(String(d.sourceHoldingId));
-        if (d.destHoldingId != null) setDestHoldingId(String(d.destHoldingId));
-        if (typeof d.sourceQty === "number") setSourceQty(String(d.sourceQty));
-        if (typeof d.sourceProceeds === "number")
-          setSourceProceeds(String(d.sourceProceeds));
-        if (typeof d.destQty === "number") setDestQty(String(d.destQty));
-        if (typeof d.destCost === "number") setDestCost(String(d.destCost));
-        if (d.date) setDate(d.date);
-        setPayee(d.payee ?? "");
-        setNote(d.note ?? "");
-      })
-      .catch((e: unknown) => {
-        if (cancelled) return;
-        setLoadError(e instanceof Error ? e.message : "Failed to load edit data");
-      });
-    return () => {
-      cancelled = true;
-    };
-  }, [editId, isEdit]);
-
-  const investmentAccounts = useMemo(
-    () => accounts.filter((a) => a.isInvestment === true),
-    [accounts],
-  );
-
-  const selectedAccount = useMemo(
-    () =>
-      accountId
-        ? investmentAccounts.find((a) => String(a.id) === accountId) ?? null
-        : null,
-    [accountId, investmentAccounts],
-  );
-
-  const accountHoldings = useMemo(
-    () =>
-      selectedAccount
-        ? holdings.filter(
-            (h) => h.accountId === selectedAccount.id && !h.isCash,
-          )
-        : [],
-    [holdings, selectedAccount],
-  );
+  const { investmentAccounts, selectedAccount, accountHoldings } =
+    useAccountHoldingSelection(accounts, holdings, accountId);
 
   const sourceHolding = useMemo(
     () =>

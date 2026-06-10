@@ -6,6 +6,7 @@ import { requireAuth } from "@/lib/auth/require-auth";
 import { getDEK } from "@/lib/crypto/dek-cache";
 import { tryDecryptField } from "@/lib/crypto/envelope";
 import { decryptStaged } from "@/lib/crypto/staging-envelope";
+import { decryptStagingMeta } from "@/lib/crypto/staging-metadata";
 import { safeErrorMessage } from "@/lib/validate";
 import { validatePasswordStrength } from "@/lib/auth/password-policy";
 
@@ -122,6 +123,34 @@ function decryptBankLedgerRow(
       }
     }
   }
+  // FINLYNQ-132 — source_filenames (TEXT[]) is encrypted per-element at the
+  // row's tier. Decrypt each element to plaintext for backup portability,
+  // branching on encryption_tier like the scalar fields above. decryptStagingMeta
+  // returns null on auth-tag failure / missing DEK (never leaks ciphertext);
+  // a decrypt miss drops that element and bumps the failure counter rather
+  // than embedding a v1:/sv1: envelope in the portable backup.
+  const filenames = out.sourceFilenames;
+  if (Array.isArray(filenames)) {
+    const decrypted: string[] = [];
+    for (const el of filenames) {
+      if (typeof el !== "string") continue;
+      try {
+        // decryptStagingMeta delegates to decryptStaged for service-tier,
+        // which THROWS on malformed sv1: ciphertext — guard so one bad
+        // element never aborts the whole export.
+        const pt = decryptStagingMeta(el, tier, dek);
+        if (pt == null) {
+          // Auth-tag failure or no DEK on a real envelope — drop + count.
+          if (el.startsWith("v1:") || el.startsWith("sv1:")) failures.count++;
+          continue;
+        }
+        decrypted.push(pt);
+      } catch {
+        failures.count++;
+      }
+    }
+    out.sourceFilenames = decrypted;
+  }
   return out;
 }
 
@@ -218,6 +247,21 @@ async function handleExport(request: NextRequest) {
     const decryptedBankTransactions = bankTransactions.map((b) =>
       decryptBankLedgerRow(dek, b as Record<string, unknown>, failures)
     );
+    // FINLYNQ-120 — bank_upload_batches.filename is now encrypted in-place
+    // (v1:/sv1: per encryptionTier). Decrypt to plaintext so the backup is
+    // portable across DEKs (mirrors the bank_transactions tier-aware decrypt).
+    const decryptedBankUploadBatches = bankUploadBatches.map((b) => {
+      const row = b as Record<string, unknown>;
+      const tier = String(row.encryptionTier ?? "user");
+      return {
+        ...row,
+        filename: decryptStagingMeta(
+          row.filename as string | null,
+          tier,
+          dek,
+        ),
+      };
+    });
 
     const dateStr = new Date().toISOString().slice(0, 10);
     const backup = {
@@ -234,7 +278,7 @@ async function handleExport(request: NextRequest) {
         bankTransactions: decryptedBankTransactions,
         transactionBankLinks,
         bankDailyBalances,
-        bankUploadBatches,
+        bankUploadBatches: decryptedBankUploadBatches,
         budgets,
         budgetTemplates,
         loans,

@@ -488,6 +488,7 @@ export function InboxToCategorizeTab({
 
       <TransactionDialog
         open={dialogOpen}
+        offerRuleSuggestion
         onOpenChange={(o) => {
           setDialogOpen(o);
           if (!o) {

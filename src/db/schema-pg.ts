@@ -856,6 +856,15 @@ export const stagedImports = pgTable("staged_imports", {
   // parse time. Hides the picker UI when null.
   headers: jsonb("headers"),
   sampleRows: jsonb("sample_rows"),
+  // ─── FINLYNQ-120: staging-metadata encryption tier ───────────────────
+  // from_address / subject / original_filename / sample_rows are encrypted
+  // in-place (v1: or sv1: envelope). Two-tier, mirrors staged_transactions:
+  //   - 'service' (default at email-webhook ingest): sv1: under PF_STAGING_KEY.
+  //   - 'user' (web uploads + post-login sweep): v1: under the user's DEK.
+  // Read paths branch per-row on this column (decryptStagingMeta /
+  // decryptSampleRows). `headers` stays plaintext (column-names only, low
+  // sensitivity).
+  encryptionTier: text("encryption_tier").notNull().default("service"),
 });
 
 export const stagedTransactions = pgTable("staged_transactions", {
@@ -1023,6 +1032,13 @@ export const bankUploadBatches = pgTable("bank_upload_batches", {
   stagedImportId: text("staged_import_id").references(() => stagedImports.id, {
     onDelete: "set null",
   }),
+  // ─── FINLYNQ-120: filename encryption tier ───────────────────────────
+  // `filename` is encrypted in-place (v1:/sv1: envelope) — this row is
+  // PERMANENT so plaintext leaked bank identity indefinitely. Both writers
+  // (simplifiedUpload + the detailed approve route) have a DEK, so new rows
+  // land at 'user' tier. 'service' exists only for the login-sweep upgrade of
+  // pre-FINLYNQ-120 plaintext rows. Read paths branch per-row.
+  encryptionTier: text("encryption_tier").notNull().default("service"),
 });
 
 export const bankTransactions = pgTable("bank_transactions", {

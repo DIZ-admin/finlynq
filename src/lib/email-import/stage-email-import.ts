@@ -23,6 +23,10 @@ import { generateImportHash } from "@/lib/import-hash";
 import { normalizeDate, parseAmount as parseAmountStr } from "@/lib/csv-parser";
 import type { RawTransaction } from "@/lib/import-pipeline";
 import { encryptStaged } from "@/lib/crypto/staging-envelope";
+import {
+  encryptStagingMeta,
+  encryptSampleRows,
+} from "@/lib/crypto/staging-metadata";
 
 export interface StageEmailImportInput {
   userId: string;
@@ -163,19 +167,26 @@ export async function stageEmailImport(
   const stagedImportId = randomUUID();
   const expiresAt = new Date(Date.now() + STAGE_TTL_MS);
 
+  // FINLYNQ-120 — the email webhook has no session DEK, so metadata lands at
+  // SERVICE tier (sv1: under PF_STAGING_KEY). The login-time sweep
+  // (upgrade-staging-metadata.ts) re-encrypts to the user's DEK (v1:) on next
+  // login. `headers` stays plaintext (column-names only). sample_rows is the
+  // highest-sensitivity payload (raw statement rows) — encrypted as a single
+  // JSON-string envelope stored in the JSONB column.
   await db.insert(schema.stagedImports).values({
     id: stagedImportId,
     userId,
     source,
-    fromAddress: fromAddress ?? null,
-    subject: subject ?? null,
+    fromAddress: encryptStagingMeta(fromAddress ?? null, "service", null),
+    subject: encryptStagingMeta(subject ?? null, "service", null),
     svixId: svixId ?? null,
     status: "pending",
     totalRowCount: prepared.length,
     duplicateCount,
     expiresAt,
     headers: headers ?? null,
-    sampleRows: sampleRows ?? null,
+    sampleRows: encryptSampleRows(sampleRows ?? null, "service", null),
+    encryptionTier: "service",
   });
 
   if (prepared.length > 0) {

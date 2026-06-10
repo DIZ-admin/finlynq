@@ -33,6 +33,7 @@ import { sql } from "drizzle-orm";
 import { db } from "@/db";
 import { encryptField } from "@/lib/crypto/envelope";
 import { encryptStaged } from "@/lib/crypto/staging-envelope";
+import { encryptStagingMeta } from "@/lib/crypto/staging-metadata";
 import { SOURCES, type TransactionSource } from "@/lib/tx-source";
 
 /**
@@ -142,8 +143,21 @@ export async function upsertBankTransaction(
   // doesn't serialize a JS array to PG's `{elem1,elem2}` literal form —
   // PG sees a bare string and 22P02s ("malformed array literal"). Build
   // the array inline with ARRAY[…] using a properly-bound element instead.
-  const filenamesFragment = row.filename
-    ? sql`ARRAY[${row.filename}]::TEXT[]`
+  //
+  // FINLYNQ-132 — the filename element is ENCRYPTED at rest under the row's
+  // tier (v1: user-DEK via encryptField, sv1: PF_STAGING_KEY via encryptStaged)
+  // exactly like payee/note/tags/accountName above. Filenames leak bank name /
+  // account fragments / statement period to a DB-dump attacker, so they never
+  // land plaintext. Decryption branches per-row on encryption_tier at every
+  // reader (export, login-sweep upgrade) via decryptStagingMeta. The audit
+  // invariant `source-filenames-encrypted` guards this write-site — a raw
+  // `ARRAY[${row.filename}]::TEXT[]` here (without the encrypt helper) fails
+  // `npm run audit:invariants`. Keep the encrypt call in this file.
+  const encFilename = row.filename
+    ? encryptStagingMeta(row.filename, tier, dek)
+    : null;
+  const filenamesFragment = encFilename
+    ? sql`ARRAY[${encFilename}]::TEXT[]`
     : sql`ARRAY[]::TEXT[]`;
 
   // The `xmax = 0` trick distinguishes a fresh INSERT from an ON CONFLICT
