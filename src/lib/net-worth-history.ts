@@ -83,9 +83,25 @@ export interface BuildNetWorthHistoryInput {
   today: string;
 }
 
+/**
+ * One member's contribution on a grid day, keyed by account. Names are NOT
+ * resolved here (the pure core has no DEK) — the route maps accountId → a
+ * decrypted, safeName-fallback label before serializing. FINLYNQ-128.
+ */
+export interface NetWorthBreakdownEntry {
+  accountId: number;
+  value: number;
+}
+
 export interface NetWorthPoint {
   date: string; // YYYY-MM-DD
   value: number;
+  /**
+   * Per-account contributions to `value` on this day (cash + investment passes
+   * merged). Drives the tooltip top-10 breakdown (FINLYNQ-128) and the stacked
+   * view (FINLYNQ-129). Same currency basis as `value`.
+   */
+  breakdown: NetWorthBreakdownEntry[];
 }
 
 export interface BuildNetWorthHistoryResult {
@@ -153,6 +169,10 @@ function buildSnapStates(rows: AccountSnapshot[]): Map<number, SnapState> {
  * live override (if any accounts are present) REPLACES the whole pass total so
  * the latest point matches the dashboard hero; otherwise each account carries
  * its nearest snapshot at-or-before `day`.
+ *
+ * Side effect: accumulates each account's per-day contribution into `perAccount`
+ * (keyed by accountId, in displayCurrency) so the caller can build the FINLYNQ-128
+ * tooltip breakdown. Returns the pass total (sum of those contributions).
  */
 function sumPassForDay(
   states: Map<number, SnapState>,
@@ -160,20 +180,26 @@ function sumPassForDay(
   isFinalDay: boolean,
   liveByAccount: Map<number, LiveAccountValue> | undefined,
   rateMap: Map<string, number>,
+  perAccount: Map<number, number>,
 ): number {
   if (isFinalDay && liveByAccount && liveByAccount.size > 0) {
     let sum = 0;
-    for (const [, live] of liveByAccount) {
-      sum += convertWithRateMap(live.value, live.currency, rateMap);
+    for (const [accId, live] of liveByAccount) {
+      const v = convertWithRateMap(live.value, live.currency, rateMap);
+      perAccount.set(accId, (perAccount.get(accId) ?? 0) + v);
+      sum += v;
     }
     return sum;
   }
   let sum = 0;
-  for (const st of states.values()) {
+  for (const [accId, st] of states) {
     while (st.ptr < st.rows.length && st.rows[st.ptr].snapDate <= day) {
       const snap = st.rows[st.ptr];
       st.lastValue = convertWithRateMap(snap.marketValue, snap.currency, rateMap);
       st.ptr++;
+    }
+    if (st.lastValue !== 0) {
+      perAccount.set(accId, (perAccount.get(accId) ?? 0) + st.lastValue);
     }
     sum += st.lastValue;
   }
@@ -221,15 +247,25 @@ export function buildNetWorthHistory(
   while (day <= today && guard < MAX_DAYS) {
     guard++;
     const isFinalDay = day === today;
-    const cash = sumPassForDay(cashState, day, isFinalDay, liveCashByAccount, rateMap);
-    const investment = sumPassForDay(
-      invState,
-      day,
-      isFinalDay,
-      liveInvestmentByAccount,
-      rateMap,
+    // Per-account contributions for THIS day (cash + investment merged). Both
+    // passes write into the same map; an account never appears in both passes
+    // (the readers partition on is_investment), so no key collision.
+    const perAccount = new Map<number, number>();
+    const cash = sumPassForDay(
+      cashState, day, isFinalDay, liveCashByAccount, rateMap, perAccount,
     );
-    series.push({ date: day, value: Math.round((cash + investment) * 100) / 100 });
+    const investment = sumPassForDay(
+      invState, day, isFinalDay, liveInvestmentByAccount, rateMap, perAccount,
+    );
+    const breakdown: NetWorthBreakdownEntry[] = [];
+    for (const [accountId, v] of perAccount) {
+      breakdown.push({ accountId, value: Math.round(v * 100) / 100 });
+    }
+    series.push({
+      date: day,
+      value: Math.round((cash + investment) * 100) / 100,
+      breakdown,
+    });
 
     if (day === today) break;
     day = addDaysISO(day, 1);

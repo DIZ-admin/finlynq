@@ -2,6 +2,7 @@ import { NextRequest, NextResponse } from "next/server";
 import {
   getAccountBalances,
   getIncomeVsExpenses,
+  getIncomeExpenseByCategory,
   getSpendingByCategoryWithReporting,
   getNetWorthOverTime,
 } from "@/lib/queries";
@@ -11,7 +12,9 @@ import { getHoldingsValueByAccount } from "@/lib/holdings-value";
 import { requireAuth } from "@/lib/auth/require-auth";
 import { getDEK } from "@/lib/crypto/dek-cache";
 import { logApiError } from "@/lib/validate";
-import { decryptNamedRows } from "@/lib/crypto/encrypted-columns";
+import { decryptNamedRows, decryptName } from "@/lib/crypto/encrypted-columns";
+import { safeName } from "@/lib/safe-name";
+import { rankBreakdown, type BreakdownMember } from "@/lib/chart-breakdown";
 
 export async function GET(request: NextRequest) {
   // Dashboard must stay accessible even when the session has no cached DEK
@@ -112,6 +115,52 @@ export async function GET(request: NextRequest) {
       .map((r) => ({ ...r, total: Math.round(r.total * 100) / 100 }))
       .sort((a, b) => a.month.localeCompare(b.month));
 
+    // FINLYNQ-128 — per-(month, type) category breakdown for the Income vs
+    // Expenses tooltip. Convert each currency/reporting slice to the display
+    // currency (same convertGroup path), accumulate per category, then rank into
+    // a top-10 + "Other" residual via the shared rankBreakdown helper. Expenses
+    // are normalized to magnitude (abs) so the breakdown ties to the chart's
+    // positive expense area.
+    const ieCatSlices = await getIncomeExpenseByCategory(userId, startDate, endDate);
+    type CatAccum = { categoryId: number | null; nameCt: string | null; total: number };
+    const ieCatMap = new Map<string, CatAccum>(); // key = `${month}|${type}|${categoryId}`
+    for (const r of ieCatSlices) {
+      const key = `${r.month}|${r.type}|${r.categoryId ?? "null"}`;
+      const cur = ieCatMap.get(key) ?? { categoryId: r.categoryId, nameCt: r.categoryNameCt, total: 0 };
+      cur.total += convertGroup(r);
+      ieCatMap.set(key, cur);
+    }
+    // Re-group into month → { income: members[], expenses: members[] }.
+    const ieMembers = new Map<string, { income: BreakdownMember[]; expenses: BreakdownMember[] }>();
+    for (const [key, acc] of ieCatMap) {
+      const [month, type] = key.split("|");
+      const slot = ieMembers.get(month) ?? { income: [], expenses: [] };
+      const name = safeName(
+        decryptName(acc.nameCt, dek, null),
+        "Category",
+        acc.categoryId ?? 0,
+      );
+      const member: BreakdownMember = {
+        id: acc.categoryId,
+        name: acc.categoryId == null ? "Uncategorized" : name,
+        value: type === "E" ? Math.abs(acc.total) : acc.total,
+      };
+      if (type === "I") slot.income.push(member);
+      else slot.expenses.push(member);
+      ieMembers.set(month, slot);
+    }
+    const rankRows = (members: BreakdownMember[]) => {
+      const { rows, other } = rankBreakdown(members, { maxMembers: 10 });
+      const list = (other ? [...rows, other] : rows).map((m) => ({ name: m.name, value: m.value }));
+      return list;
+    };
+    const incomeExpenseBreakdown = Object.fromEntries(
+      Array.from(ieMembers.entries()).map(([month, slot]) => [
+        month,
+        { income: rankRows(slot.income), expenses: rankRows(slot.expenses) },
+      ]),
+    );
+
     const spendSlices = await getSpendingByCategoryWithReporting(userId, startDate, endDate);
     const spendMap = new Map<string | number, {
       categoryId: number | null;
@@ -152,6 +201,7 @@ export async function GET(request: NextRequest) {
       displayCurrency,
       balances: convertedBalances,
       incomeVsExpenses,
+      incomeExpenseBreakdown,
       spendingByCategory,
       netWorthOverTime,
     });

@@ -14,7 +14,13 @@ const itemVariants = {
   visible: { opacity: 1, y: 0, transition: { duration: 0.4, ease: "easeOut" as const } },
 };
 
-export function IncomeExpenseChart({ data }: { data: MonthlyData[] }) {
+export function IncomeExpenseChart({
+  data,
+  currency = "USD",
+}: {
+  data: MonthlyData[];
+  currency?: string;
+}) {
   return (
     <motion.div variants={itemVariants}>
       <Card className="card-hover">
@@ -49,7 +55,7 @@ export function IncomeExpenseChart({ data }: { data: MonthlyData[] }) {
                 tick={{ fill: "var(--color-muted-foreground)" }}
                 tickFormatter={(v) => `${(v / 1000).toFixed(0)}k`}
               />
-              <Tooltip content={<ChartTooltip />} cursor={{ stroke: "var(--color-border)", strokeDasharray: "4 4" }} />
+              <Tooltip content={<ChartTooltip currency={currency} />} cursor={{ stroke: "var(--color-border)", strokeDasharray: "4 4" }} />
               <Area
                 type="monotone"
                 dataKey="income"

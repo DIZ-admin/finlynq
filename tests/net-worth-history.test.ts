@@ -41,9 +41,9 @@ describe("buildNetWorthHistory", () => {
       today: "2026-05-03",
     });
     expect(res.series).toEqual([
-      { date: "2026-05-01", value: 100 },
-      { date: "2026-05-02", value: 100 },
-      { date: "2026-05-03", value: 100 },
+      { date: "2026-05-01", value: 100, breakdown: [{ accountId: 1, value: 100 }] },
+      { date: "2026-05-02", value: 100, breakdown: [{ accountId: 1, value: 100 }] },
+      { date: "2026-05-03", value: 100, breakdown: [{ accountId: 1, value: 100 }] },
     ]);
     expect(res.hasInvestmentData).toBe(false);
   });
@@ -65,10 +65,15 @@ describe("buildNetWorthHistory", () => {
     });
     // 180 days back, inclusive → 181 points.
     expect(res.series.length).toBe(181);
-    expect(res.series[0]).toEqual({ date: "2025-12-04", value: 500 });
+    expect(res.series[0]).toEqual({
+      date: "2025-12-04",
+      value: 500,
+      breakdown: [{ accountId: 1, value: 500 }],
+    });
     expect(res.series[res.series.length - 1]).toEqual({
       date: "2026-06-02",
       value: 500,
+      breakdown: [{ accountId: 1, value: 500 }],
     });
   });
 
@@ -86,10 +91,10 @@ describe("buildNetWorthHistory", () => {
       today: "2026-05-04",
     });
     expect(res.series).toEqual([
-      { date: "2026-05-01", value: 1000 },
-      { date: "2026-05-02", value: 1000 }, // carry-forward
-      { date: "2026-05-03", value: 1100 },
-      { date: "2026-05-04", value: 1100 }, // carry-forward
+      { date: "2026-05-01", value: 1000, breakdown: [{ accountId: 1, value: 1000 }] },
+      { date: "2026-05-02", value: 1000, breakdown: [{ accountId: 1, value: 1000 }] }, // carry-forward
+      { date: "2026-05-03", value: 1100, breakdown: [{ accountId: 1, value: 1100 }] },
+      { date: "2026-05-04", value: 1100, breakdown: [{ accountId: 1, value: 1100 }] }, // carry-forward
     ]);
     expect(res.hasInvestmentData).toBe(true);
   });
@@ -115,7 +120,16 @@ describe("buildNetWorthHistory", () => {
       today: "2026-05-01",
     });
     // 100 CAD + 50 USD × 1.4 = 170
-    expect(res.series).toEqual([{ date: "2026-05-01", value: 170 }]);
+    expect(res.series).toEqual([
+      {
+        date: "2026-05-01",
+        value: 170,
+        breakdown: [
+          { accountId: 1, value: 100 },
+          { accountId: 2, value: 70 },
+        ],
+      },
+    ]);
   });
 
   it("re-FXes a CAD-stored cash snapshot when displayCurrency switched to USD", () => {
@@ -135,7 +149,9 @@ describe("buildNetWorthHistory", () => {
       snapshots: [],
       today: "2026-05-01",
     });
-    expect(res.series).toEqual([{ date: "2026-05-01", value: 70 }]);
+    expect(res.series).toEqual([
+      { date: "2026-05-01", value: 70, breakdown: [{ accountId: 1, value: 70 }] },
+    ]);
   });
 
   it("substitutes live cash balance on the final (today) grid point", () => {
@@ -155,8 +171,8 @@ describe("buildNetWorthHistory", () => {
       today: "2026-05-02",
     });
     expect(res.series).toEqual([
-      { date: "2026-05-01", value: 100 }, // historical snapshot
-      { date: "2026-05-02", value: 130 }, // live override on today
+      { date: "2026-05-01", value: 100, breakdown: [{ accountId: 1, value: 100 }] }, // historical snapshot
+      { date: "2026-05-02", value: 130, breakdown: [{ accountId: 1, value: 130 }] }, // live override on today
     ]);
   });
 
@@ -175,8 +191,8 @@ describe("buildNetWorthHistory", () => {
       today: "2026-05-02",
     });
     expect(res.series).toEqual([
-      { date: "2026-05-01", value: 1000 }, // historical snapshot
-      { date: "2026-05-02", value: 1200 }, // live override on today
+      { date: "2026-05-01", value: 1000, breakdown: [{ accountId: 1, value: 1000 }] }, // historical snapshot
+      { date: "2026-05-02", value: 1200, breakdown: [{ accountId: 1, value: 1200 }] }, // live override on today
     ]);
     expect(res.hasInvestmentData).toBe(true);
   });
@@ -205,8 +221,22 @@ describe("buildNetWorthHistory", () => {
       today: "2026-05-02",
     });
     expect(res.series).toEqual([
-      { date: "2026-05-01", value: 900 }, // 100 cash + 800 investment (historical)
-      { date: "2026-05-02", value: 970 }, // 120 live cash + 850 live investment
+      {
+        date: "2026-05-01",
+        value: 900, // 100 cash + 800 investment (historical)
+        breakdown: [
+          { accountId: 1, value: 100 },
+          { accountId: 2, value: 800 },
+        ],
+      },
+      {
+        date: "2026-05-02",
+        value: 970, // 120 live cash + 850 live investment
+        breakdown: [
+          { accountId: 1, value: 120 },
+          { accountId: 2, value: 850 },
+        ],
+      },
     ]);
     expect(res.hasInvestmentData).toBe(true);
   });
@@ -226,7 +256,16 @@ describe("buildNetWorthHistory", () => {
       snapshots,
       today: "2026-05-01",
     });
-    expect(res.series).toEqual([{ date: "2026-05-01", value: 1050 }]);
+    expect(res.series).toEqual([
+      {
+        date: "2026-05-01",
+        value: 1050,
+        breakdown: [
+          { accountId: 1, value: 250 },
+          { accountId: 2, value: 800 },
+        ],
+      },
+    ]);
   });
 
   it("returns hasInvestmentData=false and a zero series when there is no data", () => {
@@ -238,7 +277,7 @@ describe("buildNetWorthHistory", () => {
       snapshots: [],
       today: "2026-05-01",
     });
-    expect(res.series).toEqual([{ date: "2026-05-01", value: 0 }]);
+    expect(res.series).toEqual([{ date: "2026-05-01", value: 0, breakdown: [] }]);
     expect(res.hasInvestmentData).toBe(false);
     expect(res.fxApproximation).toBe(true);
   });

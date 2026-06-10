@@ -180,7 +180,16 @@ export default function DashboardPage() {
     if (row.type === "E") entry.expenses = Math.abs(row.total);
     monthMap.set(row.month, entry);
   });
-  const incExpData = Array.from(monthMap.values()).slice(-12);
+  // FINLYNQ-128 — attach the per-category tooltip breakdown (keyed by the same
+  // "YYYY-MM" month) so the Income vs Expenses tooltip can show contributors.
+  const ieBreakdown = data.incomeExpenseBreakdown ?? {};
+  const incExpData = Array.from(monthMap.values())
+    .map((m) => ({
+      ...m,
+      incomeBreakdown: ieBreakdown[m.month]?.income,
+      expenseBreakdown: ieBreakdown[m.month]?.expenses,
+    }))
+    .slice(-12);
   const incExpLast6 = incExpData.slice(-6);
   const incomeSparkline = incExpLast6.map((d) => d.income);
   const expenseSparkline = incExpLast6.map((d) => d.expenses);
@@ -401,7 +410,7 @@ export default function DashboardPage() {
       {devMode && (
         <>
           <div className="grid grid-cols-1 lg:grid-cols-2 gap-5">
-            <IncomeExpenseChart data={incExpData} />
+            <IncomeExpenseChart data={incExpData} currency={apiDisplayCurrency} />
             <SpendingCategoryChart data={spendingData} currency={apiDisplayCurrency} />
           </div>
           <div className="grid grid-cols-1 lg:grid-cols-3 gap-5">

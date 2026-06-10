@@ -27,12 +27,15 @@ import { Button } from "@/components/ui/button";
 import { formatCurrency } from "@/lib/currency";
 import { RebuildSnapshotsButton } from "@/components/portfolio/rebuild-snapshots-button";
 import { prepareTimeSeries } from "@/lib/chart-series";
+import { TooltipBreakdownList, type BreakdownRow } from "@/components/chart-breakdown-list";
 
 type Period = "6m" | "1y" | "all";
 
 interface NetWorthPoint {
   date: string;
   value: number;
+  /** Per-account top-10 (+ "Other") breakdown, pre-ranked by the API (FINLYNQ-128). */
+  breakdown?: BreakdownRow[];
 }
 
 interface ApiResponse {
@@ -81,21 +84,26 @@ function HistoryTooltip({
   payload,
   label,
   currency,
+  accountScoped,
 }: {
   active?: boolean;
-  payload?: { value: number }[];
+  payload?: { value: number; payload?: NetWorthPoint }[];
   label?: string;
   currency: string;
+  /** True for a single-account "Balance Over Time" chart — hide the (redundant) per-account breakdown. */
+  accountScoped?: boolean;
 }) {
   if (!active || !payload?.length) return null;
+  const breakdown = accountScoped ? undefined : payload[0].payload?.breakdown;
   return (
-    <div className="rounded-xl border border-border/50 bg-card/95 backdrop-blur-sm px-3.5 py-2.5 shadow-lg">
+    <div className="rounded-xl border border-border/50 bg-card/95 backdrop-blur-sm px-3.5 py-2.5 shadow-lg max-w-[260px]">
       <p className="text-[11px] font-medium text-muted-foreground mb-1">
         {label ? fmtFullDate(label) : ""}
       </p>
       <p className="text-sm font-semibold tabular-nums">
         {formatCurrency(Number(payload[0].value), currency)}
       </p>
+      <TooltipBreakdownList rows={breakdown} currency={currency} heading="By account" />
     </div>
   );
 }
@@ -218,7 +226,9 @@ export function NetWorthHistoryChart({
                   domain={domain}
                 />
                 <Tooltip
-                  content={<HistoryTooltip currency={currency} />}
+                  content={
+                    <HistoryTooltip currency={currency} accountScoped={accountId != null} />
+                  }
                   cursor={{ stroke: "var(--color-border)", strokeDasharray: "4 4" }}
                 />
                 <Area

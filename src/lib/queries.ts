@@ -914,6 +914,47 @@ export async function getIncomeVsExpenses(userId: string, startDate: string, end
     .all();
 }
 
+/**
+ * FINLYNQ-128 — per-month, per-category, per-type income/expense slices so the
+ * dashboard route can build the Income-vs-Expenses tooltip breakdown. Same WHERE
+ * + currency/reporting slicing as getIncomeVsExpenses, but adds the category
+ * grain (categoryId + nameCt for decryption). The route converts each slice to
+ * the display currency and ranks per (month, type) via rankBreakdown.
+ */
+export async function getIncomeExpenseByCategory(userId: string, startDate: string, endDate: string) {
+  return db
+    .select({
+      month: monthExpr(transactions.date),
+      type: categories.type,
+      categoryId: categories.id,
+      categoryNameCt: categories.nameCt,
+      currency: transactions.currency,
+      reportingCurrency: transactions.reportingCurrency,
+      totalAmount: sql<number>`SUM(${transactions.amount})`,
+      totalReporting: sql<number | null>`SUM(${transactions.reportingAmount})`,
+    })
+    .from(transactions)
+    .leftJoin(categories, eq(transactions.categoryId, categories.id))
+    .where(
+      and(
+        eq(transactions.userId, userId),
+        gte(transactions.date, startDate),
+        lte(transactions.date, endDate),
+        sql`${categories.type} IN ('E', 'I')`
+      )
+    )
+    .groupBy(
+      monthExpr(transactions.date),
+      categories.type,
+      categories.id,
+      categories.nameCt,
+      transactions.currency,
+      transactions.reportingCurrency,
+    )
+    .orderBy(monthExpr(transactions.date))
+    .all();
+}
+
 // Currency rework Phase 3 — dashboard spending-by-category with per-currency +
 // reporting slices so the route can convert to the display currency. Distinct
 // from getSpendingByCategory (left raw for the budget-rollover internal caller).
