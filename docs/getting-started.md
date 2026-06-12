@@ -34,13 +34,13 @@ Want to look around before signing up? Open **[finlynq.com/cloud?demo=1](https:/
 
 ```bash
 git clone https://github.com/finlynq/finlynq.git
-cd finlynq/pf-app
+cd finlynq
 npm install
 ```
 
 ### Configure
 
-Finlynq connects to PostgreSQL and needs a few secrets for encryption and sessions. Create a `.env.local` file in `pf-app/`:
+Finlynq connects to PostgreSQL and needs a few secrets for encryption and sessions. Create a `.env.local` file in the repository root:
 
 ```bash
 # PostgreSQL connection string
@@ -63,7 +63,9 @@ npm run dev         # start the dev server at http://localhost:3000
 
 Open [http://localhost:3000](http://localhost:3000) and create your account.
 
-For production deployment (systemd, HTTPS, automated migrations, backups), see **DEPLOY.md** in the repository.
+For a containerized self-host, a ready-made `docker-compose.yml` lives at the repository root (see the [README](../README.md#quick-start--self-hosted)) — it runs the app and PostgreSQL together and requires the three `PF_*` secrets via a sibling `.env`. Production deployment notes (systemd, HTTPS, automated migrations, backups) are at [finlynq.com/self-hosted](https://finlynq.com/self-hosted).
+
+If you run Finlynq behind a reverse proxy (Caddy, nginx, Cloudflare Tunnel), point your uptime monitor and proxy health gate at **`/api/healthz`** — it's a public, unauthenticated endpoint that returns `200` when the app and database are healthy (`503` when degraded).
 
 ## Creating your account
 
