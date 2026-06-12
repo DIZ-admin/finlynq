@@ -12,7 +12,7 @@ import { AppState, AppStateStatus } from "react-native";
 import AsyncStorage from "@react-native-async-storage/async-storage";
 import * as LocalAuthentication from "expo-local-authentication";
 import * as SecureStore from "expo-secure-store";
-import type { RegisterPayload } from "../../../shared/types";
+import type { RegisterPayload, SessionInfo } from "../../../shared/types";
 import {
   endpoints,
   getSession,
@@ -210,6 +210,10 @@ function useAuthEngine() {
   // reads the freshest value without re-creating the callback (matches the
   // existing stable-callback pattern in this hook).
   const biometricEnabledRef = useRef(false);
+  // Latest `recoverIfEncryptionLocked` (declared far below), exposed via a ref so
+  // the app-resume AppState effect can call it WITHOUT taking it as a dependency
+  // (which would be a temporal-dead-zone reference at the effect's render point).
+  const recoverRef = useRef<null | (() => Promise<unknown>)>(null);
 
   // Bootstrap: restore the server URL + biometric prefs, then validate any
   // stored session token against the backend's single identity source.
@@ -248,17 +252,25 @@ function useAuthEngine() {
         setAuthToken(token);
         try {
           const session = await getSession();
-          if (session.authenticated) {
+          if (session.authenticated && !session.encryptionLocked) {
             hasSession = true;
             isAdmin = !!session.isAdmin;
             // Gate behind biometrics when enabled; otherwise unlock straight away.
             isUnlocked = !(biometricHw && biometricEnabled);
-          } else {
+          } else if (!session.authenticated) {
             // Token rejected (expired / deploy-rotated) — drop it so the silent
             // re-login path below can take over.
             logger.warn("auth", "stored token rejected by /api/auth/session — dropping");
             setAuthToken(null);
             await SecureStore.deleteItemAsync(SESSION_TOKEN_KEY);
+          } else {
+            // FINLYNQ-152 follow-up — authenticated but the server lost our DEK
+            // (it restarted since login). DON'T treat this as a live session:
+            // leave hasSession false so the silent re-login below re-derives the
+            // DEK (or drops to the login screen if biometric/creds aren't set
+            // up). The token is still a valid JWT, so keep it — a successful
+            // re-login overwrites it.
+            logger.warn("auth", "session DEK-locked at bootstrap — re-establishing via re-login");
           }
         } catch (e) {
           // Couldn't reach the server. Keep the stored token (it may still be
@@ -316,15 +328,22 @@ function useAuthEngine() {
       } else if (nextState === "active" && backgroundedAt.current) {
         const elapsed = (Date.now() - backgroundedAt.current) / 60000; // minutes
         backgroundedAt.current = null;
-        if (
+        const shouldAutoLock =
           state.autoLockMinutes > 0 &&
           elapsed >= state.autoLockMinutes &&
           state.isUnlocked &&
           state.biometricAvailable &&
-          state.biometricEnabled
-        ) {
-          // Lock the UI but keep the session token; biometric re-unlocks.
+          state.biometricEnabled;
+        if (shouldAutoLock) {
+          // Lock the UI but keep the session token; biometric re-unlocks (and
+          // the LockScreen's biometricUnlock recovers the DEK if it was lost).
           setState((s) => ({ ...s, isUnlocked: false }));
+        } else if (state.isUnlocked) {
+          // FINLYNQ-152 follow-up — not auto-locking, but the server may have
+          // dropped our DEK while we were backgrounded (it restarted). Verify
+          // the live session and silently re-login if it's encryptionLocked, so
+          // a returning user never sits on undecryptable data.
+          void recoverRef.current?.();
         }
       }
     };
@@ -622,8 +641,78 @@ function useAuthEngine() {
 
   /** Unlock the UI with biometrics. The session token already lives in
    *  SecureStore — biometrics only gate the local UI, they don't re-auth. */
+  /**
+   * FINLYNQ-152 follow-up — proactive lost-DEK recovery. Reads the LIVE session;
+   * if it's authenticated-but-`encryptionLocked` (the server restarted since
+   * login, so encrypted data can't be decrypted), re-derive the DEK via a silent
+   * biometric re-login. Used on app-resume and from the LockScreen unlock so a
+   * returning user never lands in an undecryptable session. Returns:
+   *   "recovered"  — DEK restored in place (state set unlocked)
+   *   "logged_out" — couldn't recover (no creds / declined / token dead) → login
+   *   "ok"         — session is fine (not locked) — caller proceeds normally
+   *   "unknown"    — server unreachable — left as-is
+   */
+  const recoverIfEncryptionLocked = useCallback(async (): Promise<
+    "recovered" | "logged_out" | "ok" | "unknown"
+  > => {
+    let session: SessionInfo;
+    try {
+      session = await getSession();
+    } catch {
+      return "unknown";
+    }
+    if (!session.authenticated) {
+      void clearSessionToken();
+      setState((s) => ({
+        ...s,
+        hasSession: false,
+        isUnlocked: false,
+        isAdmin: false,
+        pendingOnboarding: false,
+      }));
+      return "logged_out";
+    }
+    if (!session.encryptionLocked) return "ok";
+    logger.warn("auth", "session DEK-locked — re-establishing via silent re-login");
+    const biometricHw = await LocalAuthentication.hasHardwareAsync().catch(() => false);
+    const relogin = await attemptSilentRelogin({
+      biometricHw,
+      biometricEnabled: biometricEnabledRef.current,
+    });
+    if (relogin.restored) {
+      setState((s) => ({
+        ...s,
+        hasSession: true,
+        isUnlocked: true,
+        isAdmin: relogin.isAdmin,
+      }));
+      return "recovered";
+    }
+    void clearSessionToken();
+    setState((s) => ({
+      ...s,
+      hasSession: false,
+      isUnlocked: false,
+      isAdmin: false,
+      pendingOnboarding: false,
+    }));
+    return "logged_out";
+  }, [clearSessionToken]);
+
+  // Keep the resume-handler's ref pointed at the latest recovery callback.
+  recoverRef.current = recoverIfEncryptionLocked;
+
   const biometricUnlock = useCallback(async () => {
     if (!state.biometricEnabled || !state.biometricAvailable) return false;
+    // FINLYNQ-152 follow-up — if the session ALSO lost its DEK while we were
+    // locked, "unlocking" must RE-LOGIN to re-derive it; that re-login's
+    // credential read is itself the biometric gate, so route straight to
+    // recovery (one prompt) rather than a UI-only unlock that would leave the
+    // data undecryptable. When the session is fine (or the server is
+    // unreachable) fall through to a plain UI unlock.
+    const recovery = await recoverIfEncryptionLocked();
+    if (recovery === "recovered") return true;
+    if (recovery === "logged_out") return false;
     try {
       const result = await LocalAuthentication.authenticateAsync({
         promptMessage: "Unlock Finlynq",
@@ -636,7 +725,7 @@ function useAuthEngine() {
     } catch {
       return false;
     }
-  }, [state.biometricEnabled, state.biometricAvailable]);
+  }, [state.biometricEnabled, state.biometricAvailable, recoverIfEncryptionLocked]);
 
   /**
    * Enable / disable biometric sign-in.

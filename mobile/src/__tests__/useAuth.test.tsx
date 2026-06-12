@@ -497,4 +497,92 @@ describe("useAuth — FINLYNQ-134 biometric silent re-login + secure credential 
       expect(result.current.biometricEnabled).toBe(false);
     });
   });
+
+  // FINLYNQ-152 follow-up — proactive lost-DEK recovery. A session can be
+  // authenticated but encryptionLocked (server restarted since login); the app
+  // must re-derive the DEK on open/resume/unlock, not sit on ciphertext.
+  describe("FINLYNQ-152 — proactive encryptionLocked recovery", () => {
+    it("bootstrap: re-logs in when the session is authenticated but encryptionLocked (creds stored)", async () => {
+      SECURE.getItemAsync.mockImplementation(async (key: string) =>
+        key === SESSION_TOKEN_KEY
+          ? "valid-jwt"
+          : key === STORED_CREDENTIALS_KEY
+            ? JSON.stringify({ identifier: "alice", password: "hunter2hunter2" })
+            : null
+      );
+      ASYNC.getItem.mockImplementation(async (key: string) =>
+        key === BIOMETRIC_KEY ? "true" : null
+      );
+      LOCAL.hasHardwareAsync.mockResolvedValue(true);
+      // Bootstrap sees authenticated+locked; the post-re-login meta read is fine.
+      mockGetSession
+        .mockResolvedValueOnce({ authenticated: true, encryptionLocked: true })
+        .mockResolvedValue({ authenticated: true, isAdmin: false });
+      mockLogin.mockResolvedValue({ ok: true, status: 200, data: {}, token: "fresh-jwt" });
+
+      const { result } = renderHook(() => useAuth(), { wrapper });
+      await waitFor(() => expect(result.current.isLoading).toBe(false));
+
+      // The DEK was re-derived via a single silent re-login from stored creds...
+      expect(mockLogin).toHaveBeenCalledTimes(1);
+      expect(mockLogin).toHaveBeenCalledWith("alice", "hunter2hunter2");
+      // ...and the user is in, not stranded on a locked session.
+      expect(result.current.hasSession).toBe(true);
+      expect(result.current.isUnlocked).toBe(true);
+    });
+
+    it("bootstrap: drops to the login screen when encryptionLocked and no creds are stored", async () => {
+      SECURE.getItemAsync.mockImplementation(async (key: string) =>
+        key === SESSION_TOKEN_KEY ? "valid-jwt" : null
+      );
+      ASYNC.getItem.mockImplementation(async (key: string) =>
+        key === BIOMETRIC_KEY ? "true" : null
+      );
+      LOCAL.hasHardwareAsync.mockResolvedValue(true);
+      mockGetSession.mockResolvedValue({ authenticated: true, encryptionLocked: true });
+
+      const { result } = renderHook(() => useAuth(), { wrapper });
+      await waitFor(() => expect(result.current.isLoading).toBe(false));
+
+      // No creds → no silent re-login → not treated as a live session.
+      expect(mockLogin).not.toHaveBeenCalled();
+      expect(result.current.hasSession).toBe(false);
+    });
+
+    it("biometricUnlock: a locked session re-logs in (re-derives the DEK) instead of a UI-only unlock", async () => {
+      // Mount locked: token + biometric on, session OK at bootstrap.
+      SECURE.getItemAsync.mockImplementation(async (key: string) =>
+        key === SESSION_TOKEN_KEY
+          ? "valid-jwt"
+          : key === STORED_CREDENTIALS_KEY
+            ? JSON.stringify({ identifier: "alice", password: "hunter2hunter2" })
+            : null
+      );
+      ASYNC.getItem.mockImplementation(async (key: string) =>
+        key === BIOMETRIC_KEY ? "true" : null
+      );
+      LOCAL.hasHardwareAsync.mockResolvedValue(true);
+      mockGetSession.mockResolvedValue({ authenticated: true, isAdmin: false });
+      mockLogin.mockResolvedValue({ ok: true, status: 200, data: {}, token: "fresh-jwt" });
+
+      const { result } = renderHook(() => useAuth(), { wrapper });
+      await waitFor(() => expect(result.current.isLoading).toBe(false));
+      // Biometric-gated → locked UI.
+      expect(result.current.hasSession).toBe(true);
+      expect(result.current.isUnlocked).toBe(false);
+
+      // Now the server has lost the DEK; the unlock must re-login.
+      mockGetSession.mockResolvedValue({ authenticated: true, encryptionLocked: true });
+      mockLogin.mockClear();
+
+      let unlocked: boolean | undefined;
+      await act(async () => {
+        unlocked = await result.current.biometricUnlock();
+      });
+
+      expect(unlocked).toBe(true);
+      expect(mockLogin).toHaveBeenCalledTimes(1); // re-login, not a UI-only unlock
+      expect(result.current.isUnlocked).toBe(true);
+    });
+  });
 });

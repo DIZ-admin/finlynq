@@ -213,6 +213,11 @@ export interface SessionInfo {
   authMethod?: string | null;
   userId: string | null;
   mfaVerified?: boolean;
+  /** FINLYNQ-152 follow-up — authenticated but the server has no DEK for this
+   *  session (it restarted since login). Encrypted fields can't be decrypted
+   *  (reads show ciphertext, writes 423 session_locked); the mobile app
+   *  re-authenticates on open/resume/unlock when this is true. */
+  encryptionLocked?: boolean;
   onboardingComplete?: boolean;
   isAdmin?: boolean;
   username?: string | null;
