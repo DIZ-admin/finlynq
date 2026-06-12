@@ -76,6 +76,20 @@ interface SilentReloginResult {
 }
 
 /**
+ * FINLYNQ-134 — result of `setBiometricEnabled(true, …)`. `needsPassword` tells
+ * the caller it must prompt for the password and call again with
+ * `{ password }` — the case where the user enables biometric sign-in while
+ * already logged in from a prior launch, so no credentials are in memory to
+ * capture. Without this, enabling stored nothing and silent re-login silently
+ * no-opped (the bug). `error` carries a user-facing reason (not enrolled / wrong
+ * password / unreachable).
+ */
+export type BiometricEnableResult =
+  | { ok: true }
+  | { ok: false; needsPassword: true }
+  | { ok: false; error: string };
+
+/**
  * FINLYNQ-134 — silent re-authentication from stored credentials, gated behind
  * a biometric prompt. Called from bootstrap when a stored session token has
  * been rejected. No-ops (returns `restored:false`) unless biometric hardware is
@@ -214,6 +228,10 @@ function useAuthEngine() {
       let isUnlocked = false;
       let hasSession = false;
       let isAdmin = false;
+      // Set only when a network/server error left token validity unknown — we
+      // then skip silent re-login (the login would fail too) and fall to the
+      // login screen so the user can retry or fix the server URL.
+      let serverUnreachable = false;
 
       if (token) {
         setAuthToken(token);
@@ -225,27 +243,36 @@ function useAuthEngine() {
             // Gate behind biometrics when enabled; otherwise unlock straight away.
             isUnlocked = !(biometricHw && biometricEnabled);
           } else {
-            // Token rejected (expired / deploy-rotated) — drop it. FINLYNQ-134:
-            // before falling back to the manual login form, attempt a silent,
-            // biometric-gated re-login from stored credentials so a returning
-            // user (esp. after a deploy rotates DEPLOY_GENERATION) doesn't have
-            // to re-type their password.
+            // Token rejected (expired / deploy-rotated) — drop it so the silent
+            // re-login path below can take over.
             logger.warn("auth", "stored token rejected by /api/auth/session — dropping");
             setAuthToken(null);
             await SecureStore.deleteItemAsync(SESSION_TOKEN_KEY);
-            const relogin = await attemptSilentRelogin({ biometricHw, biometricEnabled });
-            if (relogin.restored) {
-              hasSession = true;
-              isUnlocked = true;
-              isAdmin = relogin.isAdmin;
-            }
           }
         } catch (e) {
           // Couldn't reach the server. Keep the stored token (it may still be
-          // valid once the URL/network is fixed) but fall through to the login
-          // screen so the user can retry or correct the server URL.
+          // valid once the URL/network is fixed) but fall through to login.
+          serverUnreachable = true;
           const detail = e instanceof Error ? `${e.name}: ${e.message}` : String(e);
           logger.error("auth", "session validation threw during bootstrap", { detail });
+        }
+      }
+
+      // FINLYNQ-134 — silent, biometric-gated re-login from stored credentials.
+      // Attempt it whenever we have NO live session but biometrics are set up,
+      // INDEPENDENT of whether a (possibly already-cleared) session token was
+      // present. This is what lets a returning user back in with just a
+      // biometric prompt after a deploy rotates DEPLOY_GENERATION — including
+      // the case where a prior mid-session 401 (FINLYNQ-135) already deleted the
+      // stored token (gating on `if (token)` here previously made that case
+      // unreachable). No-ops without stored credentials, so it never prompts a
+      // user who hasn't opted in; skipped on a network error (login would fail).
+      if (!hasSession && !serverUnreachable && biometricHw && biometricEnabled) {
+        const relogin = await attemptSilentRelogin({ biometricHw, biometricEnabled });
+        if (relogin.restored) {
+          hasSession = true;
+          isUnlocked = true;
+          isAdmin = relogin.isAdmin;
         }
       }
 
@@ -553,32 +580,94 @@ function useAuthEngine() {
     }
   }, [state.biometricEnabled, state.biometricAvailable]);
 
-  const setBiometricEnabled = useCallback(async (enabled: boolean) => {
-    if (enabled) {
+  /**
+   * Enable / disable biometric sign-in.
+   *
+   * FINLYNQ-134 — enabling MUST capture the user's credentials into the
+   * hardware-backed store, otherwise silent re-login has nothing to use and the
+   * toggle is a no-op. (The bug this fixes: turning it on in Settings while
+   * already logged in from a prior launch stored nothing, because the password
+   * was no longer in memory.) Credential-resolution order when enabling:
+   *   - credentials already in memory (the user signed in THIS session) →
+   *     persist them; no password prompt needed;
+   *   - else a `password` was supplied (the Settings password prompt) → resolve
+   *     the identifier from the live session, verify the password with a login
+   *     (so a wrong password is caught HERE, not silently at the next re-login),
+   *     then persist;
+   *   - else → return `{ needsPassword: true }` WITHOUT enabling, so the caller
+   *     prompts for the password and calls again.
+   * Disabling purges the stored credential (one of the three teardown paths).
+   */
+  const setBiometricEnabled = useCallback(
+    async (
+      enabled: boolean,
+      opts?: { password?: string }
+    ): Promise<BiometricEnableResult> => {
+      if (!enabled) {
+        await AsyncStorage.setItem(BIOMETRIC_KEY, "false");
+        biometricEnabledRef.current = false;
+        lastCredentials.current = null;
+        await purgeStoredCredentials();
+        setState((s) => ({ ...s, biometricEnabled: false }));
+        return { ok: true };
+      }
+
       const enrolled = await LocalAuthentication.isEnrolledAsync();
       if (!enrolled) {
-        setState((s) => ({ ...s, error: "No biometrics enrolled on this device" }));
-        return;
+        const error = "No biometrics enrolled on this device";
+        setState((s) => ({ ...s, error }));
+        return { ok: false, error };
       }
-    }
-    await AsyncStorage.setItem(BIOMETRIC_KEY, String(enabled));
-    biometricEnabledRef.current = enabled;
-    if (enabled) {
-      // FINLYNQ-134 — opting in right after a manual login persists the
-      // in-memory credentials so the next deploy-rotated launch re-logs in
-      // silently. If there are none in scope (e.g. toggled before any login
-      // this session) the next successful signIn captures + persists them.
-      if (lastCredentials.current) {
-        await persistCredentials(lastCredentials.current);
+
+      // Resolve the credentials to store.
+      let creds = lastCredentials.current;
+      if (!creds) {
+        const password = opts?.password;
+        if (!password) {
+          // No password in scope — caller must prompt and call again.
+          return { ok: false, needsPassword: true };
+        }
+        // The user is signed in but the password wasn't in memory; pull the
+        // identifier from the live session and verify the typed password with a
+        // login (also refreshes the token).
+        let identifier: string | null = null;
+        try {
+          const sess = await getSession();
+          identifier = sess.authenticated ? sess.username ?? null : null;
+        } catch {
+          identifier = null;
+        }
+        if (!identifier) {
+          return {
+            ok: false,
+            error: "Couldn't confirm your account. Sign in again, then enable biometrics.",
+          };
+        }
+        let res: Awaited<ReturnType<typeof endpoints.login>>;
+        try {
+          res = await endpoints.login(identifier, password);
+        } catch {
+          return { ok: false, error: "Can't reach the server. Check your connection and try again." };
+        }
+        if (!res.ok) {
+          return { ok: false, error: (res.data?.error as string) || "Password incorrect" };
+        }
+        if (res.token) {
+          setAuthToken(res.token);
+          await SecureStore.setItemAsync(SESSION_TOKEN_KEY, res.token);
+        }
+        creds = { identifier, password };
       }
-    } else {
-      // Disabling biometric sign-in is one of the three teardown paths — purge
-      // the hardware-backed credential store.
-      lastCredentials.current = null;
-      await purgeStoredCredentials();
-    }
-    setState((s) => ({ ...s, biometricEnabled: enabled }));
-  }, []);
+
+      lastCredentials.current = creds;
+      await persistCredentials(creds);
+      await AsyncStorage.setItem(BIOMETRIC_KEY, "true");
+      biometricEnabledRef.current = true;
+      setState((s) => ({ ...s, biometricEnabled: true, error: null }));
+      return { ok: true };
+    },
+    []
+  );
 
   const setAutoLockMinutes = useCallback(async (minutes: number) => {
     await AsyncStorage.setItem(AUTO_LOCK_KEY, String(minutes));

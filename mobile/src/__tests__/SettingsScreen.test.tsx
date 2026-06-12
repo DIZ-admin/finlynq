@@ -72,7 +72,7 @@ describe("SettingsScreen", () => {
   it("shows SECURITY section", () => {
     const { getByText } = renderWithTheme(<SettingsScreen />);
     expect(getByText("SECURITY")).toBeTruthy();
-    expect(getByText("Biometric Unlock")).toBeTruthy();
+    expect(getByText("Biometric Sign-In")).toBeTruthy();
     expect(getByText("Auto-Lock After")).toBeTruthy();
   });
 

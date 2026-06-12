@@ -3,7 +3,7 @@ import { renderHook, act, waitFor } from "@testing-library/react-native";
 import * as SecureStore from "expo-secure-store";
 import * as LocalAuthentication from "expo-local-authentication";
 import AsyncStorage from "@react-native-async-storage/async-storage";
-import { AuthProvider, useAuth } from "../hooks/useAuth";
+import { AuthProvider, useAuth, type BiometricEnableResult } from "../hooks/useAuth";
 
 // Mock the API client so we drive login / session without real fetch. The hook
 // imports endpoints/getSession/setAuthToken/getServerUrl/setServerUrl from here.
@@ -277,6 +277,112 @@ describe("useAuth — FINLYNQ-134 biometric silent re-login + secure credential 
       await waitFor(() => expect(result.current.hasSession).toBe(false));
       expect(result.current.isUnlocked).toBe(false);
       expect(result.current.isAdmin).toBe(false);
+    });
+  });
+
+  // FINLYNQ-134 (fix) — the on-device bug: enabling biometric sign-in in
+  // Settings while ALREADY logged in (no password in memory) stored nothing, so
+  // silent re-login silently no-opped. The fix captures the credential at
+  // enable-time (prompting for the password) and makes bootstrap re-login work
+  // even when no session token is present (a prior 401 cleared it).
+  describe("FINLYNQ-134 fix — enable-time credential capture + tokenless re-login", () => {
+    /** Bootstrap signed-in WITHOUT calling signIn, so no credentials are in
+     *  memory — models a user already logged in from a prior launch. */
+    async function mountAlreadyLoggedIn() {
+      SECURE.getItemAsync.mockImplementation(async (key: string) =>
+        key === SESSION_TOKEN_KEY ? "live-jwt" : null
+      );
+      LOCAL.hasHardwareAsync.mockResolvedValue(true);
+      LOCAL.isEnrolledAsync.mockResolvedValue(true);
+      mockGetSession.mockResolvedValue({
+        authenticated: true,
+        isAdmin: false,
+        username: "alice",
+      });
+      const hook = renderHook(() => useAuth(), { wrapper });
+      await waitFor(() => expect(hook.result.current.isLoading).toBe(false));
+      return hook;
+    }
+
+    it("enabling while already logged in (no creds in memory) asks for a password and stores nothing yet", async () => {
+      const { result } = await mountAlreadyLoggedIn();
+      SECURE.setItemAsync.mockClear();
+      let res: BiometricEnableResult | undefined;
+      await act(async () => {
+        res = await result.current.setBiometricEnabled(true);
+      });
+      // Caller is told to prompt for the password...
+      expect(res).toEqual({ ok: false, needsPassword: true });
+      // ...and nothing was persisted (no credential write, toggle stays off).
+      const credWrite = SECURE.setItemAsync.mock.calls.find(
+        ([k]) => k === STORED_CREDENTIALS_KEY
+      );
+      expect(credWrite).toBeUndefined();
+      expect(result.current.biometricEnabled).toBe(false);
+    });
+
+    it("enabling with a verified password captures the credential and turns biometrics on", async () => {
+      const { result } = await mountAlreadyLoggedIn();
+      mockLogin.mockResolvedValue({ ok: true, status: 200, data: {}, token: "fresh-jwt" });
+      SECURE.setItemAsync.mockClear();
+      let res: BiometricEnableResult | undefined;
+      await act(async () => {
+        res = await result.current.setBiometricEnabled(true, { password: "hunter2hunter2" });
+      });
+      expect(res).toEqual({ ok: true });
+      // Password verified via login using the identifier from the live session.
+      expect(mockLogin).toHaveBeenCalledWith("alice", "hunter2hunter2");
+      // Credential persisted to SecureStore only, exactly as typed.
+      const credWrite = SECURE.setItemAsync.mock.calls.find(
+        ([k]) => k === STORED_CREDENTIALS_KEY
+      );
+      expect(credWrite).toBeDefined();
+      expect(credWrite![1]).toBe(
+        JSON.stringify({ identifier: "alice", password: "hunter2hunter2" })
+      );
+      expect(result.current.biometricEnabled).toBe(true);
+    });
+
+    it("a wrong password is rejected at enable-time — no credential stored, toggle stays off", async () => {
+      const { result } = await mountAlreadyLoggedIn();
+      mockLogin.mockResolvedValue({ ok: false, status: 401, data: { error: "Invalid credentials" } });
+      SECURE.setItemAsync.mockClear();
+      let res: BiometricEnableResult | undefined;
+      await act(async () => {
+        res = await result.current.setBiometricEnabled(true, { password: "wrong" });
+      });
+      expect(res).toEqual({ ok: false, error: "Invalid credentials" });
+      const credWrite = SECURE.setItemAsync.mock.calls.find(
+        ([k]) => k === STORED_CREDENTIALS_KEY
+      );
+      expect(credWrite).toBeUndefined();
+      expect(result.current.biometricEnabled).toBe(false);
+    });
+
+    it("silently re-logs in at bootstrap even with NO stored session token (a prior 401 cleared it)", async () => {
+      // No session token at all, but biometrics enabled + credentials stored.
+      SECURE.getItemAsync.mockImplementation(async (key: string) => {
+        if (key === STORED_CREDENTIALS_KEY)
+          return JSON.stringify({ identifier: "alice", password: "hunter2hunter2" });
+        return null; // SESSION_TOKEN_KEY absent — previously made re-login unreachable
+      });
+      ASYNC.getItem.mockImplementation(async (key: string) =>
+        key === BIOMETRIC_KEY ? "true" : null
+      );
+      LOCAL.hasHardwareAsync.mockResolvedValue(true);
+      LOCAL.authenticateAsync.mockResolvedValue({ success: true } as never);
+      mockLogin.mockResolvedValue({ ok: true, status: 200, data: {}, token: "fresh-jwt" });
+      mockGetSession.mockResolvedValue({ authenticated: true, isAdmin: false });
+
+      const { result } = renderHook(() => useAuth(), { wrapper });
+      await waitFor(() => expect(result.current.isLoading).toBe(false));
+
+      // Re-login fired once from the stored creds despite there being no token.
+      expect(mockLogin).toHaveBeenCalledTimes(1);
+      expect(mockLogin).toHaveBeenCalledWith("alice", "hunter2hunter2");
+      expect(LOCAL.authenticateAsync).toHaveBeenCalled();
+      expect(result.current.hasSession).toBe(true);
+      expect(result.current.isUnlocked).toBe(true);
     });
   });
 });

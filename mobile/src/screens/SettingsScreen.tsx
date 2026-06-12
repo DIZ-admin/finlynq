@@ -105,7 +105,56 @@ export default function SettingsScreen() {
   const [password, setPassword] = useState("");
   const [busy, setBusy] = useState(false);
 
+  // FINLYNQ-134 — enabling biometric sign-in while already logged in has no
+  // password in memory to capture, so we prompt for it here before storing.
+  const [bioPwModalOpen, setBioPwModalOpen] = useState(false);
+  const [bioPw, setBioPw] = useState("");
+  const [bioBusy, setBioBusy] = useState(false);
+  const [bioError, setBioError] = useState<string | null>(null);
+
   const colors = theme.colors;
+
+  // Biometric toggle. Disabling and the in-memory-creds enable path are
+  // one-shot; enabling without creds in scope opens the password prompt.
+  const handleBiometricToggle = async (next: boolean) => {
+    if (!next) {
+      await setBiometricEnabled(false);
+      return;
+    }
+    const res = await setBiometricEnabled(true);
+    if (res.ok) return;
+    if ("needsPassword" in res) {
+      setBioPw("");
+      setBioError(null);
+      setBioPwModalOpen(true);
+      return;
+    }
+    Alert.alert("Biometric sign-in", res.error);
+  };
+
+  const confirmBiometricPassword = async () => {
+    if (!bioPw) {
+      setBioError("Enter your password.");
+      return;
+    }
+    setBioBusy(true);
+    setBioError(null);
+    const res = await setBiometricEnabled(true, { password: bioPw });
+    setBioBusy(false);
+    if (res.ok) {
+      setBioPwModalOpen(false);
+      setBioPw("");
+      return;
+    }
+    setBioError("error" in res ? res.error : "Couldn't enable biometric sign-in.");
+  };
+
+  const closeBioModal = () => {
+    if (bioBusy) return;
+    setBioPwModalOpen(false);
+    setBioPw("");
+    setBioError(null);
+  };
 
   const logColor = (level: LogLevel): string =>
     level === "error"
@@ -313,15 +362,15 @@ export default function SettingsScreen() {
             <View style={[styles.settingRow, { borderBottomColor: colors.border }]}>
               <View style={styles.settingLeft}>
                 <Text style={[styles.settingLabel, { color: colors.foreground }]}>
-                  Biometric Unlock
+                  Biometric Sign-In
                 </Text>
                 <Text style={[styles.settingDesc, { color: colors.mutedForeground }]}>
-                  Use Face ID or fingerprint to unlock
+                  Use Face ID or fingerprint to unlock and to sign back in
                 </Text>
               </View>
               <Switch
                 value={biometricEnabled}
-                onValueChange={setBiometricEnabled}
+                onValueChange={handleBiometricToggle}
                 trackColor={{ false: colors.secondary, true: colors.primary + "80" }}
                 thumbColor={biometricEnabled ? colors.primary : colors.mutedForeground}
               />
@@ -578,6 +627,62 @@ export default function SettingsScreen() {
                   <Text style={[styles.modalBtnText, { color: colors.destructiveForeground }]}>
                     {dataAction === "delete" ? "Delete account" : "Delete data"}
                   </Text>
+                )}
+              </TouchableOpacity>
+            </View>
+          </View>
+        </View>
+      </Modal>
+
+      {/* FINLYNQ-134 — password prompt shown when enabling biometric sign-in
+          while already logged in (no credentials in memory to capture). */}
+      <Modal
+        visible={bioPwModalOpen}
+        transparent
+        animationType="fade"
+        onRequestClose={closeBioModal}
+      >
+        <View style={styles.modalBackdrop}>
+          <View style={[styles.modalCard, { backgroundColor: colors.card, borderColor: colors.border }]}>
+            <Text style={[styles.modalTitle, { color: colors.foreground }]}>
+              Enable biometric sign-in
+            </Text>
+            <Text style={[styles.modalDesc, { color: colors.mutedForeground }]}>
+              Confirm your password once so we can sign you back in with biometrics after the app restarts or your session expires.
+            </Text>
+            <TextInput
+              style={[
+                styles.input,
+                { backgroundColor: colors.secondary, color: colors.foreground, borderColor: colors.border, marginTop: 4 },
+              ]}
+              value={bioPw}
+              onChangeText={setBioPw}
+              placeholder="Enter your password"
+              placeholderTextColor={colors.mutedForeground}
+              secureTextEntry
+              autoCapitalize="none"
+              autoCorrect={false}
+            />
+            {bioError && (
+              <Text style={[styles.modalNote, { color: colors.destructive }]}>{bioError}</Text>
+            )}
+            <View style={styles.modalBtnRow}>
+              <TouchableOpacity
+                style={[styles.modalBtn, { backgroundColor: colors.secondary }]}
+                onPress={closeBioModal}
+                disabled={bioBusy}
+              >
+                <Text style={[styles.modalBtnText, { color: colors.foreground }]}>Cancel</Text>
+              </TouchableOpacity>
+              <TouchableOpacity
+                style={[styles.modalBtn, { backgroundColor: colors.primary }]}
+                onPress={confirmBiometricPassword}
+                disabled={bioBusy}
+              >
+                {bioBusy ? (
+                  <ActivityIndicator size="small" color={colors.primaryForeground} />
+                ) : (
+                  <Text style={[styles.modalBtnText, { color: colors.primaryForeground }]}>Enable</Text>
                 )}
               </TouchableOpacity>
             </View>
