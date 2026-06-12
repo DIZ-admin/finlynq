@@ -91,4 +91,6 @@ npx eas build --platform ios --profile production --auto-submit --non-interactiv
 - The biometric/secure-storage work (FINLYNQ-134) and the 401 interceptor (FINLYNQ-135) shipped in
   **1.0.8 / vc16**; **1.0.9 / vc17** re-cut them for the on-device acceptance pass; **1.0.10 / vc18**
   adds the FINLYNQ-134 enable-time credential-capture fix (enabling biometrics while already logged
-  in now prompts for the password instead of silently storing nothing) + tokenless bootstrap re-login.
+  in now prompts for the password instead of silently storing nothing) + tokenless bootstrap re-login;
+  **1.0.11 / vc19 (Android only)** binds the stored credential to an OS-level auth gate
+  (`requireAuthentication`); iOS stayed on 1.0.10 for this one.
