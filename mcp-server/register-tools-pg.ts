@@ -123,6 +123,7 @@ import {
 import { decryptStaged, encryptStaged } from "../src/lib/crypto/staging-envelope";
 import { calculateFinancialHealth } from "../src/lib/financial-health";
 import { getHoldingsValueByAccount } from "../src/lib/holdings-value";
+import { applyInvestmentMarketOverlay } from "./investment-balance-overlay";
 import { isCashLegRow } from "../src/lib/portfolio/aggregation-predicates";
 import { computeGoalProgress } from "../src/lib/goals-progress";
 import { sourceTagFor, isFormatTag, type FormatTag } from "../src/lib/tx-source";
@@ -1253,7 +1254,7 @@ export function registerPgTools(
   // ── get_account_balances ───────────────────────────────────────────────────
   server.tool(
     "get_account_balances",
-    "Get current balances for all accounts. Each account's balance is in its own (account) currency. When reportingCurrency is set, also returns a unified total converted to that currency. Default reporting = user's display currency.",
+    "Get current balances for all accounts. Each account's balance is in its own (account) currency. INVESTMENT accounts are valued at MARKET (current `holdings.value`, cash sleeve included), matching the web dashboard — but only on OAuth/built-in-chat connections that carry a decryption key; over a `pf_` API key (no key) investment accounts fall back to ledger (net contributions = SUM(transactions.amount)) and a top-level `note` explains the fallback. Each account row carries `isInvestment` and `balanceBasis` ('market'|'ledger'); market-valued rows also carry `costBasis` and `cashFlowBasis` (the underlying tx-sum). When reportingCurrency is set, also returns a unified total converted to that currency. Default reporting = user's display currency.",
     {
       currency: z.enum(["CAD", "USD", "all"]).optional().describe("Filter rows by currency"),
       reportingCurrency: z.string().optional().describe("ISO code (USD/CAD/EUR/...) — if set, response includes per-account converted balance + a grand total in this currency. Defaults to user's display currency."),
@@ -1261,21 +1262,40 @@ export function registerPgTools(
     async ({ currency, reportingCurrency }) => {
       const raw = await q(db, sql`
         SELECT a.id, a.name_ct, a.alias_ct, a.type, a."group", a.currency,
+               a.is_investment,
                COALESCE(SUM(t.amount), 0) AS balance
         FROM accounts a
         LEFT JOIN transactions t ON a.id = t.account_id AND t.user_id = ${userId}
         WHERE a.user_id = ${userId}
           ${currency && currency !== "all" ? sql`AND a.currency = ${currency}` : sql``}
-        GROUP BY a.id, a.name_ct, a.alias_ct, a.type, a."group", a.currency
-        ORDER BY a.type, a."group"
+        GROUP BY a.id, a.name_ct, a.alias_ct, a.type, a."group", a.currency, a.is_investment
+        ORDER BY a.type, a."group", a.id
       `);
       // Stream D: decrypt name + alias before returning. Drop the internal
-      // _ct columns from the response so Claude doesn't see them.
-      const rows = decryptNameish(raw, dek).map((r) => {
-        const { name_ct, alias_ct, ...rest } = r;
-        void name_ct; void alias_ct;
+      // _ct columns AND the raw is_investment flag from the response (the
+      // overlay re-surfaces a typed `isInvestment` instead).
+      const decrypted = decryptNameish(raw, dek).map((r) => {
+        const { name_ct, alias_ct, is_investment, ...rest } = r;
+        void name_ct; void alias_ct; void is_investment;
         return rest;
       });
+
+      // FINLYNQ-151 — value investment accounts at market (matching the web
+      // "account with holdings = holdings.value" invariant). DEK-gated: the
+      // overlay never prices when `dek == null` (qty×1 hazard) and yields
+      // ledger numbers + a note instead. The Issue #210 `items` array MUST be
+      // fed from the OVERLAID balances so `totalReporting` ties to
+      // `get_net_worth.total.net.amount` on identical state.
+      const overlay = await applyInvestmentMarketOverlay(
+        raw.map((r, i) => ({
+          id: Number(r.id),
+          currency: String(decrypted[i].currency),
+          isInvestment: r.is_investment === true,
+          ledgerBalance: Number(r.balance),
+        })),
+        dek,
+        () => getHoldingsValueByAccount(userId, dek),
+      );
 
       const reporting = await resolveReportingCurrency(db, userId, reportingCurrency);
       const today = new Date().toISOString().split("T")[0];
@@ -1283,10 +1303,10 @@ export function registerPgTools(
       // Issue #210 — round-once aggregation. Callers MUST NOT round per-item
       // before summing or `totalReporting` will drift 1c from `get_net_worth`
       // for users with many multi-currency accounts. Aggregate the raw
-      // (unrounded) balance/currency tuples; render per-row display values
-      // separately from the inputs we pass to the helper.
-      const items = rows.map((r) => ({
-        amount: Number(r.balance),
+      // (unrounded) overlaid balance/currency tuples; render per-row display
+      // values separately from the inputs we pass to the helper.
+      const items = overlay.rows.map((r) => ({
+        amount: r.balance,
         currency: String(r.currency),
       }));
       const agg = await aggregateInReporting(
@@ -1295,25 +1315,38 @@ export function registerPgTools(
         (from, to) => getRate(from, to, today, userId),
       );
 
-      const enriched = rows.map((r, i) => {
+      const enriched = decrypted.map((r, i) => {
+        const ov = overlay.rows[i];
         const ccy = String(r.currency);
         // Issue #208 — round the raw `balance` to crush IEEE-754 leaks
         // (`-3.6e-11`-class noise from SUM(t.amount)). `tagAmount` already
         // 2dp-rounds the tagged variants; this fixes the bypassed field.
-        const rawBalance = roundMoney(Number(r.balance), ccy);
+        const rawBalance = roundMoney(ov.balance, ccy);
         const reportingAmount = agg.perItem[i].reportingAmount;
-        return {
+        const out: Row = {
           ...r,
           balance: rawBalance,
           balanceTagged: tagAmount(rawBalance, ccy, "account"),
           balanceReporting: tagAmount(reportingAmount, reporting, "reporting"),
+          isInvestment: ov.isInvestment,
+          balanceBasis: ov.balanceBasis,
         };
+        if (ov.balanceBasis === "market") {
+          // Market-valued investment rows: surface the remaining cost basis
+          // and the net-contribution figure (the underlying tx-sum) so the
+          // contribution number stays reachable. Field name mirrors the
+          // dashboard's `cashFlowBasis`.
+          out.costBasis = tagAmount(ov.costBasis ?? 0, ccy, "account");
+          out.cashFlowBasis = tagAmount(roundMoney(ov.ledgerBalance, ccy), ccy, "account");
+        }
+        return out;
       });
 
       return dataResponse({
         accounts: enriched,
         reportingCurrency: reporting,
         totalReporting: tagAmount(agg.totalReporting, reporting, "reporting"),
+        ...(overlay.note ? { note: overlay.note } : {}),
       });
     }
   );
@@ -1624,7 +1657,7 @@ export function registerPgTools(
   // ── get_net_worth ──────────────────────────────────────────────────────────
   server.tool(
     "get_net_worth",
-    "Net worth across all accounts. Returns per-currency assets/liabilities/net AND a unified total in the reporting currency (defaults to user's display currency). Pass `priorMonths` > 0 for a month-by-month trend (returns the current month plus N priors, with `currentMonth` flagged separately); omit for current totals only. Issue #210: legacy `months` param is accepted as a deprecated alias.",
+    "Net worth across all accounts. Returns per-currency assets/liabilities/net AND a unified total in the reporting currency (defaults to user's display currency). INVESTMENT accounts are valued at MARKET (current holdings value, cash sleeve included), matching the web dashboard and get_account_balances, on OAuth/built-in-chat connections that carry a decryption key; over a `pf_` API key they fall back to ledger (net contributions) and a top-level `note` explains it. The current-totals response carries `basis` ('market'|'ledger'); `total.net.amount` equals `get_account_balances.totalReporting.amount` on identical state. Pass `priorMonths` > 0 for a month-by-month trend (returns the current month plus N priors, with `currentMonth` flagged separately) — the trend is ALWAYS contribution-basis (`basis: 'ledger'`; marking history to market needs daily snapshots and is out of scope), so the current-month trend row won't match a market-valued current-totals call. Omit `priorMonths` for current totals only. Issue #210: legacy `months` param is accepted as a deprecated alias.",
     {
       currency: z.enum(["CAD", "USD", "all"]).optional().describe("Filter by currency (per-row)"),
       priorMonths: z.number().optional().describe("If set, return a trend covering the current (partial) month plus N prior months. Omit or set to 0 for current totals."),
@@ -1645,31 +1678,64 @@ export function registerPgTools(
         console.warn("[mcp] get_net_worth: `months` is deprecated (issue #210); use `priorMonths`.");
       }
       if (!lookback || lookback <= 0) {
-        const rows = await q(db, sql`
-          SELECT a.type, a.currency, COALESCE(SUM(t.amount), 0) AS total
+        // FINLYNQ-151 — restructure to PER-ACCOUNT grain (was grouped by
+        // type+currency) with the SAME ordering as get_account_balances'
+        // query so the two tools' overlaid item arrays line up. This lets the
+        // market overlay run per account and makes Issue #210 parity
+        // STRUCTURAL (see the parity comment below).
+        const acctRows = await q(db, sql`
+          SELECT a.id, a.type, a.currency, a."group", a.is_investment,
+                 COALESCE(SUM(t.amount), 0) AS total
           FROM accounts a
           LEFT JOIN transactions t ON a.id = t.account_id AND t.user_id = ${userId}
           WHERE a.user_id = ${userId}
             ${currency && currency !== "all" ? sql`AND a.currency = ${currency}` : sql``}
-          GROUP BY a.type, a.currency
-        `) as { type: string; currency: string; total: number }[];
+          GROUP BY a.id, a.type, a.currency, a."group", a.is_investment
+          ORDER BY a.type, a."group", a.id
+        `) as { id: number; type: string; currency: string; group: string; is_investment: boolean; total: number }[];
 
+        // Apply the identical market overlay get_account_balances uses. With a
+        // DEK, investment accounts are valued at market; without one (pf_ API
+        // key) they stay at ledger and `overlay.note` explains the fallback.
+        const overlay = await applyInvestmentMarketOverlay(
+          acctRows.map((r) => ({
+            id: Number(r.id),
+            currency: r.currency ?? "CAD",
+            isInvestment: r.is_investment === true,
+            ledgerBalance: Number(r.total),
+          })),
+          dek,
+          () => getHoldingsValueByAccount(userId, dek),
+        );
+
+        // Roll up per-currency assets/liabilities/net from the OVERLAID
+        // per-account balances (+= so multiple accounts per currency sum).
         const summary: Record<string, { assets: number; liabilities: number; net: number }> = {};
-        for (const row of rows) {
-          const c = row.currency ?? "CAD";
+        overlay.rows.forEach((ov, i) => {
+          const c = acctRows[i].currency ?? "CAD";
           if (!summary[c]) summary[c] = { assets: 0, liabilities: 0, net: 0 };
-          if (row.type === "A") summary[c].assets = Number(row.total);
-          else summary[c].liabilities = Number(row.total);
+          if (acctRows[i].type === "A") summary[c].assets += ov.balance;
+          else summary[c].liabilities += ov.balance;
           summary[c].net = summary[c].assets + summary[c].liabilities;
-        }
+        });
 
-        // Issue #210 — round-once aggregation. Same helper as
-        // `get_account_balances` so `total.net.amount` agrees byte-for-byte
-        // with `get_account_balances.totalReporting.amount` on the same state.
+        // Issue #210 parity is now STRUCTURAL. `netItems` is one item per
+        // account from the SAME overlaid rows, in the SAME grain + order +
+        // amounts as get_account_balances' `items` array. So
+        // `aggregateInReporting(netItems)` accumulates the identical
+        // un-rounded reporting sum that get_account_balances' `totalReporting`
+        // does, and `total.net.amount === get_account_balances.totalReporting
+        // .amount` holds — in BOTH the dek-present case (both tools market)
+        // and the dek-null case (both tools ledger). `assetItems`/`liabItems`
+        // are the same per-account rows filtered by `type`.
         const fxLookup = (from: string, to: string) => getRate(from, to, today, userId);
-        const assetItems = Object.entries(summary).map(([ccy, v]) => ({ amount: v.assets, currency: ccy }));
-        const liabItems = Object.entries(summary).map(([ccy, v]) => ({ amount: v.liabilities, currency: ccy }));
-        const netItems = Object.entries(summary).map(([ccy, v]) => ({ amount: v.net, currency: ccy }));
+        const assetItems = overlay.rows
+          .map((ov, i) => ({ amount: ov.balance, currency: acctRows[i].currency ?? "CAD", type: acctRows[i].type }))
+          .filter((it) => it.type === "A");
+        const liabItems = overlay.rows
+          .map((ov, i) => ({ amount: ov.balance, currency: acctRows[i].currency ?? "CAD", type: acctRows[i].type }))
+          .filter((it) => it.type !== "A");
+        const netItems = overlay.rows.map((ov, i) => ({ amount: ov.balance, currency: acctRows[i].currency ?? "CAD" }));
         const aggAssets = await aggregateInReporting(assetItems, reporting, fxLookup);
         const aggLiab = await aggregateInReporting(liabItems, reporting, fxLookup);
         const aggNet = await aggregateInReporting(netItems, reporting, fxLookup);
@@ -1688,11 +1754,17 @@ export function registerPgTools(
         return dataResponse({
           byCurrency: roundedSummary,
           reportingCurrency: reporting,
+          // FINLYNQ-151 — discloses whether investment accounts were market-
+          // valued ('market', DEK present) or fell back to ledger / net-
+          // contributions ('ledger', pf_ API key). `note` mirrors
+          // get_account_balances.
+          basis: overlay.marketApplied ? "market" : "ledger",
           total: {
             assets: tagAmount(aggAssets.totalReporting, reporting, "reporting"),
             liabilities: tagAmount(aggLiab.totalReporting, reporting, "reporting"),
             net: tagAmount(aggNet.totalReporting, reporting, "reporting"),
           },
+          ...(overlay.note ? { note: overlay.note } : {}),
         });
       }
 
@@ -1759,6 +1831,13 @@ export function registerPgTools(
         months: lookback,
         currentMonth: currentMonthStr,
         reportingCurrency: reporting,
+        // FINLYNQ-151 — the trend is ALWAYS contribution-basis: each row is a
+        // running `SUM(t.amount)`, and marking the monthly history to market
+        // would need daily `portfolio_snapshots` (out of scope, candidate
+        // follow-up). So the current-month trend row will NOT match a market-
+        // valued current-totals call for users with investment accounts.
+        basis: "ledger",
+        note: "Trend rows are net-contribution (ledger) basis, NOT market value — the current-month row may differ from a market-valued get_net_worth() current-totals call for portfolios with investment accounts.",
         trend,
       });
     }
@@ -5438,7 +5517,8 @@ export function registerPgTools(
           apply_rules_to_uncategorized: "apply_rules_to_uncategorized(dry_run?, limit?) — Batch-apply rules to uncategorized transactions.",
           get_portfolio_analysis: "get_portfolio_analysis(symbols?) — Holdings with full metrics; pass symbols[] to filter. Includes disclaimer.",
           get_investment_insights: "get_investment_insights(mode?, targets?, benchmark?) — mode: 'patterns' (default), 'rebalancing' (needs targets), 'benchmark' (SP500|TSX|MSCI_WORLD|BONDS_CA).",
-          get_net_worth: "get_net_worth(currency?, months?) — Omit months for current totals; set months>0 for a trend.",
+          get_account_balances: "get_account_balances(currency?, reportingCurrency?) — Current balance per account in its own currency, plus a unified total in reportingCurrency. INVESTMENT accounts are valued at MARKET (holdings.value, cash sleeve incl.) on OAuth/built-in-chat (DEK present); a pf_ API key falls back to ledger (SUM(amount)) + a top-level note. Each row carries isInvestment + balanceBasis; market rows also costBasis + cashFlowBasis (the net-contribution tx-sum).",
+          get_net_worth: "get_net_worth(currency?, priorMonths? [months? deprecated alias], reportingCurrency?) — Omit priorMonths for current totals; set priorMonths>0 for a month-by-month trend. Current totals value INVESTMENT accounts at MARKET (matching the web + get_account_balances) on OAuth/built-in-chat; a pf_ API key falls back to ledger + a note. Response carries basis ('market'|'ledger'); total.net.amount == get_account_balances.totalReporting.amount on identical state. The trend is ALWAYS contribution-basis (basis:'ledger').",
           record_transfer: "record_transfer(from_account_id? OR fromAccount, to_account_id? OR toAccount, amount, ...) — Atomic transfer pair between two accounts. PREFER from_account_id/to_account_id (exact); the name path is strict fuzzy with fail-loud ambiguity. Mismatched name+id pairs fail loud. Cross-currency: pass receivedAmount. In-kind: pass holding+quantity. Same-account forex (cash-sleeve ↔ cash-sleeve in different conceptual currencies inside one account, e.g. 'Cash - USD' → 'Cash - CAD'): receivedAmount is honored when both holding names carry divergent ISO-4217 suffixes — pass receivedAmount and the destination quantity is derived from it (cash sleeves track quantity = amount).",
           portfolio_buy: "portfolio_buy(account_id? OR account, holdingId? OR holding, qty, totalCost, date?, payee?, note?, tags?) — Buy shares in a brokerage account. Writes the canonical buy + buy_cash_leg pair (stock leg +, cash leg −, sum 0), opens a cost-basis lot, debits the cash sleeve. The cash sleeve for the holding's currency must already exist (add_portfolio_holding a 'Cash' holding first). Replaces the removed record_trade buy path.",
           portfolio_sell: "portfolio_sell(account_id? OR account, holdingId? OR holding, qty, totalProceeds, date?, lotSelection?, payee?, note?, tags?) — Sell shares. Writes sell + sell_cash_leg, closes lots (lotSelection.method FIFO|HIFO|SPECIFIC, default FIFO), credits the cash sleeve. Replaces the removed record_trade sell path.",
@@ -6340,7 +6420,7 @@ export function registerPgTools(
 
       return dataResponse({
         disclaimer: PORTFOLIO_DISCLAIMER,
-        note: "marketValue and unrealizedGain require live prices — not available in MCP. Use the portfolio page for full metrics. Results are per-holdingId — two holdings sharing a name across accounts return as separate rows. Per-row amounts stay in each holding's native currency; summary aggregates are converted to `reportingCurrency`. Cash-sleeve holdings (name='Cash', symbol=NULL) appear in `holdings[]` with `status: 'cash_only'` and `totalReturnPct: null`.",
+        note: "Per-holding marketValue and unrealizedGain require live prices and are not surfaced here — use the portfolio page for full per-holding metrics. (Account-LEVEL market value IS available via get_account_balances / get_net_worth on OAuth/built-in-chat connections.) Results are per-holdingId — two holdings sharing a name across accounts return as separate rows. Per-row amounts stay in each holding's native currency; summary aggregates are converted to `reportingCurrency`. Cash-sleeve holdings (name='Cash', symbol=NULL) appear in `holdings[]` with `status: 'cash_only'` and `totalReturnPct: null`.",
         totalHoldings: results.length,
         reportingCurrency: reporting,
         warnings,
@@ -6878,7 +6958,7 @@ export function registerPgTools(
 
       return dataResponse({
         disclaimer: PORTFOLIO_DISCLAIMER,
-        note: "unrealizedGain requires live prices — not available in MCP.",
+        note: "Per-holding unrealizedGain requires live prices and is not surfaced here. (Account-level market value IS available via get_account_balances / get_net_worth on OAuth/built-in-chat connections.)",
         // FK to portfolio_holdings.id — pass as portfolioHoldingId on
         // record_transaction / update_transaction to bind a transaction to
         // this position. Null when the matched rows are pure payee-fuzzy
