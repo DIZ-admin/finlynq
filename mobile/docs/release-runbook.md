@@ -95,4 +95,6 @@ npx eas build --platform ios --profile production --auto-submit --non-interactiv
   **1.0.11 / vc19 (Android only)** binds the stored credential to an OS-level auth gate
   (`requireAuthentication`); iOS stayed on 1.0.10 for this one. **1.0.12 / vc20 (Android only)**
   auto-recovers from a `session_locked` (lost-DEK) session via silent re-login instead of
-  stranding the user on undecryptable data.
+  stranding the user on undecryptable data. **1.0.13 / vc21 (Android only)** moves the biometric
+  opt-in onto the login screen (captures the password at login — kills the "enabled but nothing
+  stored" footgun).
