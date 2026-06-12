@@ -12,6 +12,7 @@ import { Combobox, type ComboboxItemShape } from "@/components/ui/combobox";
 import { useDropdownOrder } from "@/components/dropdown-order-provider";
 import { Dialog, DialogContent, DialogHeader, DialogTitle, DialogTrigger } from "@/components/ui/dialog";
 import { formatCurrency } from "@/lib/currency";
+import { todayISO } from "@/lib/utils/date";
 import { useDisplayCurrency } from "@/components/currency-provider";
 import { OnboardingTips } from "@/components/onboarding-tips";
 import { EmptyState } from "@/components/empty-state";
@@ -218,7 +219,7 @@ export default function AccountsPage() {
           method: "POST",
           headers: { "Content-Type": "application/json" },
           body: JSON.stringify({
-            date: new Date().toISOString().split("T")[0],
+            date: todayISO(),
             accountId: account.id,
             categoryId: 1,
             currency: form.currency,
@@ -391,6 +392,7 @@ export default function AccountsPage() {
                   className="h-7 w-7 shrink-0 opacity-0 group-hover:opacity-100 transition-opacity mr-1"
                   onClick={(e) => { e.preventDefault(); openEditDialog(a); }}
                   title="Edit account"
+                  aria-label="Edit account"
                 >
                   <Pencil className="h-3 w-3" />
                 </Button>
@@ -590,7 +592,7 @@ export default function AccountsPage() {
         ].map(({ label, value, Icon, color }) => (
           <Card key={label}>
             <CardContent className="pt-3 pb-3">
-              <div className={`flex h-7 w-7 items-center justify-center rounded-lg mb-1.5 ${color === "emerald" ? "bg-emerald-100 text-emerald-600" : "bg-rose-100 text-rose-600"}`}>
+              <div className={`flex h-7 w-7 items-center justify-center rounded-lg mb-1.5 ${color === "emerald" ? "bg-emerald-100 text-emerald-600 dark:bg-emerald-950/60 dark:text-emerald-400" : "bg-rose-100 text-rose-600 dark:bg-rose-950/60 dark:text-rose-400"}`}>
                 <Icon className="h-4 w-4" />
               </div>
               <p className="text-xs text-muted-foreground truncate">{label}</p>
@@ -603,8 +605,8 @@ export default function AccountsPage() {
       </div>
 
       <div className="grid grid-cols-1 lg:grid-cols-2 gap-4">
-        {renderSection("Assets", assets, "text-emerald-600", ArrowUpRight, "bg-indigo-100 text-indigo-700")}
-        {renderSection("Liabilities", liabilities, "text-rose-600", ArrowDownRight, "bg-rose-100 text-rose-700")}
+        {renderSection("Assets", assets, "text-emerald-600", ArrowUpRight, "bg-indigo-100 text-indigo-700 dark:bg-indigo-950/60 dark:text-indigo-300")}
+        {renderSection("Liabilities", liabilities, "text-rose-600", ArrowDownRight, "bg-rose-100 text-rose-700 dark:bg-rose-950/60 dark:text-rose-300")}
       </div>
 
       {/* Edit account dialog */}
