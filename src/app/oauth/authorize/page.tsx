@@ -42,6 +42,35 @@ function knownClientName(clientId: string): string | null {
   return known[clientId] ?? null;
 }
 
+/**
+ * Returns true when `host` is finlynq.com, a subdomain of finlynq.com, or
+ * localhost / 127.0.0.1 (local dev). These are the only redirect destinations
+ * that a verified Finlynq integration is expected to use. An external host
+ * signals an arbitrary DCR client and triggers the consent warning banner.
+ *
+ * Guards against null/empty input — returns false (= show warning) so an
+ * unparseable redirect_uri is treated as untrusted rather than silently trusted.
+ */
+function isFinlynqHost(host: string | null | undefined): boolean {
+  if (!host) return false;
+  if (host === "localhost" || host === "127.0.0.1") return true;
+  if (host === "finlynq.com" || host.endsWith(".finlynq.com")) return true;
+  return false;
+}
+
+/**
+ * Parse the hostname out of a redirect_uri string. Returns null when the URI
+ * is malformed or empty — callers should treat a null result as untrusted.
+ */
+function redirectUriHost(uri: string): string | null {
+  if (!uri) return null;
+  try {
+    return new URL(uri).hostname;
+  } catch {
+    return null;
+  }
+}
+
 function AuthorizePageInner() {
   const searchParams = useSearchParams();
   const router = useRouter();
@@ -249,6 +278,14 @@ function AuthorizePageInner() {
   const displayName = wellKnown ?? clientMeta.client_name ?? clientId;
   const showRegisteredName = !wellKnown && clientMeta.client_name && clientMeta.client_name !== clientId;
 
+  // Warning banner logic:
+  // Show a red/amber banner when EITHER the client is not in our well-known
+  // list OR the redirect_uri points outside the finlynq.com / localhost
+  // allowlist. A legitimate Claude / Cursor integration pointing at a finlynq
+  // or localhost URI is considered verified; anything else is not.
+  const redirectHost = redirectUriHost(redirectUri);
+  const showUnverifiedBanner = !wellKnown || !isFinlynqHost(redirectHost);
+
   return (
     <div className="flex min-h-screen items-center justify-center bg-background bg-dot-pattern ambient-glow">
       <div className="mx-auto w-full max-w-sm px-6 py-12">
@@ -346,6 +383,27 @@ function AuthorizePageInner() {
             {redirectUri}
           </p>
         </div>
+
+        {/* Unverified-app / external-redirect warning banner.
+            Shown when the client is not in the well-known list (Claude,
+            Cursor, …) OR the redirect host is outside the finlynq.com /
+            localhost allowlist. A user who started a legitimate MCP
+            connection sees this for an arbitrary DCR client and can abort. */}
+        {showUnverifiedBanner && (
+          <div className="rounded-lg border border-red-500/40 bg-red-500/8 p-3 mb-4">
+            <div className="flex items-start gap-2">
+              <AlertTriangle className="h-4 w-4 text-red-500 mt-0.5 shrink-0" />
+              <p className="text-xs text-foreground/80 leading-relaxed">
+                <strong className="text-red-500">This is not a verified Finlynq app.</strong>{" "}
+                It will send an authorization code to{" "}
+                <span className="font-mono font-semibold">
+                  {redirectHost ?? redirectUri}
+                </span>
+                . Only continue if you started this connection.
+              </p>
+            </div>
+          </div>
+        )}
 
         {error && (
           <div className="mb-4 rounded-lg bg-destructive/10 border border-destructive/20 px-4 py-3">
