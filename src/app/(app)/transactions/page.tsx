@@ -31,6 +31,7 @@ import { useLookups, useTxColumnPrefs, useTxSortPref, useTxFilterPrefs } from ".
 import { useTransactions } from "./_hooks/use-transactions";
 import { TransactionTable } from "./_components/transaction-table";
 import { buildTransactionQuery } from "@/lib/transactions/build-query";
+import { buildTxDrillUrl } from "@/lib/transactions/drill-url";
 import { exportCsv, type CsvColumn } from "@/lib/csv-export";
 import { todayISO } from "@/lib/utils/date";
 import { LotReallocationNotice } from "@/components/portfolio/lot-reallocation-notice";
@@ -92,6 +93,8 @@ function TransactionsPageInner() {
   // `portfolioHolding` is a server-side post-decrypt filter (ciphertext-at-
   // rest on this column), `accountId` is a standard SQL filter.
   const [filters, setFilters] = useState({
+    // FINLYNQ-177 — single-transaction deep link (`/transactions?id=<n>`).
+    id: "",
     startDate: "",
     endDate: "",
     accountId: "",
@@ -116,6 +119,9 @@ function TransactionsPageInner() {
   // any prior filter state rather than merging into it.
   useEffect(() => {
     setFilters({
+      // FINLYNQ-177 — single-tx id deep link is URL-driven like the rest, so a
+      // drill while already mounted REPLACES (not merges) prior filters.
+      id: urlParams.get("id") ?? "",
       startDate: urlParams.get("startDate") ?? "",
       endDate: urlParams.get("endDate") ?? "",
       accountId: urlParams.get("accountId") ?? "",
@@ -229,7 +235,7 @@ function TransactionsPageInner() {
 
   function clearFilters() {
     setSearchInput("");
-    setFilters({ startDate: "", endDate: "", accountId: "", categoryId: "", search: "", portfolioHolding: "", tag: "" });
+    setFilters({ id: "", startDate: "", endDate: "", accountId: "", categoryId: "", search: "", portfolioHolding: "", tag: "" });
     // Issue #59 — also wipe the per-column filters + sort. The chip row
     // below the top-bar shows both, so "Clear all" should drop both.
     setColFilters([]);
@@ -801,7 +807,7 @@ function TransactionsPageInner() {
                 </DropdownMenuGroup>
               </DropdownMenuContent>
             </DropdownMenu>
-            {(filters.startDate || filters.endDate || filters.accountId || filters.categoryId || filters.search || filters.portfolioHolding || filters.tag || colFilters.length > 0 || sortPref.columnId) && (
+            {(filters.id || filters.startDate || filters.endDate || filters.accountId || filters.categoryId || filters.search || filters.portfolioHolding || filters.tag || colFilters.length > 0 || sortPref.columnId) && (
               <button onClick={clearFilters} className="text-xs text-muted-foreground hover:text-foreground flex items-center gap-1 transition-colors ml-1">
                 <X className="h-3 w-3" /> Clear all
               </button>
@@ -906,6 +912,23 @@ function TransactionsPageInner() {
                   onClick={() => { setFilters({ ...filters, tag: "" }); setPage(0); }}
                   className="p-0.5 rounded hover:bg-sky-100 dark:hover:bg-sky-900 transition-colors"
                   aria-label="Clear tag filter"
+                >
+                  <X className="h-3 w-3" />
+                </button>
+              </Badge>
+            </div>
+          )}
+          {/* FINLYNQ-177 — single-transaction id deep link chip. Clearing it
+              drops the filter so the user can step back to the full list. */}
+          {filters.id && (
+            <div className="flex items-center gap-2">
+              <span className="text-xs text-muted-foreground">Transaction:</span>
+              <Badge variant="outline" className="h-7 gap-1.5 pr-1 border-primary/30 bg-primary/5 text-primary">
+                <span className="font-medium font-mono">#{filters.id}</span>
+                <button
+                  onClick={() => { setFilters({ ...filters, id: "" }); setPage(0); }}
+                  className="p-0.5 rounded hover:bg-primary/10 transition-colors"
+                  aria-label="Clear single-transaction filter"
                 >
                   <X className="h-3 w-3" />
                 </button>
@@ -1078,7 +1101,7 @@ function TransactionsPageInner() {
                     {deleteBlockedError.blockingIds.map((id) => (
                       <li key={id}>
                         <Link
-                          href={`/transactions?search=%23${id}`}
+                          href={buildTxDrillUrl({ id: String(id) })}
                           className="text-primary underline hover:no-underline"
                           onClick={() => {
                             setDeleteConfirmId(null);

@@ -178,9 +178,26 @@ export async function GET(request: NextRequest) {
     filterPortfolio || filterPortfolioTicker || filterTags
   );
 
+  // FINLYNQ-177 — single-transaction id deep link. Owner-scoped SQL pushdown
+  // (combined with the user_id predicate in buildTxFilterConditions). A present
+  // but non-positive / non-numeric `id` param can never match a real serial id,
+  // so short-circuit to the empty state rather than silently dropping the
+  // filter and rendering the full list.
+  const idParamRaw = params.get("id");
+  let idFilter: number | undefined;
+  if (idParamRaw != null && idParamRaw !== "") {
+    const parsed = parseInt(idParamRaw, 10);
+    if (Number.isFinite(parsed) && parsed > 0) {
+      idFilter = parsed;
+    } else {
+      return NextResponse.json({ data: [], total: 0 });
+    }
+  }
+
   // FK filter is SQL-side, so it's NOT a postDecryptFilter — paginate normally.
   const postDecryptFilter = search || tag || hasEncryptedSubstringFilter;
   const filters: TxSortFilter = {
+    id: idFilter,
     startDate: params.get("startDate") ?? undefined,
     endDate: params.get("endDate") ?? undefined,
     createdAtFrom: params.get("createdAtFrom") ?? undefined,
