@@ -535,6 +535,12 @@ export async function GET(request: NextRequest) {
     let quoteCurrency: string | null = null;
     let marketCap: number | null = null;
     let image: string | null = null;
+    // FINLYNQ-174: human-readable long name from the quote layer (Yahoo
+    // `meta.shortName`). Only populated on a live fetch — on a warm
+    // price_cache hit the quote `name` is just the symbol, which the
+    // client-side `holdingDescription(...)` resolver treats as "no
+    // description". Null for cash/metals/crypto/custom.
+    let quoteName: string | null = null;
 
     if (isCrypto && h.symbol) {
       const base = String(h.symbol).toUpperCase().split("-")[0];
@@ -556,6 +562,11 @@ export async function GET(request: NextRequest) {
         change = q.change;
         changePct = q.changePct ? Math.round(q.changePct * 100) / 100 : null;
         quoteCurrency = q.currency;
+        // Surface the Yahoo long name when it's a real description, not the
+        // symbol echoed back (cache-hit rows return name === symbol).
+        if (q.name && q.name.trim().toUpperCase() !== h.symbol.toUpperCase()) {
+          quoteName = q.name.trim();
+        }
       }
     }
 
@@ -648,6 +659,7 @@ export async function GET(request: NextRequest) {
       accountName: h.accountName ?? "Unknown",
       name: h.name,
       symbol: h.symbol,
+      quoteName,
       currency: h.currency,
       assetType,
       price,
@@ -937,6 +949,8 @@ export async function GET(request: NextRequest) {
     key: string;
     symbol: string | null;
     name: string;
+    // FINLYNQ-174: first non-null member quoteName (Yahoo long name).
+    description: string | null;
     assetType: AssetType;
     totalQty: number;
     costBasisDisplay: number;
@@ -959,6 +973,7 @@ export async function GET(request: NextRequest) {
         key: ck.key,
         symbol: ck.symbol,
         name: ck.name,
+        description: null,
         assetType: h.assetType,
         totalQty: 0,
         costBasisDisplay: 0,
@@ -974,6 +989,10 @@ export async function GET(request: NextRequest) {
       byHoldingMap.set(ck.key, acc);
     }
     if (h.accountId != null) acc.accountIds.add(h.accountId);
+    // FINLYNQ-174: carry the first member with a real quote long name up to
+    // the canonical row (all members of an `eq:`/`crypto:` key share a
+    // ticker, so any member's quoteName describes the whole row).
+    if (acc.description == null && h.quoteName) acc.description = h.quoteName;
     if (h.quantity != null) acc.totalQty += h.quantity;
     acc.marketValueDisplay += h.marketValueDisplay ?? 0;
     acc.unrealizedGainDisplay += h.unrealizedGainDisplay ?? 0;
@@ -1009,6 +1028,7 @@ export async function GET(request: NextRequest) {
       key: a.key,
       symbol: a.symbol,
       name: a.name,
+      description: a.description,
       assetType: a.assetType,
       totalQty: Math.round(a.totalQty * 1e6) / 1e6,
       avgCostDisplay: avgCostDisplay != null ? Math.round(avgCostDisplay * 10000) / 10000 : null,
