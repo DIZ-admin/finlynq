@@ -261,6 +261,15 @@ const BASELINE_EXCEPTIONS: Record<string, string> = {
   // exception for the note invariant.
   "mcp-server/register-core-tools.ts:note-columns-encrypted":
     "stdio MCP has no DEK; writes plaintext note/payee/tags by design — the login sweep (upgradeUserFieldEncryption) encrypts them on next HTTP login.",
+  // Securities master (Phase B). The backup-RESTORE path bulk-inserts
+  // portfolio_holdings rows verbatim from the user's encrypted backup
+  // (already-encrypted symbol_ct/name_ct, no decrypted symbol available at the
+  // bulk-insert boundary). Resolving a security per row would require
+  // decrypting each row mid-restore; instead the login-time backfill
+  // (backfillSecuritiesForUser) reconciles security_id on the user's next
+  // login — the same backstop that covers stdio/DEK-less writes. Accepted.
+  "src/app/api/data/import/route.ts:securities-dual-write":
+    "backup restore bulk-inserts pre-encrypted rows; login-time backfillSecuritiesForUser populates security_id on next login (same backstop as DEK-less writes).",
 };
 
 interface InvariantConfig {
@@ -537,6 +546,21 @@ const INVARIANTS: InvariantConfig[] = [
     writeSite: /ARRAY\[\s*\$\{[^}]*\}\s*\]::TEXT\[\]/,
     requiredHelper: /\bencryptStagingMeta\s*\(/,
     helperName: "encryptStagingMeta (tier-aware filename encrypt)",
+  },
+  {
+    // Securities master (Tier 2, 2026-06-16) — every position INSERT must
+    // resolve a security_id so the new identity table stays populated for the
+    // read-flip. Mirrors the holding_accounts dual-write invariant. The
+    // login-time backfill is the backstop, but the write-time resolve keeps
+    // new positions linked immediately. → docs/architecture/securities.md
+    id: "securities-dual-write",
+    description:
+      "every portfolio_holdings INSERT must resolve a security_id via resolveOrCreateSecurity (securities master Phase B)",
+    fileGlobs: ["src/", "mcp-server/"],
+    writeSite:
+      /db\s*\.\s*insert\(\s*(?:schema\.)?portfolioHoldings\s*\)|INSERT\s+INTO\s+portfolio_holdings\b/,
+    requiredHelper: /\bresolveOrCreateSecurity\s*\(/,
+    helperName: "resolveOrCreateSecurity (securities master dual-write)",
   },
 ];
 

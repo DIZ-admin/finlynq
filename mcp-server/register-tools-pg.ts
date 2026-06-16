@@ -22,6 +22,7 @@ import { maybeDecryptFileBytes } from "../src/lib/crypto/file-envelope";
 import { encryptName, nameLookup } from "../src/lib/crypto/encrypted-columns";
 import { encryptRuleFields, decryptRuleFields } from "../src/lib/rules/crypto";
 import { resolveDividendsCategoryId } from "../src/lib/dividends-category";
+import { resolveOrCreateSecurity } from "../src/lib/securities/resolve";
 import { resolveOrCreateInvestmentIncomeCategory } from "../src/lib/investment-income-category";
 import {
   buildLoanSchedule,
@@ -5733,6 +5734,17 @@ export function registerPgTools(
       const nameEnc = dek ? encryptName(dek, name) : { ct: null, lookup: null };
       const symbolEnc = dek ? encryptName(dek, symbolValue) : { ct: null, lookup: null };
       const cur = currency ?? String(acct.currency ?? "CAD");
+      // Securities master (Phase B) — dual-write security_id. MCP read-flip is
+      // deferred (the legacy path stays), but populating it now means no extra
+      // backfill when the MCP read tools flip later. Null DEK (stdio) ⇒ null;
+      // the login-time backfill reconciles on the user's next web login.
+      const securityId = await resolveOrCreateSecurity(userId, dek, {
+        symbol: symbolValue,
+        name,
+        isCryptoFlag: !!isCrypto,
+        isCash: false,
+        currency: cur,
+      });
 
       try {
         // Issue #95: dual-write portfolio_holdings + holding_accounts. Every
@@ -5750,11 +5762,11 @@ export function registerPgTools(
         // Stream D Phase 4 — plaintext name/symbol dropped.
         const result = await q(db, sql`
           INSERT INTO portfolio_holdings (
-            user_id, account_id, currency, is_crypto, note,
+            user_id, account_id, currency, is_crypto, security_id, note,
             name_ct, name_lookup, symbol_ct, symbol_lookup
           )
           VALUES (
-            ${userId}, ${acct.id}, ${cur}, ${isCrypto ? 1 : 0}, ${note ?? ""},
+            ${userId}, ${acct.id}, ${cur}, ${isCrypto ? 1 : 0}, ${securityId}, ${note ?? ""},
             ${nameEnc.ct}, ${nameEnc.lookup}, ${symbolEnc.ct}, ${symbolEnc.lookup}
           )
           RETURNING id

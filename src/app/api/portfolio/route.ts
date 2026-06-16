@@ -6,6 +6,7 @@ import { requireAuth } from "@/lib/auth/require-auth";
 import { requireEncryption } from "@/lib/auth/require-encryption";
 import { validateBody, safeErrorMessage, logApiError } from "@/lib/validate";
 import { buildNameFields, decryptName, decryptNamedRows, nameLookup } from "@/lib/crypto/encrypted-columns";
+import { resolveOrCreateSecurity } from "@/lib/securities/resolve";
 import {
   holdingCreateSchema,
   holdingUpdateSchema,
@@ -76,6 +77,15 @@ export async function POST(request: NextRequest) {
 
     const symbolValue = symbol && symbol.trim() ? symbol.trim() : null;
     const enc = buildNameFields(auth.dek, { name, symbol: symbolValue });
+    // Securities master (Phase B) — resolve the shared identity before insert.
+    const holdingCurrency = currency ?? acct.currency ?? "CAD";
+    const securityId = await resolveOrCreateSecurity(auth.userId, auth.dek, {
+      symbol: symbolValue,
+      name,
+      isCryptoFlag: !!isCrypto,
+      isCash: false,
+      currency: holdingCurrency,
+    });
 
     try {
       // Stream D Phase 4 — plaintext name/symbol dropped.
@@ -83,8 +93,9 @@ export async function POST(request: NextRequest) {
         .insert(schema.portfolioHoldings)
         .values({
           accountId,
-          currency: currency ?? acct.currency ?? "CAD",
+          currency: holdingCurrency,
           isCrypto: isCrypto ? 1 : 0,
+          securityId,
           note: note ?? "",
           userId: auth.userId,
           ...enc,

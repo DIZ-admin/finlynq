@@ -34,6 +34,7 @@
 import { db, schema } from "@/db";
 import { and, eq, inArray, sql } from "drizzle-orm";
 import { buildNameFields } from "@/lib/crypto/encrypted-columns";
+import { resolveOrCreateSecurity } from "@/lib/securities/resolve";
 
 export class InvestmentHoldingRequiredError extends Error {
   code = "investment_holding_required" as const;
@@ -127,6 +128,14 @@ export async function getOrCreateCashHolding(
   if (existing?.id != null) return existing.id;
 
   const enc = buildNameFields(dek, { name: "Cash" });
+  // Securities master (Phase B) — cash sleeve clusters as cash#<CCY>.
+  const securityId = await resolveOrCreateSecurity(userId, dek, {
+    symbol: null,
+    name: "Cash",
+    isCryptoFlag: false,
+    isCash: true,
+    currency,
+  });
   try {
     const inserted = await db
       .insert(schema.portfolioHoldings)
@@ -136,6 +145,7 @@ export async function getOrCreateCashHolding(
         currency,
         isCrypto: 0,
         isCash: true,
+        securityId,
         note: "auto-created for cash sleeve",
         ...enc,
       })

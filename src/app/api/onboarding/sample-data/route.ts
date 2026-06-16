@@ -12,6 +12,7 @@ import {
   encryptOptional,
 } from "@/lib/crypto/encrypted-columns";
 import { encryptField } from "@/lib/crypto/envelope";
+import { resolveOrCreateSecurity } from "@/lib/securities/resolve";
 // Importing the canonical portfolio-op helpers keeps the buy/sell/deposit
 // rows audit-clean (invariant #8 — portfolio-op kinds must originate from
 // operations.ts) AND gets the cash-leg pairing + inline lot/closure wiring
@@ -615,6 +616,14 @@ async function createHolding(
   h: { name: string; symbol: string; isCrypto: 0 | 1; note: string },
 ): Promise<number> {
   const enc = buildNameFields(dek, { name: h.name, symbol: h.symbol });
+  // Securities master (Phase B) — link the shared identity.
+  const securityId = await resolveOrCreateSecurity(userId, dek, {
+    symbol: h.symbol,
+    name: h.name,
+    isCryptoFlag: h.isCrypto === 1,
+    isCash: false,
+    currency: "USD",
+  });
   const inserted = await db
     .insert(schema.portfolioHoldings)
     .values({
@@ -623,6 +632,7 @@ async function createHolding(
       currency: "USD",
       isCrypto: h.isCrypto,
       isCash: false,
+      securityId,
       note: h.note,
       ...enc,
     })
@@ -645,6 +655,14 @@ async function createCashSleeve(
   currency: string,
 ): Promise<number> {
   const enc = buildNameFields(dek, { name: `Cash ${currency}` });
+  // Securities master (Phase B) — cash sleeve clusters as cash#<CCY>.
+  const securityId = await resolveOrCreateSecurity(userId, dek, {
+    symbol: null,
+    name: `Cash ${currency}`,
+    isCryptoFlag: false,
+    isCash: true,
+    currency,
+  });
   const inserted = await db
     .insert(schema.portfolioHoldings)
     .values({
@@ -653,6 +671,7 @@ async function createCashSleeve(
       currency,
       isCrypto: 0,
       isCash: true,
+      securityId,
       note: "",
       ...enc,
     })

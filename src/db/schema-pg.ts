@@ -207,10 +207,67 @@ export const txCurrencyAudit = pgTable("tx_currency_audit", {
   resolution: text("resolution"), // 'converted' | 'kept' | 'edited'
 });
 
+// Securities master (Tier 2, 2026-06-16). The centralized "identity" entity:
+// one row per (user, ticker/cluster). A `portfolio_holdings` row is the
+// per-account POSITION (cost basis is account-specific); `securities` lifts the
+// shared identity (ticker, name, currency, asset type) up so the same security
+// held in N accounts is ONE securities row referenced by N positions.
+//
+// Identity ONLY — zero dollar amounts. Positions/lots/transactions never move;
+// aggregation just swaps the grouping key from an in-memory symbol string to a
+// real `security_id` FK (behind a flag during rollout). → docs/architecture/securities.md
+//
+// `cluster_key` is the privacy-preserving cluster discriminator computed by
+// src/lib/securities/canonical.ts — `eq:<symbol_lookup>` / `crypto:<…>` /
+// `metal:<…>` (HMAC, ticker-hiding) for symbol-bearing rows, `cash#<CCY>`
+// (plaintext currency, non-sensitive) for cash sleeves, `custom:<name_lookup>`
+// for symbol-less user holdings. The (user_id, cluster_key) unique index makes
+// find-or-create concurrency-safe (23505 re-select) AND keeps clustering
+// provably equivalent to the legacy `canonicalKey` partition.
+export const securities = pgTable(
+  "securities",
+  {
+    id: serial("id").primaryKey(),
+    userId: text("user_id").notNull(),
+    // Cluster discriminator (see header). NOT NULL — every security has one.
+    clusterKey: text("cluster_key").notNull(),
+    // Display asset class: stock|etf|crypto|cash|metal|custom. Cosmetic — the
+    // cluster_key (not asset_type) is the uniqueness/grouping key.
+    assetType: text("asset_type").notNull(),
+    // Quote/trading currency, copied from the representative position.
+    currency: text("currency").notNull().default("USD"),
+    isCash: boolean("is_cash").notNull().default(false),
+    isCrypto: integer("is_crypto").default(0),
+    // Encrypted identity copied VERBATIM from the representative position's
+    // ciphertext — no decrypt/re-encrypt needed (same per-user DEK).
+    symbolCt: text("symbol_ct"),
+    symbolLookup: text("symbol_lookup"),
+    nameCt: text("name_ct"),
+    nameLookup: text("name_lookup"),
+    image: text("image"),
+    createdAt: timestamp("created_at", { withTimezone: true }).notNull().defaultNow(),
+    updatedAt: timestamp("updated_at", { withTimezone: true }).notNull().defaultNow(),
+  },
+  (t) => [
+    // One security per (user, cluster). Backs the find-or-create re-select.
+    uniqueIndex("securities_user_cluster_idx").on(t.userId, t.clusterKey),
+    index("securities_user_idx").on(t.userId),
+  ],
+);
+
 export const portfolioHoldings = pgTable("portfolio_holdings", {
   id: serial("id").primaryKey(),
   userId: text("user_id").notNull(),
   accountId: integer("account_id").references(() => accounts.id),
+  // Securities master (2026-06-16) — nullable FK lifting this position's
+  // identity into the shared `securities` row. Populated at write time
+  // (resolveOrCreateSecurity) + by the login-time per-user backfill. NULL on
+  // un-backfilled rows; aggregators fall back to the legacy `canonicalKey`
+  // string for those. ON DELETE SET NULL so deleting a security never orphans
+  // a position. → docs/architecture/securities.md
+  securityId: integer("security_id").references(() => securities.id, {
+    onDelete: "set null",
+  }),
   // Stream D Phase 4 (2026-05-03) — plaintext `name` and `symbol` columns
   // physically dropped. Reads via `name_ct`/`symbol_ct` + DEK; exact-match
   // queries via `name_lookup`/`symbol_lookup`.
@@ -616,6 +673,12 @@ export const users = pgTable(
     // src/lib/auth/last-active.ts (bumpLastActive). Nullable = never seen active.
     // Migration: 20260620_user_last_active.sql.
     lastActiveAt: timestamp("last_active_at", { withTimezone: true }),
+    // Securities master (2026-06-16) — per-user one-time backfill stamp.
+    // The login-time `backfillSecuritiesForUser` (DEK-available, exact
+    // canonicalKey parity) clusters existing positions under `securities` rows
+    // and stamps this once done. Mirrors `portfolio_names_canonicalized_at`.
+    // Migration: 20260622_securities_phase_a.sql.
+    securitiesBackfilledAt: timestamp("securities_backfilled_at", { withTimezone: true }),
     // Envelope encryption: per-user DEK wrapped with a password-derived KEK.
     // All fields are base64-encoded. See src/lib/crypto/envelope.ts.
     // Nullable during migration — accounts created before encryption rollout
