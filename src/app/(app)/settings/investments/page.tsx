@@ -1,27 +1,24 @@
 "use client";
 
 /**
- * /settings/investments — the consolidated Investments surface.
+ * /settings/investments — the consolidated Investments surface (3 tabs).
  *
- * One row per SECURITY (the centralized per-(user,ticker) identity from the
- * securities master, Tier 2). This page absorbs the former
- * /settings/holding-accounts ("Holding ↔ Account Map") and /settings/securities
- * pages — both now redirect here. The table is compact + filterable by column
- * header (the owner's ask): filter inputs under each header + click-to-sort.
+ * Tab "Securities"   — the catalog: one row per security (Symbol / Description /
+ *   Type / Currency), filterable by column header. "Add security" DEFINES a bare
+ *   security from a ticker (auto-filling name + currency from the quote lookup
+ *   when possible) with NO account — it's a catalog entry until linked. Rename;
+ *   Delete is offered only for securities not held in any account.
+ * Tab "By security" — collapsible securities → the accounts that hold them, with
+ *   "+ Account" to link another account (creates an empty position).
+ * Tab "By account"  — the reverse: collapsible investment accounts → the
+ *   securities they hold, with "+ Security" to add one.
  *
- * Adding to the portfolio is security-first (the owner's two-step vision):
- *   - "Existing security" → pick a security from the catalog → pick an account
- *     → POST /api/securities { securityId, accountId } creates the position in
- *     that account (copying the security's identity + security_id). Quantity /
- *     cost basis come later from a transaction.
- *   - "New security" → the shared <HoldingEditForm> (symbol/name/currency +
- *     account), which dual-writes a brand-new security.
- * Each row also has an "Account" shortcut that opens the dialog in
- * existing-security mode pre-selected to that row.
- *
- * Reads GET /api/securities ({ success, data } envelope) — security-grained,
- * NOT flag-gated. Bespoke fetch/useState/useEffect (NO SWR), mirroring the
- * sibling money pages. → plan/architecture/securities.md
+ * Linking (Tab 2/3) reuses POST /api/securities {securityId, accountId};
+ * unlinking a tx-free position uses DELETE /api/securities?positionId. Bare
+ * create/delete use /api/securities/define; ticker auto-fill uses
+ * /api/securities/lookup. Absorbs the former /settings/holding-accounts +
+ * /settings/securities pages (both redirect here). Bespoke fetch/useState (NO
+ * SWR). → plan/architecture/securities.md
  */
 
 import { useCallback, useEffect, useMemo, useState } from "react";
@@ -54,7 +51,8 @@ import {
   SelectTrigger,
   SelectValue,
 } from "@/components/ui/select";
-import { HoldingEditForm } from "@/components/holdings/holding-edit-form";
+import { Tabs, TabsList, TabsTrigger, TabsContent } from "@/components/ui/tabs";
+import { ConfirmDialog } from "@/components/ui/confirm-dialog";
 import { RebuildSnapshotsButton } from "@/components/portfolio/rebuild-snapshots-button";
 import { PageSkeleton } from "@/components/page-skeleton";
 import { ErrorState } from "@/components/error-state";
@@ -64,10 +62,13 @@ import {
   Briefcase,
   Plus,
   Pencil,
+  Trash2,
   History,
   ArrowUpDown,
   ChevronUp,
   ChevronDown,
+  ChevronRight,
+  Loader2,
 } from "lucide-react";
 
 type SecurityAccount = {
@@ -110,7 +111,7 @@ function descriptionOf(s: Security): string {
   return nm && nm.toUpperCase() !== sym.toUpperCase() ? nm : "";
 }
 
-type SortKey = "symbol" | "description" | "type" | "currency" | "accounts";
+type SortKey = "symbol" | "description" | "type" | "currency";
 type SortDir = "asc" | "desc";
 type FilterKey = "symbol" | "description" | "type" | "currency";
 
@@ -121,6 +122,11 @@ const EMPTY_FILTERS: Record<FilterKey, string> = {
   currency: "",
 };
 
+type LinkDialogState =
+  | { mode: "account"; securityId: number } // pick an account for this security
+  | { mode: "security"; accountId: number } // pick a security for this account
+  | null;
+
 export default function InvestmentsSettingsPage() {
   const [securities, setSecurities] = useState<Security[] | null>(null);
   const [accounts, setAccounts] = useState<Account[]>([]);
@@ -128,24 +134,41 @@ export default function InvestmentsSettingsPage() {
   const [error, setError] = useState<string | null>(null);
   const [toast, setToast] = useState<{ type: "success" | "error"; msg: string } | null>(null);
 
-  // Table controls.
+  // Tab 1 table controls.
   const [filters, setFilters] = useState<Record<FilterKey, string>>(EMPTY_FILTERS);
   const [sort, setSort] = useState<{ key: SortKey; dir: SortDir }>({ key: "symbol", dir: "asc" });
 
-  // Add-to-portfolio dialog (security-first: existing security → account, OR a
-  // brand-new security via the shared <HoldingEditForm>).
+  // Add-security dialog (bare catalog entry — no account).
   const [addOpen, setAddOpen] = useState(false);
-  const [addMode, setAddMode] = useState<"existing" | "new">("existing");
-  const [linkSecurityId, setLinkSecurityId] = useState<string>("");
-  const [linkAccountId, setLinkAccountId] = useState<string>("");
-  const [linkErrors, setLinkErrors] = useState<Record<string, string>>({});
-  const [linking, setLinking] = useState(false);
+  const [addSymbol, setAddSymbol] = useState("");
+  const [addName, setAddName] = useState("");
+  const [addNameTouched, setAddNameTouched] = useState(false);
+  const [addCurrency, setAddCurrency] = useState("USD");
+  const [addCurrencyTouched, setAddCurrencyTouched] = useState(false);
+  const [addIsCrypto, setAddIsCrypto] = useState(false);
+  const [addErrors, setAddErrors] = useState<Record<string, string>>({});
+  const [adding, setAdding] = useState(false);
+  const [lookupLoading, setLookupLoading] = useState(false);
 
   // Rename dialog.
   const [renameSecurity, setRenameSecurity] = useState<Security | null>(null);
   const [renameValue, setRenameValue] = useState("");
   const [renameErrors, setRenameErrors] = useState<Record<string, string>>({});
   const [renaming, setRenaming] = useState(false);
+
+  // Delete confirm (catalog cleanup, unused securities only).
+  const [deleteTarget, setDeleteTarget] = useState<Security | null>(null);
+  const [deleting, setDeleting] = useState(false);
+
+  // Link dialog (Tab 2 "+ Account" / Tab 3 "+ Security").
+  const [linkDialog, setLinkDialog] = useState<LinkDialogState>(null);
+  const [linkValue, setLinkValue] = useState("");
+  const [linkError, setLinkError] = useState("");
+  const [linking, setLinking] = useState(false);
+
+  // Collapsible expand sets.
+  const [expandedSecurities, setExpandedSecurities] = useState<Set<number>>(new Set());
+  const [expandedAccounts, setExpandedAccounts] = useState<Set<number>>(new Set());
 
   const load = useCallback(async () => {
     setLoading(true);
@@ -177,53 +200,11 @@ export default function InvestmentsSettingsPage() {
 
   function toggleSort(key: SortKey) {
     setSort((prev) =>
-      prev.key === key
-        ? { key, dir: prev.dir === "asc" ? "desc" : "asc" }
-        : { key, dir: "asc" },
+      prev.key === key ? { key, dir: prev.dir === "asc" ? "desc" : "asc" } : { key, dir: "asc" },
     );
   }
 
-  const rows = useMemo(() => {
-    if (!securities) return [];
-    const mapped = securities.map((s) => ({
-      s,
-      symbol: symbolLabel(s),
-      description: descriptionOf(s),
-      type: s.assetType,
-      currency: s.currency,
-      accounts: s.accounts.length,
-    }));
-    const filtered = mapped.filter(
-      (r) =>
-        (!filters.symbol || r.symbol.toLowerCase().includes(filters.symbol.toLowerCase())) &&
-        (!filters.description ||
-          r.description.toLowerCase().includes(filters.description.toLowerCase())) &&
-        (!filters.type || r.type.toLowerCase().includes(filters.type.toLowerCase())) &&
-        (!filters.currency ||
-          r.currency.toLowerCase().includes(filters.currency.toLowerCase())),
-    );
-    const dir = sort.dir === "asc" ? 1 : -1;
-    filtered.sort((a, b) => {
-      if (sort.key === "accounts") return (a.accounts - b.accounts) * dir;
-      const av = String(a[sort.key] ?? "").toLowerCase();
-      const bv = String(b[sort.key] ?? "").toLowerCase();
-      return av.localeCompare(bv) * dir;
-    });
-    return filtered;
-  }, [securities, filters, sort]);
-
-  const hasActiveFilter = Object.values(filters).some((v) => v.trim() !== "");
-
-  // Investment accounts that don't already hold the chosen security.
-  const eligibleAccountsForLink = useMemo(() => {
-    const sec = securities?.find((s) => String(s.id) === linkSecurityId);
-    const taken = new Set(sec?.accounts.map((a) => a.accountId) ?? []);
-    return accounts.filter((a) => a.isInvestment && !a.archived && !taken.has(a.id));
-  }, [securities, accounts, linkSecurityId]);
-
-  // base-ui Select renders the raw value in its trigger unless the Root is given
-  // an `items` value→label map; build one so the trigger shows the symbol /
-  // account name instead of the numeric id.
+  // ---- value→label maps (base-ui Select shows the raw value otherwise) ----
   const securityLabelById = useMemo(() => {
     const m: Record<string, string> = {};
     for (const s of securities ?? []) {
@@ -238,56 +219,128 @@ export default function InvestmentsSettingsPage() {
     return m;
   }, [accounts]);
 
-  // ---- Add to portfolio ------------------------------------------------
+  // ---- Tab 1 rows ----
+  const rows = useMemo(() => {
+    if (!securities) return [];
+    const mapped = securities.map((s) => ({
+      s,
+      symbol: symbolLabel(s),
+      description: descriptionOf(s),
+      type: s.assetType,
+      currency: s.currency,
+    }));
+    const filtered = mapped.filter(
+      (r) =>
+        (!filters.symbol || r.symbol.toLowerCase().includes(filters.symbol.toLowerCase())) &&
+        (!filters.description ||
+          r.description.toLowerCase().includes(filters.description.toLowerCase())) &&
+        (!filters.type || r.type.toLowerCase().includes(filters.type.toLowerCase())) &&
+        (!filters.currency ||
+          r.currency.toLowerCase().includes(filters.currency.toLowerCase())),
+    );
+    const dir = sort.dir === "asc" ? 1 : -1;
+    filtered.sort((a, b) => {
+      const av = String(a[sort.key] ?? "").toLowerCase();
+      const bv = String(b[sort.key] ?? "").toLowerCase();
+      return av.localeCompare(bv) * dir;
+    });
+    return filtered;
+  }, [securities, filters, sort]);
 
-  function openAdd() {
-    setAddMode(securities && securities.length > 0 ? "existing" : "new");
-    setLinkSecurityId("");
-    setLinkAccountId("");
-    setLinkErrors({});
-    setAddOpen(true);
-  }
+  const hasActiveFilter = Object.values(filters).some((v) => v.trim() !== "");
 
-  function openAddForSecurity(s: Security) {
-    setAddMode("existing");
-    setLinkSecurityId(String(s.id));
-    setLinkAccountId("");
-    setLinkErrors({});
-    setAddOpen(true);
-  }
-
-  async function submitLink() {
-    const securityId = parseInt(linkSecurityId, 10);
-    const accountId = parseInt(linkAccountId, 10);
-    const errs: Record<string, string> = {};
-    if (!Number.isFinite(securityId) || securityId <= 0) errs.security = "Pick a security";
-    if (!Number.isFinite(accountId) || accountId <= 0) errs.account = "Pick an account";
-    setLinkErrors(errs);
-    if (Object.keys(errs).length > 0) return;
-    setLinking(true);
-    try {
-      const res = await fetch("/api/securities", {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ securityId, accountId }),
-      });
-      if (!res.ok) {
-        const msg = await parseSaveError(res, "Failed to add to account");
-        setLinkErrors({ account: msg });
-        return;
+  // ---- Tab 3 inversion: investment accounts → their securities ----
+  const byAccount = useMemo(() => {
+    const map = new Map<
+      number,
+      { account: Account; items: { security: Security; positionId: number; isCash: boolean }[] }
+    >();
+    for (const a of accounts) {
+      if (a.isInvestment && !a.archived) map.set(a.id, { account: a, items: [] });
+    }
+    for (const s of securities ?? []) {
+      for (const a of s.accounts) {
+        let entry = map.get(a.accountId);
+        if (!entry) {
+          const acct = accounts.find((x) => x.id === a.accountId);
+          if (!acct) continue;
+          entry = { account: acct, items: [] };
+          map.set(a.accountId, entry);
+        }
+        entry.items.push({ security: s, positionId: a.positionId, isCash: a.isCash });
       }
-      setAddOpen(false);
-      showToast("success", "Added to account");
-      await load();
-    } catch (e) {
-      setLinkErrors({ account: e instanceof Error ? e.message : "Failed" });
+    }
+    return Array.from(map.values()).sort((x, y) => x.account.name.localeCompare(y.account.name));
+  }, [securities, accounts]);
+
+  // ---- Add security (bare catalog entry) ----
+  function openAdd() {
+    setAddSymbol("");
+    setAddName("");
+    setAddNameTouched(false);
+    setAddCurrency("USD");
+    setAddCurrencyTouched(false);
+    setAddIsCrypto(false);
+    setAddErrors({});
+    setAddOpen(true);
+  }
+
+  async function lookupTicker(raw: string) {
+    const symbol = raw.trim();
+    if (!symbol) return;
+    setLookupLoading(true);
+    try {
+      const res = await fetch(`/api/securities/lookup?symbol=${encodeURIComponent(symbol)}`);
+      if (!res.ok) return;
+      const json = await res.json();
+      const d = (json.data ?? json) as { found?: boolean; name?: string | null; currency?: string | null };
+      if (d?.found) {
+        if (!addNameTouched && d.name) setAddName(d.name);
+        if (!addCurrencyTouched && d.currency) setAddCurrency(d.currency);
+      }
+    } catch {
+      /* best-effort — manual entry */
     } finally {
-      setLinking(false);
+      setLookupLoading(false);
     }
   }
 
-  // ---- Rename ----------------------------------------------------------
+  async function submitAddSecurity() {
+    const symbol = addSymbol.trim();
+    const currency = addCurrency.trim().toUpperCase();
+    const errs: Record<string, string> = {};
+    if (!symbol) errs.symbol = "Ticker is required";
+    if (!/^[A-Z]{3,4}$/.test(currency)) errs.currency = "Enter a 3-4 letter currency code";
+    setAddErrors(errs);
+    if (Object.keys(errs).length > 0) return;
+    setAdding(true);
+    try {
+      const res = await fetch("/api/securities/define", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          symbol,
+          name: addName.trim() || undefined,
+          currency,
+          isCrypto: addIsCrypto,
+        }),
+      });
+      if (!res.ok) {
+        const msg = await parseSaveError(res, "Failed to add security");
+        setAddErrors({ symbol: msg });
+        return;
+      }
+      setAddOpen(false);
+      showToast("success", "Security added");
+      await load();
+    } catch (e) {
+      setAddErrors({ symbol: e instanceof Error ? e.message : "Failed" });
+    } finally {
+      setAdding(false);
+    }
+  }
 
+  // ---- Rename ----
   function openRename(s: Security) {
     setRenameSecurity(s);
     setRenameValue(s.name ?? "");
@@ -324,8 +377,131 @@ export default function InvestmentsSettingsPage() {
     }
   }
 
-  // ---- Render ----------------------------------------------------------
+  // ---- Delete (unused securities only) ----
+  async function confirmDelete() {
+    if (!deleteTarget) return;
+    setDeleting(true);
+    try {
+      const res = await fetch(`/api/securities/define?id=${deleteTarget.id}`, { method: "DELETE" });
+      if (!res.ok) {
+        const msg = await parseSaveError(res, "Failed to delete security");
+        showToast("error", msg);
+        return;
+      }
+      showToast("success", "Security deleted");
+      setDeleteTarget(null);
+      await load();
+    } catch (e) {
+      showToast("error", e instanceof Error ? e.message : "Delete failed");
+    } finally {
+      setDeleting(false);
+    }
+  }
 
+  // ---- Link / unlink (Tab 2 + Tab 3) ----
+  function openLinkAccount(securityId: number) {
+    setLinkDialog({ mode: "account", securityId });
+    setLinkValue("");
+    setLinkError("");
+  }
+  function openLinkSecurity(accountId: number) {
+    setLinkDialog({ mode: "security", accountId });
+    setLinkValue("");
+    setLinkError("");
+  }
+
+  const linkEligible = useMemo(() => {
+    if (!linkDialog) return [] as { value: string; label: string }[];
+    if (linkDialog.mode === "account") {
+      const sec = securities?.find((s) => s.id === linkDialog.securityId);
+      const taken = new Set(sec?.accounts.map((a) => a.accountId) ?? []);
+      return accounts
+        .filter((a) => a.isInvestment && !a.archived && !taken.has(a.id))
+        .map((a) => ({ value: String(a.id), label: `${a.name} (${a.currency})` }));
+    }
+    const heldHere = new Set(
+      (securities ?? [])
+        .filter((s) => s.accounts.some((a) => a.accountId === linkDialog.accountId))
+        .map((s) => s.id),
+    );
+    return (securities ?? [])
+      .filter((s) => !heldHere.has(s.id))
+      .map((s) => {
+        const d = descriptionOf(s);
+        return { value: String(s.id), label: `${symbolLabel(s)}${d ? ` — ${d}` : ""} (${s.currency})` };
+      });
+  }, [linkDialog, securities, accounts]);
+
+  const linkItems = useMemo(() => {
+    const m: Record<string, string> = {};
+    for (const e of linkEligible) m[e.value] = e.label;
+    return m;
+  }, [linkEligible]);
+
+  async function submitLink() {
+    if (!linkDialog) return;
+    const picked = parseInt(linkValue, 10);
+    if (!Number.isFinite(picked) || picked <= 0) {
+      setLinkError(linkDialog.mode === "account" ? "Pick an account" : "Pick a security");
+      return;
+    }
+    const securityId = linkDialog.mode === "account" ? linkDialog.securityId : picked;
+    const accountId = linkDialog.mode === "account" ? picked : linkDialog.accountId;
+    setLinking(true);
+    try {
+      const res = await fetch("/api/securities", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ securityId, accountId }),
+      });
+      if (!res.ok) {
+        const msg = await parseSaveError(res, "Failed to link");
+        setLinkError(msg);
+        return;
+      }
+      setLinkDialog(null);
+      showToast("success", "Linked");
+      await load();
+    } catch (e) {
+      setLinkError(e instanceof Error ? e.message : "Failed");
+    } finally {
+      setLinking(false);
+    }
+  }
+
+  async function unlinkPosition(positionId: number) {
+    try {
+      const res = await fetch(`/api/securities?positionId=${positionId}`, { method: "DELETE" });
+      if (!res.ok) {
+        const msg = await parseSaveError(res, "Failed to unlink");
+        showToast("error", msg);
+        return;
+      }
+      showToast("success", "Unlinked");
+      await load();
+    } catch (e) {
+      showToast("error", e instanceof Error ? e.message : "Unlink failed");
+    }
+  }
+
+  function toggleSecurity(id: number) {
+    setExpandedSecurities((prev) => {
+      const next = new Set(prev);
+      if (next.has(id)) next.delete(id);
+      else next.add(id);
+      return next;
+    });
+  }
+  function toggleAccount(id: number) {
+    setExpandedAccounts((prev) => {
+      const next = new Set(prev);
+      if (next.has(id)) next.delete(id);
+      else next.add(id);
+      return next;
+    });
+  }
+
+  // ---- Render ----
   if (loading && !securities) {
     return (
       <div className="max-w-5xl">
@@ -333,7 +509,6 @@ export default function InvestmentsSettingsPage() {
       </div>
     );
   }
-
   if (error && !securities) {
     return (
       <div className="max-w-5xl">
@@ -342,8 +517,6 @@ export default function InvestmentsSettingsPage() {
     );
   }
 
-  // Render helpers (lowercase, called inline — NOT components defined during
-  // render, which the react-hooks compiler rule forbids).
   const sortHeader = (k: SortKey, label: string) => {
     const active = sort.key === k;
     return (
@@ -366,15 +539,17 @@ export default function InvestmentsSettingsPage() {
     );
   };
 
-  const filterInput = (col: FilterKey, placeholder: string) => (
+  const filterInput = (col: FilterKey) => (
     <Input
       value={filters[col]}
       onChange={(e) => setFilters((p) => ({ ...p, [col]: e.target.value }))}
-      placeholder={placeholder}
+      placeholder="Filter…"
       className="h-7 text-xs"
       aria-label={`Filter by ${col}`}
     />
   );
+
+  const allSecurities = securities ?? [];
 
   return (
     <div className="max-w-5xl space-y-6">
@@ -382,12 +557,9 @@ export default function InvestmentsSettingsPage() {
         <div>
           <h1 className="text-2xl font-bold tracking-tight">Investments</h1>
           <p className="text-sm text-muted-foreground mt-0.5">
-            Every security you hold appears once. Filter by any column header.
+            Your securities, and how they map to your accounts.
           </p>
         </div>
-        <Button onClick={openAdd} size="sm">
-          <Plus className="h-4 w-4 mr-1.5" /> Add to portfolio
-        </Button>
       </div>
 
       {toast && (
@@ -402,24 +574,32 @@ export default function InvestmentsSettingsPage() {
         </div>
       )}
 
-      {securities && securities.length === 0 ? (
-        <EmptyState
-          icon={Briefcase}
-          title="No securities yet"
-          description="Add a holding to get started — each ticker you hold will then appear here once."
-          action={{ label: "Add to portfolio", onClick: openAdd }}
-        />
-      ) : (
-        <Card>
-          <CardHeader>
-            <CardTitle className="text-base">Securities</CardTitle>
-            <CardDescription>
-              The centralized list of tickers, cash positions, and other holdings you
-              own. Rename a security or add it to an account here; record a transaction
-              to set quantity and cost basis.
-            </CardDescription>
-          </CardHeader>
-          <CardContent>
+      <Tabs defaultValue="securities" className="w-full">
+        <TabsList>
+          <TabsTrigger value="securities">Securities</TabsTrigger>
+          <TabsTrigger value="by-security">By security</TabsTrigger>
+          <TabsTrigger value="by-account">By account</TabsTrigger>
+        </TabsList>
+
+        {/* ── Tab 1: Securities catalog ─────────────────────────────────── */}
+        <TabsContent value="securities" className="space-y-4">
+          <div className="flex items-center justify-between gap-3">
+            <p className="text-sm text-muted-foreground">
+              Every security you hold or track appears once. Filter by any column.
+            </p>
+            <Button onClick={openAdd} size="sm">
+              <Plus className="h-4 w-4 mr-1.5" /> Add security
+            </Button>
+          </div>
+
+          {allSecurities.length === 0 ? (
+            <EmptyState
+              icon={Briefcase}
+              title="No securities yet"
+              description="Add a security (a ticker, cash, or crypto), then link it to your accounts under “By security” or “By account”."
+              action={{ label: "Add security", onClick: openAdd }}
+            />
+          ) : (
             <div className="rounded-md border overflow-x-auto">
               <Table>
                 <TableHeader>
@@ -428,29 +608,21 @@ export default function InvestmentsSettingsPage() {
                     <TableHead>{sortHeader("description", "Description")}</TableHead>
                     <TableHead>{sortHeader("type", "Type")}</TableHead>
                     <TableHead>{sortHeader("currency", "Currency")}</TableHead>
-                    <TableHead className="text-right">
-                      {sortHeader("accounts", "# Accounts")}
-                    </TableHead>
                     <TableHead className="text-right" />
                   </TableRow>
                   <TableRow>
-                    <TableHead className="py-1">{filterInput("symbol", "Filter…")}</TableHead>
-                    <TableHead className="py-1">
-                      {filterInput("description", "Filter…")}
-                    </TableHead>
-                    <TableHead className="py-1">{filterInput("type", "Filter…")}</TableHead>
-                    <TableHead className="py-1">{filterInput("currency", "Filter…")}</TableHead>
-                    <TableHead className="py-1" />
+                    <TableHead className="py-1">{filterInput("symbol")}</TableHead>
+                    <TableHead className="py-1">{filterInput("description")}</TableHead>
+                    <TableHead className="py-1">{filterInput("type")}</TableHead>
+                    <TableHead className="py-1">{filterInput("currency")}</TableHead>
                     <TableHead className="py-1" />
                   </TableRow>
                 </TableHeader>
                 <TableBody>
                   {rows.length === 0 ? (
                     <TableRow>
-                      <TableCell colSpan={6} className="text-center text-sm text-muted-foreground py-8">
-                        {hasActiveFilter
-                          ? "No securities match the current filters."
-                          : "No securities."}
+                      <TableCell colSpan={5} className="text-center text-sm text-muted-foreground py-8">
+                        {hasActiveFilter ? "No securities match the current filters." : "No securities."}
                       </TableCell>
                     </TableRow>
                   ) : (
@@ -477,30 +649,21 @@ export default function InvestmentsSettingsPage() {
                             {r.currency}
                           </Badge>
                         </TableCell>
-                        <TableCell className="text-right text-sm">
-                          <span
-                            title={
-                              r.s.accounts.length
-                                ? r.s.accounts.map((a) => a.accountName ?? "—").join(", ")
-                                : "Not held in any account yet"
-                            }
-                          >
-                            {r.accounts}
-                          </span>
-                        </TableCell>
                         <TableCell className="text-right">
                           <div className="inline-flex gap-1">
-                            <Button
-                              variant="ghost"
-                              size="sm"
-                              onClick={() => openAddForSecurity(r.s)}
-                              title="Add this security to an account"
-                            >
-                              <Plus className="h-3.5 w-3.5 mr-1" /> Account
-                            </Button>
                             <Button variant="ghost" size="sm" onClick={() => openRename(r.s)}>
                               <Pencil className="h-3.5 w-3.5 mr-1" /> Rename
                             </Button>
+                            {r.s.accounts.length === 0 && (
+                              <Button
+                                variant="ghost"
+                                size="sm"
+                                onClick={() => setDeleteTarget(r.s)}
+                                title="Delete this unused security"
+                              >
+                                <Trash2 className="h-3.5 w-3.5 text-rose-500" />
+                              </Button>
+                            )}
                           </div>
                         </TableCell>
                       </TableRow>
@@ -509,18 +672,173 @@ export default function InvestmentsSettingsPage() {
                 </TableBody>
               </Table>
             </div>
-            <p className="mt-2 text-[11px] text-muted-foreground">
-              {rows.length} of {securities?.length ?? 0} securities
+          )}
+          {allSecurities.length > 0 && (
+            <p className="text-[11px] text-muted-foreground">
+              {rows.length} of {allSecurities.length} securities
               {hasActiveFilter ? " (filtered)" : ""}.
             </p>
-          </CardContent>
-        </Card>
-      )}
+          )}
+        </TabsContent>
 
-      {/* Rebuild investment history — re-materializes daily portfolio_snapshots
-          from the first transaction to today so the "Net Worth / Balance Over
-          Time" charts reflect back-dated investment edits. The nightly cron is
-          forward-only; this is the manual trigger. plan/net-worth-over-time.md. */}
+        {/* ── Tab 2: By security → accounts ─────────────────────────────── */}
+        <TabsContent value="by-security" className="space-y-2">
+          <p className="text-sm text-muted-foreground">
+            Expand a security to see (and change) which accounts hold it.
+          </p>
+          {allSecurities.length === 0 ? (
+            <EmptyState
+              icon={Briefcase}
+              title="No securities yet"
+              description="Add a security on the Securities tab first."
+            />
+          ) : (
+            <div className="rounded-md border divide-y">
+              {allSecurities.map((s) => {
+                const open = expandedSecurities.has(s.id);
+                return (
+                  <div key={s.id}>
+                    <button
+                      type="button"
+                      onClick={() => toggleSecurity(s.id)}
+                      className="flex w-full items-center justify-between gap-3 px-3 py-2.5 text-left hover:bg-muted/40"
+                    >
+                      <div className="flex items-center gap-2 min-w-0">
+                        {open ? (
+                          <ChevronDown className="h-4 w-4 shrink-0 text-muted-foreground" />
+                        ) : (
+                          <ChevronRight className="h-4 w-4 shrink-0 text-muted-foreground" />
+                        )}
+                        <span className="font-mono text-sm font-medium">{symbolLabel(s)}</span>
+                        {descriptionOf(s) && (
+                          <span className="truncate text-xs text-muted-foreground">{descriptionOf(s)}</span>
+                        )}
+                      </div>
+                      <Badge variant="outline" className="text-[10px] shrink-0">
+                        {s.accounts.length} {s.accounts.length === 1 ? "account" : "accounts"}
+                      </Badge>
+                    </button>
+                    {open && (
+                      <div className="px-3 pb-3 pl-9 space-y-1.5">
+                        {s.accounts.length === 0 ? (
+                          <p className="text-xs text-muted-foreground">Not in any account yet.</p>
+                        ) : (
+                          s.accounts.map((a) => (
+                            <div
+                              key={a.positionId}
+                              className="flex items-center justify-between gap-2 rounded-md border bg-card px-2.5 py-1.5"
+                            >
+                              <span className="text-sm">
+                                {a.accountName ?? "(account)"}
+                                {a.isCash && (
+                                  <span className="ml-1.5 text-[10px] text-muted-foreground">cash sleeve</span>
+                                )}
+                              </span>
+                              <Button
+                                variant="ghost"
+                                size="sm"
+                                className="h-7 px-2 text-xs"
+                                onClick={() => unlinkPosition(a.positionId)}
+                                title="Unlink (transaction-free positions only)"
+                              >
+                                <Trash2 className="h-3.5 w-3.5 text-rose-500" />
+                              </Button>
+                            </div>
+                          ))
+                        )}
+                        <Button variant="outline" size="sm" onClick={() => openLinkAccount(s.id)}>
+                          <Plus className="h-3.5 w-3.5 mr-1" /> Account
+                        </Button>
+                      </div>
+                    )}
+                  </div>
+                );
+              })}
+            </div>
+          )}
+        </TabsContent>
+
+        {/* ── Tab 3: By account → securities ────────────────────────────── */}
+        <TabsContent value="by-account" className="space-y-2">
+          <p className="text-sm text-muted-foreground">
+            Expand an account to see (and change) which securities it holds.
+          </p>
+          {byAccount.length === 0 ? (
+            <EmptyState
+              icon={Briefcase}
+              title="No investment accounts"
+              description="Create an investment account first, then add securities to it here."
+            />
+          ) : (
+            <div className="rounded-md border divide-y">
+              {byAccount.map(({ account, items }) => {
+                const open = expandedAccounts.has(account.id);
+                return (
+                  <div key={account.id}>
+                    <button
+                      type="button"
+                      onClick={() => toggleAccount(account.id)}
+                      className="flex w-full items-center justify-between gap-3 px-3 py-2.5 text-left hover:bg-muted/40"
+                    >
+                      <div className="flex items-center gap-2 min-w-0">
+                        {open ? (
+                          <ChevronDown className="h-4 w-4 shrink-0 text-muted-foreground" />
+                        ) : (
+                          <ChevronRight className="h-4 w-4 shrink-0 text-muted-foreground" />
+                        )}
+                        <span className="text-sm font-medium truncate">{account.name}</span>
+                        <Badge variant="outline" className="font-mono text-[10px] shrink-0">
+                          {account.currency}
+                        </Badge>
+                      </div>
+                      <Badge variant="outline" className="text-[10px] shrink-0">
+                        {items.length} {items.length === 1 ? "security" : "securities"}
+                      </Badge>
+                    </button>
+                    {open && (
+                      <div className="px-3 pb-3 pl-9 space-y-1.5">
+                        {items.length === 0 ? (
+                          <p className="text-xs text-muted-foreground">No securities in this account yet.</p>
+                        ) : (
+                          items.map(({ security, positionId, isCash }) => (
+                            <div
+                              key={positionId}
+                              className="flex items-center justify-between gap-2 rounded-md border bg-card px-2.5 py-1.5"
+                            >
+                              <span className="text-sm font-mono">
+                                {symbolLabel(security)}
+                                {isCash && (
+                                  <span className="ml-1.5 font-sans text-[10px] text-muted-foreground">
+                                    cash sleeve
+                                  </span>
+                                )}
+                              </span>
+                              <Button
+                                variant="ghost"
+                                size="sm"
+                                className="h-7 px-2 text-xs"
+                                onClick={() => unlinkPosition(positionId)}
+                                title="Unlink (transaction-free positions only)"
+                              >
+                                <Trash2 className="h-3.5 w-3.5 text-rose-500" />
+                              </Button>
+                            </div>
+                          ))
+                        )}
+                        <Button variant="outline" size="sm" onClick={() => openLinkSecurity(account.id)}>
+                          <Plus className="h-3.5 w-3.5 mr-1" /> Security
+                        </Button>
+                      </div>
+                    )}
+                  </div>
+                );
+              })}
+            </div>
+          )}
+        </TabsContent>
+      </Tabs>
+
+      {/* Rebuild investment history (page-level utility). */}
       <Card>
         <CardHeader>
           <div className="flex items-center gap-3">
@@ -530,9 +848,9 @@ export default function InvestmentsSettingsPage() {
             <div>
               <CardTitle className="text-base">Rebuild investment history</CardTitle>
               <CardDescription>
-                Recompute daily portfolio value snapshots from your first
-                transaction to today. Run this if the &ldquo;Net Worth Over
-                Time&rdquo; chart looks stale after a back-dated trade edit.
+                Recompute daily portfolio value snapshots from your first transaction
+                to today. Run this if the &ldquo;Net Worth Over Time&rdquo; chart looks
+                stale after a back-dated trade edit.
               </CardDescription>
             </div>
           </div>
@@ -542,143 +860,136 @@ export default function InvestmentsSettingsPage() {
         </CardContent>
       </Card>
 
-      {/* Add-to-portfolio dialog — security-first. Existing security → account
-          reuses POST /api/securities; new security uses the shared form. */}
-      <Dialog open={addOpen} onOpenChange={(open) => { if (!open) setAddOpen(false); }}>
+      {/* ── Add security dialog (bare catalog entry) ───────────────────── */}
+      <Dialog open={addOpen} onOpenChange={(o) => { if (!o) setAddOpen(false); }}>
         <DialogContent className="sm:max-w-md">
           <DialogHeader>
-            <DialogTitle>Add to portfolio</DialogTitle>
+            <DialogTitle>Add security</DialogTitle>
             <DialogDescription>
-              Put a security into one of your accounts — pick an existing security or
-              define a new one.
+              Define a security by its ticker. Link it to an account later under “By
+              security” / “By account”.
             </DialogDescription>
           </DialogHeader>
-
-          <div className="inline-flex w-full rounded-lg border p-0.5 text-xs font-medium">
-            <button
-              type="button"
-              onClick={() => setAddMode("existing")}
-              className={cn(
-                "flex-1 rounded-md px-3 py-1.5 transition-colors",
-                addMode === "existing"
-                  ? "bg-primary/10 text-primary"
-                  : "text-muted-foreground hover:text-foreground",
-              )}
-            >
-              Existing security
-            </button>
-            <button
-              type="button"
-              onClick={() => setAddMode("new")}
-              className={cn(
-                "flex-1 rounded-md px-3 py-1.5 transition-colors",
-                addMode === "new"
-                  ? "bg-primary/10 text-primary"
-                  : "text-muted-foreground hover:text-foreground",
-              )}
-            >
-              New security
-            </button>
-          </div>
-
-          {addMode === "existing" ? (
-            <div className="space-y-3">
-              <div>
-                <Label>Security</Label>
-                <Select
-                  items={securityLabelById}
-                  value={linkSecurityId}
-                  onValueChange={(v) => {
-                    setLinkSecurityId(v ?? "");
-                    setLinkAccountId("");
-                  }}
-                >
-                  <SelectTrigger>
-                    <SelectValue placeholder="Choose a security" />
-                  </SelectTrigger>
-                  <SelectContent>
-                    {(securities ?? []).map((s) => {
-                      const desc = descriptionOf(s);
-                      return (
-                        <SelectItem key={s.id} value={String(s.id)}>
-                          {symbolLabel(s)}
-                          {desc ? ` — ${desc}` : ""}{" "}
-                          <span className="text-muted-foreground">({s.currency})</span>
-                        </SelectItem>
-                      );
-                    })}
-                  </SelectContent>
-                </Select>
-                {linkErrors.security && (
-                  <p className="text-xs text-rose-600 mt-1">{linkErrors.security}</p>
+          <div className="space-y-3">
+            <div>
+              <Label>Ticker</Label>
+              <div className="relative">
+                <Input
+                  value={addSymbol}
+                  onChange={(e) => setAddSymbol(e.target.value)}
+                  onBlur={() => lookupTicker(addSymbol)}
+                  placeholder="e.g. AAPL, VTI, BTC"
+                  autoFocus
+                />
+                {lookupLoading && (
+                  <Loader2 className="absolute right-2.5 top-1/2 -translate-y-1/2 h-4 w-4 animate-spin text-muted-foreground" />
                 )}
               </div>
-              <div>
-                <Label>Account</Label>
-                <Select
-                  items={accountLabelById}
-                  value={linkAccountId}
-                  onValueChange={(v) => setLinkAccountId(v ?? "")}
-                >
-                  <SelectTrigger>
-                    <SelectValue placeholder={linkSecurityId ? "Choose an account" : "Pick a security first"} />
-                  </SelectTrigger>
-                  <SelectContent>
-                    {eligibleAccountsForLink.length === 0 ? (
-                      <SelectItem value="__none__" disabled>
-                        {linkSecurityId ? "No eligible accounts" : "Pick a security first"}
-                      </SelectItem>
-                    ) : (
-                      eligibleAccountsForLink.map((a) => (
-                        <SelectItem key={a.id} value={String(a.id)}>
-                          {a.name} <span className="text-muted-foreground">({a.currency})</span>
-                        </SelectItem>
-                      ))
-                    )}
-                  </SelectContent>
-                </Select>
-                {linkErrors.account && (
-                  <p className="text-xs text-rose-600 mt-1">{linkErrors.account}</p>
-                )}
-              </div>
-              <p className="text-xs text-muted-foreground">
-                Creates the position in that account. Add quantity and cost basis by
-                recording a transaction.
+              {addErrors.symbol && <p className="text-xs text-rose-600 mt-1">{addErrors.symbol}</p>}
+              <p className="text-[11px] text-muted-foreground mt-1">
+                We’ll try to fill the name + currency from the ticker; edit them if needed.
               </p>
-              <DialogFooter>
-                <Button variant="outline" onClick={() => setAddOpen(false)} disabled={linking}>
-                  Cancel
-                </Button>
-                <Button onClick={submitLink} disabled={linking}>
-                  {linking ? "Adding…" : "Add to account"}
-                </Button>
-              </DialogFooter>
             </div>
-          ) : (
-            <HoldingEditForm
-              onCancel={() => setAddOpen(false)}
-              onSave={(result) => {
-                setAddOpen(false);
-                if (result.kind === "saved") showToast("success", "Holding saved");
-                load();
-              }}
-            />
-          )}
+            <div>
+              <Label>Name</Label>
+              <Input
+                value={addName}
+                onChange={(e) => {
+                  setAddName(e.target.value);
+                  setAddNameTouched(true);
+                }}
+                placeholder="auto-filled from the ticker, or type it"
+              />
+            </div>
+            <div className="grid grid-cols-2 gap-3">
+              <div>
+                <Label>Holding currency</Label>
+                <Input
+                  value={addCurrency}
+                  onChange={(e) => {
+                    setAddCurrency(e.target.value.toUpperCase());
+                    setAddCurrencyTouched(true);
+                  }}
+                  placeholder="USD"
+                  maxLength={4}
+                />
+                {addErrors.currency && <p className="text-xs text-rose-600 mt-1">{addErrors.currency}</p>}
+              </div>
+              <label className="flex items-end gap-2 text-sm cursor-pointer pb-2">
+                <input
+                  type="checkbox"
+                  checked={addIsCrypto}
+                  onChange={(e) => setAddIsCrypto(e.target.checked)}
+                />
+                Crypto asset
+              </label>
+            </div>
+          </div>
+          <DialogFooter>
+            <Button variant="outline" onClick={() => setAddOpen(false)} disabled={adding}>
+              Cancel
+            </Button>
+            <Button onClick={submitAddSecurity} disabled={adding}>
+              {adding ? "Adding…" : "Add security"}
+            </Button>
+          </DialogFooter>
         </DialogContent>
       </Dialog>
 
-      {/* Rename dialog */}
-      <Dialog
-        open={renameSecurity != null}
-        onOpenChange={(open) => { if (!open) setRenameSecurity(null); }}
-      >
+      {/* ── Link dialog (Tab 2 "+ Account" / Tab 3 "+ Security") ───────── */}
+      <Dialog open={linkDialog != null} onOpenChange={(o) => { if (!o) setLinkDialog(null); }}>
+        <DialogContent className="sm:max-w-md">
+          <DialogHeader>
+            <DialogTitle>{linkDialog?.mode === "account" ? "Add to an account" : "Add a security"}</DialogTitle>
+            <DialogDescription>
+              {linkDialog?.mode === "account"
+                ? "Choose an account to hold this security. Quantity and cost basis come from a transaction."
+                : "Choose a security to add to this account. Quantity and cost basis come from a transaction."}
+            </DialogDescription>
+          </DialogHeader>
+          <div className="space-y-3">
+            <div>
+              <Label>{linkDialog?.mode === "account" ? "Account" : "Security"}</Label>
+              <Select items={linkItems} value={linkValue} onValueChange={(v) => setLinkValue(v ?? "")}>
+                <SelectTrigger>
+                  <SelectValue placeholder={linkDialog?.mode === "account" ? "Choose an account" : "Choose a security"} />
+                </SelectTrigger>
+                <SelectContent>
+                  {linkEligible.length === 0 ? (
+                    <SelectItem value="__none__" disabled>
+                      {linkDialog?.mode === "account" ? "No eligible accounts" : "No eligible securities"}
+                    </SelectItem>
+                  ) : (
+                    linkEligible.map((e) => (
+                      <SelectItem key={e.value} value={e.value}>
+                        {e.label}
+                      </SelectItem>
+                    ))
+                  )}
+                </SelectContent>
+              </Select>
+              {linkError && <p className="text-xs text-rose-600 mt-1">{linkError}</p>}
+            </div>
+          </div>
+          <DialogFooter>
+            <Button variant="outline" onClick={() => setLinkDialog(null)} disabled={linking}>
+              Cancel
+            </Button>
+            <Button onClick={submitLink} disabled={linking}>
+              {linking ? "Adding…" : "Add"}
+            </Button>
+          </DialogFooter>
+        </DialogContent>
+      </Dialog>
+
+      {/* ── Rename dialog ──────────────────────────────────────────────── */}
+      <Dialog open={renameSecurity != null} onOpenChange={(o) => { if (!o) setRenameSecurity(null); }}>
         <DialogContent className="sm:max-w-lg">
           <DialogHeader>
             <DialogTitle>Rename security</DialogTitle>
             <DialogDescription>
-              Update the display label for{" "}
-              {renameSecurity ? symbolLabel(renameSecurity) : "this security"}. This
-              renames it across every account that holds it.
+              Update the display label for {renameSecurity ? symbolLabel(renameSecurity) : "this security"}.
+              This renames it across every account that holds it.
             </DialogDescription>
           </DialogHeader>
           <div className="space-y-3">
@@ -689,9 +1000,7 @@ export default function InvestmentsSettingsPage() {
                 onChange={(e) => setRenameValue(e.target.value)}
                 placeholder="e.g. Apple Inc."
               />
-              {renameErrors.name && (
-                <p className="text-xs text-rose-600 mt-1">{renameErrors.name}</p>
-              )}
+              {renameErrors.name && <p className="text-xs text-rose-600 mt-1">{renameErrors.name}</p>}
             </div>
           </div>
           <DialogFooter>
@@ -704,6 +1013,22 @@ export default function InvestmentsSettingsPage() {
           </DialogFooter>
         </DialogContent>
       </Dialog>
+
+      {/* ── Delete confirm (unused securities only) ────────────────────── */}
+      <ConfirmDialog
+        open={deleteTarget != null}
+        onOpenChange={(o) => { if (!o) setDeleteTarget(null); }}
+        title="Delete security"
+        description={
+          deleteTarget
+            ? `Remove ${symbolLabel(deleteTarget)} from your catalog? It isn't held in any account. This can't be undone.`
+            : ""
+        }
+        confirmLabel="Delete"
+        busyLabel="Deleting…"
+        busy={deleting}
+        onConfirm={confirmDelete}
+      />
     </div>
   );
 }
