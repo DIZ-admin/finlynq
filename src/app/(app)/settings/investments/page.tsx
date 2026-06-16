@@ -9,16 +9,23 @@
  * pages — both now redirect here. The table is compact + filterable by column
  * header (the owner's ask): filter inputs under each header + click-to-sort.
  *
- * Linking a security to a specific account (qty / cost basis) happens in the
- * transaction / portfolio-entry flow, NOT here — so this page is the catalog +
- * rename, plus the existing "Add holding" form and "Rebuild investment history"
- * utility. Reads GET /api/securities ({ success, data } envelope) which lists
- * each security once with the accounts that hold it; renaming is PATCH
- * /api/securities. Bespoke fetch/useState/useEffect (NO SWR), mirroring the
+ * Adding to the portfolio is security-first (the owner's two-step vision):
+ *   - "Existing security" → pick a security from the catalog → pick an account
+ *     → POST /api/securities { securityId, accountId } creates the position in
+ *     that account (copying the security's identity + security_id). Quantity /
+ *     cost basis come later from a transaction.
+ *   - "New security" → the shared <HoldingEditForm> (symbol/name/currency +
+ *     account), which dual-writes a brand-new security.
+ * Each row also has an "Account" shortcut that opens the dialog in
+ * existing-security mode pre-selected to that row.
+ *
+ * Reads GET /api/securities ({ success, data } envelope) — security-grained,
+ * NOT flag-gated. Bespoke fetch/useState/useEffect (NO SWR), mirroring the
  * sibling money pages. → plan/architecture/securities.md
  */
 
 import { useCallback, useEffect, useMemo, useState } from "react";
+import { cn } from "@/lib/utils";
 import { Card, CardContent, CardHeader, CardTitle, CardDescription } from "@/components/ui/card";
 import { Button } from "@/components/ui/button";
 import { Input } from "@/components/ui/input";
@@ -40,6 +47,13 @@ import {
   DialogDescription,
   DialogFooter,
 } from "@/components/ui/dialog";
+import {
+  Select,
+  SelectContent,
+  SelectItem,
+  SelectTrigger,
+  SelectValue,
+} from "@/components/ui/select";
 import { HoldingEditForm } from "@/components/holdings/holding-edit-form";
 import { RebuildSnapshotsButton } from "@/components/portfolio/rebuild-snapshots-button";
 import { PageSkeleton } from "@/components/page-skeleton";
@@ -76,6 +90,15 @@ type Security = {
   accounts: SecurityAccount[];
 };
 
+type Account = {
+  id: number;
+  name: string;
+  type: string;
+  currency: string;
+  isInvestment: boolean;
+  archived?: boolean;
+};
+
 function symbolLabel(s: Security): string {
   return s.symbol?.trim() || s.name?.trim() || "—";
 }
@@ -100,6 +123,7 @@ const EMPTY_FILTERS: Record<FilterKey, string> = {
 
 export default function InvestmentsSettingsPage() {
   const [securities, setSecurities] = useState<Security[] | null>(null);
+  const [accounts, setAccounts] = useState<Account[]>([]);
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState<string | null>(null);
   const [toast, setToast] = useState<{ type: "success" | "error"; msg: string } | null>(null);
@@ -108,8 +132,14 @@ export default function InvestmentsSettingsPage() {
   const [filters, setFilters] = useState<Record<FilterKey, string>>(EMPTY_FILTERS);
   const [sort, setSort] = useState<{ key: SortKey; dir: SortDir }>({ key: "symbol", dir: "asc" });
 
-  // Add-holding dialog (the existing shared form; also mounts on /portfolio).
+  // Add-to-portfolio dialog (security-first: existing security → account, OR a
+  // brand-new security via the shared <HoldingEditForm>).
   const [addOpen, setAddOpen] = useState(false);
+  const [addMode, setAddMode] = useState<"existing" | "new">("existing");
+  const [linkSecurityId, setLinkSecurityId] = useState<string>("");
+  const [linkAccountId, setLinkAccountId] = useState<string>("");
+  const [linkErrors, setLinkErrors] = useState<Record<string, string>>({});
+  const [linking, setLinking] = useState(false);
 
   // Rename dialog.
   const [renameSecurity, setRenameSecurity] = useState<Security | null>(null);
@@ -121,10 +151,14 @@ export default function InvestmentsSettingsPage() {
     setLoading(true);
     setError(null);
     try {
-      const res = await fetch("/api/securities");
-      if (!res.ok) throw new Error("Failed to load securities");
-      const json: { data: Security[] } = await res.json();
+      const [sRes, aRes] = await Promise.all([
+        fetch("/api/securities"),
+        fetch("/api/accounts"),
+      ]);
+      if (!sRes.ok) throw new Error("Failed to load securities");
+      const json: { data: Security[] } = await sRes.json();
       setSecurities(json.data ?? []);
+      setAccounts(aRes.ok ? ((await aRes.json()) as Account[]) : []);
     } catch (e) {
       setError(e instanceof Error ? e.message : "Failed to load");
     } finally {
@@ -179,6 +213,61 @@ export default function InvestmentsSettingsPage() {
   }, [securities, filters, sort]);
 
   const hasActiveFilter = Object.values(filters).some((v) => v.trim() !== "");
+
+  // Investment accounts that don't already hold the chosen security.
+  const eligibleAccountsForLink = useMemo(() => {
+    const sec = securities?.find((s) => String(s.id) === linkSecurityId);
+    const taken = new Set(sec?.accounts.map((a) => a.accountId) ?? []);
+    return accounts.filter((a) => a.isInvestment && !a.archived && !taken.has(a.id));
+  }, [securities, accounts, linkSecurityId]);
+
+  // ---- Add to portfolio ------------------------------------------------
+
+  function openAdd() {
+    setAddMode(securities && securities.length > 0 ? "existing" : "new");
+    setLinkSecurityId("");
+    setLinkAccountId("");
+    setLinkErrors({});
+    setAddOpen(true);
+  }
+
+  function openAddForSecurity(s: Security) {
+    setAddMode("existing");
+    setLinkSecurityId(String(s.id));
+    setLinkAccountId("");
+    setLinkErrors({});
+    setAddOpen(true);
+  }
+
+  async function submitLink() {
+    const securityId = parseInt(linkSecurityId, 10);
+    const accountId = parseInt(linkAccountId, 10);
+    const errs: Record<string, string> = {};
+    if (!Number.isFinite(securityId) || securityId <= 0) errs.security = "Pick a security";
+    if (!Number.isFinite(accountId) || accountId <= 0) errs.account = "Pick an account";
+    setLinkErrors(errs);
+    if (Object.keys(errs).length > 0) return;
+    setLinking(true);
+    try {
+      const res = await fetch("/api/securities", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ securityId, accountId }),
+      });
+      if (!res.ok) {
+        const msg = await parseSaveError(res, "Failed to add to account");
+        setLinkErrors({ account: msg });
+        return;
+      }
+      setAddOpen(false);
+      showToast("success", "Added to account");
+      await load();
+    } catch (e) {
+      setLinkErrors({ account: e instanceof Error ? e.message : "Failed" });
+    } finally {
+      setLinking(false);
+    }
+  }
 
   // ---- Rename ----------------------------------------------------------
 
@@ -279,8 +368,8 @@ export default function InvestmentsSettingsPage() {
             Every security you hold appears once. Filter by any column header.
           </p>
         </div>
-        <Button onClick={() => setAddOpen(true)} size="sm">
-          <Plus className="h-4 w-4 mr-1.5" /> Add holding
+        <Button onClick={openAdd} size="sm">
+          <Plus className="h-4 w-4 mr-1.5" /> Add to portfolio
         </Button>
       </div>
 
@@ -301,7 +390,7 @@ export default function InvestmentsSettingsPage() {
           icon={Briefcase}
           title="No securities yet"
           description="Add a holding to get started — each ticker you hold will then appear here once."
-          action={{ label: "Add holding", onClick: () => setAddOpen(true) }}
+          action={{ label: "Add to portfolio", onClick: openAdd }}
         />
       ) : (
         <Card>
@@ -309,8 +398,8 @@ export default function InvestmentsSettingsPage() {
             <CardTitle className="text-base">Securities</CardTitle>
             <CardDescription>
               The centralized list of tickers, cash positions, and other holdings you
-              own. Rename a security here; add it to an account by recording a
-              transaction.
+              own. Rename a security or add it to an account here; record a transaction
+              to set quantity and cost basis.
             </CardDescription>
           </CardHeader>
           <CardContent>
@@ -383,13 +472,19 @@ export default function InvestmentsSettingsPage() {
                           </span>
                         </TableCell>
                         <TableCell className="text-right">
-                          <Button
-                            variant="ghost"
-                            size="sm"
-                            onClick={() => openRename(r.s)}
-                          >
-                            <Pencil className="h-3.5 w-3.5 mr-1" /> Rename
-                          </Button>
+                          <div className="inline-flex gap-1">
+                            <Button
+                              variant="ghost"
+                              size="sm"
+                              onClick={() => openAddForSecurity(r.s)}
+                              title="Add this security to an account"
+                            >
+                              <Plus className="h-3.5 w-3.5 mr-1" /> Account
+                            </Button>
+                            <Button variant="ghost" size="sm" onClick={() => openRename(r.s)}>
+                              <Pencil className="h-3.5 w-3.5 mr-1" /> Rename
+                            </Button>
+                          </div>
                         </TableCell>
                       </TableRow>
                     ))
@@ -430,15 +525,114 @@ export default function InvestmentsSettingsPage() {
         </CardContent>
       </Card>
 
-      {/* Add-holding dialog — the shared <HoldingEditForm> (same component as
-          /portfolio mounts). Creating a holding dual-writes its security, which
-          then appears in the table above. */}
+      {/* Add-to-portfolio dialog — security-first. Existing security → account
+          reuses POST /api/securities; new security uses the shared form. */}
       <Dialog open={addOpen} onOpenChange={(open) => { if (!open) setAddOpen(false); }}>
         <DialogContent className="sm:max-w-md">
           <DialogHeader>
-            <DialogTitle>Add Holding</DialogTitle>
+            <DialogTitle>Add to portfolio</DialogTitle>
+            <DialogDescription>
+              Put a security into one of your accounts — pick an existing security or
+              define a new one.
+            </DialogDescription>
           </DialogHeader>
-          {addOpen && (
+
+          <div className="inline-flex w-full rounded-lg border p-0.5 text-xs font-medium">
+            <button
+              type="button"
+              onClick={() => setAddMode("existing")}
+              className={cn(
+                "flex-1 rounded-md px-3 py-1.5 transition-colors",
+                addMode === "existing"
+                  ? "bg-primary/10 text-primary"
+                  : "text-muted-foreground hover:text-foreground",
+              )}
+            >
+              Existing security
+            </button>
+            <button
+              type="button"
+              onClick={() => setAddMode("new")}
+              className={cn(
+                "flex-1 rounded-md px-3 py-1.5 transition-colors",
+                addMode === "new"
+                  ? "bg-primary/10 text-primary"
+                  : "text-muted-foreground hover:text-foreground",
+              )}
+            >
+              New security
+            </button>
+          </div>
+
+          {addMode === "existing" ? (
+            <div className="space-y-3">
+              <div>
+                <Label>Security</Label>
+                <Select
+                  value={linkSecurityId}
+                  onValueChange={(v) => {
+                    setLinkSecurityId(v ?? "");
+                    setLinkAccountId("");
+                  }}
+                >
+                  <SelectTrigger>
+                    <SelectValue placeholder="Choose a security" />
+                  </SelectTrigger>
+                  <SelectContent>
+                    {(securities ?? []).map((s) => {
+                      const desc = descriptionOf(s);
+                      return (
+                        <SelectItem key={s.id} value={String(s.id)}>
+                          {symbolLabel(s)}
+                          {desc ? ` — ${desc}` : ""}{" "}
+                          <span className="text-muted-foreground">({s.currency})</span>
+                        </SelectItem>
+                      );
+                    })}
+                  </SelectContent>
+                </Select>
+                {linkErrors.security && (
+                  <p className="text-xs text-rose-600 mt-1">{linkErrors.security}</p>
+                )}
+              </div>
+              <div>
+                <Label>Account</Label>
+                <Select value={linkAccountId} onValueChange={(v) => setLinkAccountId(v ?? "")}>
+                  <SelectTrigger>
+                    <SelectValue placeholder={linkSecurityId ? "Choose an account" : "Pick a security first"} />
+                  </SelectTrigger>
+                  <SelectContent>
+                    {eligibleAccountsForLink.length === 0 ? (
+                      <SelectItem value="__none__" disabled>
+                        {linkSecurityId ? "No eligible accounts" : "Pick a security first"}
+                      </SelectItem>
+                    ) : (
+                      eligibleAccountsForLink.map((a) => (
+                        <SelectItem key={a.id} value={String(a.id)}>
+                          {a.name} <span className="text-muted-foreground">({a.currency})</span>
+                        </SelectItem>
+                      ))
+                    )}
+                  </SelectContent>
+                </Select>
+                {linkErrors.account && (
+                  <p className="text-xs text-rose-600 mt-1">{linkErrors.account}</p>
+                )}
+              </div>
+              <p className="text-xs text-muted-foreground">
+                Creates the position in that account. Add quantity and cost basis by
+                recording a transaction.
+              </p>
+              <DialogFooter>
+                <Button variant="outline" onClick={() => setAddOpen(false)} disabled={linking}>
+                  Cancel
+                </Button>
+                <Button onClick={submitLink} disabled={linking}>
+                  {linking ? "Adding…" : "Add to account"}
+                </Button>
+              </DialogFooter>
+            </div>
+          ) : (
             <HoldingEditForm
               onCancel={() => setAddOpen(false)}
               onSave={(result) => {
