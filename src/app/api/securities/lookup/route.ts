@@ -16,7 +16,7 @@
  */
 
 import { apiHandler } from "@/lib/api-handler";
-import { fetchQuote } from "@/lib/price-service";
+import { fetchQuoteLive } from "@/lib/price-service";
 import { symbolToCoinGeckoId, getCryptoPrice } from "@/lib/crypto-service";
 
 export const GET = apiHandler(
@@ -40,9 +40,12 @@ export const GET = apiHandler(
       return { found: false, isCrypto: true };
     }
 
-    // Stock / ETF path (Yahoo). `fetchQuote` falls back to name=symbol when
-    // there's no shortName — in that case there's no real description.
-    const quote = await fetchQuote(symbol).catch(() => null);
+    // Stock / ETF path (Yahoo). Must be the LIVE fetch — a cache-aware
+    // `fetchQuote` would return name=symbol on a warm cache (price_cache has no
+    // name column), which we'd discard as "no name". Live always carries the
+    // `shortName`. `fetchQuoteLive` falls back to name=symbol only when Yahoo
+    // itself has no shortName.
+    const quote = await fetchQuoteLive(symbol).catch(() => null);
     if (!quote) return { found: false, isCrypto: false };
     const name =
       quote.name && quote.name.trim().toUpperCase() !== symbol.toUpperCase()
