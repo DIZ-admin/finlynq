@@ -1430,6 +1430,20 @@ export const emailImportRules = pgTable(
     categoryId: integer("category_id").references(() => categories.id, {
       onDelete: "set null",
     }),
+    // FINLYNQ-189 (2026-06-17) — optional transfer destination. NULL ⇒
+    // category/expense mode (today's behavior). When set, a matched email
+    // records a TRANSFER from `account_id` (outflow/source) → this account
+    // (inflow) via the canonical web transfer write path (resolveTransferCategoryId
+    // → the "Transfer" category, FINLYNQ-131; one server-generated link_id),
+    // and `category_id` is ignored (mutually exclusive). v1 is SAME-CURRENCY
+    // only — the record path refuses a cross-currency source/dest pair. ON
+    // DELETE SET NULL (like category_id): deleting the dest account clears the
+    // destination (rule degrades to category mode), never cascade-deletes the
+    // rule the way the NOT-NULL source account_id does.
+    transferDestAccountId: integer("transfer_dest_account_id").references(
+      () => accounts.id,
+      { onDelete: "set null" },
+    ),
     // 'auto' (auto-record) | 'review' (resolve account, wait for a click).
     mode: text("mode").notNull().default("auto"),
     // 2026-06-16 — v1 transforms applied in the single materialize path before
