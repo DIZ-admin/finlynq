@@ -7,7 +7,7 @@ import type { SortableColumnId } from "@/lib/transactions/columns";
 import { computeReportingFields } from "@/lib/fx/reporting-amount";
 import { getDisplayCurrency } from "@/lib/fx-service";
 
-const { accounts, categories, transactions, portfolioHoldings, budgets, budgetTemplates } = schema;
+const { accounts, categories, transactions, portfolioHoldings, securities, budgets, budgetTemplates } = schema;
 
 /** Dialect-safe month extraction: strftime for SQLite, to_char for PG */
 function monthExpr(dateCol: typeof transactions.date | typeof transactions.date): SQL<string> {
@@ -300,6 +300,12 @@ export async function getTransactions(userId: string, filters?: TxSortFilter) {
       portfolioHoldingId: transactions.portfolioHoldingId,
       portfolioHoldingNameCt: portfolioHoldings.nameCt,
       portfolioHoldingSymbolCt: portfolioHoldings.symbolCt,
+      // Securities master read-flip: the centralized identity for this holding.
+      // The route prefers these over the per-position name/symbol when the flag
+      // is on, so a renamed security (e.g. a cash sleeve "Cash USD") shows in
+      // the ledger instead of the stale position name.
+      securityNameCt: securities.nameCt,
+      securitySymbolCt: securities.symbolCt,
       note: transactions.note,
       payee: transactions.payee,
       tags: transactions.tags,
@@ -322,6 +328,7 @@ export async function getTransactions(userId: string, filters?: TxSortFilter) {
     .leftJoin(accounts, eq(transactions.accountId, accounts.id))
     .leftJoin(categories, eq(transactions.categoryId, categories.id))
     .leftJoin(portfolioHoldings, eq(transactions.portfolioHoldingId, portfolioHoldings.id))
+    .leftJoin(securities, eq(portfolioHoldings.securityId, securities.id))
     .where(and(...conditions))
     .orderBy(...orderClauses)
     .limit(filters?.limit ?? 100)
