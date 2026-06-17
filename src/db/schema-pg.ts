@@ -695,10 +695,14 @@ export const users = pgTable(
     // bumps this column. The login flow reads it and passes through to
     // deriveKEK so unrotated rows still unwrap with the old pepper.
     pepperVersion: integer("pepper_version").notNull().default(1),
-    // 2026-05-28 Phase 5 — base currency for realized-gain accounting.
-    // Distinct from `settings.display_currency` (UI presentation) — base
-    // currency drives the lot-level realized-gain math in base.
-    baseCurrency: text("base_currency").notNull().default("USD"),
+    // FINLYNQ-183 (2026-06-17): the former `base_currency` column was dropped.
+    // The app now has ONE user-facing currency (`settings.display_currency`),
+    // which also serves as the realized-gain accounting basis. The physical
+    // DROP COLUMN ships via the LOOSE migration path
+    // (scripts/migrate-drop-base-currency.sql), applied manually after deploy
+    // per docs/migrations.md (code-first, then SQL). This schema is safe to
+    // run while the column still exists — Drizzle selects explicit columns and
+    // the column's NOT NULL DEFAULT 'USD' covers any inserts in the gap.
     createdAt: text("created_at").notNull(),
     updatedAt: text("updated_at").notNull(),
   },
