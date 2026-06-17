@@ -18,12 +18,11 @@
 
 import { NextRequest, NextResponse } from "next/server";
 import { requireAuth } from "@/lib/auth/require-auth";
+import { parseGroupOrder, type AccountGroupOrder } from "@/lib/accounts/groups";
 import {
   getAccountGroupOrder,
   setAccountGroupOrder,
-  parseGroupOrder,
-  type AccountGroupOrder,
-} from "@/lib/accounts/groups";
+} from "@/lib/accounts/groups-server";
 
 export const dynamic = "force-dynamic";
 

@@ -1,27 +1,26 @@
 /**
- * Account-group customization helpers (FINLYNQ-179).
+ * Account-group customization — PURE, DB-FREE helpers (FINLYNQ-179).
  *
  * `accounts.group` is a free-text column — the backend has always been
  * flexible; the historical constraint was purely a hard-coded UI dropdown.
- * This module is the single source of truth for:
  *
+ * This module is **client-safe**: it contains ONLY pure functions + constants
+ * and imports NOTHING from the DB layer. Client components (`group-field.tsx`,
+ * `manage-groups-dialog.tsx`, the `"use client"` accounts page) import from
+ * HERE. The server-only DB/settings/rename functions live in the sibling
+ * [groups-server.ts](./groups-server.ts) (which imports `@/db` → `pg`) and are
+ * imported ONLY by API routes — keeping `pg`/`dns` out of the browser bundle.
+ *
+ * Single source of truth for:
  *   1. The seeded default group names per account type (A=Asset, L=Liability).
  *      The create/edit combobox suggests these UNION the user's own existing
  *      groups (live-derived, no migration).
- *   2. The per-user group display ORDER, persisted under the `account_group_order`
- *      key in the `settings` key/value table — NO migration (mirrors the
- *      `reconcile_hidden_accounts` / `email_retention_days` precedent).
- *   3. The owner-scoped bulk rename / merge-into-Other operations, which are a
- *      plain `UPDATE accounts SET "group"=? WHERE "group"=? AND user_id=?`
- *      (the `group` column is plaintext, not DEK-encrypted — no crypto needed).
+ *   2. The per-user group display ORDER schema + parse (the `account_group_order`
+ *      settings value), de-dupe, suggestion-union, and section-ordering.
  *
- * Groups stay scoped per account type. The pure cores never throw — a
- * malformed stored order degrades to "no custom order" (alphabetical/default
- * fallback) rather than breaking the accounts page.
+ * The pure cores never throw — a malformed stored order degrades to "no custom
+ * order" (alphabetical/default fallback) rather than breaking the accounts page.
  */
-
-import { db, schema } from "@/db";
-import { and, eq, sql } from "drizzle-orm";
 
 export const ACCOUNT_GROUP_ORDER_KEY = "account_group_order";
 
@@ -46,7 +45,9 @@ export type AccountGroupOrder = Record<AccountGroupType, string[]>;
 
 export const EMPTY_GROUP_ORDER: AccountGroupOrder = { A: [], L: [] };
 
-function normalizeGroupName(value: unknown): string | null {
+/** Trim + reject blank/non-string. Exported so the server module reuses the
+ *  exact same normalization in the bulk-rename guard. */
+export function normalizeGroupName(value: unknown): string | null {
   if (typeof value !== "string") return null;
   const trimmed = value.trim();
   return trimmed ? trimmed : null;
@@ -133,73 +134,4 @@ export function orderGroups(
     if (ra !== rb) return ra - rb;
     return fallbackCompare(a, b);
   });
-}
-
-/** Read the per-user saved group order. Empty when unset. */
-export async function getAccountGroupOrder(userId: string): Promise<AccountGroupOrder> {
-  const row = await db
-    .select({ value: schema.settings.value })
-    .from(schema.settings)
-    .where(
-      and(
-        eq(schema.settings.key, ACCOUNT_GROUP_ORDER_KEY),
-        eq(schema.settings.userId, userId),
-      ),
-    )
-    .get();
-  return parseGroupOrder(row?.value);
-}
-
-/** Persist the per-user saved group order (normalized). */
-export async function setAccountGroupOrder(
-  userId: string,
-  order: AccountGroupOrder,
-): Promise<AccountGroupOrder> {
-  const normalized: AccountGroupOrder = {
-    A: dedupeGroups(order.A ?? []),
-    L: dedupeGroups(order.L ?? []),
-  };
-  const value = JSON.stringify(normalized);
-  await db
-    .insert(schema.settings)
-    .values({ key: ACCOUNT_GROUP_ORDER_KEY, userId, value })
-    .onConflictDoUpdate({
-      target: [schema.settings.key, schema.settings.userId],
-      set: { value },
-    });
-  return normalized;
-}
-
-/**
- * Owner-scoped bulk rename of an account group. Moves every account in `from`
- * (case-insensitive match, optionally scoped to an account `type`) into `to`.
- * Returns the number of rows touched. Touches ONLY the calling user's rows.
- *
- * When `to` is "Other" this doubles as a merge-into-Other.
- */
-export async function renameAccountGroup(
-  userId: string,
-  from: string,
-  to: string,
-  type?: AccountGroupType,
-): Promise<number> {
-  const fromName = normalizeGroupName(from);
-  const toName = normalizeGroupName(to);
-  if (!fromName || !toName) return 0;
-  if (fromName.toLowerCase() === toName.toLowerCase()) return 0;
-
-  const conditions = [
-    eq(schema.accounts.userId, userId),
-    // Case-insensitive match so "savings" renames "Savings" too.
-    sql`lower(${schema.accounts.group}) = lower(${fromName})`,
-  ];
-  if (type) conditions.push(eq(schema.accounts.type, type));
-
-  // Await the builder directly (don't call .run()) and read the driver's
-  // rowCount for a portable touched-count — mirrors email-import/cleanup.ts.
-  const result = await db
-    .update(schema.accounts)
-    .set({ group: toName })
-    .where(and(...conditions));
-  return (result as unknown as { rowCount?: number }).rowCount ?? 0;
 }

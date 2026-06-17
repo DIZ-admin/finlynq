@@ -16,7 +16,8 @@
 
 import { z } from "zod";
 import { apiHandler } from "@/lib/api-handler";
-import { renameAccountGroup, type AccountGroupType } from "@/lib/accounts/groups";
+import { type AccountGroupType } from "@/lib/accounts/groups";
+import { renameAccountGroup } from "@/lib/accounts/groups-server";
 
 export const dynamic = "force-dynamic";
 
