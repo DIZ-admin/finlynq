@@ -35,6 +35,7 @@ import { decryptField } from "@/lib/crypto/envelope";
 // stream-d-backfill + stream-d-phase3-null helpers deleted. Canonicalize
 // remains and reads ciphertext directly.
 import { enqueueCanonicalizePortfolioNames } from "@/lib/crypto/stream-d-canonicalize-portfolio";
+import { enqueueBackfillSecurities } from "@/lib/securities/backfill";
 import { enqueueUpgradeStagingEncryption } from "@/lib/email-import/upgrade-staging-encryption";
 import { enqueueProcessPendingInbox } from "@/lib/email-import/process-pending-inbox";
 import { enqueueUpgradeUserFieldEncryption } from "@/lib/crypto/upgrade-user-fields";
@@ -217,6 +218,8 @@ export async function POST(request: NextRequest) {
     attemptCounter.delete(pendingJti);
     // Stream D Phase 4: only canonicalization remains. See login route.
     enqueueCanonicalizePortfolioNames(user.id, pendingDek);
+    // Securities master (Phase C) — cluster positions under securities. See login route.
+    enqueueBackfillSecurities(user.id, pendingDek);
     // Staging encryption upgrade — see login route for rationale.
     enqueueUpgradeStagingEncryption(user.id, pendingDek);
     // Plaintext-gap closure backstop (2026-06-01) — see login route.

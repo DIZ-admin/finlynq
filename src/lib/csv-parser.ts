@@ -3,6 +3,7 @@ import { and, eq } from "drizzle-orm";
 import { generateImportHash, checkDuplicates } from "./import-hash";
 import type { RawTransaction } from "./import-pipeline";
 import { buildNameFields, decryptName, nameLookup } from "./crypto/encrypted-columns";
+import { resolveOrCreateSecurity } from "./securities/resolve";
 // `parseAmount` moved to the dependency-free `./parse-amount` module
 // (2026-06-04) so client components can import it without pulling this file's
 // server-only `@/db` dependency into the browser bundle. Imported here for
@@ -550,6 +551,15 @@ export async function importPortfolio(csvText: string, userId: string, dek: Buff
           name: row["Portfolio holding name"],
           symbol: row["Symbol"] || null,
         });
+        // Securities master (Phase B) — resolve the shared identity first.
+        const holdingCurrency = row["Currency"] ?? "CAD";
+        const securityId = await resolveOrCreateSecurity(userId, dek, {
+          symbol: row["Symbol"] || null,
+          name: row["Portfolio holding name"],
+          isCryptoFlag: false,
+          isCash: false,
+          currency: holdingCurrency,
+        });
         // Issue #205 — capture id via RETURNING + dual-write holding_accounts.
         // Without the pairing, every aggregator (issue #25) silently drops
         // transactions for this holding because the JOIN through
@@ -558,7 +568,8 @@ export async function importPortfolio(csvText: string, userId: string, dek: Buff
           .values({
             userId,
             accountId: account.id,
-            currency: row["Currency"] ?? "CAD",
+            currency: holdingCurrency,
+            securityId,
             note: row["Note"] ?? "",
             ...enc,
           })

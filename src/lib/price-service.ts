@@ -160,9 +160,12 @@ async function writePriceCache(
 
 /**
  * Fetch a single live quote from Yahoo Finance — bypasses cache.
- * Internal use only; callers should prefer `fetchQuote` (cache-aware).
+ * Most callers should prefer `fetchQuote` (cache-aware). The exception is name
+ * resolution: `price_cache` has NO name column, so a warm `fetchQuote` hit
+ * returns `name === symbol` — anything that actually needs the `shortName`
+ * (e.g. the Add-security lookup) must call this LIVE path instead.
  */
-async function fetchQuoteLive(symbol: string): Promise<QuoteResult | null> {
+export async function fetchQuoteLive(symbol: string): Promise<QuoteResult | null> {
   try {
     const res = await fetch(
       `${YAHOO_BASE}/chart/${encodeURIComponent(symbol)}?interval=1d&range=1d`,

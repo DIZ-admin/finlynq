@@ -19,6 +19,7 @@ import { requireEncryption } from "@/lib/auth/require-encryption";
 import { requireAuth } from "@/lib/auth/require-auth";
 import { validateBody, safeErrorMessage, logApiError } from "@/lib/validate";
 import { buildNameFields } from "@/lib/crypto/encrypted-columns";
+import { resolveOrCreateSecurity } from "@/lib/securities/resolve";
 
 const postSchema = z.object({
   accountId: z.number().int().positive(),
@@ -71,6 +72,14 @@ export async function POST(request: NextRequest) {
     }
 
     const enc = buildNameFields(auth.dek, { name });
+    // Securities master (Phase B) — cash sleeve clusters as cash#<CCY>.
+    const securityId = await resolveOrCreateSecurity(auth.userId, auth.dek, {
+      symbol: null,
+      name,
+      isCryptoFlag: false,
+      isCash: true,
+      currency: ccy,
+    });
 
     try {
       const inserted = await db
@@ -81,6 +90,7 @@ export async function POST(request: NextRequest) {
           currency: ccy,
           isCrypto: 0,
           isCash: true,
+          securityId,
           note: "",
           ...enc,
         })

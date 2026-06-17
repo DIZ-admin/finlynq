@@ -27,6 +27,7 @@ import { validateBody, safeErrorMessage, logApiError } from "@/lib/validate";
 import { isSortableColumnId } from "@/lib/transactions/columns";
 import { isTransactionSource, type TransactionSource } from "@/lib/tx-source";
 import { verifyOwnership, OwnershipError } from "@/lib/verify-ownership";
+import { securitiesReadEnabledForUser } from "@/lib/securities/flag";
 
 const postSchema = z.object({
   date: z.string(),
@@ -234,6 +235,11 @@ export async function GET(request: NextRequest) {
   // rows + DEK-mismatch users) via decryptName's ladder. Without the
   // category + account decrypts, the /transactions page and the Reports
   // tabs render empty cells for every Phase-3-NULL'd user.
+  // Securities master read-flip — when on, the displayed holding identity comes
+  // from the centralized `securities` row (single source of truth), so a renamed
+  // security (e.g. a cash sleeve "Cash USD") shows here, not the stale position
+  // name. Off / unlinked → the holding's own name (legacy behavior).
+  const securitiesRead = await securitiesReadEnabledForUser(userId);
   decrypted = decrypted.map((r) => {
     const row = r as typeof r & {
       accountName?: string | null;
@@ -246,31 +252,51 @@ export async function GET(request: NextRequest) {
       portfolioHoldingNameCt?: string | null;
       portfolioHoldingSymbol?: string | null;
       portfolioHoldingSymbolCt?: string | null;
+      securityNameCt?: string | null;
+      securitySymbolCt?: string | null;
       portfolioHolding?: string | null;
     };
     row.accountName = decryptName(row.accountNameCt, dek, row.accountName);
     row.accountAlias = decryptName(row.accountAliasCt, dek, row.accountAlias);
     row.categoryName = decryptName(row.categoryNameCt, dek, row.categoryName);
-    let resolvedHolding: string | null = row.portfolioHoldingName ?? null;
-    if (!resolvedHolding && row.portfolioHoldingNameCt && dek) {
+    // Holding name — prefer the security's name when the read-flip is on.
+    let resolvedHolding: string | null = null;
+    if (securitiesRead && row.securityNameCt && dek) {
       try {
-        resolvedHolding = decryptField(dek, row.portfolioHoldingNameCt);
+        resolvedHolding = decryptField(dek, row.securityNameCt);
       } catch {
         resolvedHolding = null;
       }
     }
+    if (!resolvedHolding) {
+      resolvedHolding = row.portfolioHoldingName ?? null;
+      if (!resolvedHolding && row.portfolioHoldingNameCt && dek) {
+        try {
+          resolvedHolding = decryptField(dek, row.portfolioHoldingNameCt);
+        } catch {
+          resolvedHolding = null;
+        }
+      }
+    }
     row.portfolioHolding = resolvedHolding;
-    row.portfolioHoldingSymbol = decryptName(
-      row.portfolioHoldingSymbolCt,
-      dek,
-      row.portfolioHoldingSymbol,
-    );
+    // Symbol — same preference. The security's symbol equals the holding's for
+    // tickered rows; null for cash → falls back to the holding's.
+    let resolvedSymbol: string | null = null;
+    if (securitiesRead && row.securitySymbolCt) {
+      resolvedSymbol = decryptName(row.securitySymbolCt, dek, null);
+    }
+    if (resolvedSymbol == null) {
+      resolvedSymbol = decryptName(row.portfolioHoldingSymbolCt, dek, row.portfolioHoldingSymbol);
+    }
+    row.portfolioHoldingSymbol = resolvedSymbol;
     delete row.accountNameCt;
     delete row.accountAliasCt;
     delete row.categoryNameCt;
     delete row.portfolioHoldingName;
     delete row.portfolioHoldingNameCt;
     delete row.portfolioHoldingSymbolCt;
+    delete row.securityNameCt;
+    delete row.securitySymbolCt;
     return row;
   });
 

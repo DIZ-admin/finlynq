@@ -8,6 +8,7 @@ import { requireAuth } from "@/lib/auth/require-auth";
 import { requireEncryption } from "@/lib/auth/require-encryption";
 import { buildNameFields, decryptNamedRows } from "@/lib/crypto/encrypted-columns";
 import { isCryptoSymbol } from "@/lib/fx/supported-currencies";
+import { resolveOrCreateSecurity } from "@/lib/securities/resolve";
 
 export async function GET(request: NextRequest) {
   const auth = await requireAuth(request); if (!auth.authenticated) return auth.response;
@@ -100,12 +101,21 @@ export async function POST(request: NextRequest) {
     // Stream D Phase 4 — plaintext name/symbol dropped; encrypt + dual-write
     // ct/lookup pair via buildNameFields.
     const enc = buildNameFields(auth.dek, { name, symbol: symbol.toUpperCase() });
+    // Securities master (Phase B) — clusters as crypto:<symbol_lookup>.
+    const securityId = await resolveOrCreateSecurity(userId, auth.dek, {
+      symbol: symbol.toUpperCase(),
+      name,
+      isCryptoFlag: true,
+      isCash: false,
+      currency: currency ?? "CAD",
+    });
     const holding = await db
       .insert(schema.portfolioHoldings)
       .values({
         accountId: accountId ?? null,
         currency: currency ?? "CAD",
         isCrypto: 1,
+        securityId,
         note: note ?? "",
         userId,
         ...enc,

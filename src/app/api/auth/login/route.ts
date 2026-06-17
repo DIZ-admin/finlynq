@@ -50,6 +50,7 @@ import { putDEK } from "@/lib/crypto/dek-cache";
 // `stream-d-phase3-null` (NULLs plaintext after backfill) are obsolete with
 // no plaintext source; both helpers were deleted.
 import { enqueueCanonicalizePortfolioNames } from "@/lib/crypto/stream-d-canonicalize-portfolio";
+import { enqueueBackfillSecurities } from "@/lib/securities/backfill";
 import { enqueueUpgradeStagingEncryption } from "@/lib/email-import/upgrade-staging-encryption";
 import { enqueueProcessPendingInbox } from "@/lib/email-import/process-pending-inbox";
 import { enqueueUpgradeUserFieldEncryption } from "@/lib/crypto/upgrade-user-fields";
@@ -269,6 +270,11 @@ export async function POST(request: NextRequest) {
       // "Cash <CCY>"). User-defined positions keep their free-text name.
       // Bails silently for DEK-mismatch users — sample-decrypt precondition.
       enqueueCanonicalizePortfolioNames(user.id, dek);
+      // Securities master (Phase C, 2026-06-16): cluster existing positions
+      // under `securities` rows + set security_id, using the same canonicalKey
+      // partition as the read aggregators. Idempotent, fire-and-forget,
+      // DEK-bearing — runs once per user (users.securities_backfilled_at).
+      enqueueBackfillSecurities(user.id, dek);
       // Service→user staging-row encryption upgrade (2026-05-06). Flips this
       // user's pending email-staged rows from PF_STAGING_KEY to user-DEK so
       // the 60-day window isn't service-key-decryptable for active users.

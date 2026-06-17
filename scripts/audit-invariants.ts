@@ -261,6 +261,47 @@ const BASELINE_EXCEPTIONS: Record<string, string> = {
   // exception for the note invariant.
   "mcp-server/register-core-tools.ts:note-columns-encrypted":
     "stdio MCP has no DEK; writes plaintext note/payee/tags by design — the login sweep (upgradeUserFieldEncryption) encrypts them on next HTTP login.",
+  // Securities master (Phase B). The backup-RESTORE path bulk-inserts
+  // portfolio_holdings rows verbatim from the user's encrypted backup
+  // (already-encrypted symbol_ct/name_ct, no decrypted symbol available at the
+  // bulk-insert boundary). Resolving a security per row would require
+  // decrypting each row mid-restore; instead the login-time backfill
+  // (backfillSecuritiesForUser) reconciles security_id on the user's next
+  // login — the same backstop that covers stdio/DEK-less writes. Accepted.
+  "src/app/api/data/import/route.ts:securities-dual-write":
+    "backup restore bulk-inserts pre-encrypted rows; login-time backfillSecuritiesForUser populates security_id on next login (same backstop as DEK-less writes).",
+  // The /settings/securities "link to account" POST creates a position that
+  // copies an EXISTING, user-selected security row (security_id set explicitly
+  // from sec.id). resolveOrCreateSecurity would be redundant — the security is
+  // already resolved by definition. Accepted.
+  "src/app/api/securities/route.ts:securities-dual-write":
+    "links to a pre-resolved security; the INSERT sets security_id explicitly from the chosen securities row (resolveOrCreateSecurity would be redundant).",
+  // ── securities-dual-write-on-edit baseline exceptions ──────────────────────
+  // These UPDATE portfolio_holdings but NEVER move a position's cluster, so a
+  // re-resolve would be a no-op. The cluster key is HMAC(symbol)/currency/
+  // HMAC(name) — none of these sites touch the field that keys the cluster.
+  //
+  // holding-accounts: only sets `account_id` (the primary-pairing mirror) on
+  // the holding; identity (symbol/name/currency/isCrypto) is untouched.
+  "src/app/api/holding-accounts/route.ts:securities-dual-write-on-edit":
+    "only updates account_id (primary-pairing mirror); never touches symbol/name/currency/isCrypto, so the cluster_key — and security_id — cannot change.",
+  // canonicalize: rewrites name_ct back to the canonical form (symbol / "Cash"
+  // / "Cash <CCY>") for ALREADY-canonical (tickered/cash) rows. Those cluster
+  // on HMAC(symbol)/currency, never name, so the cluster is invariant; custom
+  // rows (the only name-keyed cluster) are never rewritten by classify().
+  "src/lib/crypto/stream-d-canonicalize-portfolio.ts:securities-dual-write-on-edit":
+    "rewrites name_ct to canonical form for tickered/cash rows only; their cluster keys on symbol/currency (not name), so security_id is invariant. Runs at login alongside the backfill.",
+  // backfill: backfillSecuritiesForUser IS the security-assignment path — its
+  // UPDATE sets security_id from its own inline cluster resolution (the
+  // resolveOrCreateSecurity logic, not the helper). Self-referential.
+  "src/lib/securities/backfill.ts:securities-dual-write-on-edit":
+    "the login-time backfill itself — sets security_id from its own inline cluster resolution (resolveOrCreateSecurity would be redundant/self-referential).",
+  // The PATCH (rename) copies the security's NEW name_ct/name_lookup down onto
+  // its member positions so the per-position holding name stays in sync. It does
+  // NOT change a position's security_id — the positions stay linked to the same
+  // (renamed) security — so this is a name copy, not a re-cluster.
+  "src/app/api/securities/route.ts:securities-dual-write-on-edit":
+    "PATCH copies the security's renamed name onto its member positions (name_ct/name_lookup); security_id is unchanged, so no re-cluster / resolveOrCreateSecurity needed.",
 };
 
 interface InvariantConfig {
@@ -537,6 +578,37 @@ const INVARIANTS: InvariantConfig[] = [
     writeSite: /ARRAY\[\s*\$\{[^}]*\}\s*\]::TEXT\[\]/,
     requiredHelper: /\bencryptStagingMeta\s*\(/,
     helperName: "encryptStagingMeta (tier-aware filename encrypt)",
+  },
+  {
+    // Securities master (Tier 2, 2026-06-16) — every position INSERT must
+    // resolve a security_id so the new identity table stays populated for the
+    // read-flip. Mirrors the holding_accounts dual-write invariant. The
+    // login-time backfill is the backstop, but the write-time resolve keeps
+    // new positions linked immediately. → docs/architecture/securities.md
+    id: "securities-dual-write",
+    description:
+      "every portfolio_holdings INSERT must resolve a security_id via resolveOrCreateSecurity (securities master Phase B)",
+    fileGlobs: ["src/", "mcp-server/"],
+    writeSite:
+      /db\s*\.\s*insert\(\s*(?:schema\.)?portfolioHoldings\s*\)|INSERT\s+INTO\s+portfolio_holdings\b/,
+    requiredHelper: /\bresolveOrCreateSecurity\s*\(/,
+    helperName: "resolveOrCreateSecurity (securities master dual-write)",
+  },
+  {
+    // Securities master edit-path (P0 fix, 2026-06-16) — an UPDATE that changes
+    // a position's identity (symbol/name/currency/isCrypto) must re-resolve the
+    // security so the row re-clusters under the NEW identity instead of clinging
+    // to a stale security_id (GOOGL → GOOG). Sibling of securities-dual-write;
+    // baseline-excepts the UPDATE sites that never move a cluster (account_id
+    // mirror, name-canonicalize, the backfill itself). → securities.md §edit-path
+    id: "securities-dual-write-on-edit",
+    description:
+      "every portfolio_holdings identity UPDATE must re-resolve security_id via resolveOrCreateSecurity (securities master edit-path fix)",
+    fileGlobs: ["src/", "mcp-server/"],
+    writeSite:
+      /db\s*\.\s*update\(\s*(?:schema\.)?portfolioHoldings\s*\)|UPDATE\s+portfolio_holdings\b/,
+    requiredHelper: /\bresolveOrCreateSecurity\s*\(/,
+    helperName: "resolveOrCreateSecurity (securities master edit-path re-resolve)",
   },
 ];
 

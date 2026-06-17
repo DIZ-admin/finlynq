@@ -38,6 +38,7 @@ import { db, schema } from "@/db";
 import { and, eq } from "drizzle-orm";
 import { decryptField } from "@/lib/crypto/envelope";
 import { buildNameFields, nameLookup } from "@/lib/crypto/encrypted-columns";
+import { resolveOrCreateSecurity, loadActiveCurrencyCodes } from "@/lib/securities/resolve";
 
 export interface HoldingResolver {
   /**
@@ -113,6 +114,11 @@ export async function buildHoldingResolver(
     .all();
   for (const a of accountRows) accountCurrency.set(a.id, a.currency);
 
+  // Securities master (Phase B) — load the user's active-currency codes once so
+  // every auto-created holding's security resolves with the SAME cash-symbol
+  // rule overview uses (exact clustering parity), without a per-create query.
+  const activeCurrencyCodes = await loadActiveCurrencyCodes(userId);
+
   let created = 0;
 
   const resolve = async (
@@ -143,6 +149,17 @@ export async function buildHoldingResolver(
     // Auto-create. Build the encrypted name fields if we have a DEK.
     const enc = buildNameFields(dek ?? null, { name: trimmed });
     const currency = accountCurrency.get(accountId) ?? "CAD";
+    // Securities master (Phase B) — resolve the security identity first, then
+    // link it on the new position. No symbol → clusters as cash-<currency>,
+    // matching how overview classifies symbol-less holdings.
+    const securityId = await resolveOrCreateSecurity(userId, dek ?? null, {
+      symbol: null,
+      name: trimmed,
+      isCryptoFlag: false,
+      isCash: false,
+      currency,
+      extraCurrencyCodes: activeCurrencyCodes,
+    });
     try {
       // Stream D Phase 4 — plaintext name/symbol dropped; encrypted siblings only.
       const insertedRow = await db
@@ -152,6 +169,7 @@ export async function buildHoldingResolver(
           accountId,
           currency,
           isCrypto: 0,
+          securityId,
           note: "auto-created from import",
           ...enc,
         })

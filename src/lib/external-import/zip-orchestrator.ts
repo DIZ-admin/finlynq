@@ -30,6 +30,7 @@ import {
 } from "@/lib/import-pipeline";
 import { signConfirmationToken, verifyConfirmationToken } from "@/lib/mcp/confirmation-token";
 import { encryptSplitWrite, nameLookup as computeNameLookup } from "@/lib/crypto/encrypted-columns";
+import { resolveOrCreateSecurity, loadActiveCurrencyCodes } from "@/lib/securities/resolve";
 import { invalidateUser as invalidateUserTxCache } from "@/lib/mcp/user-tx-cache";
 import {
   loadConnectorMapping,
@@ -341,8 +342,12 @@ async function syncPortfolioHoldings(
     nameLookup?: string | null;
     symbolCt?: string | null;
     symbolLookup?: string | null;
+    // Securities master (Phase B) — resolved per row below.
+    securityId?: number | null;
   };
   const toInsert: HoldingInsert[] = [];
+  // Load the active-currency codes once for clustering parity.
+  const activeCurrencyCodes = await loadActiveCurrencyCodes(userId);
 
   for (const [holdingName, info] of parsed.portfolioByHolding) {
     const brokerageExt = accountsByName.get(info.brokerageAccount);
@@ -352,16 +357,26 @@ async function syncPortfolioHoldings(
     const lookupKey = dek ? computeNameLookup(dek, holdingName) : "";
     const key = `${finlynqAccountId}|${lookupKey}`;
     if (lookupKey && existingKeys.has(key)) continue;
+    const holdingCurrency = info.currency || "CAD";
     const enc = buildNameFields(dek ?? null, {
       name: holdingName,
       symbol: info.symbol || null,
     });
+    const securityId = await resolveOrCreateSecurity(userId, dek ?? null, {
+      symbol: info.symbol || null,
+      name: holdingName,
+      isCryptoFlag: false,
+      isCash: false,
+      currency: holdingCurrency,
+      extraCurrencyCodes: activeCurrencyCodes,
+    });
     toInsert.push({
       userId,
       accountId: finlynqAccountId,
-      currency: info.currency || "CAD",
+      currency: holdingCurrency,
       isCrypto: 0,
       note: "",
+      securityId,
       ...enc,
     });
     existingKeys.add(key);
