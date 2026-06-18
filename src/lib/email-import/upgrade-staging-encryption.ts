@@ -18,7 +18,7 @@
  * Failure handling: per-row try/catch. If decrypt-then-encrypt fails for one
  * row (corrupted ciphertext, DEK eviction race), the row stays at service-tier
  * and the next login retries. Never throws into the caller — fire-and-forget,
- * mirrors `enqueueCanonicalizePortfolioNames`.
+ * mirrors `enqueueBackfillSecurities`.
  *
  * `import_hash` is NEVER touched. CLAUDE.md load-bearing rule: hash is computed
  * from plaintext payee at ingest and must remain stable across the upgrade so
