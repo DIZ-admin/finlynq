@@ -2,7 +2,7 @@
 import { db, schema } from "@/db";
 import { eq, and, isNotNull, sql, ne } from "drizzle-orm";
 import { alias } from "drizzle-orm/pg-core";
-import { fetchMultipleQuotes, aggregatePortfolioExposure, getEtfRegionBreakdown, getEtfSectorBreakdown, getEtfTopHoldings, getAvailableEtfSymbols, autoSeedEtfIfMissing } from "@/lib/price-service";
+import { fetchMultipleQuotes, getEtfRegionBreakdown, getEtfSectorBreakdown, getEtfTopHoldings, isEtfQuoteType } from "@/lib/price-service";
 import { getCryptoPrices, symbolToCoinGeckoId } from "@/lib/crypto-service";
 import { getLatestFxRate, convertCurrency, getDisplayCurrency, getRate } from "@/lib/fx-service";
 import { isSupportedCurrency, isMetalCurrency } from "@/lib/fx/supported-currencies";
@@ -426,18 +426,19 @@ export async function GET(request: NextRequest) {
     metricsByHoldingId.set(h.id, toMetrics(fkAgg));
   }
 
-  // 6c. Auto-seed any ETF symbols not yet in the shared ETF database
-  for (const h of nonCryptoWithSymbol) {
-    if (h.symbol) autoSeedEtfIfMissing(h.symbol);
-  }
-
   // 7. Build enriched holdings
   type AssetType = "etf" | "stock" | "crypto" | "cash";
 
   const enrichedHoldings = holdings.map(h => {
     const isCrypto = h.isCrypto === 1 || (h.symbol ? isCryptoSymbol(h.symbol) : false);
     const symbolIsCurrency = isCurrencyCodeSymbol(h.symbol);
-    const isEtf = h.symbol && !symbolIsCurrency ? (getEtfRegionBreakdown(h.symbol) !== null) : false;
+    // FINLYNQ-201: ETF-vs-stock is derived from Yahoo's `quoteType` ('ETF') on
+    // the live quote instead of a hardcoded list (web also layers a user-
+    // settable `securities.asset_type` override; mobile stays on the legacy
+    // read path with no securities join, so it's Yahoo-only here). Null on a
+    // warm price_cache hit → falls back to "stock", which is harmless (cosmetic
+    // badge only; never affects valuations or clustering).
+    const isEtf = h.symbol && !symbolIsCurrency ? isEtfQuoteType(quotes.get(h.symbol)?.quoteType) : false;
 
     let assetType: AssetType = "cash";
     if (isCrypto) assetType = "crypto";
