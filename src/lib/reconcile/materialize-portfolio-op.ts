@@ -91,6 +91,10 @@ export interface MaterializeBankRowAsPortfolioOpInput {
   dek: Buffer;
   bankTransactionId: string;
   action: RecordInvestmentOpAction;
+  /** FINLYNQ-208 — pure modifiers from a multi-action rule (rename_payee /
+   *  set_tags) that ride along onto the recorded op's rows. When unset, the
+   *  op uses the bank row's own payee. */
+  overrides?: { payee?: string | null; tags?: string | null };
 }
 
 interface BankRow {
@@ -149,7 +153,10 @@ export async function materializeBankRowAsPortfolioOp(
 
   const tickerPlain = decodeBankString(bank.encryptionTier, dek, bank.ticker);
   const securityNamePlain = decodeBankString(bank.encryptionTier, dek, bank.securityName);
-  const payeePlain = decodeBankString(bank.encryptionTier, dek, bank.payee) ?? undefined;
+  const payeeFromRow = decodeBankString(bank.encryptionTier, dek, bank.payee) ?? undefined;
+  // FINLYNQ-208 — a multi-action rule's rename_payee / set_tags ride along.
+  const payeePlain = input.overrides?.payee ?? payeeFromRow;
+  const tags = input.overrides?.tags ?? undefined;
 
   // 2. Resolve + ownership-check the investment account.
   const invAcct = await db
@@ -184,20 +191,20 @@ export async function materializeBankRowAsPortfolioOp(
       case "buy":
       case "sell":
         return await runTrade(
-          { userId, dek, action, bank, tickerPlain, securityNamePlain, payeePlain },
+          { userId, dek, action, bank, tickerPlain, securityNamePlain, payeePlain, tags },
           rowVars,
         );
       case "dividend":
       case "interest":
       case "fee":
         return await runHoldingCash(
-          { userId, dek, action, bank, tickerPlain, securityNamePlain, payeePlain },
+          { userId, dek, action, bank, tickerPlain, securityNamePlain, payeePlain, tags },
           rowVars,
         );
       case "deposit":
       case "withdrawal":
         return await runDepositWithdrawal(
-          { userId, dek, action, bank, payeePlain },
+          { userId, dek, action, bank, payeePlain, tags },
           rowVars,
         );
       default: {
@@ -225,6 +232,8 @@ interface OpCtx {
   tickerPlain: string | null;
   securityNamePlain: string | null;
   payeePlain?: string;
+  /** Tags from a multi-action rule's set_tags (FINLYNQ-208). */
+  tags?: string;
 }
 
 async function runTrade(
@@ -276,6 +285,7 @@ async function runTrade(
       totalCost: trade.total,
       date: bank.date,
       payee: ctx.payeePlain,
+      tags: ctx.tags,
       cashSleeveHoldingId: sleeve.id,
       source: "reconcile_link",
     });
@@ -293,6 +303,7 @@ async function runTrade(
     totalProceeds: trade.total,
     date: bank.date,
     payee: ctx.payeePlain,
+    tags: ctx.tags,
     cashSleeveHoldingId: sleeve.id,
     source: "reconcile_link",
     // Lot selection is ALWAYS automatic FIFO (default) — never rule-specified.
@@ -350,6 +361,7 @@ async function runHoldingCash(
     categoryId,
     date: bank.date,
     payee: ctx.payeePlain,
+    tags: ctx.tags,
     source: "reconcile_link",
   });
   await stampLineage(userId, r.txId, bank.id);
@@ -359,7 +371,7 @@ async function runHoldingCash(
 // ─── deposit / withdrawal ────────────────────────────────────────────────────
 
 async function runDepositWithdrawal(
-  ctx: Pick<OpCtx, "userId" | "dek" | "action" | "bank" | "payeePlain">,
+  ctx: Pick<OpCtx, "userId" | "dek" | "action" | "bank" | "payeePlain" | "tags">,
   rowVars: { amount: number | null; quantity: number | null; price: number | null },
 ): Promise<MaterializePortfolioOpResult> {
   const { userId, dek, action, bank } = ctx;
@@ -394,6 +406,7 @@ async function runDepositWithdrawal(
       amount: cash.amount,
       date: bank.date,
       payee: ctx.payeePlain,
+      tags: ctx.tags,
       source: "reconcile_link",
     });
     const linkedTransactionId =
@@ -411,6 +424,7 @@ async function runDepositWithdrawal(
     amount: cash.amount,
     date: bank.date,
     payee: ctx.payeePlain,
+    tags: ctx.tags,
     source: "reconcile_link",
   });
   const linkedTransactionId =

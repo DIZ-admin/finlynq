@@ -44,6 +44,7 @@ import { round2 } from "@/lib/utils/number";
 import { encryptField, tryDecryptField } from "@/lib/crypto/envelope";
 import { decryptStaged } from "@/lib/crypto/staging-envelope";
 import { applyRules, type TransactionRule } from "@/lib/auto-categorize";
+import { computePureActionPatch } from "@/lib/rules/execute";
 import { decryptRuleFields } from "@/lib/rules/crypto";
 import type { Action, ConditionGroup, RecordInvestmentOpAction } from "@/lib/rules/schema";
 import { invalidateUser } from "@/lib/mcp/user-tx-cache";
@@ -1190,11 +1191,18 @@ export async function applyRulesToBankRows(
     }
     rulesFired += 1;
 
+    // Apply the rule's FULL pure-action patch (set_category + set_tags +
+    // rename_payee + set_entered_currency), not just the primary action — so a
+    // multi-action rule materializes ALL of its modifiers, consistent with the
+    // staged / uncategorized paths (FINLYNQ-208, "support multiple actions").
+    const patch = computePureActionPatch(match.actions);
+
     // FINLYNQ-208 — investment-op rule. Takes precedence over category /
     // transfer actions: when the matched rule records a portfolio op, we run
     // the sanctioned investment chokepoint (which lifts the investment-account
     // refusal because it resolves/creates the position + sleeve). Planning mode
-    // (autoMaterialize=false) just reports the match.
+    // (autoMaterialize=false) just reports the match. Pure modifiers
+    // (rename_payee / set_tags) ride along as overrides onto the recorded op.
     const invOp = pickInvestmentOpFromActions(match.actions);
     if (invOp) {
       if (!autoMaterialize) {
@@ -1207,6 +1215,7 @@ export async function applyRulesToBankRows(
         dek: dek!,
         bankTransactionId: bank.id,
         action: invOp,
+        overrides: { payee: patch.payee, tags: patch.tags },
       });
       if (result.ok) {
         materialized += 1;
@@ -1225,7 +1234,7 @@ export async function applyRulesToBankRows(
       continue;
     }
 
-    const categoryId = pickCategoryFromActions(match.actions);
+    const categoryId = patch.categoryId ?? null;
     if (categoryId == null) {
       // Rule matched but its actions don't include a `set_category`. A
       // transfer-only rule (`create_transfer`, no `set_category`) is the
@@ -1337,6 +1346,13 @@ export async function applyRulesToBankRows(
     const notePlain = decodeBankString(bank.encryptionTier, dek, bank.note);
     const tagsPlain = decodeBankString(bank.encryptionTier, dek, bank.tags);
 
+    // Apply the rule's pure modifiers (rename_payee / set_tags /
+    // set_entered_currency) on top of the bank row's own values. A modifier
+    // that the rule didn't set falls back to the bank row's value.
+    const effectivePayee = patch.payee ?? payeePlain;
+    const effectiveTags = patch.tags ?? tagsPlain;
+    const effectiveEnteredCurrency = patch.enteredCurrency ?? bank.enteredCurrency;
+
     // INSERT tx + link in a single DB transaction. The dek non-null
     // assertion is safe — guarded above by the autoMaterialize=>dek check.
     const dekForWrite = dek!;
@@ -1351,13 +1367,13 @@ export async function applyRulesToBankRows(
             categoryId,
             currency: bank.currency,
             amount: bank.amount,
-            enteredCurrency: bank.enteredCurrency,
+            enteredCurrency: effectiveEnteredCurrency,
             enteredAmount: bank.enteredAmount,
             enteredFxRate: bank.enteredFxRate,
             quantity: bank.quantity,
-            payee: encryptField(dekForWrite, payeePlain) ?? "",
+            payee: encryptField(dekForWrite, effectivePayee) ?? "",
             note: encryptField(dekForWrite, notePlain) ?? "",
-            tags: encryptField(dekForWrite, tagsPlain) ?? "",
+            tags: encryptField(dekForWrite, effectiveTags) ?? "",
             importHash: bank.importHash,
             fitId: bank.fitId,
             bankTransactionId: bank.id,
