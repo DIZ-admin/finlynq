@@ -63,6 +63,16 @@ describe("formatCurrency", () => {
     expect(formatCurrency(10, "EUR")).toContain("€");
     expect(formatCurrency(10, "GBP")).toContain("£");
   });
+
+  it("does not throw on a custom / non-ISO-4217 currency code (#291)", () => {
+    // Users can add arbitrary 3-4 letter codes (e.g. "TEST") in Settings.
+    // Intl.NumberFormat({ style: "currency", currency: "TEST" }) throws
+    // RangeError — formatCurrency must degrade gracefully, not crash the page.
+    expect(() => formatCurrency(1234.56, "TEST")).not.toThrow();
+    expect(formatCurrency(1234.56, "TEST")).toBe("TEST 1,234.56");
+    expect(formatCurrency(-1234.56, "TEST")).toBe("-TEST 1,234.56");
+    expect(formatCurrency(1000, "TEST", { decimals: 0 })).toBe("TEST 1,000");
+  });
 });
 
 describe("formatNumber", () => {

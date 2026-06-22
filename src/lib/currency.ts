@@ -29,12 +29,27 @@ export function formatCurrency(
     }).format(Math.abs(amount));
     return `${amount < 0 ? "-" : ""}${symbol}${num}`;
   }
-  return new Intl.NumberFormat("en-CA", {
-    style: "currency",
-    currency,
-    minimumFractionDigits: decimals,
-    maximumFractionDigits: decimals,
-  }).format(amount);
+  try {
+    return new Intl.NumberFormat("en-CA", {
+      style: "currency",
+      currency,
+      minimumFractionDigits: decimals,
+      maximumFractionDigits: decimals,
+    }).format(amount);
+  } catch {
+    // Custom / non-ISO-4217 currency code. Users can add arbitrary 3-4 letter
+    // codes via Settings → "Currencies you use" (+ a custom FX rate), and
+    // `Intl.NumberFormat({ style: "currency", currency })` throws
+    // `RangeError: Invalid currency code` for codes that aren't well-formed
+    // ISO 4217 (e.g. a 4-letter "TEST"). Fall back to a plain decimal with the
+    // code as a prefix so a custom-currency row never crashes the page.
+    const num = new Intl.NumberFormat("en-CA", {
+      minimumFractionDigits: decimals,
+      maximumFractionDigits: decimals,
+    }).format(Math.abs(amount));
+    const code = (currency || "").trim().toUpperCase();
+    return `${amount < 0 ? "-" : ""}${code ? `${code} ` : ""}${num}`;
+  }
 }
 
 export function formatNumber(amount: number): string {
