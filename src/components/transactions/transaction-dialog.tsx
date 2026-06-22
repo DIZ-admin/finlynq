@@ -51,7 +51,7 @@ import { Combobox, type ComboboxItemShape } from "@/components/ui/combobox";
 import { Badge } from "@/components/ui/badge";
 import { useDropdownOrder } from "@/components/dropdown-order-provider";
 import { formatCurrency, formatDate } from "@/lib/currency";
-import { SUPPORTED_FIAT_CURRENCIES } from "@/lib/fx/supported-currencies";
+import { useActiveCurrencies } from "@/lib/hooks/useActiveCurrencies";
 import {
   ArrowRightLeft,
   ChevronDown,
@@ -304,6 +304,8 @@ export function TransactionDialog({
 }: TransactionDialogProps) {
   // Form (transaction mode)
   const [form, setForm] = useState<TransactionFormValues>(FORM_DEFAULTS);
+  // Currency options: built-in fiat UNION the user's active currencies (#291).
+  const currencyOptions = useActiveCurrencies(form.currency);
   const [showAdvanced, setShowAdvanced] = useState(false);
   const [showSplits, setShowSplits] = useState(false);
   const [splitRows, setSplitRows] = useState<SplitRow[]>([emptySplitRow(), emptySplitRow()]);
@@ -1260,7 +1262,7 @@ export function TransactionDialog({
                     <SelectValue />
                   </SelectTrigger>
                   <SelectContent>
-                    {SUPPORTED_FIAT_CURRENCIES.map((c) => (
+                    {currencyOptions.map((c) => (
                       <SelectItem key={c} value={c}>
                         {c}
                       </SelectItem>

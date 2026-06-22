@@ -16,7 +16,7 @@ import { Tabs, TabsContent, TabsList, TabsTrigger } from "@/components/ui/tabs";
 import { Badge } from "@/components/ui/badge";
 import { formatCurrency } from "@/lib/currency";
 import { useDisplayCurrency } from "@/components/currency-provider";
-import { SUPPORTED_FIAT_CURRENCIES } from "@/lib/fx/supported-currencies";
+import { useActiveCurrencies } from "@/lib/hooks/useActiveCurrencies";
 import { LineChart, Line, XAxis, YAxis, Tooltip, ResponsiveContainer, BarChart, Bar, Legend } from "recharts";
 import { Plus, Trash2, Landmark, CreditCard, FileText, Calendar } from "lucide-react";
 import { EmptyState } from "@/components/empty-state";
@@ -152,6 +152,8 @@ function LoansPageContent() {
   const [whatIf, setWhatIf] = useState<WhatIf[]>([]);
   const [form, setForm] = useState({ name: "", type: "mortgage", principal: "", currency: displayCurrency, annualRate: "", termMonths: "", startDate: "", paymentAmount: "", paymentFrequency: "monthly", extraPayment: "0", residualValue: "", accountId: "" });
   const [errors, setErrors] = useState<Record<string, string>>({});
+  // Built-in fiat UNION the user's active currencies (#291).
+  const currencyOptions = useActiveCurrencies(form.currency);
 
   function validateForm() {
     const e: Record<string, string> = {};
@@ -273,7 +275,7 @@ function LoansPageContent() {
                   <Select value={form.currency} onValueChange={(v) => setForm({ ...form, currency: v ?? displayCurrency })}>
                     <SelectTrigger><SelectValue /></SelectTrigger>
                     <SelectContent>
-                      {SUPPORTED_FIAT_CURRENCIES.map(c => (<SelectItem key={c} value={c}>{c}</SelectItem>))}
+                      {currencyOptions.map(c => (<SelectItem key={c} value={c}>{c}</SelectItem>))}
                     </SelectContent>
                   </Select>
                 </div>
