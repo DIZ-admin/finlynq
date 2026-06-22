@@ -26,10 +26,12 @@ problems once DMARC is tightened to `p=reject`.
 
 **File:** `src/lib/email.ts`
 
-The app sends transactional mail (email verification, password reset, welcome, budget alerts, operator
+The app sends transactional mail (email verification, password reset, welcome, budget alerts, admin
 feedback notifications) through a nodemailer `createTransport` wired to the `SMTP_HOST` / `SMTP_PORT` /
-`SMTP_USER` / `SMTP_PASS` environment variables. The `EMAIL_FROM` / `FEEDBACK_EMAIL` environment variables
-control the `From:` address (default `noreply@finlynq.com` / `feedback@finlynq.com`).
+`SMTP_USER` / `SMTP_PASS` environment variables. The `EMAIL_FROM` environment variable controls the
+`From:` address (default `noreply@finlynq.com`). Feedback notifications are addressed (`To:`) to the
+admin account email(s) resolved from the DB (`users.role='admin'`), with the **optional** `FEEDBACK_EMAIL`
+as an extra recipient — there is no hardcoded fallback address (see `src/lib/feedback/notify.ts`).
 
 The **SMTP provider is operator-configured** — it is NOT hardcoded to a specific service. The most likely
 configuration for the hosted deployment is Amazon SES over SMTP (endpoint

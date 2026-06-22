@@ -83,6 +83,28 @@ export async function createUser(input: CreateUserInput) {
   return { id, username: input.username, email: input.email ?? null, emailVerifyToken };
 }
 
+/**
+ * Change a user's recovery email and reset its verified state. Stores the
+ * SHA-256 hash of a fresh verify token (raw token mailed by the caller, see
+ * createUser / verifyUserEmail for the same Finding #10 contract). Pass a null
+ * tokenHash only if no verification is being sent.
+ */
+export async function updateUserEmail(
+  userId: string,
+  email: string,
+  emailVerifyTokenHash: string | null,
+) {
+  const now = new Date().toISOString();
+  await db.update(getSchema().users)
+    .set({
+      email,
+      emailVerified: 0,
+      emailVerifyToken: emailVerifyTokenHash,
+      updatedAt: now,
+    })
+    .where(eq(getSchema().users.id, userId));
+}
+
 export async function getUserByEmail(email: string) {
   // Case-insensitive lookup so 'Foo@x.com' and 'foo@x.com' resolve to the same
   // row; matches the partial unique index on lower(email).
@@ -367,6 +389,22 @@ export async function listUsers(options: { limit?: number; offset?: number } = {
 export async function getUserCount() {
   const rows = await db.select({ total: count() }).from(getSchema().users);
   return rows[0]?.total ?? 0;
+}
+
+/**
+ * Emails of every admin user (role='admin') that has a recovery email set.
+ * Used to route maintainer notifications (e.g. new feedback) to the actual
+ * admin account(s) instead of a hardcoded address. Empty-string emails are
+ * filtered out; returns [] when no admin has an email configured.
+ */
+export async function listAdminEmails(): Promise<string[]> {
+  const rows = await db
+    .select({ email: getSchema().users.email })
+    .from(getSchema().users)
+    .where(eq(getSchema().users.role, "admin"));
+  return rows
+    .map((r) => (r.email ?? "").trim())
+    .filter((e) => e.length > 0);
 }
 
 export async function updateUserRole(userId: string, role: string) {

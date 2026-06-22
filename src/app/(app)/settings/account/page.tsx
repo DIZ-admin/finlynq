@@ -9,7 +9,7 @@ import { useState, useEffect } from "react";
 import { Card, CardContent, CardHeader, CardTitle, CardDescription } from "@/components/ui/card";
 import { Button } from "@/components/ui/button";
 import { Input } from "@/components/ui/input";
-import { Key, RefreshCw, Eye, EyeOff, FileText, Check, Shield, Lock, Download, Upload, AlertTriangle } from "lucide-react";
+import { Key, RefreshCw, Eye, EyeOff, FileText, Check, Shield, Lock, Mail, Download, Upload, AlertTriangle } from "lucide-react";
 
 export default function AccountSettingsPage() {
   // API Key — the raw key is only held in memory on first creation or
@@ -31,6 +31,99 @@ export default function AccountSettingsPage() {
   const [restoreConfirm, setRestoreConfirm] = useState("");
   const [restoreStep, setRestoreStep] = useState(0); // 0=idle, 1=preview, 2=type RESTORE
   const [restoreStatus, setRestoreStatus] = useState("");
+
+  // Current profile — drives the credential cards. `username` is non-null only
+  // in managed mode; self-hosted (passphrase) accounts have no user row, so we
+  // hide the change-password / change-email forms there.
+  const [me, setMe] = useState<{ username: string | null; email: string | null } | null>(null);
+  const [meLoaded, setMeLoaded] = useState(false);
+
+  // Change password
+  const [curPw, setCurPw] = useState("");
+  const [newPw, setNewPw] = useState("");
+  const [confirmPw, setConfirmPw] = useState("");
+  const [pwStatus, setPwStatus] = useState("");
+  const [pwError, setPwError] = useState("");
+  const [pwSaving, setPwSaving] = useState(false);
+
+  // Change email
+  const [newEmail, setNewEmail] = useState("");
+  const [emailPw, setEmailPw] = useState("");
+  const [emailStatus, setEmailStatus] = useState("");
+  const [emailError, setEmailError] = useState("");
+  const [emailSaving, setEmailSaving] = useState(false);
+
+  // Load current profile (email + managed-mode gate)
+  useEffect(() => {
+    fetch("/api/user/me")
+      .then((r) => (r.ok ? r.json() : null))
+      .then((data) => { if (data) setMe({ username: data.username ?? null, email: data.email ?? null }); })
+      .catch(() => {})
+      .finally(() => setMeLoaded(true));
+  }, []);
+
+  async function handleChangePassword(e: React.FormEvent) {
+    e.preventDefault();
+    setPwError("");
+    setPwStatus("");
+    if (newPw.length < 12) {
+      setPwError("New password must be at least 12 characters.");
+      return;
+    }
+    if (newPw !== confirmPw) {
+      setPwError("New passwords do not match.");
+      return;
+    }
+    setPwSaving(true);
+    try {
+      const res = await fetch("/api/settings/change-password", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ currentPassword: curPw, newPassword: newPw }),
+      });
+      const data = await res.json().catch(() => ({}));
+      if (!res.ok) {
+        setPwError(data.error || "Failed to change password.");
+        return;
+      }
+      setPwStatus("Password updated.");
+      setCurPw("");
+      setNewPw("");
+      setConfirmPw("");
+    } catch {
+      setPwError("Failed to change password.");
+    } finally {
+      setPwSaving(false);
+    }
+  }
+
+  async function handleChangeEmail(e: React.FormEvent) {
+    e.preventDefault();
+    setEmailError("");
+    setEmailStatus("");
+    setEmailSaving(true);
+    try {
+      const res = await fetch("/api/settings/change-email", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ newEmail, currentPassword: emailPw }),
+      });
+      const data = await res.json().catch(() => ({}));
+      if (!res.ok) {
+        setEmailError(data.error || "Failed to change email.");
+        return;
+      }
+      const saved = data.email ?? newEmail;
+      setMe((m) => (m ? { ...m, email: saved } : m));
+      setEmailStatus(`Verification email sent to ${saved}. Check your inbox to confirm.`);
+      setNewEmail("");
+      setEmailPw("");
+    } catch {
+      setEmailError("Failed to change email.");
+    } finally {
+      setEmailSaving(false);
+    }
+  }
 
   // Load API key
   useEffect(() => {
@@ -147,8 +240,92 @@ export default function AccountSettingsPage() {
     <div className="max-w-2xl space-y-6">
       <div>
         <h1 className="text-2xl font-bold tracking-tight">Account & Security</h1>
-        <p className="text-sm text-muted-foreground mt-0.5">API key, privacy, and backup / restore</p>
+        <p className="text-sm text-muted-foreground mt-0.5">Login, API key, privacy, and backup / restore</p>
       </div>
+
+      {/* Change Password — managed mode only. */}
+      {meLoaded && me?.username && (
+        <Card>
+          <CardHeader>
+            <div className="flex items-center gap-3">
+              <div className="flex h-10 w-10 items-center justify-center rounded-xl bg-rose-100 text-rose-600">
+                <Lock className="h-5 w-5" />
+              </div>
+              <div>
+                <CardTitle className="text-base">Change Password</CardTitle>
+                <CardDescription>Your encrypted data is re-encrypted under the new password, nothing is lost</CardDescription>
+              </div>
+            </div>
+          </CardHeader>
+          <CardContent>
+            <form onSubmit={handleChangePassword} className="space-y-3 max-w-sm">
+              <div>
+                <label className="text-xs font-medium text-muted-foreground">Current password</label>
+                <Input type="password" autoComplete="current-password" value={curPw} onChange={(e) => setCurPw(e.target.value)} />
+              </div>
+              <div>
+                <label className="text-xs font-medium text-muted-foreground">New password</label>
+                <Input type="password" autoComplete="new-password" value={newPw} onChange={(e) => setNewPw(e.target.value)} />
+                <p className="text-[11px] text-muted-foreground mt-1">At least 12 characters.</p>
+              </div>
+              <div>
+                <label className="text-xs font-medium text-muted-foreground">Confirm new password</label>
+                <Input type="password" autoComplete="new-password" value={confirmPw} onChange={(e) => setConfirmPw(e.target.value)} />
+              </div>
+              {pwError && <p className="text-sm text-destructive">{pwError}</p>}
+              {pwStatus && (
+                <p className="text-sm text-emerald-600 flex items-center gap-1">
+                  <Check className="h-3.5 w-3.5" /> {pwStatus}
+                </p>
+              )}
+              <Button type="submit" disabled={pwSaving || !curPw || !newPw || !confirmPw}>
+                {pwSaving ? "Saving…" : "Update password"}
+              </Button>
+            </form>
+          </CardContent>
+        </Card>
+      )}
+
+      {/* Change Email — managed mode only. */}
+      {meLoaded && me?.username && (
+        <Card>
+          <CardHeader>
+            <div className="flex items-center gap-3">
+              <div className="flex h-10 w-10 items-center justify-center rounded-xl bg-sky-100 text-sky-600">
+                <Mail className="h-5 w-5" />
+              </div>
+              <div>
+                <CardTitle className="text-base">Change Email</CardTitle>
+                <CardDescription>Recovery email used to reset a forgotten password</CardDescription>
+              </div>
+            </div>
+          </CardHeader>
+          <CardContent className="space-y-3">
+            <p className="text-xs text-muted-foreground">
+              Current: <span className="font-medium text-foreground">{me?.email || "none set"}</span>
+            </p>
+            <form onSubmit={handleChangeEmail} className="space-y-3 max-w-sm">
+              <div>
+                <label className="text-xs font-medium text-muted-foreground">New email</label>
+                <Input type="email" autoComplete="email" value={newEmail} onChange={(e) => setNewEmail(e.target.value)} placeholder="you@example.com" />
+              </div>
+              <div>
+                <label className="text-xs font-medium text-muted-foreground">Current password</label>
+                <Input type="password" autoComplete="current-password" value={emailPw} onChange={(e) => setEmailPw(e.target.value)} />
+              </div>
+              {emailError && <p className="text-sm text-destructive">{emailError}</p>}
+              {emailStatus && (
+                <p className="text-sm text-emerald-600 flex items-center gap-1">
+                  <Check className="h-3.5 w-3.5" /> {emailStatus}
+                </p>
+              )}
+              <Button type="submit" disabled={emailSaving || !newEmail || !emailPw}>
+                {emailSaving ? "Saving…" : "Update email"}
+              </Button>
+            </form>
+          </CardContent>
+        </Card>
+      )}
 
       {/* API Key */}
       <Card>

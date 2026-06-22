@@ -5,7 +5,8 @@
  * Ownership-checked (404 on a non-owned id). Rate-limited on a DISTINCT bucket
  * (`feedback-reply:`) so replies don't starve the submit bucket (`feedback:`).
  * Inserts a feedback_messages row (author_role='user'), bumps feedback.updated_at
- * and the author's own user_last_read_at. In-app only — no email.
+ * and the author's own user_last_read_at. Fires a best-effort admin email
+ * notification (fire-and-forget) so the maintainer sees thread replies too.
  */
 
 import { NextRequest, NextResponse } from "next/server";
@@ -16,6 +17,7 @@ import { requireAuth } from "@/lib/auth/require-auth";
 import { validateBody, safeErrorMessage } from "@/lib/validate";
 import { checkRateLimit } from "@/lib/rate-limit";
 import { toFeedbackMessage } from "@/lib/feedback/thread";
+import { notifyAdminsFeedbackReply } from "@/lib/feedback/notify";
 
 export const dynamic = "force-dynamic";
 
@@ -51,7 +53,7 @@ export async function POST(
 
     // Ownership — 404 (not 403) on a stranger's id.
     const [fb] = await db
-      .select({ id: schema.feedback.id })
+      .select({ id: schema.feedback.id, type: schema.feedback.type })
       .from(schema.feedback)
       .where(
         and(eq(schema.feedback.id, feedbackId), eq(schema.feedback.userId, userId)),
@@ -73,6 +75,17 @@ export async function POST(
       .update(schema.feedback)
       .set({ updatedAt: now, userLastReadAt: now })
       .where(eq(schema.feedback.id, feedbackId));
+
+    // Fire-and-forget: notify admins of the new reply. Never block/500 the
+    // user's reply on email failure.
+    void notifyAdminsFeedbackReply({
+      userId,
+      feedbackId,
+      feedbackType: fb.type,
+      body: parsed.data.body,
+    }).catch((err) => {
+      console.error("[feedback-email] reply notify failed", err);
+    });
 
     return NextResponse.json(toFeedbackMessage(msg, userId), { status: 201 });
   } catch (e) {

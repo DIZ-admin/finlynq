@@ -253,13 +253,15 @@ export function budgetAlertEmail(
 }
 
 /**
- * Maintainer notification for in-app user feedback. Sent TO the operator
- * inbox (FEEDBACK_EMAIL, default feedback@finlynq.com), NOT the user. Every
- * user-derived field is escaped (the body is rendered as HTML). Best-effort:
- * callers fire-and-forget this so a missing SMTP config never blocks the
- * feedback submit — the DB row is the source of truth.
+ * Maintainer notification for a NEW in-app feedback submission. Sent TO the
+ * admin recipient(s) resolved by the caller (admin user email from the DB —
+ * never a hardcoded address), NOT the submitting user. Every user-derived
+ * field is escaped (the body is rendered as HTML). Best-effort: callers
+ * fire-and-forget this so a missing SMTP config never blocks the feedback
+ * submit — the DB row is the source of truth.
  */
 export function feedbackNotificationEmail(opts: {
+  to: string;
   feedbackType: string;
   message: string;
   userId: string;
@@ -267,7 +269,7 @@ export function feedbackNotificationEmail(opts: {
   pageUrl?: string | null;
   appVersion?: string | null;
 }): EmailMessage {
-  const to = process.env.FEEDBACK_EMAIL || "feedback@finlynq.com";
+  const to = opts.to;
   const safeType = escapeHtml(opts.feedbackType);
   const safeMessage = escapeHtml(opts.message).replace(/\n/g, "<br>");
   const safeUser = escapeHtml(opts.userLabel || opts.userId);
@@ -289,5 +291,41 @@ export function feedbackNotificationEmail(opts: {
     subject: `[Finlynq feedback] ${opts.feedbackType}`,
     html,
     text: `New ${opts.feedbackType} feedback from ${opts.userLabel || opts.userId} (page: ${opts.pageUrl || "—"}):\n\n${opts.message}`,
+  };
+}
+
+/**
+ * Maintainer notification for a user REPLY on an existing feedback thread.
+ * Same routing + best-effort contract as feedbackNotificationEmail: sent TO
+ * the admin recipient(s) resolved by the caller (never hardcoded). The reply
+ * body is user-derived and rendered as HTML, so it is escaped.
+ */
+export function feedbackReplyNotificationEmail(opts: {
+  to: string;
+  feedbackId: number;
+  feedbackType?: string | null;
+  body: string;
+  userId: string;
+  userLabel?: string | null;
+}): EmailMessage {
+  const to = opts.to;
+  const safeType = escapeHtml(opts.feedbackType || "feedback");
+  const safeBody = escapeHtml(opts.body).replace(/\n/g, "<br>");
+  const safeUser = escapeHtml(opts.userLabel || opts.userId);
+  const reviewUrl = `${APP_URL()}/admin/feedback`;
+  const html = baseLayout(
+    `New reply on ${safeType} feedback`,
+    `<table style="width:100%;border-collapse:collapse;color:#3f3f46;font-size:14px;margin-bottom:16px">
+       <tr><td style="padding:4px 0;color:#71717a;width:90px">Thread</td><td style="padding:4px 0"><strong>#${opts.feedbackId}</strong> (${safeType})</td></tr>
+       <tr><td style="padding:4px 0;color:#71717a">From</td><td style="padding:4px 0">${safeUser}</td></tr>
+     </table>
+     <div style="background:#fafafa;border-radius:6px;padding:16px;line-height:1.6;white-space:pre-wrap">${safeBody}</div>
+     <p style="color:#71717a;font-size:13px;margin-top:16px">Review at ${escapeHtml(reviewUrl)}</p>`,
+  );
+  return {
+    to,
+    subject: `[Finlynq feedback] reply on #${opts.feedbackId}`,
+    html,
+    text: `New reply on feedback #${opts.feedbackId} (${opts.feedbackType || "feedback"}) from ${opts.userLabel || opts.userId}:\n\n${opts.body}`,
   };
 }
