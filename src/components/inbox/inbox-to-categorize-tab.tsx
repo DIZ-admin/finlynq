@@ -281,6 +281,10 @@ export function InboxToCategorizeTab({
           categoryId: b.suggestedCategoryId,
           categoryName: catName(b.suggestedCategoryId),
         });
+      } else if (b.suggestedInvestmentOp) {
+        // FINLYNQ-208 — an investment-op rule matched; show "record <op>" + a
+        // Record button that opens the preview (handled in onApprove → onEdit).
+        map.set(b.id, { kind: "investment_op", op: b.suggestedInvestmentOp });
       }
     }
     return map;

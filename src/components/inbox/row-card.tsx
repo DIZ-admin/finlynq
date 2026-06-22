@@ -64,10 +64,17 @@ export interface RowCardSuggestionTransfer {
   destAccountId: number;
   destAccountName: string;
 }
+export interface RowCardSuggestionInvestmentOp {
+  /** A `record_investment_op` rule matched (FINLYNQ-208) — record a lot-aware
+   *  portfolio op (buy/sell/dividend/…). Approving opens the preview dialog. */
+  kind: "investment_op";
+  op: string;
+}
 export type RowCardSuggestionAny =
   | RowCardSuggestion
   | RowCardSuggestionCreate
-  | RowCardSuggestionTransfer;
+  | RowCardSuggestionTransfer
+  | RowCardSuggestionInvestmentOp;
 
 export interface RowCardBank {
   id: string;
@@ -130,6 +137,17 @@ function SuggestionLine({ s }: { s: RowCardSuggestionAny | null }) {
         <span className="text-muted-foreground">transfer to</span>
         <Badge variant="secondary" className="font-mono text-[10px]">
           {s.destAccountName}
+        </Badge>
+      </span>
+    );
+  }
+  if (s.kind === "investment_op") {
+    return (
+      <span className="inline-flex items-center gap-1.5 text-xs">
+        <Sparkles className="h-3.5 w-3.5 text-emerald-500" />
+        <span className="text-muted-foreground">record</span>
+        <Badge variant="secondary" className="font-mono text-[10px] uppercase">
+          {s.op}
         </Badge>
       </span>
     );
@@ -222,6 +240,15 @@ export function RowCard({
                 Keep separate
               </Button>
             </>
+          ) : suggestion?.kind === "investment_op" ? (
+            <Button
+              size="sm"
+              className="h-7 gap-1"
+              onClick={onApprove}
+              disabled={busy}
+            >
+              <Plus className="h-3.5 w-3.5" /> Record {suggestion.op}
+            </Button>
           ) : hasSuggestion ? (
             <Button
               size="sm"
