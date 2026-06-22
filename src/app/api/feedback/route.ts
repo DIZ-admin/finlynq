@@ -16,8 +16,7 @@ import { desc, eq, inArray } from "drizzle-orm";
 import { requireAuth } from "@/lib/auth/require-auth";
 import { validateBody, safeErrorMessage } from "@/lib/validate";
 import { checkRateLimit } from "@/lib/rate-limit";
-import { sendEmail, feedbackNotificationEmail } from "@/lib/email";
-import { getUserById } from "@/lib/auth/queries";
+import { notifyAdminsNewFeedback } from "@/lib/feedback/notify";
 import { buildThreadSummary } from "@/lib/feedback/thread";
 import type { FeedbackThreadSummary } from "@shared/types";
 
@@ -29,31 +28,6 @@ const bodySchema = z.object({
   pageUrl: z.string().max(500).optional(),
   appVersion: z.string().max(50).optional(),
 });
-
-// Best-effort maintainer notification — resolve a friendly user label, then
-// fire the email. Any failure (no SMTP, DB hiccup) is swallowed by the caller.
-async function notifyMaintainer(
-  userId: string,
-  d: z.infer<typeof bodySchema>,
-): Promise<void> {
-  let userLabel: string | null = null;
-  try {
-    const user = await getUserById(userId);
-    userLabel = user?.username || user?.email || null;
-  } catch {
-    /* fall back to userId in the template */
-  }
-  await sendEmail(
-    feedbackNotificationEmail({
-      feedbackType: d.type,
-      message: d.message,
-      userId,
-      userLabel,
-      pageUrl: d.pageUrl ?? null,
-      appVersion: d.appVersion ?? null,
-    }),
-  );
-}
 
 // GET /api/feedback — the current user's feedback threads (summaries with an
 // `unread` flag driving the nav badge). Bare JSON array, mirroring
@@ -130,8 +104,13 @@ export async function POST(request: NextRequest) {
       .returning({ id: schema.feedback.id });
 
     // Fire-and-forget: never block the response or 500 on email failure.
-    void notifyMaintainer(userId, d).catch((err) => {
-
+    void notifyAdminsNewFeedback({
+      userId,
+      feedbackType: d.type,
+      message: d.message,
+      pageUrl: d.pageUrl ?? null,
+      appVersion: d.appVersion ?? null,
+    }).catch((err) => {
       console.error("[feedback-email] notify failed", err);
     });
 

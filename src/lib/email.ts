@@ -81,22 +81,67 @@ function createSmtpTransport(): EmailTransport {
   };
 }
 
+// ─── Resend Transport (HTTP API) ──────────────────────────────────────────────
+
+/**
+ * Send via the Resend HTTP API. Preferred over SMTP because RESEND_API_KEY is
+ * the email provider already configured for this deployment — no separate SMTP
+ * credentials needed. The `from` address MUST be on a Resend-verified domain
+ * (`finlynq.com` is verified, sending enabled); override the default with
+ * EMAIL_FROM. Throws on a non-2xx so callers' existing error handling applies
+ * (fire-and-forget for feedback notifications; surfaced for password reset).
+ */
+function createResendTransport(): EmailTransport {
+  return {
+    async send(message) {
+      const res = await fetch("https://api.resend.com/emails", {
+        method: "POST",
+        headers: {
+          Authorization: `Bearer ${process.env.RESEND_API_KEY}`,
+          "Content-Type": "application/json",
+        },
+        body: JSON.stringify({
+          from: process.env.EMAIL_FROM || "Finlynq <noreply@finlynq.com>",
+          to: message.to,
+          subject: message.subject,
+          html: message.html,
+          text: message.text,
+        }),
+      });
+      if (!res.ok) {
+        const detail = await res.text().catch(() => "");
+        throw new Error(
+          `Resend API send failed (${res.status}): ${detail.slice(0, 300)}`,
+        );
+      }
+    },
+  };
+}
+
 // ─── Transport Selection ────────────────────────────────────────────────────
 
 /**
  * Finding M-17 (2026-05-07) — never silently fall back to console-logging
  * the email body in production. The previous behavior would dump the full
- * password-reset link into stdout (and onward into log aggregation) if SMTP
- * was misconfigured. We now refuse to run without SMTP in prod and surface
- * the misconfiguration as an explicit error from `sendEmail`.
+ * password-reset link into stdout (and onward into log aggregation) if the
+ * transport was misconfigured. We refuse to run without a real transport in
+ * prod and surface the misconfiguration as an explicit error from `sendEmail`.
+ *
+ * Transport priority: Resend HTTP API (RESEND_API_KEY) → SMTP (SMTP_HOST) →
+ * console (dev only). Resend is preferred because it's the provider already
+ * provisioned for this deployment; SMTP stays supported for self-hosters who
+ * wire their own mail server.
  */
 function getTransport(): EmailTransport {
+  if (process.env.RESEND_API_KEY) {
+    return createResendTransport();
+  }
   if (process.env.SMTP_HOST) {
     return createSmtpTransport();
   }
   if (process.env.NODE_ENV === "production") {
     throw new Error(
-      "Email transport not configured: SMTP_HOST is required in production. " +
+      "Email transport not configured: set RESEND_API_KEY (preferred) or SMTP_HOST in production. " +
         "Refusing to fall back to console transport — that would log password reset tokens / verification links to stdout."
     );
   }
@@ -253,13 +298,15 @@ export function budgetAlertEmail(
 }
 
 /**
- * Maintainer notification for in-app user feedback. Sent TO the operator
- * inbox (FEEDBACK_EMAIL, default feedback@finlynq.com), NOT the user. Every
- * user-derived field is escaped (the body is rendered as HTML). Best-effort:
- * callers fire-and-forget this so a missing SMTP config never blocks the
- * feedback submit — the DB row is the source of truth.
+ * Maintainer notification for a NEW in-app feedback submission. Sent TO the
+ * admin recipient(s) resolved by the caller (admin user email from the DB —
+ * never a hardcoded address), NOT the submitting user. Every user-derived
+ * field is escaped (the body is rendered as HTML). Best-effort: callers
+ * fire-and-forget this so a missing SMTP config never blocks the feedback
+ * submit — the DB row is the source of truth.
  */
 export function feedbackNotificationEmail(opts: {
+  to: string;
   feedbackType: string;
   message: string;
   userId: string;
@@ -267,7 +314,7 @@ export function feedbackNotificationEmail(opts: {
   pageUrl?: string | null;
   appVersion?: string | null;
 }): EmailMessage {
-  const to = process.env.FEEDBACK_EMAIL || "feedback@finlynq.com";
+  const to = opts.to;
   const safeType = escapeHtml(opts.feedbackType);
   const safeMessage = escapeHtml(opts.message).replace(/\n/g, "<br>");
   const safeUser = escapeHtml(opts.userLabel || opts.userId);
@@ -289,5 +336,41 @@ export function feedbackNotificationEmail(opts: {
     subject: `[Finlynq feedback] ${opts.feedbackType}`,
     html,
     text: `New ${opts.feedbackType} feedback from ${opts.userLabel || opts.userId} (page: ${opts.pageUrl || "—"}):\n\n${opts.message}`,
+  };
+}
+
+/**
+ * Maintainer notification for a user REPLY on an existing feedback thread.
+ * Same routing + best-effort contract as feedbackNotificationEmail: sent TO
+ * the admin recipient(s) resolved by the caller (never hardcoded). The reply
+ * body is user-derived and rendered as HTML, so it is escaped.
+ */
+export function feedbackReplyNotificationEmail(opts: {
+  to: string;
+  feedbackId: number;
+  feedbackType?: string | null;
+  body: string;
+  userId: string;
+  userLabel?: string | null;
+}): EmailMessage {
+  const to = opts.to;
+  const safeType = escapeHtml(opts.feedbackType || "feedback");
+  const safeBody = escapeHtml(opts.body).replace(/\n/g, "<br>");
+  const safeUser = escapeHtml(opts.userLabel || opts.userId);
+  const reviewUrl = `${APP_URL()}/admin/feedback`;
+  const html = baseLayout(
+    `New reply on ${safeType} feedback`,
+    `<table style="width:100%;border-collapse:collapse;color:#3f3f46;font-size:14px;margin-bottom:16px">
+       <tr><td style="padding:4px 0;color:#71717a;width:90px">Thread</td><td style="padding:4px 0"><strong>#${opts.feedbackId}</strong> (${safeType})</td></tr>
+       <tr><td style="padding:4px 0;color:#71717a">From</td><td style="padding:4px 0">${safeUser}</td></tr>
+     </table>
+     <div style="background:#fafafa;border-radius:6px;padding:16px;line-height:1.6;white-space:pre-wrap">${safeBody}</div>
+     <p style="color:#71717a;font-size:13px;margin-top:16px">Review at ${escapeHtml(reviewUrl)}</p>`,
+  );
+  return {
+    to,
+    subject: `[Finlynq feedback] reply on #${opts.feedbackId}`,
+    html,
+    text: `New reply on feedback #${opts.feedbackId} (${opts.feedbackType || "feedback"}) from ${opts.userLabel || opts.userId}:\n\n${opts.body}`,
   };
 }
