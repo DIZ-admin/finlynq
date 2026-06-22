@@ -53,7 +53,7 @@ import {
   SelectValue,
 } from "@/components/ui/select";
 import { Trash2, AlertTriangle } from "lucide-react";
-import { SUPPORTED_FIAT_CURRENCIES } from "@/lib/fx/supported-currencies";
+import { useActiveCurrencies } from "@/lib/hooks/useActiveCurrencies";
 import {
   holdingCreateSchema,
   holdingUpdateSchema,
@@ -129,6 +129,10 @@ export function HoldingEditForm({
   const [errors, setErrors] = useState<Record<string, string>>({});
   const [saving, setSaving] = useState(false);
   const [deleteConfirm, setDeleteConfirm] = useState(false);
+  // Symbol-suggestion currency codes: built-in fiat UNION the user's active
+  // currencies (#291) — matches this field's "custom currencies … recognized
+  // here too" note.
+  const currencyOptions = useActiveCurrencies(form.currency);
   const [hydrated, setHydrated] = useState(initialHolding !== undefined || isCreateMode);
 
   // Symbol auto-detection state. Lookup runs on Symbol blur or after a
@@ -456,7 +460,7 @@ export function HoldingEditForm({
           list="symbol-suggestions"
         />
         <datalist id="symbol-suggestions">
-          {SUPPORTED_FIAT_CURRENCIES.map((c) => (
+          {currencyOptions.map((c) => (
             <option key={c} value={c} />
           ))}
         </datalist>

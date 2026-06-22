@@ -106,6 +106,10 @@ export const CONDITION_FIELDS: Array<{ value: Condition["field"]; label: string 
   { value: "account", label: "Account" },
   { value: "currency", label: "Currency" },
   { value: "date", label: "Date" },
+  // FINLYNQ-208 — investment-import captured fields.
+  { value: "ticker", label: "Ticker" },
+  { value: "security_name", label: "Security name" },
+  { value: "quantity", label: "Quantity" },
 ];
 
 export const ACTION_KINDS: Array<{ value: Action["kind"]; label: string; sideEffect?: true }> = [
@@ -113,9 +117,32 @@ export const ACTION_KINDS: Array<{ value: Action["kind"]; label: string; sideEff
   { value: "set_tags", label: "Set tags" },
   { value: "rename_payee", label: "Rename payee" },
   { value: "set_entered_currency", label: "Set entered currency" },
-  { value: "set_portfolio_holding", label: "Set holding" },
+  // `set_portfolio_holding` ("Set holding") intentionally NOT offered — removed
+  // from the new-rule menu (FINLYNQ-208 feedback). The schema member + executor
+  // support stay so any pre-existing rule that uses it keeps working.
   { value: "set_account", label: "Move to account (approve-time only)", sideEffect: true },
   { value: "create_transfer", label: "Create transfer pair (approve-time only)", sideEffect: true },
+  // FINLYNQ-208 — record a lot-aware investment op (buy/sell/dividend/…).
+  { value: "record_investment_op", label: "Record investment transaction", sideEffect: true },
+];
+
+/** Investment op types the action can record (mirrors the schema enum). */
+const INVESTMENT_OPS: Array<{ value: string; label: string }> = [
+  { value: "buy", label: "Buy" },
+  { value: "sell", label: "Sell" },
+  { value: "dividend", label: "Dividend" },
+  { value: "interest", label: "Interest" },
+  { value: "fee", label: "Fee" },
+  { value: "deposit", label: "Deposit (bank → investment)" },
+  { value: "withdrawal", label: "Withdrawal (investment → bank)" },
+];
+
+/** Row-variable sources the user can bind a numeric param to. */
+const VAR_SOURCES: Array<{ value: string; label: string }> = [
+  { value: "row_amount", label: "Row amount" },
+  { value: "row_quantity", label: "Row quantity" },
+  { value: "row_price", label: "Row price/unit" },
+  { value: "fixed", label: "Fixed value" },
 ];
 
 export function blankCondition(): Condition {
@@ -289,7 +316,7 @@ export function RuleEditorDialog({
             <div className="text-xs space-y-0.5 text-muted-foreground">
               <p>Sample: <span className="font-mono">{samplePayee || "(empty)"}</span> @ ${sampleAmount}</p>
               <p>Action patch: <span className="font-mono">{JSON.stringify(livePatch)}</span></p>
-              <p className="italic">Side-effect actions (set_account, create_transfer) only fire from the staging-approve path; they don&apos;t appear in the patch.</p>
+              <p className="italic">Side-effect actions (set_account, create_transfer, record investment transaction) only fire from the staging-approve / reconcile materialize paths; they don&apos;t appear in the patch.</p>
             </div>
           </div>
         </div>
@@ -333,7 +360,8 @@ function ConditionRow({
       </Select>
 
       {/* Operator + value vary per field. */}
-      {(cond.field === "payee" || cond.field === "note" || cond.field === "tags") && (
+      {(cond.field === "payee" || cond.field === "note" || cond.field === "tags" ||
+        cond.field === "ticker" || cond.field === "security_name") && (
         <>
           <Select value={cond.op} onValueChange={(v) => onChange({ op: (v ?? "contains") as "contains" | "exact" | "regex" } as Partial<Condition>)}>
             <SelectTrigger className="w-28"><SelectValue /></SelectTrigger>
@@ -343,7 +371,37 @@ function ConditionRow({
               <SelectItem value="regex">regex</SelectItem>
             </SelectContent>
           </Select>
-          <Input value={(cond as { value: string }).value ?? ""} onChange={(e) => onChange({ value: e.target.value } as Partial<Condition>)} className="flex-1" />
+          <Input value={(cond as { value: string }).value ?? ""} onChange={(e) => onChange({ value: e.target.value } as Partial<Condition>)} className="flex-1" placeholder={cond.field === "ticker" ? "VTI" : ""} />
+        </>
+      )}
+
+      {cond.field === "quantity" && cond.op !== "between" && (
+        <>
+          <Select value={cond.op} onValueChange={(v) => onChange({ op: (v ?? "gt") as "gt" | "lt" | "eq" | "between" } as Partial<Condition>)}>
+            <SelectTrigger className="w-28"><SelectValue /></SelectTrigger>
+            <SelectContent>
+              <SelectItem value="gt">&gt;</SelectItem>
+              <SelectItem value="lt">&lt;</SelectItem>
+              <SelectItem value="eq">=</SelectItem>
+              <SelectItem value="between">between</SelectItem>
+            </SelectContent>
+          </Select>
+          <Input type="number" value={(cond as { value: number }).value} onChange={(e) => onChange({ value: parseFloat(e.target.value) || 0 } as Partial<Condition>)} className="flex-1" />
+        </>
+      )}
+      {cond.field === "quantity" && cond.op === "between" && (
+        <>
+          <Select value="between" onValueChange={(v) => onChange({ op: (v ?? "between") as "gt" | "lt" | "eq" | "between" } as Partial<Condition>)}>
+            <SelectTrigger className="w-28"><SelectValue /></SelectTrigger>
+            <SelectContent>
+              <SelectItem value="gt">&gt;</SelectItem>
+              <SelectItem value="lt">&lt;</SelectItem>
+              <SelectItem value="eq">=</SelectItem>
+              <SelectItem value="between">between</SelectItem>
+            </SelectContent>
+          </Select>
+          <Input type="number" value={(cond as { min: number }).min ?? 0} onChange={(e) => onChange({ min: parseFloat(e.target.value) || 0 } as Partial<Condition>)} className="w-24" placeholder="min" />
+          <Input type="number" value={(cond as { max: number }).max ?? 0} onChange={(e) => onChange({ max: parseFloat(e.target.value) || 0 } as Partial<Condition>)} className="w-24" placeholder="max" />
         </>
       )}
 
@@ -494,10 +552,17 @@ function ActionRow({
     onChange(defaultActionForKind(kind, seedId));
   }
 
-  const isSideEffect = action.kind === "set_account" || action.kind === "create_transfer";
+  const isInvestmentOp = action.kind === "record_investment_op";
+  const isSideEffect =
+    action.kind === "set_account" || action.kind === "create_transfer" || isInvestmentOp;
 
   return (
-    <div className={`flex items-center gap-2 ${isSideEffect ? "border-l-2 border-amber-500/50 pl-2" : ""}`}>
+    <div
+      className={`${isSideEffect ? "border-l-2 border-amber-500/50 pl-2" : ""} ${
+        isInvestmentOp ? "flex flex-col gap-2" : "flex items-center gap-2"
+      }`}
+    >
+      <div className={isInvestmentOp ? "flex items-center gap-2" : "contents"}>
       <Select value={action.kind} onValueChange={(v) => setKind((v ?? "set_category") as Action["kind"])}>
         <SelectTrigger className="w-56"><SelectValue /></SelectTrigger>
         <SelectContent>
@@ -578,6 +643,177 @@ function ActionRow({
       <Button variant="ghost" size="icon" className="h-8 w-8 text-destructive" onClick={onRemove}>
         <Trash2 className="h-3 w-3" />
       </Button>
+      </div>
+
+      {isInvestmentOp && (
+        <InvestmentOpFields
+          action={action}
+          accounts={accounts}
+          holdings={holdings}
+          onChange={onChange}
+        />
+      )}
+    </div>
+  );
+}
+
+/**
+ * Config block for the `record_investment_op` action (FINLYNQ-208). Lets the
+ * user pick the op type, the investment account, the position (resolved from the
+ * row's captured ticker OR an explicit holding), the deposit/withdrawal
+ * counterparty, and bind qty/total/price to row variables or fixed values. Lot
+ * allocation is always automatic FIFO — never selectable here.
+ */
+function InvestmentOpFields({
+  action,
+  accounts,
+  holdings,
+  onChange,
+}: {
+  action: Extract<Action, { kind: "record_investment_op" }>;
+  accounts: Account[];
+  holdings: Holding[];
+  onChange: (patch: Partial<Action>) => void;
+}) {
+  const op = action.op;
+  const isTrade = op === "buy" || op === "sell";
+  const isCashOnAccount = op === "deposit" || op === "withdrawal";
+  const usesPosition = isTrade || op === "dividend" || op === "interest" || op === "fee";
+
+  const acctItems = accounts.map((a): ComboboxItemShape => ({ value: String(a.id), label: a.name }));
+
+  return (
+    <div className="ml-2 grid gap-2 rounded-md border bg-muted/20 p-2 text-sm">
+      <div className="flex flex-wrap items-center gap-2">
+        <Label className="w-28 text-xs text-muted-foreground">Transaction</Label>
+        <Select value={op} onValueChange={(v) => onChange({ op: (v ?? "buy") } as Partial<Action>)}>
+          <SelectTrigger className="w-56"><SelectValue /></SelectTrigger>
+          <SelectContent>
+            {INVESTMENT_OPS.map((o) => <SelectItem key={o.value} value={o.value}>{o.label}</SelectItem>)}
+          </SelectContent>
+        </Select>
+      </div>
+
+      <div className="flex flex-wrap items-center gap-2">
+        <Label className="w-28 text-xs text-muted-foreground">Investment account</Label>
+        <Combobox
+          value={String(action.investmentAccountId || "")}
+          onValueChange={(v) => onChange({ investmentAccountId: parseInt(v ?? "0") } as Partial<Action>)}
+          items={acctItems}
+          placeholder="Select investment account"
+          searchPlaceholder="Search accounts…"
+          emptyMessage="No matches"
+          className="flex-1 min-w-48"
+        />
+      </div>
+
+      {isCashOnAccount && (
+        <div className="flex flex-wrap items-center gap-2">
+          <Label className="w-28 text-xs text-muted-foreground">Bank account</Label>
+          <Combobox
+            value={String(action.counterpartyAccountId ?? "")}
+            onValueChange={(v) => onChange({ counterpartyAccountId: parseInt(v ?? "0") } as Partial<Action>)}
+            items={acctItems}
+            placeholder="Select bank (non-investment) account"
+            searchPlaceholder="Search accounts…"
+            emptyMessage="No matches"
+            className="flex-1 min-w-48"
+          />
+        </div>
+      )}
+
+      {usesPosition && (
+        <div className="flex flex-wrap items-center gap-2">
+          <Label className="w-28 text-xs text-muted-foreground">Holding</Label>
+          <label className="flex items-center gap-1 text-xs">
+            <input
+              type="checkbox"
+              checked={action.useRowTicker ?? false}
+              onChange={(e) =>
+                onChange({
+                  useRowTicker: e.target.checked,
+                  ...(e.target.checked ? { holdingId: undefined } : {}),
+                } as Partial<Action>)
+              }
+            />
+            Resolve from row ticker
+          </label>
+          {!action.useRowTicker && (
+            <Combobox
+              value={String(action.holdingId ?? "")}
+              onValueChange={(v) => onChange({ holdingId: parseInt(v ?? "0") } as Partial<Action>)}
+              items={holdings.map((h): ComboboxItemShape => ({ value: String(h.id), label: h.name }))}
+              placeholder="Select holding"
+              searchPlaceholder="Search holdings…"
+              emptyMessage="No matches"
+              className="flex-1 min-w-48"
+            />
+          )}
+          {op !== "buy" && op !== "sell" && action.useRowTicker && (
+            <span className="text-xs text-muted-foreground italic">
+              optional — attributes the {op} to the row&apos;s security
+            </span>
+          )}
+        </div>
+      )}
+
+      {isTrade ? (
+        <>
+          <VarBindingRow label="Quantity" value={action.qty} onChange={(qty) => onChange({ qty } as Partial<Action>)} />
+          <VarBindingRow label="Total amount" value={action.total} onChange={(total) => onChange({ total } as Partial<Action>)} />
+          <VarBindingRow label="Price/unit" value={action.price} onChange={(price) => onChange({ price } as Partial<Action>)} optional />
+          <p className="text-[11px] text-muted-foreground italic">
+            Bind any two of quantity / total / price; the third is computed. Lots are matched FIFO automatically.
+          </p>
+        </>
+      ) : (
+        <VarBindingRow label="Amount" value={action.total} onChange={(total) => onChange({ total } as Partial<Action>)} />
+      )}
+    </div>
+  );
+}
+
+/** A single qty/total/price binding: source selector + a fixed-value input when
+ *  the source is "fixed". `undefined` value renders an empty (unset) binding. */
+function VarBindingRow({
+  label,
+  value,
+  onChange,
+  optional,
+}: {
+  label: string;
+  value: { from: string; value?: number } | undefined;
+  onChange: (v: { from: string; value?: number } | undefined) => void;
+  optional?: boolean;
+}) {
+  const from = value?.from ?? "";
+  return (
+    <div className="flex flex-wrap items-center gap-2">
+      <Label className="w-28 text-xs text-muted-foreground">{label}{optional ? " (optional)" : ""}</Label>
+      <Select
+        value={from || "__unset"}
+        onValueChange={(v) => {
+          const next = v ?? "__unset";
+          if (next === "__unset") return onChange(undefined);
+          if (next === "fixed") return onChange({ from: "fixed", value: value?.value ?? 0 });
+          return onChange({ from: next });
+        }}
+      >
+        <SelectTrigger className="w-40"><SelectValue /></SelectTrigger>
+        <SelectContent>
+          {optional && <SelectItem value="__unset">— none —</SelectItem>}
+          {VAR_SOURCES.map((s) => <SelectItem key={s.value} value={s.value}>{s.label}</SelectItem>)}
+        </SelectContent>
+      </Select>
+      {from === "fixed" && (
+        <Input
+          type="number"
+          value={value?.value ?? 0}
+          onChange={(e) => onChange({ from: "fixed", value: parseFloat(e.target.value) || 0 })}
+          className="w-28"
+          placeholder="value"
+        />
+      )}
     </div>
   );
 }

@@ -313,8 +313,19 @@ function Combobox({
   }, [items, value])
 
   const handleChange = React.useCallback(
-    (next: string | null) => {
-      onValueChange?.((next ?? "") as string)
+    (next: unknown) => {
+      // base-ui can hand back the full selected ITEM ({value,label}) rather
+      // than the raw string id (notably on type-ahead auto-select). Always
+      // normalize to the string `value` so consumers — some of which render
+      // the chosen value directly as JSX text — never receive an object
+      // (which would throw React error #31 "objects are not valid as a child").
+      const str =
+        next == null
+          ? ""
+          : typeof next === "object"
+            ? String((next as { value?: unknown }).value ?? "")
+            : String(next)
+      onValueChange?.(str)
     },
     [onValueChange]
   )

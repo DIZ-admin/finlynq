@@ -10,11 +10,10 @@ import { Combobox, type ComboboxItemShape } from "@/components/ui/combobox";
 import { useDropdownOrder } from "@/components/dropdown-order-provider";
 import { Plus, Trash2, RefreshCw } from "lucide-react";
 import {
-  SUPPORTED_FIAT_CURRENCIES,
-  SUPPORTED_CRYPTO_CURRENCIES,
   currencyLabel,
   isSupportedCurrency,
 } from "@/lib/fx/supported-currencies";
+import { useActiveCurrencies } from "@/lib/hooks/useActiveCurrencies";
 import { todayISO } from "@/lib/utils/date";
 
 type Override = {
@@ -33,6 +32,10 @@ export function FxOverridesSection() {
   const [error, setError] = useState("");
 
   const sortCurrency = useDropdownOrder("currency");
+  // Built-in fiat UNION the user's active currencies (#291) — so a custom code
+  // the user already added (e.g. TEST) is selectable here directly instead of
+  // showing "No matches" and forcing the "+ Custom currency code…" path.
+  const activeCurrencies = useActiveCurrencies();
 
   // Add form
   const [adding, setAdding] = useState(false);
@@ -197,10 +200,9 @@ export function FxOverridesSection() {
                     }}
                     items={[
                       ...sortCurrency(
-                        [
-                          ...SUPPORTED_FIAT_CURRENCIES.filter((c) => c !== "USD"),
-                          ...SUPPORTED_CRYPTO_CURRENCIES,
-                        ].map((c): ComboboxItemShape => ({ value: c, label: `${c} — ${currencyLabel(c)}` })),
+                        activeCurrencies
+                          .filter((c) => c !== "USD")
+                          .map((c): ComboboxItemShape => ({ value: c, label: `${c} — ${currencyLabel(c)}` })),
                         (c) => c.value,
                         (a, z) => a.label.localeCompare(z.label),
                       ),

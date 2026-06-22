@@ -26,6 +26,7 @@ import {
 } from "@/lib/accounts/groups";
 import { GroupField } from "./_components/group-field";
 import { ManageGroupsDialog } from "./_components/manage-groups-dialog";
+import { useActiveCurrencies } from "@/lib/hooks/useActiveCurrencies";
 import {
   TrendingUp,
   TrendingDown,
@@ -170,6 +171,12 @@ export default function AccountsPage() {
   const [showArchived, setShowArchived] = useState(false);
 
   const sortCurrency = useDropdownOrder("currency");
+  // Currency dropdown options: built-in fiat UNION the user's active currencies
+  // (Settings → "Currencies you use"), so custom/regional/metal codes appear.
+  // `ensure` keeps the form's current value present even if it's not active
+  // (e.g. editing an account already denominated in a now-deselected currency).
+  const createCurrencyOptions = useActiveCurrencies(form.currency);
+  const editCurrencyOptions = useActiveCurrencies(editForm.currency);
   // FINLYNQ-148: the Settings → Dropdown Ordering "account" list is the user's
   // configured account sort order. The /accounts list must honour it (it was
   // ignoring the setting and rendering in raw API order). Pinned accounts lead
@@ -556,7 +563,7 @@ export default function AccountsPage() {
                 value={form.currency}
                 onValueChange={(v) => setForm({ ...form, currency: v || "CAD" })}
                 items={sortCurrency(
-                  ["CAD", "USD", "EUR", "GBP"].map((c): ComboboxItemShape => ({ value: c, label: c })),
+                  createCurrencyOptions.map((c): ComboboxItemShape => ({ value: c, label: c })),
                   (c) => c.value,
                   (a, z) => a.label.localeCompare(z.label),
                 )}
@@ -747,7 +754,7 @@ export default function AccountsPage() {
                 value={editForm.currency}
                 onValueChange={(v) => setEditForm({ ...editForm, currency: v || "CAD" })}
                 items={sortCurrency(
-                  ["CAD", "USD", "EUR", "GBP"].map((c): ComboboxItemShape => ({ value: c, label: c })),
+                  editCurrencyOptions.map((c): ComboboxItemShape => ({ value: c, label: c })),
                   (c) => c.value,
                   (a, z) => a.label.localeCompare(z.label),
                 )}

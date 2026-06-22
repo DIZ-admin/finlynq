@@ -13,7 +13,7 @@ import { Badge } from "@/components/ui/badge";
 import { formatCurrency } from "@/lib/currency";
 import { useDisplayCurrency } from "@/components/currency-provider";
 import { useDropdownOrder } from "@/components/dropdown-order-provider";
-import { SUPPORTED_FIAT_CURRENCIES } from "@/lib/fx/supported-currencies";
+import { useActiveCurrencies } from "@/lib/hooks/useActiveCurrencies";
 import { Plus, Trash2, Target, CheckCircle2, TrendingUp, Calendar, Pencil, X } from "lucide-react";
 import { ConfirmDialog } from "@/components/ui/confirm-dialog";
 import { ErrorState } from "@/components/error-state";
@@ -130,6 +130,8 @@ function GoalEditForm({
   const [errors, setErrors] = useState<Record<string, string>>({});
   const [submitting, setSubmitting] = useState(false);
   const sortAccount = useDropdownOrder("account");
+  // Built-in fiat UNION the user's active currencies (#291).
+  const currencyOptions = useActiveCurrencies(form.currency);
 
   function validateForm() {
     const e: Record<string, string> = {};
@@ -228,7 +230,7 @@ function GoalEditForm({
           <Select value={form.currency} onValueChange={(v) => setForm({ ...form, currency: v ?? displayCurrency })}>
             <SelectTrigger><SelectValue /></SelectTrigger>
             <SelectContent>
-              {SUPPORTED_FIAT_CURRENCIES.map((c) => (
+              {currencyOptions.map((c) => (
                 <SelectItem key={c} value={c}>{c}</SelectItem>
               ))}
             </SelectContent>

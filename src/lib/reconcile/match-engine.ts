@@ -44,11 +44,13 @@ import { round2 } from "@/lib/utils/number";
 import { encryptField, tryDecryptField } from "@/lib/crypto/envelope";
 import { decryptStaged } from "@/lib/crypto/staging-envelope";
 import { applyRules, type TransactionRule } from "@/lib/auto-categorize";
+import { computePureActionPatch } from "@/lib/rules/execute";
 import { decryptRuleFields } from "@/lib/rules/crypto";
-import type { Action, ConditionGroup } from "@/lib/rules/schema";
+import type { Action, ConditionGroup, RecordInvestmentOpAction } from "@/lib/rules/schema";
 import { invalidateUser } from "@/lib/mcp/user-tx-cache";
 import { validateSignVsCategoryById } from "@/lib/transactions/sign-category-invariant";
 import { materializeBankRowAsTransfer } from "./materialize-transfer";
+import { materializeBankRowAsPortfolioOp } from "./materialize-portfolio-op";
 import {
   buildBankLedgerCandidatePool,
   type BankCandidateRow,
@@ -160,6 +162,11 @@ export interface ReconcileBankSnapshot {
   /** Share/unit count for an investment row. Numeric, never encrypted.
    *  Present only when captured; omitted for cash rows. */
   quantity?: number | null;
+  /** FINLYNQ-208 — when a user-authored rule's action is `record_investment_op`,
+   *  the op type it would record (buy/sell/dividend/interest/fee/deposit/
+   *  withdrawal). Lets the reconcile UI preview "this row → Buy" before the user
+   *  applies the rule. `null`/absent when no investment-op rule matches. */
+  suggestedInvestmentOp?: string | null;
 }
 
 export interface ReconcileResult {
@@ -430,12 +437,26 @@ export async function computeReconcileForAccount(
         amount: b.amount,
         accountId: b.accountId,
         date: b.date,
+        // FINLYNQ-208 — investment-import captured fields so a rule's
+        // ticker/security_name/quantity conditions can match here too.
+        ticker: b.tickerPlain,
+        securityName: b.securityNamePlain,
+        quantity: b.quantity,
       },
       activeRules,
     );
     const suggestedCategoryId = ruleMatch
       ? pickCategoryFromActions(ruleMatch.actions)
       : null;
+    // All investment-op names the matched rule would record (e.g. "buy, deposit"
+    // for a multi-op rule) so the UI chip + preview reflect every op, not just
+    // the first.
+    const invOpNames = ruleMatch
+      ? ruleMatch.actions
+          .filter((a): a is RecordInvestmentOpAction => a.kind === "record_investment_op")
+          .map((a) => a.op)
+      : [];
+    const suggestedInvestmentOp = invOpNames.length > 0 ? invOpNames.join(", ") : null;
     // A matched rule whose action set names a transfer destination routes
     // the materialize dialog into Transfer mode. Drop self-transfers (a rule
     // pointing back at the bank row's own account is a no-op pair).
@@ -461,6 +482,7 @@ export async function computeReconcileForAccount(
       suggestedTransferAccountId,
       duplicateOfTransactionId: strictDupFor(b),
     };
+    if (suggestedInvestmentOp) snap.suggestedInvestmentOp = suggestedInvestmentOp;
     // FINLYNQ-207 — surface the FINLYNQ-195 investment-import capture. Attach
     // ticker/securityName/quantity ONLY when the row actually captured one (an
     // investment-account import); cash rows leave all three NULL so the keys
@@ -579,6 +601,7 @@ function pickTransferDestFromActions(actions: Action[]): number | null {
   }
   return null;
 }
+
 
 /**
  * Load the user's active transaction rules in priority-descending order,
@@ -986,6 +1009,8 @@ export async function applyRulesToBankRows(
       payee: schema.bankTransactions.payee,
       note: schema.bankTransactions.note,
       tags: schema.bankTransactions.tags,
+      ticker: schema.bankTransactions.ticker,
+      securityName: schema.bankTransactions.securityName,
       encryptionTier: schema.bankTransactions.encryptionTier,
       importHash: schema.bankTransactions.importHash,
       fitId: schema.bankTransactions.fitId,
@@ -1126,12 +1151,19 @@ export async function applyRulesToBankRows(
     }
 
     const payeePlain = decodeBankString(bank.encryptionTier, dek, bank.payee);
+    const tickerPlain = decodeBankString(bank.encryptionTier, dek, bank.ticker);
+    const securityNamePlain = decodeBankString(bank.encryptionTier, dek, bank.securityName);
     const match = applyRules(
       {
         payee: payeePlain,
         amount: bank.amount,
         accountId: bank.accountId,
         date: bank.date,
+        // FINLYNQ-208 — investment-import captured fields for ticker /
+        // security_name / quantity conditions.
+        ticker: tickerPlain,
+        securityName: securityNamePlain,
+        quantity: bank.quantity,
       },
       activeRules,
     );
@@ -1152,7 +1184,63 @@ export async function applyRulesToBankRows(
     }
     rulesFired += 1;
 
-    const categoryId = pickCategoryFromActions(match.actions);
+    // Apply the rule's FULL pure-action patch (set_category + set_tags +
+    // rename_payee + set_entered_currency), not just the primary action — so a
+    // multi-action rule materializes ALL of its modifiers, consistent with the
+    // staged / uncategorized paths (FINLYNQ-208, "support multiple actions").
+    const patch = computePureActionPatch(match.actions);
+
+    // FINLYNQ-208 — investment-op rule(s). Take precedence over category /
+    // transfer actions: when the matched rule records portfolio op(s), we run
+    // the sanctioned investment chokepoint (which lifts the investment-account
+    // refusal because it resolves/creates the position + sleeve). Planning mode
+    // (autoMaterialize=false) just reports the match. Pure modifiers
+    // (rename_payee / set_tags) ride along as overrides onto the recorded op(s).
+    //
+    // A rule may carry MULTIPLE record_investment_op actions (e.g. buy + deposit)
+    // — execute EVERY one, not just the first ("support multiple actions"). Each
+    // op materializes its own rows + links to the bank row.
+    const invOps = match.actions.filter(
+      (a): a is RecordInvestmentOpAction => a.kind === "record_investment_op",
+    );
+    if (invOps.length > 0) {
+      if (!autoMaterialize) {
+        perRow.push({ bankRowId: bank.id, matched: true });
+        continue;
+      }
+      // dek is non-null here — guarded by the autoMaterialize=>dek check.
+      let firstTxId: number | undefined;
+      let lastFailCode: string | undefined;
+      let okCount = 0;
+      for (const invOp of invOps) {
+        const result = await materializeBankRowAsPortfolioOp({
+          userId,
+          dek: dek!,
+          bankTransactionId: bank.id,
+          action: invOp,
+          overrides: { payee: patch.payee, tags: patch.tags },
+        });
+        if (result.ok) {
+          okCount += 1;
+          if (firstTxId == null) firstTxId = result.linkedTransactionId;
+        } else {
+          lastFailCode = result.code;
+        }
+      }
+      if (okCount > 0) {
+        materialized += 1;
+        perRow.push({ bankRowId: bank.id, matched: true, transactionId: firstTxId });
+      } else {
+        perRow.push({
+          bankRowId: bank.id,
+          matched: true,
+          skipReason: `investment_op_${lastFailCode ?? "failed"}`,
+        });
+      }
+      continue;
+    }
+
+    const categoryId = patch.categoryId ?? null;
     if (categoryId == null) {
       // Rule matched but its actions don't include a `set_category`. A
       // transfer-only rule (`create_transfer`, no `set_category`) is the
@@ -1264,6 +1352,13 @@ export async function applyRulesToBankRows(
     const notePlain = decodeBankString(bank.encryptionTier, dek, bank.note);
     const tagsPlain = decodeBankString(bank.encryptionTier, dek, bank.tags);
 
+    // Apply the rule's pure modifiers (rename_payee / set_tags /
+    // set_entered_currency) on top of the bank row's own values. A modifier
+    // that the rule didn't set falls back to the bank row's value.
+    const effectivePayee = patch.payee ?? payeePlain;
+    const effectiveTags = patch.tags ?? tagsPlain;
+    const effectiveEnteredCurrency = patch.enteredCurrency ?? bank.enteredCurrency;
+
     // INSERT tx + link in a single DB transaction. The dek non-null
     // assertion is safe — guarded above by the autoMaterialize=>dek check.
     const dekForWrite = dek!;
@@ -1278,13 +1373,13 @@ export async function applyRulesToBankRows(
             categoryId,
             currency: bank.currency,
             amount: bank.amount,
-            enteredCurrency: bank.enteredCurrency,
+            enteredCurrency: effectiveEnteredCurrency,
             enteredAmount: bank.enteredAmount,
             enteredFxRate: bank.enteredFxRate,
             quantity: bank.quantity,
-            payee: encryptField(dekForWrite, payeePlain) ?? "",
+            payee: encryptField(dekForWrite, effectivePayee) ?? "",
             note: encryptField(dekForWrite, notePlain) ?? "",
-            tags: encryptField(dekForWrite, tagsPlain) ?? "",
+            tags: encryptField(dekForWrite, effectiveTags) ?? "",
             importHash: bank.importHash,
             fitId: bank.fitId,
             bankTransactionId: bank.id,
