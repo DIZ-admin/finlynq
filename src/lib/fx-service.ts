@@ -15,9 +15,10 @@
 // Crypto (BTC, ETH, USDC, USDT) routes through CoinGecko via crypto-service.ts.
 
 import { db, schema } from "@/db";
-import { and, eq, desc, gte, lte, isNull, or, sql } from "drizzle-orm";
+import { and, eq, desc, gte, lte, isNull, or } from "drizzle-orm";
 import { todayISO } from "@/lib/utils/date";
 import { round2 } from "@/lib/currency-conversion";
+import { marketFetch } from "@/lib/market-fetch";
 import {
   SUPPORTED_CURRENCIES,
   isCryptoCurrency,
@@ -235,7 +236,7 @@ async function fetchYahooChartRateToUsd(symbol: string, date: string): Promise<n
       url = `https://query1.finance.yahoo.com/v8/finance/chart/${enc}?interval=1d&period1=${start}&period2=${end}`;
       isHistorical = true;
     }
-    const res = await fetch(url, {
+    const res = await marketFetch(url, {
       headers: { "User-Agent": "Mozilla/5.0" },
       next: { revalidate: 3600 },
       signal: AbortSignal.timeout(FX_FETCH_TIMEOUT_MS),

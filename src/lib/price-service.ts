@@ -19,6 +19,7 @@
 import { db, schema } from "@/db";
 import { and, eq, gte, inArray, lte } from "drizzle-orm";
 import { todayISO } from "@/lib/utils/date";
+import { marketFetch } from "@/lib/market-fetch";
 
 // FINLYNQ-201: the ETF-vs-stock classification no longer relies on a hardcoded
 // ETF registry. The badge is driven by Yahoo's `quoteType`/`instrumentType`
@@ -248,7 +249,7 @@ async function writePriceCache(
  */
 export async function fetchQuoteLive(symbol: string): Promise<QuoteResult | null> {
   try {
-    const res = await fetch(
+    const res = await marketFetch(
       `${YAHOO_BASE}/chart/${encodeURIComponent(symbol)}?interval=1d&range=1d`,
       {
         headers: { "User-Agent": "Mozilla/5.0" },
@@ -473,7 +474,7 @@ export async function fetchYahooDailyCloses(
     const period2 = Math.floor(Date.now() / 1000);
     if (!Number.isFinite(period1) || period1 >= period2) return [];
     const url = `${YAHOO_BASE}/chart/${encodeURIComponent(symbol)}?period1=${period1}&period2=${period2}&interval=1d`;
-    const res = await fetch(url, {
+    const res = await marketFetch(url, {
       headers: { "User-Agent": "Mozilla/5.0" },
       next: { revalidate: 86400 },
       signal: AbortSignal.timeout(QUOTE_FETCH_TIMEOUT_MS),
@@ -534,7 +535,7 @@ export async function fetchQuoteAtDate(symbol: string, date: string): Promise<Qu
     const period1 = Math.floor(windowStart.getTime() / 1000);
     const period2 = Math.floor(windowEndMs / 1000);
     const url = `${YAHOO_BASE}/chart/${encodeURIComponent(symbol)}?period1=${period1}&period2=${period2}&interval=1d`;
-    const res = await fetch(url, {
+    const res = await marketFetch(url, {
       headers: { "User-Agent": "Mozilla/5.0" },
       next: { revalidate: 86400 },
       signal: AbortSignal.timeout(QUOTE_FETCH_TIMEOUT_MS),

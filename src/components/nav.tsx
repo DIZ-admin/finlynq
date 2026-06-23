@@ -35,6 +35,7 @@ import {
   Megaphone,
   MessageCircle,
   Database,
+  Activity,
 } from "lucide-react";
 import type { LucideIcon } from "lucide-react";
 import { FinlynqLogo } from "@/components/FinlynqLogo";
@@ -101,6 +102,7 @@ const toolLinks: NavItem[] = [
   { href: "/admin/inbox", label: "Admin Inbox", icon: Inbox, color: ACTIVE_ACCENT, mode: "prod" },
   { href: "/admin/email-inbox", label: "Email Oversight", icon: Mailbox, color: ACTIVE_ACCENT, mode: "prod" },
   { href: "/admin/price-cache", label: "Rate Cache", icon: Database, color: ACTIVE_ACCENT, mode: "prod" },
+  { href: "/admin/api-log", label: "API Log", icon: Activity, color: ACTIVE_ACCENT, mode: "prod" },
   { href: "/admin/announcements", label: "Announcements", icon: Megaphone, color: ACTIVE_ACCENT, mode: "prod" },
   { href: "/admin/feedback", label: "Feedback", icon: MessageCircle, color: ACTIVE_ACCENT, mode: "prod" },
   { href: "/feedback", label: "Your feedback", icon: MessageCircle, color: ACTIVE_ACCENT, mode: "prod" },
