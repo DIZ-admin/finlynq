@@ -4,6 +4,7 @@
 import { db, schema } from "@/db";
 import { and, eq, inArray } from "drizzle-orm";
 import { todayISO } from "@/lib/utils/date";
+import { marketFetch } from "@/lib/market-fetch";
 // FINLYNQ-204: share the stock path's 30-min today-row TTL + staleness predicate
 // so crypto VALUATIONS (dashboard / net-worth / getHoldingsValueByAccount) refresh
 // intraday instead of freezing at the first cache fill of the UTC day. (The
@@ -115,7 +116,7 @@ export type CryptoSearchResult = {
 };
 
 async function coinGeckoFetch(endpoint: string): Promise<Response> {
-  return fetch(`${COINGECKO_BASE}${endpoint}`, {
+  return marketFetch(`${COINGECKO_BASE}${endpoint}`, {
     headers: {
       Accept: "application/json",
       "User-Agent": "Mozilla/5.0",

@@ -15,9 +15,10 @@
 // Crypto (BTC, ETH, USDC, USDT) routes through CoinGecko via crypto-service.ts.
 
 import { db, schema } from "@/db";
-import { and, eq, desc, gte, lte, isNull, or, sql } from "drizzle-orm";
+import { and, eq, desc, gte, lte, isNull, or } from "drizzle-orm";
 import { todayISO } from "@/lib/utils/date";
 import { round2 } from "@/lib/currency-conversion";
+import { marketFetch } from "@/lib/market-fetch";
 import {
   SUPPORTED_CURRENCIES,
   isCryptoCurrency,
@@ -112,12 +113,14 @@ const FALLBACK_RATE_TO_USD: Record<string, number> = {
   CNY: 0.14,
   HKD: 0.128,
   SGD: 0.74,
-  // Precious metals — rough 2026 spot levels, updated only when stooq is
-  // unreachable AND nothing is cached AND no override exists.
-  XAU: 4700,
-  XAG: 75,
-  XPT: 1000,
-  XPD: 1000,
+  // Precious metals (USD per troy oz) — LAST-RESORT fallback, used only when
+  // Yahoo futures are unreachable AND nothing is cached AND no override exists.
+  // Refreshed to ~2026-06 spot when the dead stooq source was replaced by Yahoo
+  // futures (see fetchYahooMetalRateToUsd / METAL_YAHOO_TICKER).
+  XAU: 4150,
+  XAG: 62,
+  XPT: 1660,
+  XPD: 1240,
 };
 
 // Pull the hardcoded codes into the validator's allowlist too, so users on a
@@ -193,16 +196,32 @@ function markFxFetchMiss(code: string): void {
 
 // ─── Yahoo Finance fetch ────────────────────────────────────────────────
 
-async function fetchYahooRateToUsd(currency: string, date: string): Promise<number | null> {
-  if (currency === "USD") return 1;
+// Yahoo front-month metal-futures tickers. stooq.com retired its free CSV
+// endpoints (2026-06: /q/l/ now 404s for EVERY symbol, incl. equities; /q/d/l/
+// sits behind a JS proof-of-work bot-challenge a server fetch can't pass), so
+// XAU/XAG/XPT/XPD now price off Yahoo futures — the same reliable source as
+// fiat. A front-month future tracks spot within ~1%, and Yahoo's chart endpoint
+// serves full daily history for the snapshot rebuild. ISO 4217 metal code →
+// Yahoo ticker.
+const METAL_YAHOO_TICKER: Record<string, string> = {
+  XAU: "GC=F", // gold
+  XAG: "SI=F", // silver
+  XPT: "PL=F", // platinum
+  XPD: "PA=F", // palladium
+};
+
+// Shared Yahoo chart fetch → price of one unit in USD. `symbol` is any Yahoo
+// chart symbol: "<CCY>USD=X" for fiat (1 unit → USD) or a futures ticker like
+// "GC=F" for a metal (1 troy oz → USD). For a past date, picks the latest close
+// on/before the requested date.
+async function fetchYahooChartRateToUsd(symbol: string, date: string): Promise<number | null> {
   try {
-    // <CCY>USD=X gives 1 unit of <CCY> in USD directly.
-    const symbol = `${currency}USD=X`;
     const today = todayISO();
+    const enc = encodeURIComponent(symbol);
     let url: string;
     let isHistorical = false;
     if (date >= today) {
-      url = `https://query1.finance.yahoo.com/v8/finance/chart/${symbol}?interval=1d&range=1d`;
+      url = `https://query1.finance.yahoo.com/v8/finance/chart/${enc}?interval=1d&range=1d`;
     } else {
       // Issue #231: window is biased BACKWARDS from the requested date so a
       // weekend / exchange-holiday lookup resolves to the prior trading day's
@@ -214,10 +233,10 @@ async function fetchYahooRateToUsd(currency: string, date: string): Promise<numb
       const reqMs = new Date(`${date}T00:00:00Z`).getTime();
       const start = Math.floor((reqMs - 86400_000 * 7) / 1000);
       const end = Math.floor((reqMs + 86400_000) / 1000);
-      url = `https://query1.finance.yahoo.com/v8/finance/chart/${symbol}?interval=1d&period1=${start}&period2=${end}`;
+      url = `https://query1.finance.yahoo.com/v8/finance/chart/${enc}?interval=1d&period1=${start}&period2=${end}`;
       isHistorical = true;
     }
-    const res = await fetch(url, {
+    const res = await marketFetch(url, {
       headers: { "User-Agent": "Mozilla/5.0" },
       next: { revalidate: 3600 },
       signal: AbortSignal.timeout(FX_FETCH_TIMEOUT_MS),
@@ -253,6 +272,20 @@ async function fetchYahooRateToUsd(currency: string, date: string): Promise<numb
   }
 }
 
+// 1 unit of `currency` in USD via Yahoo's `<CCY>USD=X` chart.
+async function fetchYahooRateToUsd(currency: string, date: string): Promise<number | null> {
+  if (currency === "USD") return 1;
+  return fetchYahooChartRateToUsd(`${currency}USD=X`, date);
+}
+
+// 1 troy oz of a precious metal (XAU/XAG/XPT/XPD) in USD via Yahoo futures.
+// Replaces the retired stooq CSV source. Returns null for a non-metal code.
+async function fetchYahooMetalRateToUsd(currency: string, date: string): Promise<number | null> {
+  const ticker = METAL_YAHOO_TICKER[currency.toUpperCase()];
+  if (!ticker) return null;
+  return fetchYahooChartRateToUsd(ticker, date);
+}
+
 async function fetchCryptoRateToUsd(currency: string): Promise<number | null> {
   if (currency === "USDC" || currency === "USDT") return 1;
   try {
@@ -267,62 +300,6 @@ async function fetchCryptoRateToUsd(currency: string): Promise<number | null> {
     const prices = await getCryptoSpotPrices([{ coinId: id, symbol: currency }]);
     const match = prices.find((p) => p.id === id);
     return match && match.price > 0 ? match.price : null;
-  } catch {
-    return null;
-  }
-}
-
-// Spot precious-metals rates from stooq.com. Yahoo's `<CCY>USD=X` pattern
-// returns 404 for XAU/XAG/XPT/XPD; stooq serves them via a free unauthenticated
-// CSV endpoint. Maps ISO 4217 metal codes to stooq's `xauusd` / `xagusd` /
-// `xptusd` / `xpdusd` symbols.
-async function fetchStooqMetalRateToUsd(currency: string, date: string): Promise<number | null> {
-  const symbol = `${currency.toLowerCase()}usd`;
-  const today = todayISO();
-  try {
-    if (date >= today) {
-      // Latest close — column layout: Symbol,Date,Time,Open,High,Low,Close
-      const url = `https://stooq.com/q/l/?s=${symbol}&f=sd2t2ohlc&h&e=csv`;
-      const res = await fetch(url, {
-        headers: { "User-Agent": "Mozilla/5.0" },
-        next: { revalidate: 3600 },
-        signal: AbortSignal.timeout(FX_FETCH_TIMEOUT_MS),
-      });
-      if (!res.ok) return null;
-      const text = await res.text();
-      const lines = text.trim().split(/\r?\n/);
-      if (lines.length < 2) return null;
-      const cols = lines[1].split(",");
-      const close = Number(cols[6]);
-      return Number.isFinite(close) && close > 0 ? close : null;
-    }
-    // Historical — 5-day window covering the requested date so weekend/holiday
-    // gaps still resolve. Column layout: Date,Open,High,Low,Close,Volume.
-    const reqMs = new Date(`${date}T00:00:00Z`).getTime();
-    const fromIso = new Date(reqMs - 86400_000 * 4).toISOString().slice(0, 10);
-    const d1 = fromIso.replaceAll("-", "");
-    const d2 = date.replaceAll("-", "");
-    const url = `https://stooq.com/q/d/l/?s=${symbol}&d1=${d1}&d2=${d2}&i=d`;
-    const res = await fetch(url, {
-      headers: { "User-Agent": "Mozilla/5.0" },
-      next: { revalidate: 3600 },
-      signal: AbortSignal.timeout(FX_FETCH_TIMEOUT_MS),
-    });
-    if (!res.ok) return null;
-    const text = await res.text();
-    const lines = text.trim().split(/\r?\n/);
-    if (lines.length < 2) return null;
-    // Pick the latest row with date <= requested date.
-    let best: { date: string; close: number } | null = null;
-    for (let i = 1; i < lines.length; i++) {
-      const cols = lines[i].split(",");
-      const rowDate = cols[0];
-      const close = Number(cols[4]);
-      if (!rowDate || !Number.isFinite(close) || close <= 0) continue;
-      if (rowDate > date) continue;
-      if (!best || rowDate > best.date) best = { date: rowDate, close };
-    }
-    return best ? best.close : null;
   } catch {
     return null;
   }
@@ -441,7 +418,7 @@ export async function getRateToUsdDetailed(
   const cached = await findCached(code, date);
   if (cached) return { rate: cached.rate, source: "yahoo", effectiveDate: cached.effectiveDate };
 
-  // 3. Live fetch — Yahoo for fiat, CoinGecko for crypto, stooq for metals.
+  // 3. Live fetch — Yahoo for fiat + metals (futures), CoinGecko for crypto.
   //    Skip the live call entirely if this currency's source recently failed or
   //    timed out (negative cache), so a hung/throttled upstream can't re-stall
   //    every request — we fall through to the most-recent cached rate (step 4).
@@ -452,8 +429,8 @@ export async function getRateToUsdDetailed(
       fetched = await fetchCryptoRateToUsd(code);
       liveSource = "coingecko";
     } else if (isMetalCurrency(code)) {
-      fetched = await fetchStooqMetalRateToUsd(code, date);
-      liveSource = "stooq";
+      fetched = await fetchYahooMetalRateToUsd(code, date);
+      liveSource = "yahoo";
     } else {
       fetched = await fetchYahooRateToUsd(code, date);
       liveSource = "yahoo";

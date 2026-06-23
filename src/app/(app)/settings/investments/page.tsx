@@ -69,7 +69,9 @@ import {
   ChevronDown,
   ChevronRight,
   Loader2,
+  AlertTriangle,
 } from "lucide-react";
+import { getTickerAdvisory } from "@/lib/securities/ticker-advisories";
 
 type SecurityAccount = {
   accountId: number;
@@ -176,6 +178,10 @@ export default function InvestmentsSettingsPage() {
   // Delete confirm (catalog cleanup, unused securities only).
   const [deleteTarget, setDeleteTarget] = useState<Security | null>(null);
   const [deleting, setDeleting] = useState(false);
+
+  // Ticker change (re-cluster) confirm — from the unpriceable-ticker advisory.
+  const [tickerTarget, setTickerTarget] = useState<{ security: Security; toSymbol: string } | null>(null);
+  const [tickerBusy, setTickerBusy] = useState(false);
 
   // Link dialog (Tab 2 "+ Account" / Tab 3 "+ Security").
   const [linkDialog, setLinkDialog] = useState<LinkDialogState>(null);
@@ -466,6 +472,31 @@ export default function InvestmentsSettingsPage() {
     }
   }
 
+  // ---- Ticker change (re-cluster) from the unpriceable-ticker advisory ----
+  async function confirmTickerChange() {
+    if (!tickerTarget) return;
+    setTickerBusy(true);
+    try {
+      const res = await fetch("/api/securities", {
+        method: "PATCH",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ id: tickerTarget.security.id, symbol: tickerTarget.toSymbol }),
+      });
+      if (!res.ok) {
+        const msg = await parseSaveError(res, "Failed to change ticker");
+        showToast("error", msg);
+        return;
+      }
+      showToast("success", `Ticker changed to ${tickerTarget.toSymbol}`);
+      setTickerTarget(null);
+      await load();
+    } catch (e) {
+      showToast("error", e instanceof Error ? e.message : "Failed to change ticker");
+    } finally {
+      setTickerBusy(false);
+    }
+  }
+
   // ---- Delete (unused securities only) ----
   async function confirmDelete() {
     if (!deleteTarget) return;
@@ -681,6 +712,53 @@ export default function InvestmentsSettingsPage() {
             </Button>
           </div>
 
+          {(() => {
+            const flagged = allSecurities.filter((s) => getTickerAdvisory(s.symbol));
+            if (flagged.length === 0) return null;
+            return (
+              <Card className="border-amber-300 bg-amber-50/50 dark:border-amber-900/50 dark:bg-amber-950/20">
+                <CardContent className="space-y-2 py-3">
+                  <div className="flex items-center gap-2 text-sm font-medium text-amber-700 dark:text-amber-400">
+                    <AlertTriangle className="h-4 w-4" />
+                    {flagged.length === 1 ? "A ticker can't be priced" : "Some tickers can't be priced"}
+                  </div>
+                  <ul className="space-y-1 text-xs text-amber-800/90 dark:text-amber-200/80">
+                    {flagged.map((s) => {
+                      const a = getTickerAdvisory(s.symbol)!;
+                      return (
+                        <li key={s.id} className="flex flex-wrap items-center gap-2">
+                          <span>
+                            <span className="font-mono font-semibold">{s.symbol}</span>
+                            {a.suggestedSymbol && (
+                              <>
+                                {" → "}
+                                <span className="font-mono font-semibold">{a.suggestedSymbol}</span>
+                              </>
+                            )}
+                            {`: ${a.message}`}
+                          </span>
+                          {a.suggestedSymbol && (
+                            <Button
+                              variant="outline"
+                              size="sm"
+                              className="h-6 shrink-0 border-amber-400 px-2 text-[11px] text-amber-800 hover:bg-amber-100 dark:border-amber-700 dark:text-amber-200 dark:hover:bg-amber-900/40"
+                              onClick={() => setTickerTarget({ security: s, toSymbol: a.suggestedSymbol! })}
+                            >
+                              Change to {a.suggestedSymbol}
+                            </Button>
+                          )}
+                        </li>
+                      );
+                    })}
+                  </ul>
+                  <p className="text-[11px] text-amber-700/80 dark:text-amber-300/70">
+                    To fix, edit the holding on the Portfolio page and change its ticker to the suggested symbol.
+                  </p>
+                </CardContent>
+              </Card>
+            );
+          })()}
+
           {allSecurities.length === 0 ? (
             <EmptyState
               icon={Briefcase}
@@ -723,6 +801,14 @@ export default function InvestmentsSettingsPage() {
                             <Badge variant="outline" className="ml-1.5 text-[10px]">
                               cash
                             </Badge>
+                          )}
+                          {getTickerAdvisory(r.symbol) && (
+                            <span
+                              className="ml-1.5 inline-flex align-text-bottom"
+                              title={getTickerAdvisory(r.symbol)!.message}
+                            >
+                              <AlertTriangle className="h-3.5 w-3.5 text-amber-500" />
+                            </span>
                           )}
                         </TableCell>
                         <TableCell className="text-sm">
@@ -1188,6 +1274,22 @@ export default function InvestmentsSettingsPage() {
         busyLabel="Deleting…"
         busy={deleting}
         onConfirm={confirmDelete}
+      />
+
+      {/* ── Ticker change confirm (re-cluster) ─────────────────────────── */}
+      <ConfirmDialog
+        open={tickerTarget != null}
+        onOpenChange={(o) => { if (!o) setTickerTarget(null); }}
+        title="Change ticker"
+        description={
+          tickerTarget
+            ? `Change ${symbolLabel(tickerTarget.security)} to ${tickerTarget.toSymbol}? This re-points the holding (and its full history) to the new ticker — prices will use ${tickerTarget.toSymbol} going forward. Positions, lots, and transactions are unchanged.`
+            : ""
+        }
+        confirmLabel="Change ticker"
+        busyLabel="Changing…"
+        busy={tickerBusy}
+        onConfirm={confirmTickerChange}
       />
     </div>
   );
