@@ -352,7 +352,11 @@ async function runHoldingCash(
   // runHoldingCash is only reached for these three ops (dispatched by the
   // switch in materializeBankRowAsPortfolioOp).
   const kind = action.op as "dividend" | "interest" | "fee";
-  const categoryId = await resolveOrCreateInvestmentIncomeCategory(db, userId, dek, kind);
+  // An explicit rule category wins; otherwise resolve the canonical income
+  // category by op kind (Dividends / Interest / Investment Fees).
+  const categoryId =
+    action.categoryId ??
+    (await resolveOrCreateInvestmentIncomeCategory(db, userId, dek, kind));
 
   // dividend / interest are income (+); fee is an expense (−).
   const signed = kind === "fee" ? -cash.amount : cash.amount;
@@ -417,7 +421,11 @@ async function runIncomeInShares(
   }
 
   const kind = action.op as "dividend" | "interest";
-  const categoryId = await resolveOrCreateInvestmentIncomeCategory(db, userId, dek, kind);
+  // An explicit rule category wins; otherwise resolve the canonical income
+  // category by op kind (Dividends / Interest).
+  const categoryId =
+    action.categoryId ??
+    (await resolveOrCreateInvestmentIncomeCategory(db, userId, dek, kind));
 
   const r = await recordReinvestedIncomeInShares({
     userId,

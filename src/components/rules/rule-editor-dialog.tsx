@@ -650,6 +650,7 @@ function ActionRow({
           action={action}
           accounts={accounts}
           holdings={holdings}
+          categories={categories}
           onChange={onChange}
         />
       )}
@@ -668,11 +669,13 @@ function InvestmentOpFields({
   action,
   accounts,
   holdings,
+  categories,
   onChange,
 }: {
   action: Extract<Action, { kind: "record_investment_op" }>;
   accounts: Account[];
   holdings: Holding[];
+  categories: Category[];
   onChange: (patch: Partial<Action>) => void;
 }) {
   const op = action.op;
@@ -682,6 +685,11 @@ function InvestmentOpFields({
   const isIncomeOp = op === "dividend" || op === "interest";
   const isShares = isIncomeOp && action.settleAs === "shares";
   const usesPosition = isTrade || op === "dividend" || op === "interest" || op === "fee";
+  // dividend / interest / fee record a categorized income/expense row — let the
+  // user pick ANY category, defaulting to the canonical one for the op kind.
+  const usesCategory = op === "dividend" || op === "interest" || op === "fee";
+  const autoCategoryName =
+    op === "dividend" ? "Dividends" : op === "interest" ? "Interest" : "Investment Fees";
   // Shares-settled income needs qty + value bindings, exactly like a trade.
   const usesTradeBindings = isTrade || isShares;
 
@@ -814,6 +822,32 @@ function InvestmentOpFields({
         </>
       ) : (
         <VarBindingRow label="Amount" value={action.total} onChange={(total) => onChange({ total } as Partial<Action>)} />
+      )}
+
+      {usesCategory && (
+        <div className="flex flex-wrap items-center gap-2">
+          <Label className="w-28 text-xs text-muted-foreground">Category</Label>
+          <Combobox
+            value={String(action.categoryId ?? 0)}
+            onValueChange={(v) => {
+              const n = parseInt(v ?? "0");
+              onChange({ categoryId: n > 0 ? n : undefined } as Partial<Action>);
+            }}
+            items={[
+              { value: "0", label: `Auto — ${autoCategoryName}` },
+              ...categories
+                .map((c): ComboboxItemShape => ({
+                  value: String(c.id),
+                  label: `${c.group} — ${c.name}`,
+                }))
+                .sort((a, z) => (a.label ?? "").localeCompare(z.label ?? "")),
+            ]}
+            placeholder="Select category"
+            searchPlaceholder="Search categories…"
+            emptyMessage="No matches"
+            className="flex-1 min-w-48"
+          />
+        </div>
       )}
     </div>
   );

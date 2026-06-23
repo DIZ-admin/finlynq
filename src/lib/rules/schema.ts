@@ -195,6 +195,11 @@ const RecordInvestmentOpAction = z.object({
    *  qty + total bind like a trade (any two of {qty,total,price}) — instead of
    *  crediting a cash sleeve. Absent / "cash" = the legacy cash-sleeve path. */
   settleAs: z.enum(["cash", "shares"]).optional(),
+  /** Optional explicit category for the income/cash ops (dividend / interest /
+   *  fee — applies in both cash and shares settle modes). When unset, the
+   *  executor resolves the canonical income category by op kind (Dividends /
+   *  Interest / Investment Fees). Ignored by buy/sell/deposit/withdrawal. */
+  categoryId: z.number().int().positive().optional(),
 });
 
 export const Action = z.discriminatedUnion("kind", [
@@ -341,6 +346,7 @@ export function collectActionFKs(actions: Action[]): {
         accountIds.add(a.investmentAccountId);
         if (a.counterpartyAccountId != null) accountIds.add(a.counterpartyAccountId);
         if (a.holdingId != null) holdingIds.add(a.holdingId);
+        if (a.categoryId != null) categoryIds.add(a.categoryId);
         break;
       default:
         break;
