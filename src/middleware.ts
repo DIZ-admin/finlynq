@@ -314,6 +314,7 @@ export function middleware(request: NextRequest) {
     pathname === "/self-hosted" ||
     pathname === "/about" ||
     pathname === "/blog" ||
+    pathname === "/releases" ||
     pathname === "/roadmap" ||
     pathname === "/vs" ||
     pathname === "/glossary" ||
@@ -322,6 +323,7 @@ export function middleware(request: NextRequest) {
     pathname.startsWith("/self-hosted/") ||
     pathname.startsWith("/vs/") ||
     pathname.startsWith("/blog/") ||
+    pathname.startsWith("/releases/") ||
     pathname.startsWith("/glossary/") ||
     pathname.startsWith("/mcp-guide/") ||
     pathname.startsWith("/docs");

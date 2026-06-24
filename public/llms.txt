@@ -10,6 +10,7 @@ Finlynq is the only open-source, self-hostable personal finance manager (PFM) wi
 - [MCP tool catalog](https://finlynq.com/mcp-guide/tools): The full list of HTTP + stdio MCP tools, grouped by category.
 - [Self-hosting](https://finlynq.com/self-hosted): Run Finlynq on your own infrastructure with Docker Compose.
 - [Managed cloud](https://finlynq.com/cloud): Free hosted edition, same features as self-host.
+- [Releases](https://finlynq.com/releases): Release notes and changelog. What's new in each version.
 
 ## Comparisons
 - [Finlynq vs Monarch Money](https://finlynq.com/vs/monarch): Open-source self-host vs polished closed SaaS with mature US bank sync.
