@@ -1,4 +1,5 @@
 import { GLOSSARY } from "@/lib/seo/glossary";
+import { RELEASES_BY_DATE } from "@/lib/seo/releases";
 import { SITE_URL, VS_SLUGS, VS_META } from "@/lib/seo/site";
 
 // Long-form companion to /llms.txt — the full text of the public glossary plus
@@ -36,6 +37,22 @@ export function GET() {
       } else {
         lines.push(block.text);
       }
+    }
+  }
+
+  lines.push("");
+  lines.push("## Releases");
+  lines.push(`Releases index: ${SITE_URL}/releases`);
+  for (const release of RELEASES_BY_DATE) {
+    lines.push("");
+    lines.push(`### ${release.name} (${release.date})`);
+    lines.push(`Source: ${SITE_URL}/releases/${release.slug}`);
+    lines.push("");
+    lines.push(release.tagline);
+    for (const section of release.sections) {
+      lines.push("");
+      lines.push(`#### ${section.heading}`);
+      for (const item of section.items) lines.push(`- ${item}`);
     }
   }
 

@@ -881,6 +881,7 @@ export function LandingClient() {
                 <li><a href="#flow">How it works</a></li>
                 <li><Link href="/mcp-guide">MCP &amp; API guide</Link></li>
                 <li><Link href="/roadmap">Roadmap</Link></li>
+                <li><Link href="/releases">Releases</Link></li>
                 <li><Link href="/glossary">Glossary</Link></li>
                 <li><Link href="/blog">Blog</Link></li>
                 <li>
