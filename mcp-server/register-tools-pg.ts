@@ -151,6 +151,7 @@ import { materializeBankRowAsTransaction } from "../src/lib/reconcile/materializ
 import { materializeBankRowAsTransfer } from "../src/lib/reconcile/materialize-transfer";
 import {
   linkTransactionToBank,
+  linkTransactionsToBank,
   unlinkTransactionFromBank,
   LinkError,
 } from "../src/lib/reconcile/links";
@@ -5624,7 +5625,7 @@ export function registerPgTools(
           portfolio_tools: ["get_portfolio_analysis", "get_portfolio_performance", "analyze_holding", "trace_holding_quantity", "get_investment_insights"],
           portfolio_write_tools: ["portfolio_buy", "portfolio_sell", "portfolio_swap", "portfolio_transfer", "portfolio_income_expense", "portfolio_fx_conversion", "portfolio_deposit", "portfolio_withdrawal", "add_portfolio_holding", "update_portfolio_holding", "delete_portfolio_holding"],
           transfer_tools: ["record_transfer"],
-          reconcile_tools: ["upload_statement", "get_reconcile_suggestions", "get_reconciliation_summary", "find_duplicate_bank_rows", "delete_bank_transaction", "send_to_bank_ledger", "materialize_bank_row", "accept_reconcile_suggestion", "unlink_reconcile", "set_account_mode", "apply_rules_to_staged_import", "apply_rules_to_bank_rows"],
+          reconcile_tools: ["upload_statement", "get_reconcile_suggestions", "get_reconciliation_summary", "find_duplicate_bank_rows", "delete_bank_transaction", "send_to_bank_ledger", "materialize_bank_row", "accept_reconcile_suggestion", "accept_reconcile_suggestions", "unlink_reconcile", "set_account_mode", "apply_rules_to_staged_import", "apply_rules_to_bank_rows"],
           tip: "Finlynq records bookkeeping entries in your own database; it never connects to a brokerage or bank or moves real money. Use tool_name='record_transaction' for detailed usage of any tool. INVESTMENT accounts CANNOT use record_transaction / bulk_record_transactions / record_transfer for trades — use the portfolio_* write tools (portfolio_buy / portfolio_sell / portfolio_swap / portfolio_transfer / portfolio_deposit / portfolio_withdrawal / portfolio_income_expense / portfolio_fx_conversion). record_transfer remains the path for plain cash transfers between non-investment accounts. Use topic='reconcile' for the bank-ledger reconciliation + rule-application tools.",
         });
       }
@@ -5694,8 +5695,8 @@ export function registerPgTools(
         return dataResponse({
           read_tools: ["get_reconciliation_summary", "get_reconcile_suggestions", "find_duplicate_bank_rows"],
           write_tools: ["upload_statement", "send_to_bank_ledger", "delete_bank_transaction", "materialize_bank_row", "accept_reconcile_suggestion", "unlink_reconcile", "set_account_mode", "apply_rules_to_staged_import"],
-          bulk_tools: ["apply_rules_to_bank_rows"],
-          flow: "-2) get_reconciliation_summary() → portfolio-wide reconcile health in ONE call (per-account linked / suggestions / bankOnly / txOnly counts + balanceDelta) — run this at session start instead of one get_reconcile_suggestions per account, then drill into the off accounts. -1) upload_statement(fileContent[base64], fileName, accountId) → stage a CSV/OFX/QFX statement over MCP (no browser session) — returns a real stagedImportId (NOT the mcp_uploads artifact of the legacy /api/mcp/upload path) for the steps below. 0) send_to_bank_ledger(stagedImportId) → promote a pending statement import into the BANK LEDGER ONLY (no `transactions` rows) + load its balance anchor — the normal reconcile setup when the account already has ledger transactions for the period (use approve_staged_rows only for a first import of a brand-new account). 0.5) find_duplicate_bank_rows(accountId) → list groups of duplicate bank-ledger rows (distinct ids for one event from overlapping imports); canonicalId is the oldest to keep, then delete_bank_transaction(bankTransactionId) removes each extra (dryRun:true to preview the affected transactions first). 1) get_reconcile_suggestions(accountId) → see linked / suggestions / bankOnly rows, each bank row carrying suggestedCategoryId / suggestedTransferAccountId / duplicateOfTransactionId. 2) materialize_bank_row(bankTransactionId, categoryId) for a category tx, or (bankTransactionId, destAccountId) for a transfer pair (outflow rows only). 3) accept_reconcile_suggestion / unlink_reconcile to link/undo an existing tx ↔ bank pairing. 4) set_account_mode(accountId, mode) to flip the per-account pipeline policy (auto/approve/manual). 5) apply_rules_to_staged_import(stagedImportId) to re-fire rules over a pending import. 6) apply_rules_to_bank_rows(bankRowIds) → preview + confirmationToken; resend with the token + autoMaterialize:true to bulk-materialize matched rows.",
+          bulk_tools: ["accept_reconcile_suggestions", "apply_rules_to_bank_rows"],
+          flow: "-2) get_reconciliation_summary() → portfolio-wide reconcile health in ONE call (per-account linked / suggestions / bankOnly / txOnly counts + balanceDelta) — run this at session start instead of one get_reconcile_suggestions per account, then drill into the off accounts. -1) upload_statement(fileContent[base64], fileName, accountId) → stage a CSV/OFX/QFX statement over MCP (no browser session) — returns a real stagedImportId (NOT the mcp_uploads artifact of the legacy /api/mcp/upload path) for the steps below. 0) send_to_bank_ledger(stagedImportId) → promote a pending statement import into the BANK LEDGER ONLY (no `transactions` rows) + load its balance anchor — the normal reconcile setup when the account already has ledger transactions for the period (use approve_staged_rows only for a first import of a brand-new account). 0.5) find_duplicate_bank_rows(accountId) → list groups of duplicate bank-ledger rows (distinct ids for one event from overlapping imports); canonicalId is the oldest to keep, then delete_bank_transaction(bankTransactionId) removes each extra (dryRun:true to preview the affected transactions first). 1) get_reconcile_suggestions(accountId) → see linked / suggestions / bankOnly rows, each bank row carrying suggestedCategoryId / suggestedTransferAccountId / duplicateOfTransactionId. 2) materialize_bank_row(bankTransactionId, categoryId) for a category tx, or (bankTransactionId, destAccountId) for a transfer pair (outflow rows only). 3) accept_reconcile_suggestion / unlink_reconcile to link/undo an existing tx ↔ bank pairing, or accept_reconcile_suggestions(pairs[]) to link MANY tx↔bank pairs in ONE call (positional results; partial commit — a bad/cross-account id carries `error` and the rest still land). 4) set_account_mode(accountId, mode) to flip the per-account pipeline policy (auto/approve/manual). 5) apply_rules_to_staged_import(stagedImportId) to re-fire rules over a pending import. 6) apply_rules_to_bank_rows(bankRowIds) → preview + confirmationToken; resend with the token + autoMaterialize:true to bulk-materialize matched rows.",
           note: "All reconcile tools are HTTP-only and need an unlocked DEK. upload_statement decodes a base64 file (CSV/OFX/QFX, 5 MB decoded cap) and stages it → a real staged_imports.id for send_to_bank_ledger / approve_staged_rows; an unrecognised/unparseable file returns detectedFormat:'unrecognised' and creates nothing. send_to_bank_ledger writes ONLY bank_transactions (never `transactions`); approve_staged_rows is the one that CREATES ledger transactions (first-import only). delete_bank_transaction removes a bank row (cascade clears its links + nulls transactions.bank_transaction_id; the `transactions` rows survive) — dryRun first. apply_rules_to_bank_rows uses a two-step confirmation token (preview never writes).",
         });
       }
@@ -12454,6 +12455,56 @@ export function registerPgTools(
         }
         throw e;
       }
+    },
+  );
+
+  // ── accept_reconcile_suggestions (bulk) ─────────────────────────────────────
+  // FINLYNQ-216 / R-01. Link many bank↔tx pairs in one call. Each pair runs in
+  // its OWN transaction (per-pair savepoint), so one bad/cross-account/unknown
+  // id rolls back only that pair and the rest still commit (partial commit).
+  // Results are POSITIONAL with the input. invalidateUser fires EXACTLY ONCE
+  // after the batch. HTTP-only (registered here, not in stdio). idempotentHint
+  // passed explicitly — the name doesn't match the auto-annotation prefixes.
+  server.tool(
+    "accept_reconcile_suggestions",
+    "Bookkeeping only: links rows in the user's own Finlynq ledger (Finlynq never connects to a bank or moves real money). Bulk-accept reconcile suggestions: link MANY existing transactions to bank-ledger rows in ONE call. `pairs` is an array of {bankTransactionId, transactionId, linkType?} (linkType defaults to 'primary'). Each pair is independent: a bad/cross-account/unknown id carries an `error` and the rest still commit (partial commit). Idempotent — a re-submitted already-linked pair returns alreadyLinked:true with no error. Returns an array POSITIONAL with the input: {bankTransactionId, transactionId, linkId, setPrimaryFk, alreadyLinked, error?}. Reverse individual links with unlink_reconcile.",
+    {
+      pairs: z
+        .array(
+          z.object({
+            bankTransactionId: z
+              .string()
+              .uuid()
+              .describe("bank_transactions.id to link to."),
+            transactionId: z
+              .number()
+              .int()
+              .positive()
+              .describe("transactions.id to link."),
+            linkType: z
+              .enum(["primary", "extra"])
+              .default("primary")
+              .describe(
+                "'primary' sets the lineage FK if unset; 'extra' is an additional link. Defaults to 'primary'.",
+              ),
+          }),
+        )
+        .min(1)
+        .max(200)
+        .describe("Bank↔transaction pairs to link. Response is positional with this array."),
+    },
+    { idempotentHint: true },
+    async ({ pairs }) => {
+      const results = await linkTransactionsToBank(
+        userId,
+        pairs.map((p) => ({
+          transactionId: p.transactionId,
+          bankTransactionId: p.bankTransactionId,
+          linkType: p.linkType,
+        })),
+        "manual",
+      );
+      return dataResponse(results);
     },
   );
 

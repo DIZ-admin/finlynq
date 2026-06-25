@@ -56,18 +56,22 @@ export interface LinkResult {
 }
 
 /**
- * Link a transaction to a bank-ledger row. Inserts a `transaction_bank_links`
- * row; if `linkType='primary'` AND the transaction's FK is currently NULL,
- * also sets `transactions.bank_transaction_id` and bumps `updated_at`.
+ * Transactional core of {@link linkTransactionToBank}. Performs the ownership
+ * check, same-account guard, idempotency check, INSERT, and (for primary
+ * links) the FK bump — all inside ONE `db.transaction`. Does NOT invalidate
+ * the per-user tx cache: callers own that so a batch can invalidate exactly
+ * once. Throws {@link LinkError} on ownership / cross-account failures.
  *
- * Idempotent: if the (tx, bank) pair is already in the join table, returns
- * the existing row's id without modifying anything. The caller can flip
- * `link_type` later via a dedicated UPDATE path if needed.
+ * Extracted (FINLYNQ-216, additive — the public `linkTransactionToBank`
+ * contract below is byte-identical) so the bulk helper
+ * {@link linkTransactionsToBank} can loop this core per pair (each its own
+ * outermost transaction = a natural per-pair "savepoint": a failed pair rolls
+ * back only its own tx, the rest commit) and call `invalidateUser` once.
  */
-export async function linkTransactionToBank(
+async function linkTransactionToBankCore(
   input: LinkInput,
 ): Promise<LinkResult> {
-  const result = await db.transaction(async (tx) => {
+  return db.transaction(async (tx) => {
     // Verify ownership of both rows. Defense in depth — the API route
     // SHOULD have done this already, but if we're called from a future
     // surface that forgot, fail closed.
@@ -188,9 +192,102 @@ export async function linkTransactionToBank(
       alreadyLinked: false,
     };
   });
+}
 
+/**
+ * Link a transaction to a bank-ledger row. Inserts a `transaction_bank_links`
+ * row; if `linkType='primary'` AND the transaction's FK is currently NULL,
+ * also sets `transactions.bank_transaction_id` and bumps `updated_at`.
+ *
+ * Idempotent: if the (tx, bank) pair is already in the join table, returns
+ * the existing row's id without modifying anything. The caller can flip
+ * `link_type` later via a dedicated UPDATE path if needed.
+ */
+export async function linkTransactionToBank(
+  input: LinkInput,
+): Promise<LinkResult> {
+  const result = await linkTransactionToBankCore(input);
   invalidateUser(input.userId);
   return result;
+}
+
+/** One element of a {@link linkTransactionsToBank} batch. */
+export interface BulkLinkPair {
+  transactionId: number;
+  bankTransactionId: string;
+  linkType: LinkType;
+}
+
+/** Positional result for one {@link BulkLinkPair}. On success `error` is
+ *  absent; on failure the link fields are null and `error` carries the
+ *  human-readable reason (ownership / cross-account / unexpected). */
+export interface BulkLinkResult {
+  transactionId: number;
+  bankTransactionId: string;
+  linkId: number | null;
+  setPrimaryFk: boolean;
+  alreadyLinked: boolean;
+  error?: string;
+}
+
+/**
+ * Bulk-link many (tx, bank) pairs in a single MCP call (FINLYNQ-216).
+ *
+ * Each pair runs through {@link linkTransactionToBankCore} in its OWN
+ * transaction, so a bad / cross-account / unknown id rolls back only that
+ * pair and the rest still commit (partial commit — the per-pair "savepoint").
+ * Results are POSITIONAL with `pairs` (result[i] ↔ pairs[i]). Idempotency is
+ * inherited verbatim from the core: a re-submitted already-linked pair returns
+ * `alreadyLinked:true` with no error and inserts no duplicate.
+ *
+ * `invalidateUser(userId)` is called EXACTLY ONCE after the loop (never
+ * per-pair) so the per-user MCP tx cache is invalidated a single time for the
+ * whole batch.
+ */
+export async function linkTransactionsToBank(
+  userId: string,
+  pairs: BulkLinkPair[],
+  source: TransactionSource,
+): Promise<BulkLinkResult[]> {
+  const results: BulkLinkResult[] = [];
+  for (const pair of pairs) {
+    try {
+      const r = await linkTransactionToBankCore({
+        userId,
+        transactionId: pair.transactionId,
+        bankTransactionId: pair.bankTransactionId,
+        linkType: pair.linkType,
+        source,
+      });
+      results.push({
+        transactionId: pair.transactionId,
+        bankTransactionId: pair.bankTransactionId,
+        linkId: r.linkId,
+        setPrimaryFk: r.setPrimaryFk,
+        alreadyLinked: r.alreadyLinked,
+      });
+    } catch (e) {
+      const message =
+        e instanceof LinkError
+          ? e.code === "cross_account"
+            ? "Transaction and bank row belong to different accounts; a transfer leg can only be linked to a bank row in its own account."
+            : "Not found"
+          : e instanceof Error
+            ? e.message
+            : "Unexpected error linking pair";
+      results.push({
+        transactionId: pair.transactionId,
+        bankTransactionId: pair.bankTransactionId,
+        linkId: null,
+        setPrimaryFk: false,
+        alreadyLinked: false,
+        error: message,
+      });
+    }
+  }
+  // Exactly once after the batch — never per-pair (tc-4-invalidate-once).
+  invalidateUser(userId);
+  return results;
 }
 
 export interface UnlinkInput {
