@@ -161,6 +161,9 @@ import {
   findDuplicateBankRows,
   type DuplicateBankInputRow,
 } from "../src/lib/reconcile/find-duplicate-bank-rows";
+// FINLYNQ-215 (R-04) — portfolio-wide reconcile health aggregator for the
+// get_reconciliation_summary read tool (counts + shared balance-check delta).
+import { getReconciliationSummary } from "../src/lib/reconcile/summary";
 
 // ─── types ────────────────────────────────────────────────────────────────────
 
@@ -5621,7 +5624,7 @@ export function registerPgTools(
           portfolio_tools: ["get_portfolio_analysis", "get_portfolio_performance", "analyze_holding", "trace_holding_quantity", "get_investment_insights"],
           portfolio_write_tools: ["portfolio_buy", "portfolio_sell", "portfolio_swap", "portfolio_transfer", "portfolio_income_expense", "portfolio_fx_conversion", "portfolio_deposit", "portfolio_withdrawal", "add_portfolio_holding", "update_portfolio_holding", "delete_portfolio_holding"],
           transfer_tools: ["record_transfer"],
-          reconcile_tools: ["upload_statement", "get_reconcile_suggestions", "find_duplicate_bank_rows", "delete_bank_transaction", "send_to_bank_ledger", "materialize_bank_row", "accept_reconcile_suggestion", "unlink_reconcile", "set_account_mode", "apply_rules_to_staged_import", "apply_rules_to_bank_rows"],
+          reconcile_tools: ["upload_statement", "get_reconcile_suggestions", "get_reconciliation_summary", "find_duplicate_bank_rows", "delete_bank_transaction", "send_to_bank_ledger", "materialize_bank_row", "accept_reconcile_suggestion", "unlink_reconcile", "set_account_mode", "apply_rules_to_staged_import", "apply_rules_to_bank_rows"],
           tip: "Finlynq records bookkeeping entries in your own database; it never connects to a brokerage or bank or moves real money. Use tool_name='record_transaction' for detailed usage of any tool. INVESTMENT accounts CANNOT use record_transaction / bulk_record_transactions / record_transfer for trades — use the portfolio_* write tools (portfolio_buy / portfolio_sell / portfolio_swap / portfolio_transfer / portfolio_deposit / portfolio_withdrawal / portfolio_income_expense / portfolio_fx_conversion). record_transfer remains the path for plain cash transfers between non-investment accounts. Use topic='reconcile' for the bank-ledger reconciliation + rule-application tools.",
         });
       }
@@ -5689,10 +5692,10 @@ export function registerPgTools(
 
       if (t === "reconcile") {
         return dataResponse({
-          read_tools: ["get_reconcile_suggestions", "find_duplicate_bank_rows"],
+          read_tools: ["get_reconciliation_summary", "get_reconcile_suggestions", "find_duplicate_bank_rows"],
           write_tools: ["upload_statement", "send_to_bank_ledger", "delete_bank_transaction", "materialize_bank_row", "accept_reconcile_suggestion", "unlink_reconcile", "set_account_mode", "apply_rules_to_staged_import"],
           bulk_tools: ["apply_rules_to_bank_rows"],
-          flow: "-1) upload_statement(fileContent[base64], fileName, accountId) → stage a CSV/OFX/QFX statement over MCP (no browser session) — returns a real stagedImportId (NOT the mcp_uploads artifact of the legacy /api/mcp/upload path) for the steps below. 0) send_to_bank_ledger(stagedImportId) → promote a pending statement import into the BANK LEDGER ONLY (no `transactions` rows) + load its balance anchor — the normal reconcile setup when the account already has ledger transactions for the period (use approve_staged_rows only for a first import of a brand-new account). 0.5) find_duplicate_bank_rows(accountId) → list groups of duplicate bank-ledger rows (distinct ids for one event from overlapping imports); canonicalId is the oldest to keep, then delete_bank_transaction(bankTransactionId) removes each extra (dryRun:true to preview the affected transactions first). 1) get_reconcile_suggestions(accountId) → see linked / suggestions / bankOnly rows, each bank row carrying suggestedCategoryId / suggestedTransferAccountId / duplicateOfTransactionId. 2) materialize_bank_row(bankTransactionId, categoryId) for a category tx, or (bankTransactionId, destAccountId) for a transfer pair (outflow rows only). 3) accept_reconcile_suggestion / unlink_reconcile to link/undo an existing tx ↔ bank pairing. 4) set_account_mode(accountId, mode) to flip the per-account pipeline policy (auto/approve/manual). 5) apply_rules_to_staged_import(stagedImportId) to re-fire rules over a pending import. 6) apply_rules_to_bank_rows(bankRowIds) → preview + confirmationToken; resend with the token + autoMaterialize:true to bulk-materialize matched rows.",
+          flow: "-2) get_reconciliation_summary() → portfolio-wide reconcile health in ONE call (per-account linked / suggestions / bankOnly / txOnly counts + balanceDelta) — run this at session start instead of one get_reconcile_suggestions per account, then drill into the off accounts. -1) upload_statement(fileContent[base64], fileName, accountId) → stage a CSV/OFX/QFX statement over MCP (no browser session) — returns a real stagedImportId (NOT the mcp_uploads artifact of the legacy /api/mcp/upload path) for the steps below. 0) send_to_bank_ledger(stagedImportId) → promote a pending statement import into the BANK LEDGER ONLY (no `transactions` rows) + load its balance anchor — the normal reconcile setup when the account already has ledger transactions for the period (use approve_staged_rows only for a first import of a brand-new account). 0.5) find_duplicate_bank_rows(accountId) → list groups of duplicate bank-ledger rows (distinct ids for one event from overlapping imports); canonicalId is the oldest to keep, then delete_bank_transaction(bankTransactionId) removes each extra (dryRun:true to preview the affected transactions first). 1) get_reconcile_suggestions(accountId) → see linked / suggestions / bankOnly rows, each bank row carrying suggestedCategoryId / suggestedTransferAccountId / duplicateOfTransactionId. 2) materialize_bank_row(bankTransactionId, categoryId) for a category tx, or (bankTransactionId, destAccountId) for a transfer pair (outflow rows only). 3) accept_reconcile_suggestion / unlink_reconcile to link/undo an existing tx ↔ bank pairing. 4) set_account_mode(accountId, mode) to flip the per-account pipeline policy (auto/approve/manual). 5) apply_rules_to_staged_import(stagedImportId) to re-fire rules over a pending import. 6) apply_rules_to_bank_rows(bankRowIds) → preview + confirmationToken; resend with the token + autoMaterialize:true to bulk-materialize matched rows.",
           note: "All reconcile tools are HTTP-only and need an unlocked DEK. upload_statement decodes a base64 file (CSV/OFX/QFX, 5 MB decoded cap) and stages it → a real staged_imports.id for send_to_bank_ledger / approve_staged_rows; an unrecognised/unparseable file returns detectedFormat:'unrecognised' and creates nothing. send_to_bank_ledger writes ONLY bank_transactions (never `transactions`); approve_staged_rows is the one that CREATES ledger transactions (first-import only). delete_bank_transaction removes a bank row (cascade clears its links + nulls transactions.bank_transaction_id; the `transactions` rows survive) — dryRun first. apply_rules_to_bank_rows uses a two-step confirmation token (preview never writes).",
         });
       }
@@ -11942,6 +11945,68 @@ export function registerPgTools(
       });
 
       return dataResponse(findDuplicateBankRows(rows));
+    },
+  );
+
+  // ── get_reconciliation_summary (FINLYNQ-215 / R-04) ─────────────────────────
+  // Read-only. Portfolio-wide reconcile health in ONE call: per-account
+  // linked / suggestions / bankOnly / txOnly counts + the bank-vs-system
+  // balance check. Replaces N sequential get_reconcile_suggestions calls at
+  // session start. Counts reuse the same match engine as get_reconcile_
+  // suggestions; balanceDelta reuses the SAME calc the /import reconcile header
+  // shows (computeAccountBalanceSummary). Account names are encrypted, so this
+  // is HTTP-only / DEK-required. readOnlyHint is inferred from the get_ prefix.
+  server.tool(
+    "get_reconciliation_summary",
+    "Bookkeeping only: Finlynq reads from your own database and never connects to a bank or brokerage or moves real money. Portfolio-wide reconcile health in ONE call (instead of one get_reconcile_suggestions per account). Returns an array of { accountId, accountName, linked, suggestions, bankOnly, txOnly, balanceMismatch, balanceDelta?, lastAnchorDate?, currency } — one row per account. balanceDelta = system/ledger balance − bank statement balance (the same delta the /import reconcile header shows; positive ⇒ ledger says MORE than the statement; null when the account has no balance anchor yet). Omit accountIds to summarize ALL non-investment accounts (investment reconcile is out of scope); pass accountIds to scope it (owner-scoped). Counts only — drill into a specific account with get_reconcile_suggestions. Read-only. Requires an unlocked DEK (payees are decrypted to score fuzzy matches; account names are decrypted).",
+    {
+      accountIds: z
+        .array(z.number().int().positive())
+        .optional()
+        .describe(
+          "Restrict to these accounts.id (owner-scoped). Omit to summarize all non-investment accounts.",
+        ),
+      lookbackDays: z
+        .number()
+        .int()
+        .positive()
+        .optional()
+        .describe(
+          "Date floor on tx + bank dates, in days back from today. Default 90 (same as get_reconcile_suggestions).",
+        ),
+    },
+    async ({ accountIds, lookbackDays }) => {
+      if (!dek) {
+        return err(
+          "get_reconciliation_summary requires an unlocked DEK to decrypt payees + account names. Re-login to refresh your session.",
+        );
+      }
+
+      const rows = await getReconciliationSummary(userId, dek, {
+        accountIds,
+        lookbackDays,
+      });
+
+      // Resolve encrypted account names at the boundary (the aggregator stays
+      // DEK-free for names). One query for every in-scope account.
+      const ids = rows.map((r) => r.accountId);
+      const nameById = new Map<number, string | null>();
+      if (ids.length > 0) {
+        const rawAccounts = await q(
+          db,
+          sql`SELECT id, name_ct, alias_ct FROM accounts WHERE user_id = ${userId} AND id = ANY(${ids})`,
+        );
+        const decrypted = decryptNameish(rawAccounts, dek);
+        for (const a of decrypted) {
+          const id = Number(a.id);
+          const name = (a.alias as string | undefined) ?? (a.name as string | undefined) ?? null;
+          nameById.set(id, name);
+        }
+      }
+
+      return dataResponse(
+        rows.map((r) => ({ ...r, accountName: nameById.get(r.accountId) ?? null })),
+      );
     },
   );
 
