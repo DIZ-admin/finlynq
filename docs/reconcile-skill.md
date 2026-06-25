@@ -132,4 +132,8 @@ All reconcile tools are HTTP-only and require an unlocked DEK. Call `finlynq_hel
 **Bulk-materialize matched bank rows via rules (preview + confirm)**
 → `apply_rules_to_bank_rows(bankRowIds)` — two-step: first call returns a `confirmationToken`; resend with the token and `autoMaterialize: true` to commit.
 
-> **Not yet shipped:** Direct balance-anchor read/write tools (`get_balance_anchors` / `upsert_balance_anchor`) are planned but not yet available. Anchors are currently set via the staged-import flow and surfaced as `lastAnchorDate` / `balanceDelta` in `get_reconciliation_summary` and `get_reconcile_suggestions`.
+**Read the balance anchors for an account**
+→ `get_balance_anchors(accountId, dateMin?, dateMax?)` — lists `{ accountId, date, amount, currency, source, createdAt }` ordered date DESC. Anchors are keyed by `(accountId, date)` (no synthetic id).
+
+**Create or correct a balance anchor (the bank's reported balance for a date)**
+→ `upsert_balance_anchor(accountId, date, amount, currency)` — `ON CONFLICT (accountId, date) DO UPDATE` (newer balance wins); returns `created` (true=inserted, false=updated). Stamps `source='mcp_manual'` and immediately shifts the `balanceDelta` reported by `get_reconciliation_summary` / `get_reconcile_suggestions`.

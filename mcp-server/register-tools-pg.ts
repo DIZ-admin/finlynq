@@ -165,6 +165,12 @@ import {
 // FINLYNQ-215 (R-04) — portfolio-wide reconcile health aggregator for the
 // get_reconciliation_summary read tool (counts + shared balance-check delta).
 import { getReconciliationSummary } from "../src/lib/reconcile/summary";
+// FINLYNQ-217 (R-03) — bank balance-anchor read + upsert for the
+// get_balance_anchors / upsert_balance_anchor tools.
+import {
+  listBankAnchorsInRange,
+  upsertManualBankAnchor,
+} from "../src/lib/bank-ledger-balance";
 
 // ─── types ────────────────────────────────────────────────────────────────────
 
@@ -5625,7 +5631,7 @@ export function registerPgTools(
           portfolio_tools: ["get_portfolio_analysis", "get_portfolio_performance", "analyze_holding", "trace_holding_quantity", "get_investment_insights"],
           portfolio_write_tools: ["portfolio_buy", "portfolio_sell", "portfolio_swap", "portfolio_transfer", "portfolio_income_expense", "portfolio_fx_conversion", "portfolio_deposit", "portfolio_withdrawal", "add_portfolio_holding", "update_portfolio_holding", "delete_portfolio_holding"],
           transfer_tools: ["record_transfer"],
-          reconcile_tools: ["upload_statement", "get_reconcile_suggestions", "get_reconciliation_summary", "find_duplicate_bank_rows", "delete_bank_transaction", "send_to_bank_ledger", "materialize_bank_row", "accept_reconcile_suggestion", "accept_reconcile_suggestions", "unlink_reconcile", "set_account_mode", "apply_rules_to_staged_import", "apply_rules_to_bank_rows"],
+          reconcile_tools: ["upload_statement", "get_reconcile_suggestions", "get_reconciliation_summary", "find_duplicate_bank_rows", "get_balance_anchors", "upsert_balance_anchor", "delete_bank_transaction", "send_to_bank_ledger", "materialize_bank_row", "accept_reconcile_suggestion", "accept_reconcile_suggestions", "unlink_reconcile", "set_account_mode", "apply_rules_to_staged_import", "apply_rules_to_bank_rows"],
           tip: "Finlynq records bookkeeping entries in your own database; it never connects to a brokerage or bank or moves real money. Use tool_name='record_transaction' for detailed usage of any tool. INVESTMENT accounts CANNOT use record_transaction / bulk_record_transactions / record_transfer for trades — use the portfolio_* write tools (portfolio_buy / portfolio_sell / portfolio_swap / portfolio_transfer / portfolio_deposit / portfolio_withdrawal / portfolio_income_expense / portfolio_fx_conversion). record_transfer remains the path for plain cash transfers between non-investment accounts. Use topic='reconcile' for the bank-ledger reconciliation + rule-application tools.",
         });
       }
@@ -5693,10 +5699,10 @@ export function registerPgTools(
 
       if (t === "reconcile") {
         return dataResponse({
-          read_tools: ["get_reconciliation_summary", "get_reconcile_suggestions", "find_duplicate_bank_rows"],
-          write_tools: ["upload_statement", "send_to_bank_ledger", "delete_bank_transaction", "materialize_bank_row", "accept_reconcile_suggestion", "unlink_reconcile", "set_account_mode", "apply_rules_to_staged_import"],
+          read_tools: ["get_reconciliation_summary", "get_reconcile_suggestions", "find_duplicate_bank_rows", "get_balance_anchors"],
+          write_tools: ["upload_statement", "send_to_bank_ledger", "delete_bank_transaction", "upsert_balance_anchor", "materialize_bank_row", "accept_reconcile_suggestion", "unlink_reconcile", "set_account_mode", "apply_rules_to_staged_import"],
           bulk_tools: ["accept_reconcile_suggestions", "apply_rules_to_bank_rows"],
-          flow: "-2) get_reconciliation_summary() → portfolio-wide reconcile health in ONE call (per-account linked / suggestions / bankOnly / txOnly counts + balanceDelta) — run this at session start instead of one get_reconcile_suggestions per account, then drill into the off accounts. -1) upload_statement(fileContent[base64], fileName, accountId) → stage a CSV/OFX/QFX statement over MCP (no browser session) — returns a real stagedImportId (NOT the mcp_uploads artifact of the legacy /api/mcp/upload path) for the steps below. 0) send_to_bank_ledger(stagedImportId) → promote a pending statement import into the BANK LEDGER ONLY (no `transactions` rows) + load its balance anchor — the normal reconcile setup when the account already has ledger transactions for the period (use approve_staged_rows only for a first import of a brand-new account). 0.5) find_duplicate_bank_rows(accountId) → list groups of duplicate bank-ledger rows (distinct ids for one event from overlapping imports); canonicalId is the oldest to keep, then delete_bank_transaction(bankTransactionId) removes each extra (dryRun:true to preview the affected transactions first). 1) get_reconcile_suggestions(accountId) → see linked / suggestions / bankOnly rows, each bank row carrying suggestedCategoryId / suggestedTransferAccountId / duplicateOfTransactionId. 2) materialize_bank_row(bankTransactionId, categoryId) for a category tx, or (bankTransactionId, destAccountId) for a transfer pair (outflow rows only). 3) accept_reconcile_suggestion / unlink_reconcile to link/undo an existing tx ↔ bank pairing, or accept_reconcile_suggestions(pairs[]) to link MANY tx↔bank pairs in ONE call (positional results; partial commit — a bad/cross-account id carries `error` and the rest still land). 4) set_account_mode(accountId, mode) to flip the per-account pipeline policy (auto/approve/manual). 5) apply_rules_to_staged_import(stagedImportId) to re-fire rules over a pending import. 6) apply_rules_to_bank_rows(bankRowIds) → preview + confirmationToken; resend with the token + autoMaterialize:true to bulk-materialize matched rows.",
+          flow: "-2) get_reconciliation_summary() → portfolio-wide reconcile health in ONE call (per-account linked / suggestions / bankOnly / txOnly counts + balanceDelta) — run this at session start instead of one get_reconcile_suggestions per account, then drill into the off accounts. -1) upload_statement(fileContent[base64], fileName, accountId) → stage a CSV/OFX/QFX statement over MCP (no browser session) — returns a real stagedImportId (NOT the mcp_uploads artifact of the legacy /api/mcp/upload path) for the steps below. 0) send_to_bank_ledger(stagedImportId) → promote a pending statement import into the BANK LEDGER ONLY (no `transactions` rows) + load its balance anchor — the normal reconcile setup when the account already has ledger transactions for the period (use approve_staged_rows only for a first import of a brand-new account). 0.5) find_duplicate_bank_rows(accountId) → list groups of duplicate bank-ledger rows (distinct ids for one event from overlapping imports); canonicalId is the oldest to keep, then delete_bank_transaction(bankTransactionId) removes each extra (dryRun:true to preview the affected transactions first). 0.7) get_balance_anchors(accountId) → read the bank balance anchors (the bank's reported balance per date the reconcile engine validates against); upsert_balance_anchor(accountId, date, amount, currency) creates/corrects one (keyed by (accountId,date); created:false on update) and immediately shifts the balanceDelta. 1) get_reconcile_suggestions(accountId) → see linked / suggestions / bankOnly rows, each bank row carrying suggestedCategoryId / suggestedTransferAccountId / duplicateOfTransactionId. 2) materialize_bank_row(bankTransactionId, categoryId) for a category tx, or (bankTransactionId, destAccountId) for a transfer pair (outflow rows only). 3) accept_reconcile_suggestion / unlink_reconcile to link/undo an existing tx ↔ bank pairing, or accept_reconcile_suggestions(pairs[]) to link MANY tx↔bank pairs in ONE call (positional results; partial commit — a bad/cross-account id carries `error` and the rest still land). 4) set_account_mode(accountId, mode) to flip the per-account pipeline policy (auto/approve/manual). 5) apply_rules_to_staged_import(stagedImportId) to re-fire rules over a pending import. 6) apply_rules_to_bank_rows(bankRowIds) → preview + confirmationToken; resend with the token + autoMaterialize:true to bulk-materialize matched rows.",
           note: "All reconcile tools are HTTP-only and need an unlocked DEK. upload_statement decodes a base64 file (CSV/OFX/QFX, 5 MB decoded cap) and stages it → a real staged_imports.id for send_to_bank_ledger / approve_staged_rows; an unrecognised/unparseable file returns detectedFormat:'unrecognised' and creates nothing. send_to_bank_ledger writes ONLY bank_transactions (never `transactions`); approve_staged_rows is the one that CREATES ledger transactions (first-import only). delete_bank_transaction removes a bank row (cascade clears its links + nulls transactions.bank_transaction_id; the `transactions` rows survive) — dryRun first. apply_rules_to_bank_rows uses a two-step confirmation token (preview never writes).",
         });
       }
@@ -12096,6 +12102,95 @@ export function registerPgTools(
         unlinkedTransactionIds,
         dryRun: false,
       });
+    },
+  );
+
+  // ── get_balance_anchors (FINLYNQ-217 / R-03) ────────────────────────────────
+  // Read-only. List the bank balance anchors for one account (the reference
+  // points the reconcile engine validates the bank ledger against). Anchors
+  // live on bank_daily_balances, keyed by (user_id, account_id, date) — there
+  // is NO synthetic id, so rows are identified by (accountId, date). `amount`
+  // is the `balance` column; `createdAt` is first_seen_at. Ordered date DESC,
+  // bounded by an optional inclusive [dateMin, dateMax]. readOnlyHint inferred
+  // from the get_ prefix. HTTP-only as part of the reconcile cohort (the
+  // anchor rows are plaintext so a pf_ API key would also work; we gate the
+  // cohort to HTTP for consistency).
+  server.tool(
+    "get_balance_anchors",
+    "Bookkeeping only: Finlynq reads from your own database and never connects to a bank or brokerage or moves real money. List the BANK BALANCE ANCHORS for one account — the bank's reported balance on a given date, which the reconcile engine validates the ledger against. Returns an array of { accountId, date, amount, currency, source, createdAt } ordered by date DESC. Anchors are keyed by (accountId, date) — there is no synthetic id. Pass dateMin/dateMax (inclusive ISO YYYY-MM-DD) to bound the window. Owner-scoped; a non-existent or cross-user accountId returns []. Read-only. Pair with upsert_balance_anchor to create/correct an anchor.",
+    {
+      accountId: z.number().int().positive().describe("accounts.id to list anchors for."),
+      dateMin: ymdDate
+        .optional()
+        .describe("Inclusive ISO YYYY-MM-DD floor on the anchor date. Omit for no floor."),
+      dateMax: ymdDate
+        .optional()
+        .describe("Inclusive ISO YYYY-MM-DD ceiling on the anchor date. Omit for no ceiling."),
+    },
+    async ({ accountId, dateMin, dateMax }) => {
+      // Cross-tenant guard — empty list (not an error) for a non-existent /
+      // cross-user account, mirroring find_duplicate_bank_rows.
+      const acct = await q(
+        db,
+        sql`SELECT id FROM accounts WHERE id = ${accountId} AND user_id = ${userId} LIMIT 1`,
+      );
+      if (!acct.length) return dataResponse([]);
+
+      const rows = await listBankAnchorsInRange(userId, accountId, dateMin, dateMax);
+      return dataResponse(
+        rows.map((r) => ({
+          accountId,
+          date: r.date,
+          amount: r.balance,
+          currency: r.currency,
+          source: r.source,
+          createdAt: r.firstSeenAt instanceof Date ? r.firstSeenAt.toISOString() : r.firstSeenAt,
+        })),
+      );
+    },
+  );
+
+  // ── upsert_balance_anchor (FINLYNQ-217 / R-03) ──────────────────────────────
+  // Create or correct a single bank balance anchor for one (accountId, date).
+  // ON CONFLICT (user_id, account_id, date) DO UPDATE — newer balance wins.
+  // Stamps source='mcp_manual' (added to the ANCHOR_SOURCES tuple + the DB
+  // CHECK in migration 20260625b). `created` distinguishes insert vs update via
+  // the xmax system column. The reconcile balance check reads the latest anchor
+  // live (computeAccountBalanceSummary → getLatestBankAnchor), so an upsert here
+  // immediately affects get_reconcile_suggestions / get_reconciliation_summary.
+  // `note` is dropped from v1 (no column). The name carries no delete_/set_
+  // inference token, so we pass an explicit idempotentHint:true (an upsert with
+  // the same inputs is a no-op) + non-destructive annotations.
+  server.tool(
+    "upsert_balance_anchor",
+    "Bookkeeping only: Finlynq writes only to your own database — it never connects to a bank or brokerage and never moves real money. Create or correct a single BANK BALANCE ANCHOR (the bank's reported balance for an account on a date — the reference point the reconcile engine validates the ledger against). Anchors are keyed by (accountId, date) with no synthetic id, so re-calling with the same (accountId, date) UPDATES the existing anchor (newer balance wins). `amount` is the balance the bank reported on `date`. Returns { accountId, date, amount, currency, created } where created=true means a new anchor was inserted, false means an existing one was updated. The anchor immediately affects the balance check reported by get_reconcile_suggestions / get_reconciliation_summary for the account. Owner-scoped; a non-existent or cross-user accountId returns a not-found error. Stamps source='mcp_manual'.",
+    {
+      accountId: z.number().int().positive().describe("accounts.id the anchor belongs to."),
+      date: ymdDate.describe("ISO YYYY-MM-DD date the bank reported this balance."),
+      amount: z
+        .number()
+        .describe("The bank's reported balance on `date` (maps to the bank_daily_balances.balance column)."),
+      currency: supportedCurrencyEnum.describe(
+        "ISO 4217 currency of the anchor (issue #206: full SUPPORTED_CURRENCIES list).",
+      ),
+    },
+    { title: "Upsert Balance Anchor", idempotentHint: true, destructiveHint: false, openWorldHint: false },
+    async ({ accountId, date, amount, currency }) => {
+      // Cross-tenant guard — not-found for a non-existent / cross-user account.
+      const acct = await q(
+        db,
+        sql`SELECT id FROM accounts WHERE id = ${accountId} AND user_id = ${userId} LIMIT 1`,
+      );
+      if (!acct.length) return err("Not found");
+
+      const { created } = await upsertManualBankAnchor(
+        userId,
+        accountId,
+        date,
+        amount,
+        currency,
+      );
+      return dataResponse({ accountId, date, amount, currency, created });
     },
   );
 
