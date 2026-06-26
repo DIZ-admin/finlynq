@@ -1076,6 +1076,23 @@ async function handleGet(request: NextRequest) {
     accountIds: Set<number>;
     image: string | null;
     quoteCurrency: string | null;
+    // Day change (this canonical row's contribution to summary.dayChange).
+    // `dayChangeKnown` is true once any member has a live change so a row with
+    // no quote shows "--" instead of a misleading +$0.00.
+    dayChangeDisplay: number;
+    dayChangeNative: number;
+    dayChangeKnown: boolean;
+    // Native-currency rollup — only meaningful when every member shares one
+    // quote currency (true for a single ticker / cash sleeve). `nativeConsistent`
+    // flips false on a currency mismatch, after which the native fields are
+    // dropped (null) and the client falls back to display currency for the row.
+    nativeCurrency: string | null;
+    nativeConsistent: boolean;
+    costBasisNative: number;
+    marketValueNative: number;
+    unrealizedGainNative: number;
+    realizedGainNative: number;
+    dividendsNative: number;
   };
 
   const byHoldingMap = new Map<string, ByHoldingAccum>();
@@ -1111,6 +1128,16 @@ async function handleGet(request: NextRequest) {
         accountIds: new Set<number>(),
         image: h.image ?? null,
         quoteCurrency: h.quoteCurrency,
+        dayChangeDisplay: 0,
+        dayChangeNative: 0,
+        dayChangeKnown: false,
+        nativeCurrency: (h.quoteCurrency ?? h.currency ?? "").toUpperCase() || null,
+        nativeConsistent: true,
+        costBasisNative: 0,
+        marketValueNative: 0,
+        unrealizedGainNative: 0,
+        realizedGainNative: 0,
+        dividendsNative: 0,
       };
       byHoldingMap.set(bucketKey, acc);
     }
@@ -1134,6 +1161,26 @@ async function handleGet(request: NextRequest) {
     if (h.lifetimeCostBasis != null) acc.lifetimeCostBasisDisplay += h.lifetimeCostBasis * fxRate;
     if (h.realizedGain != null) acc.realizedGainDisplay += h.realizedGain * fxRate;
     if (h.dividendsReceived != null) acc.dividendsDisplay += h.dividendsReceived * fxRate;
+
+    // Day change — sum the per-member display contribution (already FX-converted
+    // + rounded server-side) and the native per-member contribution
+    // (change-per-unit × qty, in the member's own quote currency).
+    if (h.dayChangeDisplay !== null) {
+      acc.dayChangeDisplay += h.dayChangeDisplay;
+      acc.dayChangeNative += (h.change ?? 0) * (h.quantity ?? 0);
+      acc.dayChangeKnown = true;
+    }
+
+    // Native-currency rollup. Members of one canonical key share a quote
+    // currency (a single ticker → one Yahoo currency); a mismatch (defensive)
+    // marks the row non-native so the client renders it in display currency.
+    const memberCcy = (h.quoteCurrency ?? h.currency ?? "").toUpperCase();
+    if (memberCcy && acc.nativeCurrency && memberCcy !== acc.nativeCurrency) acc.nativeConsistent = false;
+    acc.marketValueNative += h.marketValue ?? 0;
+    if (h.totalCostBasis != null) acc.costBasisNative += h.totalCostBasis;
+    if (h.unrealizedGain != null) acc.unrealizedGainNative += h.unrealizedGain;
+    if (h.realizedGain != null) acc.realizedGainNative += h.realizedGain;
+    if (h.dividendsReceived != null) acc.dividendsNative += h.dividendsReceived;
   }
 
   const byHolding = Array.from(byHoldingMap.values()).map(a => {
@@ -1152,6 +1199,29 @@ async function handleGet(request: NextRequest) {
     const pctOfPortfolio = totalValueDisplay > 0
       ? Math.round((a.marketValueDisplay / totalValueDisplay) * 10000) / 100
       : null;
+    // Current (blended) price = market value / qty, mirroring the qty-weighted
+    // avg cost above. For a single ticker this equals the live quote; for cash
+    // it's ~1.00. Shown next to Avg Cost.
+    const currentPriceDisplay = a.totalQty !== 0 ? a.marketValueDisplay / a.totalQty : null;
+    // Day-change %: this row's display contribution over its prior-day value
+    // (= today's value − the change). Currency-independent ratio → used for both
+    // display and native modes.
+    const priorValueDisplay = a.marketValueDisplay - a.dayChangeDisplay;
+    const dayChangePct = a.dayChangeKnown && priorValueDisplay !== 0
+      ? (a.dayChangeDisplay / priorValueDisplay) * 100
+      : null;
+    // Native-currency fields — only when every member agreed on one quote
+    // currency. Otherwise null ⇒ the client renders this row in display currency
+    // even with the "Holding currency" toggle on. Unrealized %/return % are
+    // ratios, so they're shared with the display path (FX cancels).
+    const nativeCurrency = a.nativeConsistent ? a.nativeCurrency : null;
+    const avgCostNative = nativeCurrency != null && a.totalQty > 0 && a.costBasisNative > 0
+      ? a.costBasisNative / a.totalQty
+      : null;
+    const currentPriceNative = nativeCurrency != null && a.totalQty !== 0
+      ? a.marketValueNative / a.totalQty
+      : null;
+    const totalReturnNative = a.unrealizedGainNative + a.realizedGainNative + a.dividendsNative;
     return {
       key: a.key,
       symbol: a.symbol,
@@ -1160,6 +1230,7 @@ async function handleGet(request: NextRequest) {
       assetType: a.assetType,
       totalQty: Math.round(a.totalQty * 1e6) / 1e6,
       avgCostDisplay: avgCostDisplay != null ? Math.round(avgCostDisplay * 10000) / 10000 : null,
+      currentPriceDisplay: currentPriceDisplay != null ? Math.round(currentPriceDisplay * 10000) / 10000 : null,
       costBasisDisplay: Math.round(a.costBasisDisplay * 100) / 100,
       marketValueDisplay: Math.round(a.marketValueDisplay * 100) / 100,
       unrealizedGainDisplay: Math.round(a.unrealizedGainDisplay * 100) / 100,
@@ -1168,6 +1239,19 @@ async function handleGet(request: NextRequest) {
       dividendsDisplay: Math.round(a.dividendsDisplay * 100) / 100,
       totalReturnDisplay: Math.round(totalReturnDisplay * 100) / 100,
       totalReturnPct: totalReturnPct != null ? Math.round(totalReturnPct * 100) / 100 : null,
+      dayChangeDisplay: a.dayChangeKnown ? Math.round(a.dayChangeDisplay * 100) / 100 : null,
+      dayChangePct: dayChangePct != null ? Math.round(dayChangePct * 100) / 100 : null,
+      // Native-currency rollup (null when members span currencies).
+      nativeCurrency,
+      avgCostNative: avgCostNative != null ? Math.round(avgCostNative * 10000) / 10000 : null,
+      currentPriceNative: currentPriceNative != null ? Math.round(currentPriceNative * 10000) / 10000 : null,
+      costBasisNative: nativeCurrency != null ? Math.round(a.costBasisNative * 100) / 100 : null,
+      marketValueNative: nativeCurrency != null ? Math.round(a.marketValueNative * 100) / 100 : null,
+      unrealizedGainNative: nativeCurrency != null ? Math.round(a.unrealizedGainNative * 100) / 100 : null,
+      realizedGainNative: nativeCurrency != null ? Math.round(a.realizedGainNative * 100) / 100 : null,
+      dividendsNative: nativeCurrency != null ? Math.round(a.dividendsNative * 100) / 100 : null,
+      totalReturnNative: nativeCurrency != null ? Math.round(totalReturnNative * 100) / 100 : null,
+      dayChangeNative: nativeCurrency != null && a.dayChangeKnown ? Math.round(a.dayChangeNative * 100) / 100 : null,
       pctOfPortfolio,
       accountCount: a.accountIds.size,
       image: a.image,

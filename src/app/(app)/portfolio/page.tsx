@@ -52,10 +52,12 @@ export default function PortfolioPage() {
   const [etfXrayTab, setEtfXrayTab] = useState<EtfXrayTab>("stocks");
   const [stocksPage, setStocksPage] = useState(1);
   const STOCKS_PER_PAGE = 25;
-  // (Removed showInReporting toggle 2026-05-01: the All Holdings table
-  // now renders byHolding rows that are already in display currency, so
-  // the toggle had no effect. Per-account members in the expanded section
-  // still show native currency for clarity.)
+  // Show the All Holdings table in each holding's own (native) currency
+  // instead of the display/reporting currency. Re-introduced after the API
+  // started returning per-row native-currency rollups on `byHolding`; rows
+  // that span multiple currencies fall back to display currency per-row.
+  // Component-state only (resets on reload).
+  const [showNative, setShowNative] = useState(false);
   // Hide entries with no current position. For table rows: quantity is null
   // or 0 (matches the row's own `hasMetrics` rule below — these are the
   // rows that already render as "--" across Qty/Avg/Mkt Value). For chart
@@ -472,6 +474,8 @@ export default function PortfolioPage() {
         setFilter={setFilter}
         hideEmpty={hideEmpty}
         setHideEmpty={setHideEmpty}
+        showNative={showNative}
+        setShowNative={setShowNative}
         sortField={sortField}
         sortDir={sortDir}
         handleSort={handleSort}
