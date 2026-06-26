@@ -1,6 +1,6 @@
 "use client";
 
-import { useCallback, useEffect, useRef, useState } from "react";
+import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import {
   Card,
   CardContent,
@@ -17,6 +17,7 @@ import {
   SelectTrigger,
   SelectValue,
 } from "@/components/ui/select";
+import { Combobox } from "@/components/ui/combobox";
 import {
   AlertCircle,
   CheckCircle2,
@@ -54,6 +55,28 @@ type Choice =
   | { mode: "existing"; accountId: number }
   | { mode: "create"; currency: string; type: "A" | "L" };
 
+/**
+ * Collapsible, scrollable list of import issue messages. Each message is
+ * self-describing (skipped rows vs. "imported anyway" warnings), so the list
+ * is the "report" users asked for instead of a bare count.
+ */
+function IssueDetails({ title, items }: { title: string; items: string[] }) {
+  if (items.length === 0) return null;
+  return (
+    <details className="rounded-md border border-amber-500/30 bg-amber-500/5 text-xs">
+      <summary className="flex cursor-pointer select-none items-center gap-1.5 px-3 py-2 font-medium text-amber-700 dark:text-amber-400">
+        <AlertCircle className="h-3.5 w-3.5 shrink-0" />
+        {title} ({items.length})
+      </summary>
+      <ul className="max-h-48 list-disc space-y-1 overflow-y-auto border-t border-amber-500/20 px-6 py-2 text-[11px] leading-snug text-muted-foreground">
+        {items.map((msg, i) => (
+          <li key={i}>{msg}</li>
+        ))}
+      </ul>
+    </details>
+  );
+}
+
 export function MoneyProConnectorTab() {
   const [file, setFile] = useState<File | null>(null);
   const [stage, setStage] = useState<Stage>("idle");
@@ -71,6 +94,18 @@ export function MoneyProConnectorTab() {
     errors?: string[];
   } | null>(null);
   const fileInputRef = useRef<HTMLInputElement>(null);
+
+  // Options for the searchable account picker — shared across every row.
+  const accountItems = useMemo(
+    () => [
+      { value: "new", label: "+ Create new account" },
+      ...accounts.map((a) => ({
+        value: `id:${a.id}`,
+        label: `${a.name} (${a.currency})`,
+      })),
+    ],
+    [accounts],
+  );
 
   useEffect(() => {
     fetch("/api/accounts")
@@ -245,6 +280,13 @@ export function MoneyProConnectorTab() {
                 )}
               </div>
 
+              <IssueDetails
+                title="Rows skipped while reading the file"
+                items={summary.rowErrors.map(
+                  (e) => `Row ${e.row}: ${e.reason}`,
+                )}
+              />
+
               <div className="space-y-2">
                 <h3 className="text-sm font-medium">Map accounts</h3>
                 <p className="text-xs text-muted-foreground">
@@ -265,29 +307,20 @@ export function MoneyProConnectorTab() {
                             {p.currency} · {p.txCount} tx
                           </span>
                         </div>
-                        <Select
+                        <Combobox
                           value={sel}
                           onValueChange={(v) =>
                             setTarget((prev) => ({
                               ...prev,
-                              [p.sourceName]: v ?? "new",
+                              [p.sourceName]: v || "new",
                             }))
                           }
-                        >
-                          <SelectTrigger className="w-[220px] h-8">
-                            <SelectValue />
-                          </SelectTrigger>
-                          <SelectContent>
-                            <SelectItem value="new">
-                              + Create new account
-                            </SelectItem>
-                            {accounts.map((a) => (
-                              <SelectItem key={a.id} value={`id:${a.id}`}>
-                                {a.name} ({a.currency})
-                              </SelectItem>
-                            ))}
-                          </SelectContent>
-                        </Select>
+                          items={accountItems}
+                          placeholder="Select account"
+                          searchPlaceholder="Search accounts…"
+                          emptyMessage="No matching account"
+                          className="h-8 w-[220px]"
+                        />
                         {sel === "new" && (
                           <Select
                             value={newType[p.sourceName] ?? "A"}
@@ -333,12 +366,10 @@ export function MoneyProConnectorTab() {
                 <div>Skipped duplicates: {result.skippedDuplicates}</div>
                 <div>Accounts created: {result.accountsCreated}</div>
                 <div>Categories created: {result.categoriesCreated}</div>
-                {result.errors && result.errors.length > 0 && (
-                  <div className="text-amber-600 dark:text-amber-400">
-                    Warnings: {result.errors.length}
-                  </div>
-                )}
               </div>
+              {result.errors && result.errors.length > 0 && (
+                <IssueDetails title="Warnings" items={result.errors} />
+              )}
             </div>
           )}
         </CardContent>
