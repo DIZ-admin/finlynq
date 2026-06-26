@@ -21,6 +21,8 @@ const mappingSchema = z.object({
   note: z.string().optional(),
   category: z.string().optional(),
   accountTo: z.string().optional(),
+  amountTo: z.string().optional(),
+  currencyTo: z.string().optional(),
 });
 
 const choiceSchema = z.union([

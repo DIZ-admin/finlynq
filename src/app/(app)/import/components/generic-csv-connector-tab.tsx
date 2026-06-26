@@ -36,6 +36,8 @@ const FIELDS = [
   { key: "note", label: "Description / note", required: false },
   { key: "category", label: "Category", required: false },
   { key: "accountTo", label: "Transfer to (account)", required: false },
+  { key: "amountTo", label: "Amount received (FX transfer)", required: false },
+  { key: "currencyTo", label: "Currency received (FX transfer)", required: false },
 ] as const;
 
 type FieldKey = (typeof FIELDS)[number]["key"];
@@ -292,14 +294,18 @@ export function GenericCsvConnectorTab() {
             Generic CSV (full ledger)
           </CardTitle>
           <CardDescription>
-            Import a multi-account export from any app — one CSV with{" "}
+            Migrate a whole-portfolio export from any app — one CSV with{" "}
             <span className="font-mono">date</span>,{" "}
             <span className="font-mono">amount</span>,{" "}
             <span className="font-mono">account</span> columns (plus optional
             currency, category, note and a transfer-destination column). Columns
             are auto-detected; adjust the mapping below if a column isn&apos;t
             picked up. Transfers, opening balances, and multiple currencies are
-            handled.
+            handled. For a <span className="font-medium">cross-currency
+            transfer</span>, also map the{" "}
+            <span className="font-mono">amount received</span> and{" "}
+            <span className="font-mono">currency received</span> columns so each
+            side is recorded in its own currency.
           </CardDescription>
         </CardHeader>
         <CardContent className="space-y-4">

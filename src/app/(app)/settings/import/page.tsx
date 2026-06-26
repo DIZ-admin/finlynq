@@ -58,7 +58,7 @@ type ImportProvider = "wealthposition" | "moneypro" | "generic-csv";
 export default function ImportSettingsPage() {
   const [accountNames, setAccountNames] = useState<string[]>([]);
   const [templates, setTemplates] = useState<ImportTemplate[]>([]);
-  // "Import from another provider" tab — which provider's flow is open.
+  // "Migrate from another app" tab — which provider's flow is open.
   const [provider, setProvider] = useState<ImportProvider | null>(null);
   // Active tab (controlled so it's deep-linkable via ?tab=).
   const [tab, setTab] = useState("templates");
@@ -83,17 +83,19 @@ export default function ImportSettingsPage() {
   ]);
   const [retentionLoading, setRetentionLoading] = useState(false);
 
-  // Deep-link support: /settings/import?tab=connect[&provider=moneypro].
+  // Deep-link support: /settings/import?tab=migrate[&provider=moneypro].
+  // `connect` is the legacy value for the provider-migration tab — accepted as
+  // an alias so old links/bookmarks keep working.
   useEffect(() => {
     const params = new URLSearchParams(window.location.search);
     const t = params.get("tab");
-    if (t && ["templates", "email", "connect", "statements"].includes(t)) {
-      setTab(t);
+    if (t && ["templates", "email", "migrate", "connect", "statements"].includes(t)) {
+      setTab(t === "connect" ? "migrate" : t);
     }
     const p = params.get("provider");
     if (p === "wealthposition" || p === "moneypro" || p === "generic-csv") {
       setProvider(p);
-      setTab("connect");
+      setTab("migrate");
     }
   }, []);
 
@@ -214,8 +216,8 @@ export default function ImportSettingsPage() {
       <div>
         <h1 className="text-2xl font-bold tracking-tight">Import</h1>
         <p className="text-sm text-muted-foreground mt-0.5">
-          Manage CSV templates, connected services, and your email-import
-          address. To upload a file, use the{" "}
+          Manage CSV templates and your email-import address, or migrate your
+          full history from another app. To upload a bank statement, use the{" "}
           <a href="/import" className="underline hover:text-foreground">
             Import page
           </a>
@@ -295,9 +297,9 @@ export default function ImportSettingsPage() {
             <Mail className="h-4 w-4 mr-1.5" />
             Email Import
           </TabsTrigger>
-          <TabsTrigger value="connect">
+          <TabsTrigger value="migrate">
             <LinkIcon className="h-4 w-4 mr-1.5" />
-            Import from another provider
+            Migrate from another app
           </TabsTrigger>
           <TabsTrigger value="statements">
             <Landmark className="h-4 w-4 mr-1.5" />
@@ -474,14 +476,19 @@ export default function ImportSettingsPage() {
           </div>
         </TabsContent>
 
-        {/* Import from another provider — per-source submenu */}
-        <TabsContent value="connect">
-          <div className="mt-4 space-y-4" id="connect">
+        {/* Migrate from another app — per-source submenu */}
+        <TabsContent value="migrate">
+          <div className="mt-4 space-y-4" id="migrate">
             {provider === null ? (
               <>
                 <p className="text-sm text-muted-foreground">
-                  Bring your history over from another personal-finance app.
-                  Pick a provider to start.
+                  Migrate your full history from another personal-finance app.
+                  This is a one-time bulk move of your whole ledger — to import a
+                  bank statement instead, use the{" "}
+                  <a href="/import" className="underline hover:text-foreground">
+                    Import page
+                  </a>
+                  . Pick an app to start.
                 </p>
                 <div className="grid gap-3 sm:grid-cols-2">
                   <button
