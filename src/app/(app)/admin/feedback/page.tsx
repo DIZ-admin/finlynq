@@ -112,6 +112,7 @@ function AdminThreadDialog({
   const [sending, setSending] = useState(false);
   const [error, setError] = useState<string | null>(null);
   const fileRef = useRef<HTMLInputElement>(null);
+  const bottomRef = useRef<HTMLDivElement>(null);
 
   const clearReplyFile = () => {
     setReplyFile(null);
@@ -164,6 +165,13 @@ function AdminThreadDialog({
     // onChanged is stable enough (parent useCallback); intentionally omitted.
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [feedbackId]);
+
+  // Scroll to the bottom of the thread whenever it loads or a new message arrives.
+  useEffect(() => {
+    if (thread) {
+      bottomRef.current?.scrollIntoView({ block: "end", behavior: "instant" });
+    }
+  }, [thread]);
 
   const send = async () => {
     const body = reply.trim();
@@ -256,6 +264,7 @@ function AdminThreadDialog({
                   )}
                 </div>
               ))}
+              <div ref={bottomRef} />
             </div>
             <div className="space-y-2">
               <textarea
