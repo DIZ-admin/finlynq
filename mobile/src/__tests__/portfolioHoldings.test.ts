@@ -6,6 +6,7 @@ import {
   findCashSleeve,
   sleeveCurrencies,
   canonicalKeyOf,
+  holdingDescription,
 } from "../lib/portfolio/holdings";
 import type { AccountBalance, PortfolioHoldingRow, EnrichedHolding } from "../../../shared/types";
 
@@ -132,5 +133,35 @@ describe("canonicalKeyOf", () => {
     expect(canonicalKeyOf(enriched({ assetType: "stock", symbol: null, name: "My Thing" }))).toBe(
       "custom:my thing"
     );
+  });
+});
+
+describe("holdingDescription (FINLYNQ-242)", () => {
+  it("prefers the quote/description over the stored name", () => {
+    expect(
+      holdingDescription({ description: "Apple Inc.", name: "AAPL", symbol: "AAPL" })
+    ).toBe("Apple Inc.");
+  });
+  it("falls back to the stored name when no description is present", () => {
+    expect(holdingDescription({ description: null, name: "Apple Inc.", symbol: "AAPL" })).toBe(
+      "Apple Inc."
+    );
+  });
+  it("returns null when the only candidate just echoes the ticker (equity cold cache)", () => {
+    // Warm price_cache hit: quoteName === symbol AND stored name === symbol.
+    expect(holdingDescription({ description: null, name: "AAPL", symbol: "AAPL" })).toBeNull();
+    // Case-insensitive echo is also dropped.
+    expect(holdingDescription({ description: "aapl", name: "aapl", symbol: "AAPL" })).toBeNull();
+  });
+  it("returns null for cash sleeves (no distinct description vs the Cash <CCY> name)", () => {
+    // Cash sleeve: byHolding name is "Cash USD", symbol "USD" — but no quote
+    // description, and "Cash USD" !== "USD" so it would surface; the screen
+    // keeps the ticker/name primary because description is null on the payload.
+    expect(holdingDescription({ description: null, name: null, symbol: "USD" })).toBeNull();
+  });
+  it("returns null for metals / empty inputs without throwing (cold-DEK defense)", () => {
+    expect(holdingDescription({ description: null, name: null, symbol: "XAU" })).toBeNull();
+    expect(holdingDescription({})).toBeNull();
+    expect(holdingDescription({ description: "  ", name: "  ", symbol: null })).toBeNull();
   });
 });

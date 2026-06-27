@@ -22,7 +22,7 @@ import { Icon } from "../components/icon";
 import { MetricGrid, type MetricItem } from "../components/portfolio/MetricGrid";
 import { AllocationDonut, type AllocationSlice } from "../components/portfolio/AllocationDonut";
 import { GainerLoserRow } from "../components/portfolio/GainerLoserRow";
-import { canonicalKeyOf } from "../lib/portfolio/holdings";
+import { canonicalKeyOf, holdingDescription } from "../lib/portfolio/holdings";
 import type {
   PortfolioOverview,
   PortfolioHoldingSummary,
@@ -235,6 +235,16 @@ export default function PortfolioScreen({ navigation }: Props) {
                 holdings.map((h) => {
                   const g = h.unrealizedGainPct;
                   const gColor = (g ?? 0) > 0 ? colors.pos : (g ?? 0) < 0 ? colors.neg : colors.mutedForeground;
+                  // FINLYNQ-242: lead with the company/security description; the
+                  // ticker becomes the subtitle. When there's no distinct
+                  // description (cash sleeves / metals / custom holdings) the
+                  // ticker/name stays the primary line — never blank, never a
+                  // doubled code. `ticker` is the canonical symbol (or the
+                  // "Cash USD"-style name when there's no symbol).
+                  const desc = holdingDescription({ description: h.description, name: h.name, symbol: h.symbol });
+                  const ticker = safeName(h.symbol || h.name, "—");
+                  const primary = desc ?? ticker;
+                  const showSubtitle = desc != null;
                   return (
                     <TouchableOpacity
                       key={h.key}
@@ -244,10 +254,10 @@ export default function PortfolioScreen({ navigation }: Props) {
                     >
                       <View style={styles.holdingMain}>
                         <Text style={[styles.holdingSym, { color: colors.foreground }]} numberOfLines={1}>
-                          {safeName(h.symbol || h.name, "—")}
+                          {primary}
                         </Text>
                         <Text style={[styles.holdingName, { color: colors.mutedForeground }]} numberOfLines={1}>
-                          {safeName(h.name)} · {h.totalQty} units
+                          {showSubtitle ? `${ticker} · ${h.totalQty} units` : `${h.totalQty} units`}
                         </Text>
                       </View>
                       <View style={styles.holdingRight}>

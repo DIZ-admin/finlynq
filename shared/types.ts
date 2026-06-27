@@ -295,6 +295,15 @@ export interface PortfolioHoldingSummary {
   key: string;
   symbol: string | null;
   name: string;
+  /**
+   * FINLYNQ-242 (mobile catch-up to web FINLYNQ-174/194): human-readable
+   * long name (Yahoo `meta.shortName`) for the consolidated row, rolled up
+   * from the first member whose `quoteName !== symbol`. `null`/absent when no
+   * distinct description exists (cash sleeves, metals, custom holdings, or a
+   * warm price_cache hit where the quote name mirrors the symbol). The mobile
+   * Portfolio row renders this as the primary line + the ticker as subtitle.
+   */
+  description?: string | null;
   assetType: string | null;
   totalQty: number;
   avgCostDisplay: number | null;
@@ -333,6 +342,13 @@ export interface EnrichedHolding {
   accountId: number | null;
   accountName: string;
   name: string | null;
+  /**
+   * FINLYNQ-242: Yahoo `meta.shortName` for this position's symbol, set ONLY
+   * when it differs from the symbol (null on a warm price_cache hit, cash,
+   * metals, or custom holdings). Source for the `byHolding.description` rollup
+   * and the Top-movers / Holding-detail description line.
+   */
+  quoteName?: string | null;
   symbol: string | null;
   currency: string;
   assetType: "etf" | "stock" | "crypto" | "cash";

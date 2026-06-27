@@ -35,6 +35,7 @@ const overview: PortfolioOverview = {
       key: "eq:NVDA",
       symbol: "NVDA",
       name: "Nvidia",
+      description: "NVIDIA Corporation",
       assetType: "stock",
       totalQty: 40,
       avgCostDisplay: 300,
@@ -97,7 +98,10 @@ describe("PortfolioScreen", () => {
     // Async fetch resolves → the investment-returns section + holding appear.
     expect(await findByText("Investment returns")).toBeTruthy();
     expect(getByText("Market value")).toBeTruthy();
-    expect(getByText("NVDA")).toBeTruthy();
+    // FINLYNQ-242: the holding row now leads with the description; the ticker
+    // drops to the subtitle (combined with the units).
+    expect(getByText("NVIDIA Corporation")).toBeTruthy();
+    expect(getByText("NVDA · 40 units")).toBeTruthy();
   });
 
   it("shows an error state when the fetch fails", async () => {

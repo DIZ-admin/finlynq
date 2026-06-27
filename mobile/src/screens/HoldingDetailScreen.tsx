@@ -9,6 +9,7 @@ import { useTheme } from "../theme";
 import { endpoints } from "../api/client";
 import { logger } from "../lib/logger";
 import { formatCurrency, safeName, formatShortDate } from "../lib/format";
+import { holdingDescription } from "../lib/portfolio/holdings";
 import { Icon } from "../components/icon";
 import type { LotRow, Transaction } from "../../../shared/types";
 import type { PortfolioStackParamList } from "../navigation/PortfolioStack";
@@ -70,6 +71,9 @@ export default function HoldingDetailScreen({ navigation, route }: Props) {
 
   const mv = summary.marketValueDisplay;
   const unreal = summary.unrealizedGainDisplay;
+  // FINLYNQ-242: lead with the description; ticker drops to the subtitle.
+  const desc = holdingDescription({ description: summary.description, name: summary.name, symbol: summary.symbol });
+  const ticker = safeName(summary.symbol || summary.name, "—");
 
   return (
     <SafeAreaView style={[styles.safe, { backgroundColor: colors.background }]} edges={["top"]}>
@@ -79,14 +83,14 @@ export default function HoldingDetailScreen({ navigation, route }: Props) {
           <Text style={[styles.backText, { color: colors.primary }]}>Portfolio</Text>
         </TouchableOpacity>
         <Text style={[styles.title, { color: colors.foreground }]} numberOfLines={1}>
-          {safeName(summary.symbol || summary.name, "—")}
+          {desc ?? ticker}
         </Text>
         <View style={{ width: 70 }} />
       </View>
 
       <ScrollView contentContainerStyle={styles.scroll}>
         <Text style={[styles.subtitle, { color: colors.mutedForeground }]} numberOfLines={1}>
-          {safeName(summary.name)} · {summary.assetType}
+          {desc != null ? `${ticker} · ` : ""}{summary.assetType}
           {primary ? ` · ${primary.currency}` : ""}
         </Text>
 

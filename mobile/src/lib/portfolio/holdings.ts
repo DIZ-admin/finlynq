@@ -11,6 +11,30 @@ import type {
 const METALS = new Set(["XAU", "XAG", "XPT", "XPD"]);
 
 /**
+ * Pure resolver for a holding's human-readable description (FINLYNQ-242,
+ * mirrors web pf-app .../holding-description.ts). Prefers the quote-layer
+ * long name (`description`/`quoteName` = Yahoo `meta.shortName`), falls back
+ * to the stored `name`, and returns null when neither is a meaningful
+ * description distinct from the ticker code (cash sleeves, metals, custom
+ * holdings, or a stored name that just echoes the symbol). NEVER throws —
+ * every input is treated as nullable (cold-DEK null defense).
+ */
+export function holdingDescription(input: {
+  description?: string | null;
+  name?: string | null;
+  symbol?: string | null;
+}): string | null {
+  const sym = (input.symbol ?? "").trim().toUpperCase();
+  const meaningful = (candidate: string | null | undefined): string | null => {
+    const trimmed = (candidate ?? "").trim();
+    if (!trimmed) return null;
+    if (sym && trimmed.toUpperCase() === sym) return null;
+    return trimmed;
+  };
+  return meaningful(input.description) ?? meaningful(input.name);
+}
+
+/**
  * Canonical key for an enriched per-account holding — mirrors the web
  * /api/portfolio/overview `canonicalKey()` so the overview list can pool the
  * per-account rows into the same `byHolding` rows the server returns, and the

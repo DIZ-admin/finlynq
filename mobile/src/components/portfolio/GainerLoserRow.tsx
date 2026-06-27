@@ -4,6 +4,7 @@ import { View, Text, StyleSheet } from "react-native";
 import { useTheme } from "../../theme";
 import { Icon } from "../icon";
 import { formatCurrency, safeName } from "../../lib/format";
+import { holdingDescription } from "../../lib/portfolio/holdings";
 import type { EnrichedHolding } from "../../../../shared/types";
 
 export function GainerLoserRow({
@@ -19,6 +20,10 @@ export function GainerLoserRow({
   const tone = up ? colors.pos : colors.neg;
   // Day-change dollar estimate in the holding's own quote currency.
   const dayChange = (holding.change ?? 0) * (holding.quantity ?? 0);
+  // FINLYNQ-242: description leads, ticker is the subtitle; fall back to the
+  // ticker as the primary line when no distinct description exists.
+  const desc = holdingDescription({ description: holding.quoteName, name: holding.name, symbol: holding.symbol });
+  const ticker = safeName(holding.symbol || holding.name, "—");
   return (
     <View style={[styles.row, { borderBottomColor: colors.border }]}>
       <View
@@ -31,11 +36,13 @@ export function GainerLoserRow({
       </View>
       <View style={styles.mid}>
         <Text style={[styles.symbol, { color: colors.foreground }]} numberOfLines={1}>
-          {safeName(holding.symbol || holding.name, "—")}
+          {desc ?? ticker}
         </Text>
-        <Text style={[styles.name, { color: colors.mutedForeground }]} numberOfLines={1}>
-          {safeName(holding.name)}
-        </Text>
+        {desc != null && (
+          <Text style={[styles.name, { color: colors.mutedForeground }]} numberOfLines={1}>
+            {ticker}
+          </Text>
+        )}
       </View>
       <View style={styles.right}>
         <Text style={[styles.pct, { color: tone }]}>

@@ -476,6 +476,18 @@ export async function GET(request: NextRequest) {
       }
     }
 
+    // FINLYNQ-242: capture Yahoo's long name (`meta.shortName`, surfaced as
+    // `q.name`) for the holding's symbol, ONLY when it is distinct from the
+    // ticker code. On a warm price_cache hit `q.name === symbol`, so this
+    // stays null then; cash/metals/crypto skip Yahoo entirely. Rolled up to
+    // `byHolding.description` below. Mirrors web FINLYNQ-174's legacy path.
+    let quoteName: string | null = null;
+    if (h.symbol && !symbolIsCurrency && !isCrypto) {
+      const q = quotes.get(h.symbol);
+      const nm = (q?.name ?? "").trim();
+      if (nm && nm.toUpperCase() !== h.symbol.toUpperCase()) quoteName = nm;
+    }
+
     // Get quantity and cost metrics from transactions. FK-keyed lookup â€”
     // independent of holding name, so renames don't orphan transactions.
     const txData = metricsByHoldingId.get(h.id) ?? null;
@@ -556,6 +568,7 @@ export async function GET(request: NextRequest) {
       accountId: h.accountId,
       accountName: h.accountName ?? "Unknown",
       name: h.name,
+      quoteName,
       symbol: h.symbol,
       currency: h.currency,
       assetType,
@@ -833,10 +846,32 @@ export async function GET(request: NextRequest) {
     return { key: `custom:${(h.name || "?").trim().toLowerCase()}`, symbol: null, name: h.name || "?" };
   };
 
+  // FINLYNQ-242: pure null-safe resolver mirroring web's holdingDescription
+  // (pf-app .../holding-description.ts). Prefers the Yahoo quote name, falls
+  // back to the user-stored name, and returns null when neither is a
+  // meaningful description distinct from the ticker code (cash/metals/custom,
+  // or a stored name that just echoes the symbol). Never throws (cold-DEK
+  // null defense).
+  const resolveHoldingDescription = (input: {
+    quoteName?: string | null;
+    name?: string | null;
+    symbol?: string | null;
+  }): string | null => {
+    const sym = (input.symbol ?? "").trim().toUpperCase();
+    const meaningful = (candidate: string | null | undefined): string | null => {
+      const trimmed = (candidate ?? "").trim();
+      if (!trimmed) return null;
+      if (sym && trimmed.toUpperCase() === sym) return null;
+      return trimmed;
+    };
+    return meaningful(input.quoteName) ?? meaningful(input.name);
+  };
+
   type ByHoldingAccum = {
     key: string;
     symbol: string | null;
     name: string;
+    description: string | null;
     assetType: AssetType;
     totalQty: number;
     costBasisDisplay: number;
@@ -859,6 +894,7 @@ export async function GET(request: NextRequest) {
         key: ck.key,
         symbol: ck.symbol,
         name: ck.name,
+        description: null,
         assetType: h.assetType,
         totalQty: 0,
         costBasisDisplay: 0,
@@ -872,6 +908,16 @@ export async function GET(request: NextRequest) {
         quoteCurrency: h.quoteCurrency,
       };
       byHoldingMap.set(ck.key, acc);
+    }
+    // FINLYNQ-242: roll the FIRST member with a meaningful description up to
+    // the consolidated row (resolve against the canonical key's symbol so a
+    // stored name that just echoes the ticker is dropped).
+    if (acc.description == null) {
+      acc.description = resolveHoldingDescription({
+        quoteName: h.quoteName,
+        name: h.name,
+        symbol: ck.symbol,
+      });
     }
     if (h.accountId != null) acc.accountIds.add(h.accountId);
     if (h.quantity != null) acc.totalQty += h.quantity;
@@ -909,6 +955,7 @@ export async function GET(request: NextRequest) {
       key: a.key,
       symbol: a.symbol,
       name: a.name,
+      description: a.description,
       assetType: a.assetType,
       totalQty: Math.round(a.totalQty * 1e6) / 1e6,
       avgCostDisplay: avgCostDisplay != null ? Math.round(avgCostDisplay * 10000) / 10000 : null,
