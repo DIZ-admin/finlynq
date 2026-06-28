@@ -163,10 +163,13 @@ export default function AccountsPage() {
   const [editDialogOpen, setEditDialogOpen] = useState(false);
   const [editAccountId, setEditAccountId] = useState<number | null>(null);
   const [editAccountArchived, setEditAccountArchived] = useState(false);
-  const [editForm, setEditForm] = useState({ name: "", type: "A", group: "", currency: "CAD", note: "", alias: "", isInvestment: false });
+  const [editForm, setEditForm] = useState({ name: "", type: "A", group: "", currency: "CAD", note: "", alias: "", isInvestment: false, openingBalanceAmount: "", openingBalanceDate: "" });
   const [editFormErrors, setEditFormErrors] = useState<Record<string, string>>({});
   const [editSaving, setEditSaving] = useState(false);
   const [editSaveError, setEditSaveError] = useState("");
+  // FINLYNQ-206 — opening balance currently backing this (cash) account, loaded
+  // from its single kind='opening_balance' transaction. null = none yet.
+  const [editObOriginal, setEditObOriginal] = useState<{ amount: number; date: string } | null>(null);
   const [archiving, setArchiving] = useState(false);
   const [deleting, setDeleting] = useState(false);
   const [confirmDelete, setConfirmDelete] = useState(false);
@@ -291,11 +294,28 @@ export default function AccountsPage() {
   function openEditDialog(a: AccountBalance) {
     setEditAccountId(a.accountId);
     setEditAccountArchived(Boolean(a.archived));
-    setEditForm({ name: a.accountName, type: a.accountType, group: a.accountGroup || "", currency: a.currency, note: "", alias: a.alias ?? "", isInvestment: Boolean(a.isInvestment) });
+    setEditForm({ name: a.accountName, type: a.accountType, group: a.accountGroup || "", currency: a.currency, note: "", alias: a.alias ?? "", isInvestment: Boolean(a.isInvestment), openingBalanceAmount: "", openingBalanceDate: "" });
+    setEditObOriginal(null);
     setEditFormErrors({});
     setEditSaveError("");
     setConfirmDelete(false);
     setEditDialogOpen(true);
+    // FINLYNQ-206 — seed the opening-balance field from its backing transaction
+    // (cash accounts only; the field is hidden for investment accounts).
+    if (a.isInvestment !== true) {
+      fetch(`/api/accounts/${a.accountId}/opening-balance`)
+        .then((r) => (r.ok ? r.json() : null))
+        .then((j) => {
+          const ob: { amount: number; date: string } | null = j?.data ?? null;
+          setEditObOriginal(ob ? { amount: ob.amount, date: ob.date } : null);
+          setEditForm((f) => ({
+            ...f,
+            openingBalanceAmount: ob ? String(ob.amount) : "",
+            openingBalanceDate: ob ? ob.date : todayISO(),
+          }));
+        })
+        .catch(() => {});
+    }
   }
 
   async function handleToggleArchive() {
@@ -351,6 +371,15 @@ export default function AccountsPage() {
     setEditFormErrors(errs);
     if (Object.keys(errs).length > 0) return;
 
+    // Opening balance (FINLYNQ-206) — cash accounts only. Validate up front.
+    const amtStr = editForm.openingBalanceAmount.trim();
+    const newAmount: number | null = amtStr === "" ? null : Number(amtStr);
+    if (!editForm.isInvestment && amtStr !== "" && !Number.isFinite(newAmount as number)) {
+      setEditFormErrors({ openingBalance: "Opening balance must be a number" });
+      return;
+    }
+    const newDate = editForm.openingBalanceDate || todayISO();
+
     setEditSaving(true);
     setEditSaveError("");
     try {
@@ -365,6 +394,32 @@ export default function AccountsPage() {
         setEditSaving(false);
         return;
       }
+
+      // Persist the opening balance only when it changed (cash accounts only).
+      // A null amount with no existing row is a no-op (no row created).
+      const prevAmount = editObOriginal?.amount ?? null;
+      const obChanged =
+        newAmount !== prevAmount ||
+        (editObOriginal != null && newDate !== editObOriginal.date);
+      if (
+        !editForm.isInvestment &&
+        obChanged &&
+        !(newAmount == null && editObOriginal == null)
+      ) {
+        const obRes = await fetch(`/api/accounts/${editAccountId}/opening-balance`, {
+          method: "PUT",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ amount: newAmount, date: newDate }),
+        });
+        if (!obRes.ok) {
+          const d = await obRes.json().catch(() => ({}));
+          setEditSaveError(d.error ?? "Account saved, but the opening balance failed to update");
+          setEditSaving(false);
+          loadAccounts();
+          return;
+        }
+      }
+
       setEditDialogOpen(false);
       loadAccounts();
     } catch {
@@ -784,6 +839,47 @@ export default function AccountsPage() {
               <Label>Note <span className="text-muted-foreground text-xs">(optional)</span></Label>
               <Input value={editForm.note} onChange={(e) => setEditForm({ ...editForm, note: e.target.value })} />
             </div>
+
+            {/* Opening balance (FINLYNQ-206) — cash accounts only. Backed by ONE
+                kind='opening_balance' transaction; clearing zeroes it (never
+                deletes). Hidden when "Investment account" is checked. */}
+            {!editForm.isInvestment && (
+              <div className="space-y-2 rounded-lg border border-border/60 p-3">
+                <Label>Opening balance <span className="text-muted-foreground text-xs">(optional)</span></Label>
+                <p className="text-xs text-muted-foreground">
+                  A single starting-balance entry for this account. Set the date
+                  to when the account opened so Balance Over Time and Net Worth
+                  history start from the right point. Clearing the amount zeroes
+                  the entry — it is not deleted.
+                </p>
+                <div className="grid grid-cols-2 gap-3">
+                  <div className="space-y-1.5">
+                    <Label htmlFor="edit-ob-amount">Amount</Label>
+                    <Input
+                      id="edit-ob-amount"
+                      type="number"
+                      step="0.01"
+                      value={editForm.openingBalanceAmount}
+                      onChange={(e) => setEditForm({ ...editForm, openingBalanceAmount: e.target.value })}
+                      placeholder="0.00"
+                    />
+                  </div>
+                  <div className="space-y-1.5">
+                    <Label htmlFor="edit-ob-date">Date</Label>
+                    <Input
+                      id="edit-ob-date"
+                      type="date"
+                      value={editForm.openingBalanceDate}
+                      onChange={(e) => setEditForm({ ...editForm, openingBalanceDate: e.target.value })}
+                    />
+                  </div>
+                </div>
+                {editFormErrors.openingBalance && (
+                  <p className="text-xs text-destructive">{editFormErrors.openingBalance}</p>
+                )}
+              </div>
+            )}
+
             <div className="space-y-1.5">
               <div className="flex items-center gap-2">
                 <input
