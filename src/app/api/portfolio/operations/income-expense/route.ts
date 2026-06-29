@@ -52,7 +52,9 @@ export const POST = apiHandler(
       body;
 
     // ── Income received as shares (single-leg DRIP) ─────────────────────
-    // Create-only; the form never sends settleAs:"shares" with an editId.
+    // Create OR edit. On edit (`editId` set) we cascade-delete the original
+    // row (reversing its lot) before re-recording, so editing a share
+    // dividend keeps it as shares instead of converting it to a cash dividend.
     if (settleAs === "shares") {
       if (input.amount <= 0) {
         return NextResponse.json(
@@ -65,6 +67,10 @@ export const POST = apiHandler(
           { error: "Pick a holding and enter a share quantity greater than 0." },
           { status: 400 },
         );
+      }
+      if (editId != null) {
+        const refusal = await cascadeDeleteForReplace(userId, editId);
+        if (refusal) return refusal;
       }
       // Category resolution mirrors the cash path: an explicit categoryId
       // (any category the user picked) always wins; otherwise a dividend/
@@ -98,7 +104,10 @@ export const POST = apiHandler(
       });
       invalidateUserTxCache(userId);
       await markSnapshotsDirty(userId, input.date);
-      return NextResponse.json(sharesResult, { status: 201 });
+      return NextResponse.json(
+        editId != null ? { ...sharesResult, replaced: editId } : sharesResult,
+        { status: 201 },
+      );
     }
 
     // ── Cash-sleeve income/expense (existing path) ──────────────────────

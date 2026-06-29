@@ -52,8 +52,12 @@ export default function IncomeExpenseForm() {
   const [currency, setCurrency] = useState<string>("");
   const [direction, setDirection] = useState<Direction>("income");
   // Settle into: "cash" (the cash sleeve, legacy) or "shares" (a holding —
-  // income received as shares, single-leg DRIP). Income-only + create-only.
+  // income received as shares, single-leg DRIP). Offered when creating an
+  // income entry, and when editing a row that was itself settled as shares.
   const [settleAs, setSettleAs] = useState<"cash" | "shares">("cash");
+  // Whether the row being edited was originally a shares-settled (DRIP) row.
+  // Keeps the toggle visible across a shares↔cash switch in edit mode.
+  const [editLoadedAsShares, setEditLoadedAsShares] = useState(false);
   const [quantity, setQuantity] = useState<string>("");
   const [amount, setAmount] = useState<string>("");
   const [relatedHoldingId, setRelatedHoldingId] = useState<string>("");
@@ -84,8 +88,20 @@ export default function IncomeExpenseForm() {
       setDirection(editData.amount < 0 ? "expense" : "income");
       setAmount(String(Math.abs(editData.amount)));
     }
-    if (editData.relatedHoldingId != null)
+    // Shares-settled (DRIP) income: load the destination holding + qty and
+    // stay in shares mode so saving re-records it as shares (not a silent
+    // conversion to cash). The form reuses `relatedHoldingId` state as the
+    // holding the shares land on (submitted as `holdingId`).
+    if (editData.settleAs === "shares") {
+      setEditLoadedAsShares(true);
+      setSettleAs("shares");
+      setDirection("income");
+      if (editData.quantity != null) setQuantity(String(editData.quantity));
+      if (editData.holdingId != null)
+        setRelatedHoldingId(String(editData.holdingId));
+    } else if (editData.relatedHoldingId != null) {
       setRelatedHoldingId(String(editData.relatedHoldingId));
+    }
     // Editing an existing row: keep its category exactly as-is via the
     // manual picker — don't re-infer a preset and silently re-tag.
     setIncomeType("other");
@@ -183,9 +199,12 @@ export default function IncomeExpenseForm() {
     other: direction === "income" ? "Other income" : "Other expense",
   };
 
-  // Income-as-shares is income-only and create-only: hidden in edit mode and
-  // for expenses. The toggle below is only shown under the same condition.
-  const sharesAllowed = !isEdit && direction === "income";
+  // Income-as-shares is income-only. Offered when creating an income entry,
+  // and when editing a row that was originally settled as shares (so the edit
+  // keeps it as shares instead of converting to cash). `editLoadedAsShares`
+  // keeps the toggle visible across a shares↔cash switch in edit mode.
+  const sharesAllowed =
+    (!isEdit && direction === "income") || (isEdit && editLoadedAsShares);
   const sharesMode = sharesAllowed && settleAs === "shares";
 
   // Implied price/share preview for shares mode (cosmetic).
@@ -253,7 +272,9 @@ export default function IncomeExpenseForm() {
       if (payee.trim()) body.payee = payee.trim();
       if (note.trim()) body.note = note.trim();
       if (tags.trim()) body.tags = tags.trim();
-      if (isEdit && !sharesMode) body.editId = editId;
+      // Always send editId on edit — both the cash and shares branches do an
+      // edit-as-replace (cascade-delete the original, then re-record).
+      if (isEdit) body.editId = editId;
       const res = await fetch("/api/portfolio/operations/income-expense", {
         method: "POST",
         headers: { "Content-Type": "application/json" },

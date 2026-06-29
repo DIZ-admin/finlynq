@@ -249,11 +249,52 @@ export async function GET(request: NextRequest) {
       }
       case "portfolio_income":
       case "portfolio_expense": {
+        // A shares-settled (single-leg DRIP) income lands directly on a
+        // NON-cash stock holding; the cash-sleeve path lands on a cash sleeve.
+        // Both store a quantity, so `is_cash` on the row's holding is the
+        // discriminator. Return `settleAs` so the form re-records it the same
+        // way instead of silently converting a share dividend to cash.
+        let holdingIsCash = true;
+        if (t.portfolioHoldingId != null) {
+          const h = await db
+            .select({ isCash: schema.portfolioHoldings.isCash })
+            .from(schema.portfolioHoldings)
+            .where(
+              and(
+                eq(schema.portfolioHoldings.id, t.portfolioHoldingId),
+                eq(schema.portfolioHoldings.userId, userId),
+              ),
+            )
+            .get();
+          holdingIsCash = h?.isCash ?? true;
+        }
+        if (!holdingIsCash) {
+          return NextResponse.json({
+            success: true,
+            data: {
+              op: "income-expense",
+              primaryTxId: t.id,
+              settleAs: "shares",
+              accountId: t.accountId,
+              holdingId: t.portfolioHoldingId,
+              quantity: Math.abs(Number(t.quantity ?? 0)),
+              // Income value is stored positive on the holding row.
+              amount: Math.abs(Number(t.amount)),
+              currency: t.currency,
+              categoryId: t.categoryId,
+              date: t.date,
+              payee: decryptStr(t.payee),
+              note: decryptStr(t.note),
+              tags: decryptStr(t.tags),
+            },
+          });
+        }
         return NextResponse.json({
           success: true,
           data: {
             op: "income-expense",
             primaryTxId: t.id,
+            settleAs: "cash",
             accountId: t.accountId,
             currency: t.currency,
             amount: Number(t.amount),
