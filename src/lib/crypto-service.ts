@@ -9,7 +9,7 @@ import { marketFetch } from "@/lib/market-fetch";
 // so crypto VALUATIONS (dashboard / net-worth / getHoldingsValueByAccount) refresh
 // intraday instead of freezing at the first cache fill of the UTC day. (The
 // overview's *displayed* crypto day-change already reads CoinGecko live.)
-import { isPriceCacheRowStale, fetchYahooDailyCloses } from "@/lib/price-service";
+import { isPriceCacheRowStale, fetchYahooDailyCloses, fetchQuoteLive } from "@/lib/price-service";
 
 const COINGECKO_BASE = "https://api.coingecko.com/api/v3";
 
@@ -46,14 +46,22 @@ export function isWithinCryptoHistoryWindow(
 // CoinGecko's free window). Most coins map to "<SYM>-USD"; add an override only
 // where Yahoo's ticker differs from the holding's symbol.
 const YAHOO_CRYPTO_TICKER_OVERRIDES: Record<string, string> = {
-  // POL / MATIC are both listed on Yahoo as POL-USD / MATIC-USD; FTM-USD and
-  // S-USD likewise resolve under their own symbols — so no override needed yet.
+  // Polygon rename: a POL-symboled holding has no deep history under POL-USD —
+  // Yahoo keeps it under MATIC-USD (both map to CoinGecko's matic-network), so
+  // point POL at MATIC-USD. FTM-USD / S-USD resolve under their own symbols.
+  POL: "MATIC-USD",
 };
 
 /** Base crypto symbol → Yahoo crypto ticker (e.g. BTC → BTC-USD). Pure. */
 export function cryptoSymbolToYahooTicker(symbol: string): string {
   const base = (symbol ?? "").toUpperCase().split("-")[0];
   return YAHOO_CRYPTO_TICKER_OVERRIDES[base] ?? `${base}-USD`;
+}
+
+// Yahoo names crypto as "<Name> USD" (e.g. "Bitcoin USD"). Strip the trailing
+// currency suffix so display/lookup names match CoinGecko's bare name. Pure.
+export function stripYahooCryptoNameSuffix(name: string | null | undefined): string {
+  return (name ?? "").replace(/[\s-]USD$/i, "").trim();
 }
 
 // Backfill one coin's daily USD history from Yahoo (>365-day tier) into
@@ -125,7 +133,33 @@ async function coinGeckoFetch(endpoint: string): Promise<Response> {
   });
 }
 
+// Yahoo-first single-coin price (used by the Add-security lookup for the coin
+// name). CoinGecko is the fallback ONLY when Yahoo can't price the symbol.
 export async function getCryptoPrice(coinId: string): Promise<CryptoPrice | null> {
+  const sym = coinGeckoIdToSymbol(coinId);
+  if (sym) {
+    const q = await fetchQuoteLive(cryptoSymbolToYahooTicker(sym));
+    if (q && q.price > 0) {
+      const currency = q.currency || "USD";
+      await cacheCryptoPrice(sym, q.price, currency);
+      return {
+        id: coinId,
+        symbol: sym,
+        name: stripYahooCryptoNameSuffix(q.name) || sym,
+        price: q.price,
+        currency,
+        change24h: q.change,
+        changePct24h: q.changePct,
+        marketCap: 0,
+        image: undefined,
+      };
+    }
+  }
+  return getCryptoPriceFromCoinGecko(coinId);
+}
+
+// CoinGecko fallback (verbatim legacy body) — only for coins Yahoo can't price.
+async function getCryptoPriceFromCoinGecko(coinId: string): Promise<CryptoPrice | null> {
   try {
     const res = await coinGeckoFetch(
       `/coins/${coinId}?localization=false&tickers=false&community_data=false&developer_data=false`
@@ -154,9 +188,56 @@ export async function getCryptoPrice(coinId: string): Promise<CryptoPrice | null
   }
 }
 
+// Live crypto prices. Yahoo "<SYM>-USD" is the PRIMARY source (not free-tier
+// rate-limited); CoinGecko is the fallback ONLY for coins Yahoo can't price.
+// marketCap + image are Yahoo-unavailable, so a Yahoo-priced coin returns
+// marketCap:0 / image:undefined (those fields were dropped for crypto). `id`
+// stays the CoinGecko coin id so coinId-keyed callers (the overview) still match
+// on `cp.id`; today's price is cached under CRYPTO:<SYM> (one crypto namespace).
 export async function getCryptoPrices(coinIds: string[]): Promise<CryptoPrice[]> {
   if (coinIds.length === 0) return [];
+  const uniqIds = [...new Set(coinIds.filter(Boolean))];
+  const out: CryptoPrice[] = [];
+  const coinGeckoFallback: string[] = [];
 
+  // Yahoo-first, in parallel, for coins we can map to a symbol/ticker.
+  const yahoo = await Promise.all(
+    uniqIds.map(async (coinId) => {
+      const sym = coinGeckoIdToSymbol(coinId);
+      if (!sym) return { coinId, cp: null as CryptoPrice | null };
+      const q = await fetchQuoteLive(cryptoSymbolToYahooTicker(sym));
+      if (!q || !(q.price > 0)) return { coinId, cp: null };
+      const currency = q.currency || "USD";
+      await cacheCryptoPrice(sym, q.price, currency);
+      const cp: CryptoPrice = {
+        id: coinId,
+        symbol: sym,
+        name: q.name || sym,
+        price: q.price,
+        currency,
+        change24h: q.change,
+        changePct24h: q.changePct,
+        marketCap: 0,
+        image: undefined,
+      };
+      return { coinId, cp };
+    }),
+  );
+  for (const r of yahoo) {
+    if (r.cp) out.push(r.cp);
+    else coinGeckoFallback.push(r.coinId);
+  }
+
+  // CoinGecko fallback only for coins Yahoo couldn't price.
+  if (coinGeckoFallback.length > 0) {
+    out.push(...(await fetchCryptoPricesFromCoinGecko(coinGeckoFallback)));
+  }
+  return out;
+}
+
+// CoinGecko fallback (verbatim legacy body) — only for coins Yahoo can't price.
+async function fetchCryptoPricesFromCoinGecko(coinIds: string[]): Promise<CryptoPrice[]> {
+  if (coinIds.length === 0) return [];
   try {
     const ids = coinIds.join(",");
     const res = await coinGeckoFetch(
@@ -352,44 +433,6 @@ export function bucketDailyCryptoPrices(
   return byDate;
 }
 
-// Fetch daily historical prices for one coin covering [fromDate, today] in a
-// SINGLE CoinGecko call (`market_chart?days=N`) and bulk-write the strictly-past
-// days into price_cache under "CRYPTO:<SYMBOL>". Idempotent: only inserts dates
-// not already cached (historical bars are immutable), so a re-run is a no-op.
-// Free-tier historical data is limited to ~365 days, so `days` is capped there;
-// dates older than that simply stay uncached and the caller falls back to the
-// live spot price (same approximation as before historical pricing existed).
-async function fetchCryptoHistoryToCache(coinId: string, symbol: string, fromDate: string): Promise<void> {
-  const today = todayISO();
-  const spanMs = Date.parse(`${today}T00:00:00Z`) - Date.parse(`${fromDate}T00:00:00Z`);
-  if (!(spanMs > 0)) return; // fromDate is today or in the future — nothing historical to fetch
-  const days = Math.min(365, Math.ceil(spanMs / 86400000) + 1);
-  try {
-    const res = await coinGeckoFetch(`/coins/${coinId}/market_chart?vs_currency=usd&days=${days}`);
-    if (!res.ok) return;
-    const data = await res.json();
-    const byDate = bucketDailyCryptoPrices((data.prices ?? []) as Array<[number, number]>, today);
-    if (byDate.size === 0) return;
-
-    const cacheSymbol = `CRYPTO:${symbol.toUpperCase()}`;
-    const dates = [...byDate.keys()];
-    // Only insert dates not already cached — historical bars never change, and
-    // this also avoids duplicating rows on the (non-unique) (symbol, date) index.
-    const existing = await db
-      .select({ date: schema.priceCache.date })
-      .from(schema.priceCache)
-      .where(and(eq(schema.priceCache.symbol, cacheSymbol), inArray(schema.priceCache.date, dates)));
-    const have = new Set(existing.map((r) => r.date));
-    const rows = dates
-      .filter((d) => !have.has(d))
-      .map((date) => ({ symbol: cacheSymbol, date, price: byDate.get(date)!, currency: "USD", previousClose: null }));
-    if (rows.length > 0) await db.insert(schema.priceCache).values(rows);
-  } catch {
-    // Network/parse failure → leave the cache as-is; the caller degrades to the
-    // live spot price for any date it couldn't fill.
-  }
-}
-
 /**
  * Historical spot prices for VALUATION as of a past date. The crypto analogue of
  * price-service's `fetchMultipleQuotesAtDate`: read price_cache for `date` first;
@@ -424,25 +467,17 @@ export async function getCryptoPricesAtDate(
   // 1. Cache-read for the historical date.
   let cacheMap = await readCryptoCacheBulk(symbols, date);
 
-  // 2. For misses, backfill history per coin and re-read. Two tiers by age:
-  //    - WITHIN CoinGecko's free ~365-day window → CoinGecko market_chart
-  //      (crypto-native, vs_currency=usd).
-  //    - OLDER than that → Yahoo "<SYM>-USD" daily history (covers back to
-  //      ~2014), so old dates get REAL historical prices instead of degrading to
-  //      today's spot. (Calling CoinGecko for >365d is pointless — it only
-  //      returns the trailing 365 days — so we never do.)
-  //    Both write USD rows under "CRYPTO:<SYM>"; anything neither tier can fill
-  //    falls through to the spot approximation in step 3 (negative-cached so a
-  //    hopeless ticker isn't re-hit per old date).
+  // 2. For misses, backfill history per coin via Yahoo "<SYM>-USD" daily history
+  //    and re-read. Yahoo covers ~2014→today in ONE call per coin, is NOT
+  //    free-tier rate-limited, and is negative-cache + inception-memo aware.
+  //    CoinGecko's market_chart is deliberately NOT used here: its 365-day free
+  //    window made a multi-year rebuild fire one doomed/429'd request per
+  //    walk-day. Writes USD rows under "CRYPTO:<SYM>"; anything Yahoo can't fill
+  //    falls through to the spot approximation in step 3.
   const missing = [...uniq].filter(([, sym]) => !cacheMap.has(`CRYPTO:${sym}`));
   if (missing.length > 0) {
-    const withinWindow = isWithinCryptoHistoryWindow(date, today);
-    for (const [coinId, sym] of missing) {
-      if (withinWindow) {
-        await fetchCryptoHistoryToCache(coinId, sym, date);
-      } else {
-        await fetchCryptoHistoryFromYahooToCache(sym, date);
-      }
+    for (const [, sym] of missing) {
+      await fetchCryptoHistoryFromYahooToCache(sym, date);
     }
     cacheMap = await readCryptoCacheBulk(symbols, date);
   }
@@ -607,4 +642,21 @@ const SYMBOL_TO_COINGECKO: Record<string, string> = {
 export function symbolToCoinGeckoId(symbol: string): string | null {
   const upper = symbol.toUpperCase().split("-")[0]; // Handle BTC-CAD format
   return SYMBOL_TO_COINGECKO[upper] ?? null;
+}
+
+// Reverse of SYMBOL_TO_COINGECKO: CoinGecko coin id → base symbol. First-wins on
+// collisions, so `matic-network` (MATIC + POL both map to it) resolves to MATIC —
+// Yahoo's deep history is under MATIC-USD. Used to recover a Yahoo ticker for the
+// bare-coinId live paths (getCryptoPrices / getCryptoPrice); a coin id with no
+// entry has no Yahoo mapping and routes to the CoinGecko fallback.
+const COINGECKO_ID_TO_SYMBOL: Record<string, string> = (() => {
+  const m: Record<string, string> = {};
+  for (const [sym, id] of Object.entries(SYMBOL_TO_COINGECKO)) {
+    if (!(id in m)) m[id] = sym;
+  }
+  return m;
+})();
+
+export function coinGeckoIdToSymbol(coinId: string): string | null {
+  return COINGECKO_ID_TO_SYMBOL[coinId] ?? null;
 }
