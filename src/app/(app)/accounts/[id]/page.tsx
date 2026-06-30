@@ -129,7 +129,7 @@ export default function AccountDetailPage() {
   // Edit dialog (Details / Reconciliation / Import / Cash sleeves tabs).
   const [editOpen, setEditOpen] = useState(false);
   const [editTab, setEditTab] = useState<EditTab>("details");
-  const [editForm, setEditForm] = useState({ name: "", type: "A", group: "", currency: "USD", note: "", openingBalanceAmount: "", openingBalanceDate: "" });
+  const [editForm, setEditForm] = useState({ name: "", type: "A", group: "", currency: "USD", note: "", isInvestment: false, openingBalanceAmount: "", openingBalanceDate: "" });
   const [editSaving, setEditSaving] = useState(false);
   const [editError, setEditError] = useState("");
   // FINLYNQ-206 — the opening balance currently backing this (cash) account,
@@ -290,7 +290,7 @@ export default function AccountDetailPage() {
 
   function openEdit(tab: EditTab = "details") {
     if (!account) return;
-    setEditForm({ name: account.name, type: account.type, group: account.group || "", currency: account.currency, note: "", openingBalanceAmount: "", openingBalanceDate: "" });
+    setEditForm({ name: account.name, type: account.type, group: account.group || "", currency: account.currency, note: "", isInvestment: account.isInvestment === true, openingBalanceAmount: "", openingBalanceDate: "" });
     setObOriginal(null);
     setEditError("");
     setEditTab(tab);
@@ -315,7 +315,9 @@ export default function AccountDetailPage() {
 
   async function handleEdit(e: React.FormEvent) {
     e.preventDefault();
-    const isInvestmentAccount = account?.isInvestment === true;
+    // Gate on the value being SAVED (editForm), so toggling the account to
+    // investment in this same submit skips the opening-balance write.
+    const isInvestmentAccount = editForm.isInvestment === true;
 
     // Opening balance (cash accounts only). Validate before any write so a
     // bad value doesn't half-save.
@@ -813,11 +815,27 @@ export default function AccountDetailPage() {
                   <Input value={editForm.note} onChange={(e) => setEditForm({ ...editForm, note: e.target.value })} />
                 </div>
 
+                <div className="space-y-1.5">
+                  <div className="flex items-center gap-2">
+                    <input
+                      type="checkbox"
+                      id="edit-detail-isInvestment"
+                      checked={editForm.isInvestment}
+                      onChange={(e) => setEditForm({ ...editForm, isInvestment: e.target.checked })}
+                      className="h-4 w-4 rounded border-input"
+                    />
+                    <Label htmlFor="edit-detail-isInvestment" className="cursor-pointer">Investment account</Label>
+                  </div>
+                  <p className="text-xs text-muted-foreground">
+                    When enabled, every transaction in this account must reference a portfolio holding (a security or the auto-created &quot;Cash&quot; sleeve). Turning this on now will reassign any unattributed transactions to this account&apos;s Cash holding.
+                  </p>
+                </div>
+
                 {/* Opening balance (FINLYNQ-206) — cash accounts only. Backed
                     by ONE kind='opening_balance' transaction; clearing zeroes
                     it (never deletes). Hidden for investment accounts (their
                     balance comes from holdings; out of v1 scope). */}
-                {!isInvestment && (
+                {!editForm.isInvestment && (
                   <div className="space-y-2 rounded-lg border border-border/60 p-3">
                     <Label>Opening balance <span className="text-muted-foreground text-xs">(optional)</span></Label>
                     <p className="text-xs text-muted-foreground">

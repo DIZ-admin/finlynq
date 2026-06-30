@@ -144,6 +144,10 @@ const emptyForm = {
   initialBalanceDate: "",
   note: "",
   alias: "",
+  // FINLYNQ — whether the new account is an investment/brokerage account.
+  // When true, Initial Balance is hidden (opening balance is cash-only v1) and
+  // the API backfills a Cash holding so the is_investment constraint holds.
+  isInvestment: false,
 };
 
 export default function AccountsPage() {
@@ -256,6 +260,7 @@ export default function AccountsPage() {
           currency: form.currency,
           note: form.note.trim(),
           alias: form.alias.trim() || undefined,
+          isInvestment: form.isInvestment,
         }),
       });
       if (!res.ok) {
@@ -268,8 +273,9 @@ export default function AccountsPage() {
       // If initial balance is non-zero, set the account's opening balance
       // (FINLYNQ-206) — backed by ONE kind='opening_balance' transaction with
       // a partial-unique guarantee, dated as chosen (defaults to today).
+      // Skipped for investment accounts (opening balance is cash-only in v1).
       const initialBalance = parseFloat(form.initialBalance);
-      if (!isNaN(initialBalance) && initialBalance !== 0) {
+      if (!form.isInvestment && !isNaN(initialBalance) && initialBalance !== 0) {
         const account = await res.json();
         await fetch(`/api/accounts/${account.id}/opening-balance`, {
           method: "PUT",
@@ -612,7 +618,7 @@ export default function AccountsPage() {
             </div>
           </div>
 
-          <div className="grid grid-cols-2 gap-3">
+          <div className={`grid gap-3 ${form.isInvestment ? "grid-cols-1" : "grid-cols-2"}`}>
             <div className="space-y-1.5">
               <Label>Currency</Label>
               <Combobox
@@ -630,22 +636,27 @@ export default function AccountsPage() {
               />
             </div>
 
-            <div className="space-y-1.5">
-              <Label>Initial Balance</Label>
-              <Input
-                type="number"
-                step="0.01"
-                value={form.initialBalance}
-                onChange={(e) => setForm({ ...form, initialBalance: e.target.value })}
-                placeholder="0.00"
-              />
-            </div>
+            {/* Initial Balance — cash accounts only (investment accounts start
+                from holdings; opening balance is cash-only in v1). */}
+            {!form.isInvestment && (
+              <div className="space-y-1.5">
+                <Label>Initial Balance</Label>
+                <Input
+                  type="number"
+                  step="0.01"
+                  value={form.initialBalance}
+                  onChange={(e) => setForm({ ...form, initialBalance: e.target.value })}
+                  placeholder="0.00"
+                />
+              </div>
+            )}
           </div>
 
           {/* Opening-balance date (FINLYNQ-206) — only relevant when a non-zero
               initial balance is set. Defaults to today; back-date it to the
               account's open date so balance history starts correctly. */}
-          {Number.isFinite(parseFloat(form.initialBalance)) &&
+          {!form.isInvestment &&
+            Number.isFinite(parseFloat(form.initialBalance)) &&
             parseFloat(form.initialBalance) !== 0 && (
             <div className="space-y-1.5">
               <Label>Opening balance date</Label>
@@ -664,6 +675,24 @@ export default function AccountsPage() {
               onChange={(e) => setForm({ ...form, note: e.target.value })}
               placeholder="e.g. Joint account"
             />
+          </div>
+
+          <div className="space-y-1.5">
+            <div className="flex items-center gap-2">
+              <input
+                type="checkbox"
+                id="create-isInvestment"
+                checked={form.isInvestment}
+                onChange={(e) => setForm({ ...form, isInvestment: e.target.checked })}
+                className="h-4 w-4 rounded border-input"
+              />
+              <Label htmlFor="create-isInvestment" className="cursor-pointer">Investment account</Label>
+            </div>
+            <p className="text-xs text-muted-foreground">
+              For brokerage / portfolio accounts where every transaction
+              references a holding (a security or the auto-created &quot;Cash&quot;
+              sleeve). Record trades from <code className="px-1 rounded bg-muted text-[10px]">/portfolio/new</code> instead of an initial balance.
+            </p>
           </div>
 
           {saveError && <p className="text-sm text-destructive">{saveError}</p>}
