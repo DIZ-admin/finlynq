@@ -310,7 +310,7 @@ export function LotInspectorDialog({
   return (
     <>
     <Dialog open={open} onOpenChange={onOpenChange}>
-      <DialogContent className={showMatrix ? "sm:max-w-4xl" : "sm:max-w-2xl"}>
+      <DialogContent className={showMatrix ? "sm:max-w-[97vw] w-[97vw] h-[95vh] max-h-[95vh] flex flex-col overflow-hidden overflow-y-hidden" : "sm:max-w-2xl"}>
         <DialogHeader>
           <DialogTitle className="text-base">
             Lot inspector

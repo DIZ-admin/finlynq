@@ -11,6 +11,13 @@
  * the on-screen totals match the committed result. The matrix derives
  * everything from the lots + closures already loaded by the inspector — no
  * refetch. Commit POSTs to /lots/allocate (preview:false).
+ *
+ * Layout: compact + fullscreen-friendly (flex column, the grid scrolls with a
+ * sticky header row + sticky lot column). A sales date/year filter + a
+ * "used lots only" toggle shrink the visible grid WITHOUT changing the spec —
+ * the plan, validation, and commit always span EVERY editable sell + lot
+ * (applyHoldingAllocation reverses + re-closes all of them, so a hidden,
+ * unbalanced sell still surfaces in the banner).
  */
 
 "use client";
@@ -113,8 +120,37 @@ export function LotAllocationMatrix({
   const [busy, setBusy] = useState(false);
   const [err, setErr] = useState<string | null>(null);
 
+  // ─── Filters (display-only; spec/plan/commit always span ALL sells+lots) ─
+  const sellYears = useMemo(
+    () => [...new Set(sells.map((s) => s.closeDate.slice(0, 4)))].sort((a, b) => b.localeCompare(a)),
+    [sells],
+  );
+  const [yearFilter, setYearFilter] = useState<string>("all");
+  const [fromDate, setFromDate] = useState("");
+  const [toDate, setToDate] = useState("");
+  const [onlyUsedLots, setOnlyUsedLots] = useState(false);
+
   const elig = (lot: LotRow, sell: { closeDate: string }) => lot.openDate <= sell.closeDate;
   const num = (k: string) => { const n = Number(alloc[k]); return Number.isFinite(n) && n > 0 ? n : 0; };
+
+  const visibleSells = useMemo(
+    () =>
+      sells.filter((s) => {
+        if (yearFilter !== "all" && s.closeDate.slice(0, 4) !== yearFilter) return false;
+        if (fromDate && s.closeDate < fromDate) return false;
+        if (toDate && s.closeDate > toDate) return false;
+        return true;
+      }),
+    [sells, yearFilter, fromDate, toDate],
+  );
+  const visibleLots = useMemo(() => {
+    if (!onlyUsedLots) return longLots;
+    return longLots.filter((lot) =>
+      visibleSells.some((s) => elig(lot, s) || num(`${s.closeTxId}_${lot.id}`) > EPS),
+    );
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [longLots, visibleSells, onlyUsedLots, alloc]);
+  const filtered = visibleSells.length !== sells.length || visibleLots.length !== longLots.length;
 
   // ─── Build the spec + run the shared planner for live feedback ──────────
   const spec: AllocSpec = useMemo(() => {
@@ -202,65 +238,104 @@ export function LotAllocationMatrix({
     );
   }
 
+  const cur = sells[0].currency;
+  const thBase = "px-2 py-1.5 text-right font-medium align-bottom whitespace-nowrap";
+  const tdBase = "px-2 py-1 text-right align-top whitespace-nowrap";
+  const inputCls = "h-6 w-16 px-1.5 text-right text-[11px] tabular-nums";
+
   return (
-    <div className="space-y-3">
-      <div className="flex items-center justify-between gap-2 flex-wrap">
+    <div className="flex flex-1 min-h-0 flex-col gap-2.5">
+      {/* Toolbar: strategies + filters */}
+      <div className="shrink-0 flex items-center justify-between gap-2 flex-wrap">
         <h3 className="text-sm font-medium">Edit all allocations</h3>
         <div className="flex items-center gap-1.5 flex-wrap">
           <span className="text-[11px] text-muted-foreground">Auto:</span>
           {(["fifo", "hifo", "lifo", "current"] as const).map((s) => (
-            <button key={s} type="button" onClick={() => fill(s)} className="text-[11px] rounded-md border border-border px-2 py-1 hover:bg-muted">
+            <button key={s} type="button" onClick={() => fill(s)} className="text-[11px] rounded-md border border-border px-2 py-0.5 hover:bg-muted">
               {s === "hifo" ? "HIFO" : s === "current" ? "Current" : s.toUpperCase()}
             </button>
           ))}
         </div>
       </div>
 
-      <div className={`rounded-md px-3 py-2 text-xs ${plan.ok ? "bg-emerald-50/60 dark:bg-emerald-950/30 text-emerald-700 dark:text-emerald-300" : "bg-rose-50/60 dark:bg-rose-950/30 text-rose-700 dark:text-rose-300"}`}>
+      <div className="shrink-0 flex items-center gap-x-3 gap-y-1.5 flex-wrap text-[11px] text-muted-foreground">
+        <span className="font-medium">Sales:</span>
+        <div className="flex items-center gap-1">
+          <button type="button" onClick={() => { setYearFilter("all"); setFromDate(""); setToDate(""); }}
+            className={`rounded-md border px-2 py-0.5 ${yearFilter === "all" && !fromDate && !toDate ? "border-primary bg-primary/10 text-primary" : "border-border hover:bg-muted"}`}>
+            All
+          </button>
+          {sellYears.map((y) => (
+            <button key={y} type="button" onClick={() => { setYearFilter(y); setFromDate(""); setToDate(""); }}
+              className={`rounded-md border px-2 py-0.5 ${yearFilter === y ? "border-primary bg-primary/10 text-primary" : "border-border hover:bg-muted"}`}>
+              {y}
+            </button>
+          ))}
+        </div>
+        <span className="text-border">|</span>
+        <label className="flex items-center gap-1">From
+          <Input type="date" value={fromDate} onChange={(e) => { setFromDate(e.target.value); setYearFilter("all"); }} className="h-6 w-[130px] text-[11px] px-1.5" />
+        </label>
+        <label className="flex items-center gap-1">To
+          <Input type="date" value={toDate} onChange={(e) => { setToDate(e.target.value); setYearFilter("all"); }} className="h-6 w-[130px] text-[11px] px-1.5" />
+        </label>
+        <span className="text-border">|</span>
+        <label className="flex items-center gap-1.5 cursor-pointer select-none">
+          <input type="checkbox" checked={onlyUsedLots} onChange={(e) => setOnlyUsedLots(e.target.checked)} className="h-3.5 w-3.5 accent-primary" />
+          Used lots only
+        </label>
+        {filtered && (
+          <span className="text-muted-foreground/80">· showing {visibleSells.length}/{sells.length} sales, {visibleLots.length}/{longLots.length} lots</span>
+        )}
+      </div>
+
+      <div className={`shrink-0 rounded-md px-3 py-1.5 text-xs ${plan.ok ? "bg-emerald-50/60 dark:bg-emerald-950/30 text-emerald-700 dark:text-emerald-300" : "bg-rose-50/60 dark:bg-rose-950/30 text-rose-700 dark:text-rose-300"}`}>
         {plan.ok
-          ? `Balanced — ${qf(plan.totals.openShares)} sh still open. Net ${plan.totals.realizedGain >= 0 ? "gain " : "loss "}${formatCurrency(plan.totals.realizedGain, sells[0].currency)} (LT ${formatCurrency(plan.totals.longTerm, sells[0].currency)} · ST ${formatCurrency(plan.totals.shortTerm, sells[0].currency)}).`
+          ? `Balanced — ${qf(plan.totals.openShares)} sh still open. Net ${plan.totals.realizedGain >= 0 ? "gain " : "loss "}${formatCurrency(plan.totals.realizedGain, cur)} (LT ${formatCurrency(plan.totals.longTerm, cur)} · ST ${formatCurrency(plan.totals.shortTerm, cur)}).`
           : plan.errors[0]}
       </div>
 
-      <div className="overflow-x-auto rounded-md border border-border">
-        <table className="w-full text-xs border-collapse">
+      {/* Scrollable grid — sticky header row + sticky lot column */}
+      <div className="flex-1 min-h-0 overflow-auto rounded-md border border-border">
+        <table className="text-[11px] border-collapse">
           <thead>
-            <tr className="bg-muted/40">
-              <th className="text-left font-medium px-3 py-2 sticky left-0 bg-muted/40">Lot</th>
-              {sells.map((s) => (
-                <th key={s.closeTxId} className="text-right font-medium px-3 py-2 border-b-2 border-primary/40 min-w-[120px]">
-                  <div>Sell #{s.closeTxId}</div>
-                  <div className="font-normal text-muted-foreground">{s.closeDate} · @ {formatCurrency(s.proceedsPerShare, s.currency)}</div>
-                  <div className="font-normal text-muted-foreground">need {qf(s.qty)}</div>
+            <tr>
+              <th className={`${thBase} text-left sticky left-0 top-0 z-20 bg-muted min-w-[148px]`}>Lot</th>
+              {visibleSells.map((s) => (
+                <th key={s.closeTxId} className={`${thBase} sticky top-0 z-10 bg-muted border-b-2 border-primary/40 min-w-[92px]`}>
+                  <div className="font-medium text-foreground">#{s.closeTxId}</div>
+                  <div className="font-normal text-muted-foreground">{s.closeDate}</div>
+                  <div className="font-normal text-muted-foreground">@{formatCurrency(s.proceedsPerShare, s.currency)}</div>
+                  <div className="font-normal text-muted-foreground/80">need {qf(s.qty)}</div>
                 </th>
               ))}
             </tr>
           </thead>
           <tbody>
-            {longLots.map((lot) => (
+            {visibleLots.map((lot) => (
               <tr key={lot.id} className="border-b border-border/60">
-                <td className="px-3 py-2 sticky left-0 bg-background">
+                <td className={`${tdBase} text-left sticky left-0 z-10 bg-background`}>
                   <div className="font-medium">Lot #{lot.id}</div>
-                  <div className="text-muted-foreground">opened {lot.openDate} · {qf(availableByLot.get(lot.id) ?? 0)} sh @ {formatCurrency(lot.costPerShare, lot.currency)}</div>
+                  <div className="text-muted-foreground">{lot.openDate} · {qf(availableByLot.get(lot.id) ?? 0)} @ {formatCurrency(lot.costPerShare, lot.currency)}</div>
                 </td>
-                {sells.map((s) => {
+                {visibleSells.map((s) => {
                   const k = `${s.closeTxId}_${lot.id}`;
                   const ok = elig(lot, s);
                   const g = cellGain.get(k);
                   return (
-                    <td key={s.closeTxId} className="px-3 py-2 text-right align-top">
+                    <td key={s.closeTxId} className={tdBase}>
                       {ok ? (
-                        <div className="flex flex-col items-end gap-1">
+                        <div className="flex flex-col items-end gap-0.5">
                           <Input type="number" min={0} step="any" value={alloc[k] ?? ""} placeholder="0"
-                            onChange={(e) => setCell(s.closeTxId, lot.id, e.target.value)} className="h-7 w-[84px] text-right tabular-nums" />
+                            onChange={(e) => setCell(s.closeTxId, lot.id, e.target.value)} className={inputCls} />
                           {g && num(k) > EPS && (
-                            <span className={`text-[10px] tabular-nums ${g.gain >= 0 ? "text-emerald-600 dark:text-emerald-400" : "text-rose-600 dark:text-rose-400"}`}>
+                            <span className={`text-[9px] leading-none tabular-nums ${g.gain >= 0 ? "text-emerald-600 dark:text-emerald-400" : "text-rose-600 dark:text-rose-400"}`}>
                               {g.gain >= 0 ? "+" : ""}{formatCurrency(g.gain, s.currency)} {g.term === "long" ? "LT" : "ST"}
                             </span>
                           )}
                         </div>
                       ) : (
-                        <span className="text-[10px] text-amber-600 dark:text-amber-400" title={`Lot opened ${lot.openDate}, after this sale on ${s.closeDate}.`}>⚠ later</span>
+                        <span className="text-[9px] text-amber-600 dark:text-amber-400" title={`Lot opened ${lot.openDate}, after this sale on ${s.closeDate}.`}>⚠ later</span>
                       )}
                     </td>
                   );
@@ -269,16 +344,16 @@ export function LotAllocationMatrix({
             ))}
             {shortRowActive && (
               <tr className="border-b border-border/60">
-                <td className="px-3 py-2 sticky left-0 bg-background">
+                <td className={`${tdBase} text-left sticky left-0 z-10 bg-background`}>
                   <div className="font-medium text-rose-600 dark:text-rose-400">Open short</div>
-                  <div className="text-muted-foreground">the remainder not closed against a long lot</div>
+                  <div className="text-muted-foreground">remainder not closed against a long lot</div>
                 </td>
-                {sells.map((s) => {
+                {visibleSells.map((s) => {
                   const k = `${s.closeTxId}_${SHORT_LOT_ID}`;
                   return (
-                    <td key={s.closeTxId} className="px-3 py-2 text-right">
+                    <td key={s.closeTxId} className={tdBase}>
                       <Input type="number" min={0} step="any" value={alloc[k] ?? ""} placeholder="0"
-                        onChange={(e) => setCell(s.closeTxId, SHORT_LOT_ID, e.target.value)} className="h-7 w-[84px] text-right tabular-nums" />
+                        onChange={(e) => setCell(s.closeTxId, SHORT_LOT_ID, e.target.value)} className={inputCls} />
                     </td>
                   );
                 })}
@@ -286,14 +361,14 @@ export function LotAllocationMatrix({
             )}
           </tbody>
           <tfoot>
-            <tr className="bg-muted/40 font-medium">
-              <td className="px-3 py-2 sticky left-0 bg-muted/40">Allocated / needed</td>
-              {sells.map((s) => {
+            <tr className="font-medium">
+              <td className={`${tdBase} text-left sticky left-0 bottom-0 z-10 bg-muted`}>Allocated / needed</td>
+              {visibleSells.map((s) => {
                 let sum = num(`${s.closeTxId}_${SHORT_LOT_ID}`);
                 for (const lot of longLots) sum += num(`${s.closeTxId}_${lot.id}`);
                 const bal = Math.abs(sum - s.qty) <= EPS;
                 return (
-                  <td key={s.closeTxId} className={`px-3 py-2 text-right tabular-nums ${bal ? "text-emerald-600 dark:text-emerald-400" : "text-rose-600 dark:text-rose-400"}`}>
+                  <td key={s.closeTxId} className={`${tdBase} sticky bottom-0 z-[1] bg-muted tabular-nums ${bal ? "text-emerald-600 dark:text-emerald-400" : "text-rose-600 dark:text-rose-400"}`}>
                     {qf(sum)} / {qf(s.qty)}
                   </td>
                 );
@@ -303,10 +378,10 @@ export function LotAllocationMatrix({
         </table>
       </div>
 
-      {err && <p className="text-xs text-rose-600 dark:text-rose-400">{err}</p>}
+      {err && <p className="shrink-0 text-xs text-rose-600 dark:text-rose-400">{err}</p>}
 
-      <div className="flex items-center justify-between gap-2">
-        <button type="button" onClick={() => fill("clear")} className="text-[11px] text-muted-foreground hover:underline">Clear</button>
+      <div className="shrink-0 flex items-center justify-between gap-2">
+        <button type="button" onClick={() => fill("clear")} className="text-[11px] text-muted-foreground hover:underline">Clear all</button>
         <div className="flex items-center gap-2">
           <Button variant="outline" size="sm" onClick={onCancel} disabled={busy}>Cancel</Button>
           <Button size="sm" onClick={commit} disabled={!plan.ok || busy}>{busy ? "Saving…" : "Save allocation"}</Button>
