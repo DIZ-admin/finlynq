@@ -101,18 +101,31 @@ export async function GET(
             )
         : [];
 
-    const closures = closureRows.map((r) => ({
-      id: r.id,
-      lotId: r.lotId,
-      closeTxId: r.closeTxId,
-      closeDate: r.closeDate,
-      qtyClosed: Number(r.qtyClosed),
-      proceedsPerShare: Number(r.proceedsPerShare),
-      costPerShare: Number(r.costPerShare),
-      realizedGain: Number(r.realizedGain),
-      currency: r.currency,
-      closeKind: r.closeKind,
-    }));
+    // Lot open-date lookup for the temporal-consistency warning below.
+    const lotOpenDateById = new Map(lots.map((l) => [l.id, l.openDate]));
+
+    const closures = closureRows.map((r) => {
+      const lotOpenDate = lotOpenDateById.get(r.lotId) ?? null;
+      // Temporal warning (warn-but-allow): a closure must not consume a lot
+      // that opened AFTER the close date — that's the fingerprint of an
+      // out-of-order import (a sell recorded before its buy). Surface it so
+      // the user knows which transaction to rebuild.
+      const openAfterClose =
+        lotOpenDate != null && lotOpenDate > r.closeDate;
+      return {
+        id: r.id,
+        lotId: r.lotId,
+        closeTxId: r.closeTxId,
+        closeDate: r.closeDate,
+        qtyClosed: Number(r.qtyClosed),
+        proceedsPerShare: Number(r.proceedsPerShare),
+        costPerShare: Number(r.costPerShare),
+        realizedGain: Number(r.realizedGain),
+        currency: r.currency,
+        closeKind: r.closeKind,
+        openAfterClose,
+      };
+    });
 
     return NextResponse.json({ lots, closures });
   } catch (error) {

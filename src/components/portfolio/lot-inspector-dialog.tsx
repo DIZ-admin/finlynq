@@ -27,6 +27,7 @@ import {
 import { Badge } from "@/components/ui/badge";
 import { Button } from "@/components/ui/button";
 import { Input } from "@/components/ui/input";
+import { ConfirmDialog } from "@/components/ui/confirm-dialog";
 import { formatCurrency } from "@/lib/currency";
 
 interface LotRow {
@@ -53,6 +54,16 @@ interface ClosureRow {
   realizedGain: number;
   currency: string;
   closeKind: string;
+  /** True when this closure consumes a lot that opened AFTER the close date
+   *  — the fingerprint of an out-of-order import. Warn-but-allow. */
+  openAfterClose?: boolean;
+}
+
+interface RebuildResult {
+  lotsWritten: number;
+  closuresWritten: number;
+  txProcessed: number;
+  warnings: string[];
 }
 
 interface ReassignPreview {
@@ -98,6 +109,12 @@ export function LotInspectorDialog({
   const [preview, setPreview] = useState<ReassignPreview | null>(null);
   const [previewBusy, setPreviewBusy] = useState(false);
 
+  // Rebuild-this-ticker state (FINLYNQ — out-of-order-import fix).
+  const [rebuildConfirmOpen, setRebuildConfirmOpen] = useState(false);
+  const [rebuildBusy, setRebuildBusy] = useState(false);
+  const [rebuildError, setRebuildError] = useState<string | null>(null);
+  const [rebuildResult, setRebuildResult] = useState<RebuildResult | null>(null);
+
   useEffect(() => {
     if (!open || holdingId == null) return;
     let cancelled = false;
@@ -134,6 +151,9 @@ export function LotInspectorDialog({
     setAlloc({});
     setPreview(null);
     setReassignError(null);
+    setRebuildError(null);
+    setRebuildResult(null);
+    setRebuildConfirmOpen(false);
   }, [open, holdingId, accountId]);
 
   const closuresByLot = new Map<number, ClosureRow[]>();
@@ -246,7 +266,45 @@ export function LotInspectorDialog({
     }
   }
 
+  // Any closure consuming a lot that opened after its close date → the
+  // out-of-order-import fingerprint a rebuild fixes.
+  const hasTemporalWarning = useMemo(
+    () => closures.some((c) => c.openAfterClose),
+    [closures],
+  );
+
+  async function runRebuild() {
+    if (holdingId == null) return;
+    setRebuildBusy(true);
+    setRebuildError(null);
+    setRebuildResult(null);
+    try {
+      const res = await fetch(`/api/portfolio/holdings/${holdingId}/lots/rebuild`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({}),
+      });
+      const data = await res.json().catch(() => ({}));
+      if (!res.ok) throw new Error(data?.error ?? `Rebuild failed (${res.status})`);
+      setRebuildResult({
+        lotsWritten: data.lotsWritten ?? 0,
+        closuresWritten: data.closuresWritten ?? 0,
+        txProcessed: data.txProcessed ?? 0,
+        warnings: Array.isArray(data.warnings) ? data.warnings : [],
+      });
+      setRebuildConfirmOpen(false);
+      // Reload the inspector to reflect the rebuilt lots.
+      cancelEdit();
+      setReloadKey((k) => k + 1);
+    } catch (e: unknown) {
+      setRebuildError(e instanceof Error ? e.message : "Rebuild failed");
+    } finally {
+      setRebuildBusy(false);
+    }
+  }
+
   return (
+    <>
     <Dialog open={open} onOpenChange={onOpenChange}>
       <DialogContent className="sm:max-w-2xl">
         <DialogHeader>
@@ -265,6 +323,60 @@ export function LotInspectorDialog({
           <p className="text-sm text-muted-foreground">
             No lots tracked for this holding yet.
           </p>
+        )}
+
+        {/* Rebuild this ticker + out-of-order warning banner (lot-list view only) */}
+        {!loading && !error && editTxId == null && lots.length > 0 && (
+          <div className="space-y-2">
+            <div className="flex flex-wrap items-center justify-between gap-2">
+              <p className="text-xs text-muted-foreground">
+                Rebuild replays this ticker&apos;s transactions in date order to
+                fix lots. It changes lots only, never your transactions.
+              </p>
+              <Button
+                variant="outline"
+                size="sm"
+                onClick={() => {
+                  setRebuildResult(null);
+                  setRebuildError(null);
+                  setRebuildConfirmOpen(true);
+                }}
+                disabled={rebuildBusy}
+              >
+                {rebuildBusy ? "Rebuilding…" : "Rebuild lots for this ticker"}
+              </Button>
+            </div>
+            {hasTemporalWarning && (
+              <div className="rounded-md border border-amber-300 dark:border-amber-700 bg-amber-50/60 dark:bg-amber-950/30 px-3 py-2 text-xs text-amber-800 dark:text-amber-300">
+                Some closures below consume a lot that opened{" "}
+                <strong>after</strong> the close date (marked ⚠). This usually
+                means a sell was imported before its buy, opening a phantom
+                short. Rebuilding this ticker re-orders them.
+              </div>
+            )}
+            {rebuildError && (
+              <p className="text-xs text-rose-600 dark:text-rose-400">{rebuildError}</p>
+            )}
+            {rebuildResult && (
+              <div className="rounded-md border border-emerald-300 dark:border-emerald-700 bg-emerald-50/60 dark:bg-emerald-950/30 px-3 py-2 text-xs text-emerald-800 dark:text-emerald-300 space-y-1">
+                <p>
+                  Rebuilt {rebuildResult.lotsWritten} lot
+                  {rebuildResult.lotsWritten === 1 ? "" : "s"} and{" "}
+                  {rebuildResult.closuresWritten} closure
+                  {rebuildResult.closuresWritten === 1 ? "" : "s"} from{" "}
+                  {rebuildResult.txProcessed} transaction
+                  {rebuildResult.txProcessed === 1 ? "" : "s"}.
+                </p>
+                {rebuildResult.warnings.length > 0 && (
+                  <ul className="list-disc pl-4 text-amber-700 dark:text-amber-400">
+                    {rebuildResult.warnings.map((w, i) => (
+                      <li key={i}>{w}</li>
+                    ))}
+                  </ul>
+                )}
+              </div>
+            )}
+          </div>
         )}
 
         {/* FINLYNQ-178 — reassignment editor (replaces the lot list while open) */}
@@ -413,7 +525,15 @@ export function LotInspectorDialog({
                           key={c.id}
                           className="flex flex-wrap items-center justify-between gap-2 px-3 py-1.5"
                         >
-                          <span className="text-muted-foreground">
+                          <span className="text-muted-foreground flex items-center gap-1.5">
+                            {c.openAfterClose && (
+                              <span
+                                className="text-amber-600 dark:text-amber-400"
+                                title={`This closure (${c.closeDate}) consumes a lot that opened later — likely a sell imported before its buy. Rebuild this ticker to fix.`}
+                              >
+                                ⚠
+                              </span>
+                            )}
                             {c.closeKind} · tx #{c.closeTxId} · {c.closeDate}
                           </span>
                           <span className="flex items-center gap-3 font-mono">
@@ -456,5 +576,22 @@ export function LotInspectorDialog({
         )}
       </DialogContent>
     </Dialog>
+
+    <ConfirmDialog
+      open={rebuildConfirmOpen}
+      onOpenChange={setRebuildConfirmOpen}
+      title="Rebuild lots for this ticker?"
+      description={
+        `This wipes and recreates the lot history for ${holdingName ?? "this holding"}` +
+        `${accountName ? ` in ${accountName}` : ""} by replaying its transactions in date ` +
+        `order. It changes lot allocation and realized-gain figures, but never ` +
+        `touches your transactions — you can run it again. Continue?`
+      }
+      confirmLabel="Rebuild lots"
+      busyLabel="Rebuilding…"
+      busy={rebuildBusy}
+      onConfirm={runRebuild}
+    />
+    </>
   );
 }

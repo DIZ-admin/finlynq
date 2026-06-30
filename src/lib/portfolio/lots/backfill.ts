@@ -19,7 +19,7 @@
  * gain into `portfolio_legacy_realized_gain_snapshot` on first run.
  */
 
-import { and, eq, isNotNull, sql } from "drizzle-orm";
+import { and, eq, inArray, isNotNull, isNull, or, sql } from "drizzle-orm";
 import { db, schema } from "@/db";
 import { resolveDividendsCategoryId } from "@/lib/dividends-category";
 import {
@@ -45,58 +45,160 @@ export interface BackfillResult {
 }
 
 /**
+ * Scope for a TARGETED rebuild (FINLYNQ — out-of-order-import fix). When
+ * present, the replay touches ONLY the lots/closures for the given
+ * security's positions within ONE account, and replays only that account's
+ * transactions for those positions (plus their paired cash legs, needed for
+ * the issue-#96 cost-basis substitution). Lots never cross accounts, so a
+ * per-(security, account) wipe + replay is self-contained. A scoped run does
+ * NOT touch `portfolio_lots_status` (that flag is user-level).
+ */
+export interface RebuildScope {
+  /** Every portfolio_holding id that clusters under the target security. */
+  holdingIds: number[];
+  /** The single account whose lots are being rebuilt. */
+  accountId: number;
+}
+
+/** Column projection shared by the whole-user and scoped tx loads. */
+const TX_LOAD_COLS = {
+  id: schema.transactions.id,
+  userId: schema.transactions.userId,
+  date: schema.transactions.date,
+  amount: schema.transactions.amount,
+  currency: schema.transactions.currency,
+  enteredAmount: schema.transactions.enteredAmount,
+  enteredCurrency: schema.transactions.enteredCurrency,
+  quantity: schema.transactions.quantity,
+  accountId: schema.transactions.accountId,
+  categoryId: schema.transactions.categoryId,
+  portfolioHoldingId: schema.transactions.portfolioHoldingId,
+  tradeLinkId: schema.transactions.tradeLinkId,
+  linkId: schema.transactions.linkId,
+  source: schema.transactions.source,
+} as const;
+
+/**
  * Walks the user's transaction history and rebuilds holding_lots +
  * holding_lot_closures from scratch. Marks `portfolio_lots_status.backfill_done = TRUE`
  * on success but does NOT flip `enabled` — that's a manual decision after
  * a canary diff against the legacy aggregator.
+ *
+ * Pass `scope` to rebuild only one (security, account) — see RebuildScope.
+ * `rebuildLotsForPosition` is the public scoped entry point.
  */
 export async function buildLotsForUser(
   userId: string,
   dek: Buffer | null,
+  scope: RebuildScope | null = null,
 ): Promise<BackfillResult> {
   const errors: string[] = [];
   let lotsWritten = 0;
   let closuresWritten = 0;
   let txProcessed = 0;
 
-  // 1. Wipe any prior backfill output for this user. Idempotent re-run.
-  //    The CASCADE on holdingLots → holdingLotClosures cleans up closures
-  //    automatically.
-  await db
-    .delete(schema.holdingLotClosures)
-    .where(eq(schema.holdingLotClosures.userId, userId));
-  await db
-    .delete(schema.holdingLots)
-    .where(eq(schema.holdingLots.userId, userId));
+  // 1. Wipe prior lot output. Idempotent re-run. Scoped → only this
+  //    (security, account); whole-user → everything for the user.
+  if (scope) {
+    const scopedLots = await db
+      .select({ id: schema.holdingLots.id })
+      .from(schema.holdingLots)
+      .where(
+        and(
+          eq(schema.holdingLots.userId, userId),
+          inArray(schema.holdingLots.holdingId, scope.holdingIds),
+          eq(schema.holdingLots.accountId, scope.accountId),
+        ),
+      );
+    const scopedLotIds = scopedLots.map((l) => l.id);
+    if (scopedLotIds.length > 0) {
+      await db
+        .delete(schema.holdingLotClosures)
+        .where(
+          and(
+            eq(schema.holdingLotClosures.userId, userId),
+            inArray(schema.holdingLotClosures.lotId, scopedLotIds),
+          ),
+        );
+    }
+    await db
+      .delete(schema.holdingLots)
+      .where(
+        and(
+          eq(schema.holdingLots.userId, userId),
+          inArray(schema.holdingLots.holdingId, scope.holdingIds),
+          eq(schema.holdingLots.accountId, scope.accountId),
+        ),
+      );
+  } else {
+    await db
+      .delete(schema.holdingLotClosures)
+      .where(eq(schema.holdingLotClosures.userId, userId));
+    await db
+      .delete(schema.holdingLots)
+      .where(eq(schema.holdingLots.userId, userId));
+  }
 
-  // 2. Load every relevant transaction in chronological order. We pull
-  //    only investment rows — those with portfolio_holding_id set AND
-  //    non-zero quantity (or paired cash-leg companions).
-  const txRows = await db
-    .select({
-      id: schema.transactions.id,
-      userId: schema.transactions.userId,
-      date: schema.transactions.date,
-      amount: schema.transactions.amount,
-      currency: schema.transactions.currency,
-      enteredAmount: schema.transactions.enteredAmount,
-      enteredCurrency: schema.transactions.enteredCurrency,
-      quantity: schema.transactions.quantity,
-      accountId: schema.transactions.accountId,
-      categoryId: schema.transactions.categoryId,
-      portfolioHoldingId: schema.transactions.portfolioHoldingId,
-      tradeLinkId: schema.transactions.tradeLinkId,
-      linkId: schema.transactions.linkId,
-      source: schema.transactions.source,
-    })
-    .from(schema.transactions)
-    .where(
-      and(
-        eq(schema.transactions.userId, userId),
-        isNotNull(schema.transactions.portfolioHoldingId),
+  // 2. Load the transactions to replay, in chronological order.
+  //    Whole-user → every investment row. Scoped → the target security's
+  //    legs in the target account, PLUS their paired cash-leg companions
+  //    (same trade_link_id, same account) so the #96 cost substitution
+  //    still has its hint. Cross-account transfer siblings are deliberately
+  //    excluded so the replay only ever writes inside the wiped bucket.
+  const loadScopedTx = async (s: RebuildScope) => {
+    const securityLegs = await db
+      .select(TX_LOAD_COLS)
+      .from(schema.transactions)
+      .where(
+        and(
+          eq(schema.transactions.userId, userId),
+          eq(schema.transactions.accountId, s.accountId),
+          inArray(schema.transactions.portfolioHoldingId, s.holdingIds),
+        ),
+      )
+      .orderBy(schema.transactions.date, schema.transactions.id);
+    const tradeLinkIds = [
+      ...new Set(
+        securityLegs
+          .map((r) => r.tradeLinkId)
+          .filter((v): v is string => v != null && v !== ""),
       ),
-    )
-    .orderBy(schema.transactions.date, schema.transactions.id);
+    ];
+    const cashLegs =
+      tradeLinkIds.length > 0
+        ? await db
+            .select(TX_LOAD_COLS)
+            .from(schema.transactions)
+            .where(
+              and(
+                eq(schema.transactions.userId, userId),
+                eq(schema.transactions.accountId, s.accountId),
+                inArray(schema.transactions.tradeLinkId, tradeLinkIds),
+                or(
+                  isNull(schema.transactions.quantity),
+                  eq(schema.transactions.quantity, 0),
+                ),
+              ),
+            )
+        : [];
+    const seen = new Set(securityLegs.map((r) => r.id));
+    return [...securityLegs, ...cashLegs.filter((r) => !seen.has(r.id))].sort(
+      (a, b) => a.date.localeCompare(b.date) || a.id - b.id,
+    );
+  };
+  const loadWholeUserTx = () =>
+    db
+      .select(TX_LOAD_COLS)
+      .from(schema.transactions)
+      .where(
+        and(
+          eq(schema.transactions.userId, userId),
+          isNotNull(schema.transactions.portfolioHoldingId),
+        ),
+      )
+      .orderBy(schema.transactions.date, schema.transactions.id);
+
+  const txRows = scope ? await loadScopedTx(scope) : await loadWholeUserTx();
 
   // 3. Build cash-leg map (trade_link_id → cash leg) for issue #96 substitution.
   const cashLegByTradeLinkId = new Map<string, CashLegHint>();
@@ -278,6 +380,17 @@ export async function buildLotsForUser(
       continue;
     }
 
+    // Scoped rebuild only: a security leg paired by link_id whose counterpart
+    // lives in another account can't be reconstructed as an in-kind transfer
+    // here (we wiped/loaded only this account), so it falls through to the
+    // buy/sell path. Warn so the user can verify the cross-account move.
+    if (scope && r.linkId && (r.quantity ?? 0) !== 0) {
+      errors.push(
+        `tx ${r.id} (${r.date}): in-kind transfer leg with no counterpart in this account — ` +
+          `rebuilt as a plain ${(r.quantity ?? 0) < 0 ? "sell" : "buy"} within this account; verify the cross-account move.`,
+      );
+    }
+
     // Regular buy / dividend-reinvest / sell.
     if (r.quantity != null && r.quantity > 0) {
       const cashLeg = r.tradeLinkId
@@ -398,24 +511,53 @@ export async function buildLotsForUser(
     }
   }
 
-  // 8. Mark backfill done. NOT enabled — that's a separate manual flip.
-  await db
-    .insert(schema.portfolioLotsStatus)
-    .values({
-      userId,
-      backfillDone: true,
-      backfilledAt: sql`NOW()`,
-      enabled: false,
-      notes: `Backfilled ${lotsWritten} lots, ${closuresWritten} closures from ${txProcessed} transactions${errors.length ? ` (${errors.length} non-fatal errors)` : ""}`,
-    })
-    .onConflictDoUpdate({
-      target: schema.portfolioLotsStatus.userId,
-      set: {
+  // 8. Mark backfill done — WHOLE-USER ONLY. A scoped rebuild rewrites one
+  //    (security, account) and must not stamp the user-level status flag.
+  if (!scope) {
+    await db
+      .insert(schema.portfolioLotsStatus)
+      .values({
+        userId,
         backfillDone: true,
         backfilledAt: sql`NOW()`,
-        notes: `Re-backfilled ${lotsWritten} lots, ${closuresWritten} closures from ${txProcessed} transactions${errors.length ? ` (${errors.length} non-fatal errors)` : ""}`,
-      },
-    });
+        enabled: false,
+        notes: `Backfilled ${lotsWritten} lots, ${closuresWritten} closures from ${txProcessed} transactions${errors.length ? ` (${errors.length} non-fatal errors)` : ""}`,
+      })
+      .onConflictDoUpdate({
+        target: schema.portfolioLotsStatus.userId,
+        set: {
+          backfillDone: true,
+          backfilledAt: sql`NOW()`,
+          notes: `Re-backfilled ${lotsWritten} lots, ${closuresWritten} closures from ${txProcessed} transactions${errors.length ? ` (${errors.length} non-fatal errors)` : ""}`,
+        },
+      });
+  }
 
   return { userId, lotsWritten, closuresWritten, txProcessed, errors };
+}
+
+/**
+ * FINLYNQ — targeted rebuild for ONE (security, account). The public entry
+ * point behind the Lot Inspector "Rebuild lots" button. Wipes + replays only
+ * that position's lots/closures in chronological order, which is the cure for
+ * out-of-order imports (a sell recorded before its buy opened a phantom
+ * short; replaying in date order opens the long first, so the sell closes it
+ * as a long). Deletes ONLY holding_lots / holding_lot_closures — never any
+ * `transactions` row. Returns the same shape as buildLotsForUser; `errors`
+ * carries any sell shortfalls (genuine oversells) + cross-account-transfer
+ * warnings.
+ *
+ * @param holdingIds every portfolio_holding id clustering under the target
+ *   security (resolve from securities/cluster); usually one for a single
+ *   account, but a security can back >1 position row in an account.
+ */
+export async function rebuildLotsForPosition(
+  userId: string,
+  dek: Buffer | null,
+  scope: RebuildScope,
+): Promise<BackfillResult> {
+  if (scope.holdingIds.length === 0) {
+    return { userId, lotsWritten: 0, closuresWritten: 0, txProcessed: 0, errors: [] };
+  }
+  return buildLotsForUser(userId, dek, scope);
 }
