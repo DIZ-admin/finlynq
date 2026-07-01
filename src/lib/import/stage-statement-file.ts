@@ -397,6 +397,11 @@ export interface WriteStagedImportContext {
   boundAccountCurrency: string | null;
   /** User-typed statement balance (CSV form field). */
   userStatementBalance?: number | null;
+  /** staged_imports.source — default "upload". Live connectors pass "connector". */
+  source?: string;
+  /** Override staged_imports.fileFormat (default parseResult.format). Connectors
+   *  pass a provider tag (e.g. "simplefin") so the pending list labels them. */
+  fileFormatOverride?: string | null;
 }
 
 /**
@@ -592,7 +597,7 @@ export async function writeStagedImport(
     await tx.insert(schema.stagedImports).values({
       id: stagedImportId,
       userId,
-      source: "upload",
+      source: ctx.source ?? "upload",
       fromAddress: null,
       subject: null,
       svixId: null,
@@ -606,7 +611,7 @@ export async function writeStagedImport(
       statementPeriodStart,
       statementPeriodEnd,
       boundAccountId: accountId,
-      fileFormat: parseResult.format,
+      fileFormat: ctx.fileFormatOverride ?? parseResult.format,
       // FINLYNQ-120 — filename lands at USER tier (v1:) with a session DEK.
       originalFilename: encryptStagingMeta(ctx.fileName, "user", dek),
       encryptionTier: "user",

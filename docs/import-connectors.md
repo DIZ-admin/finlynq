@@ -159,25 +159,31 @@ two deliberate ways.
   `defaultCurrency`). **Skips `pending: true` rows** by default; drops out-of-range
   amounts (`isReasonableAmount`) into `errors` instead of throwing.
 
-**Divergence 1 — bank-ledger-only, NOT `executeImport`.** A bank feed must land ONLY
-in `bank_transactions` (`source='connector'`), never in the `transactions` ledger —
-writing ledger rows would double-count against the user's own manual entries. So the
-orchestrator [`simplefin-orchestrator.ts`](../src/lib/external-import/simplefin-orchestrator.ts)
-calls `upsertBankTransaction(dek, { …, source: "connector" })` per row (bank-only,
-the `send_to_bank_ledger` semantic) instead of `executeImport`. The synced rows
-surface on the `/import` **reconciliation** page for matching against ledger
-transactions. Dedup is **fitId-first** (`checkFitIdDuplicates` skips already-known
-rows) with `upsertBankTransaction`'s `(user, account, import_hash, occurrence_index)`
-ON CONFLICT as the fallback. One `bank_upload_batches` row (`source='connector'`,
-encrypted "SimpleFIN sync" label) is written per account per sync for lineage /
-reconcile-summary.
+**Divergence 1 — staging + approve, NOT `executeImport` or a direct bank-ledger
+write.** A bank feed must never create `transactions` rows (that would double-count
+the user's own manual entries), and it wants a review gate. So the orchestrator
+[`simplefin-orchestrator.ts`](../src/lib/external-import/simplefin-orchestrator.ts)
+routes rows through the **existing `/import/pending` staging flow**: it stages each
+account's rows into its own account-bound `staged_imports` row (`source='connector'`)
+via the shared `writeStagedImport` chokepoint
+([`stage-statement-file.ts`](../src/lib/import/stage-statement-file.ts), extended with
+an optional `source` + `fileFormatOverride`). `writeStagedImport` handles the
+fitId/import_hash dedup against `bank_transactions` and user-tier (`v1:`) encryption.
+The user reviews + approves at `/import/pending`; **approve →
+`sendStagedRowsToBankLedger`** (bank-only promote), which now **propagates
+`source='connector'`** onto `bank_transactions` + `bank_upload_batches` (was hardcoded
+`import`/`upload`). The promoted rows surface on the `/import` **reconciliation** page.
 
-**Divergence 2 — resolve-or-create with a PERSISTED id map.** SimpleFIN accounts are
-new to Finlynq, so `syncSimpleFin` resolve-or-creates a Finlynq account per SimpleFIN
-account (`buildNameFields`/`createAccount`, `type:'A'`) and persists the SimpleFIN
-account-id → Finlynq account-id map in a second encrypted credential slot
-(`connector:simplefin:accounts`). Re-syncs reuse the mapped account even after the
-user renames it; a mapped-but-deleted account falls back to create.
+**Divergence 2 — EXPLICIT create-or-link account mapping.** SimpleFIN accounts are new
+to Finlynq, and auto-creating silently is wrong when the user already tracks that
+account. `previewSimpleFin` classifies each detected account as **`mapped`** (already
+linked, from the persisted id map), **`suggested`** (an existing Finlynq account with a
+matching name — pre-fills Link), or **`new`**; the UI asks the user to **Create a new
+account or Link to an existing one** for each new account. `syncSimpleFin(choices)`
+resolves those (create → `buildNameFields`/`createAccount` `type:'A'`; link → the
+chosen id), and persists the SimpleFIN account-id → Finlynq account-id map in a second
+encrypted credential slot (`connector:simplefin:accounts`) so re-syncs never re-prompt
+(mapped-but-deleted falls back).
 
 **On-demand only.** The access URL is stored encrypted under the user's DEK
 ([`credentials.ts`](../src/lib/external-import/credentials.ts), slot
@@ -185,15 +191,16 @@ user renames it; a mapped-but-deleted account falls back to create.
 session-less cron can't pull. Sync fires on user click while logged in. Background
 auto-feed (a server-side master/second-wrapper key) is deferred.
 
-Routes: `POST /api/settings/bank-feeds/simplefin/connect` (exchange + save,
-`requireEncryption`), `POST …/sync` (`requireEncryption`), `GET …/status`
-(`requireAuth`), `DELETE …/disconnect` (`requireAuth`). UI:
-[`/settings/bank-feeds`](../src/app/(app)/settings/bank-feeds/page.tsx) — paste token
-→ connect → "Sync now" → result + link to `/import`; Disconnect behind `ConfirmDialog`.
+Routes: `POST /api/settings/bank-feeds/simplefin/connect` (exchange + save),
+`POST …/preview` (detect accounts + mapping status), `POST …/sync` (body `{choices}` →
+stage) — all `requireEncryption`; `GET …/status` + `DELETE …/disconnect`
+(`requireAuth`). UI:
+[`/settings/bank-feeds`](../src/app/(app)/settings/bank-feeds/page.tsx) — paste token →
+connect → **"Sync now" (detect) → per-account Create/Link → "Import to review"** → link
+to `/import/pending`; Disconnect behind `ConfirmDialog`.
 
 **Deferred:** background scheduled pulls; balance anchors from SimpleFIN `balance`;
-account-mapping UI (v1 auto-creates); MCP/mobile parity; asset-vs-liability inference
-(v1 defaults every account to Asset).
+MCP/mobile parity; asset-vs-liability inference (v1 defaults every account to Asset).
 
 ## Load-bearing rules (learned the hard way)
 

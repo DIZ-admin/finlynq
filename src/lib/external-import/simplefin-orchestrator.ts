@@ -1,41 +1,31 @@
 /**
  * SimpleFIN bank-feed orchestrator.
  *
- * Unlike the file-based connectors (Money Pro / Generic CSV) which run through
- * `executeImport` and write BOTH `transactions` + `bank_transactions`, SimpleFIN
- * is a live BANK FEED: a sync writes ONLY into `bank_transactions` with
- * `source='connector'` (never `transactions`). Those rows are the bank-candidate
- * pool the /import reconciliation page reads — the user reconciles them against
- * their own manually-entered ledger transactions there. Writing ledger rows
- * directly would double-count. This mirrors the "Send to bank ledger" /
- * `send_to_bank_ledger` bank-only-promote semantics.
+ * SimpleFIN is a live BANK FEED (the user pastes a one-time setup token, the app
+ * exchanges it for a long-lived access URL stored encrypted under the DEK, and
+ * pulls on demand while logged in). Unlike the file connectors it does NOT write
+ * the ledger directly — it stages transactions into the EXISTING
+ * `staged_imports` / `/import/pending` review flow, and the user approves them
+ * there ("Send to bank ledger" → `bank_transactions`, source='connector', which
+ * surfaces on the /import reconciliation page). No `transactions` rows are ever
+ * created (a bank feed must not double-count the user's own manual entries).
  *
- * The access URL is a long-lived secret stored encrypted under the user's DEK
- * (src/lib/external-import/credentials.ts). Because the DEK lives only in the
- * in-memory session cache, sync is ON DEMAND (user click while logged in) — no
- * background cron. See finlynq-cloud/plan/simplefin-bank-feed.md.
- *
- * Account resolution: SimpleFIN account ids are mapped to Finlynq account ids
- * and the mapping is persisted (encrypted, alongside the access URL) so a
- * re-sync reuses the same accounts even after the user renames them. A
- * SimpleFIN account with no mapping (first sync, or a newly-linked bank) is
- * resolve-or-created via buildNameFields/createAccount, exactly like the other
- * connector orchestrators.
- *
- * Dedup: fitId (the SimpleFIN transaction id) is the primary key — a row whose
- * fitId already exists in the bank ledger is skipped up front (mirrors
- * executeImport's "fitId takes priority"). Rows without a fitId, and re-pulls of
- * the same content, still dedup via upsertBankTransaction's
- * (user, account, import_hash, occurrence_index) ON CONFLICT.
+ * Account mapping is EXPLICIT: `previewSimpleFin` detects the SimpleFIN accounts
+ * and classifies each as already-`mapped`, name-`suggested`, or `new`; the UI
+ * asks the user to CREATE a new Finlynq account or LINK to an existing one for
+ * each new account. `syncSimpleFin(choices)` resolves those choices, persists
+ * the SimpleFIN-id → Finlynq-id map (a second encrypted credential slot) so
+ * re-syncs never re-prompt, and stages each account's rows into its own
+ * account-bound `staged_imports` row via the shared `writeStagedImport`
+ * chokepoint (source='connector'). See finlynq-cloud/plan/simplefin-bank-feed.md.
  */
 
 import { db, schema } from "@/db";
-import { and, desc, eq, inArray } from "drizzle-orm";
+import { and, desc, eq } from "drizzle-orm";
 import { buildNameFields } from "@/lib/crypto/encrypted-columns";
+import { tryDecryptField } from "@/lib/crypto/envelope";
 import { createAccount } from "@/lib/queries";
-import { upsertBankTransaction } from "@/lib/bank-ledger";
-import { encryptStagingMeta } from "@/lib/crypto/staging-metadata";
-import { generateImportHash } from "@/lib/import-hash";
+import { writeStagedImport, type ParseSuccess } from "@/lib/import/stage-statement-file";
 import {
   saveConnectorCredentials,
   loadConnectorCredentials,
@@ -45,7 +35,7 @@ import {
 import { simplefin } from "@finlynq/import-connectors";
 
 const CONNECTOR_ID = "simplefin";
-/** Second credential slot: SimpleFIN account id → Finlynq account id (as string). */
+/** Second credential slot: SimpleFIN account id → Finlynq account id (string). */
 const ACCOUNT_MAP_ID = "simplefin:accounts";
 /** How far back to pull on each sync. SimpleFIN keeps ~90 days. */
 const SYNC_LOOKBACK_DAYS = 90;
@@ -57,30 +47,84 @@ export class SimplefinNotConnectedError extends Error {
   }
 }
 
+// ─── Types ────────────────────────────────────────────────────────────────
+
+/** How a detected SimpleFIN account maps to Finlynq. */
+export type SimplefinAccountStatus = "mapped" | "suggested" | "new";
+
+export interface SimplefinAccountPlan {
+  /** SimpleFIN account id (stable mapping key). */
+  externalId: string;
+  /** SimpleFIN account display name. */
+  name: string;
+  /** ISO currency. */
+  currency: string;
+  /** Transactions available for this account (last ~90d, pending excluded). */
+  txCount: number;
+  /**
+   * `mapped` — already linked (from a prior sync); syncs silently.
+   * `suggested` — a Finlynq account with a matching name exists (pre-fill link).
+   * `new` — no match; the user must choose Create or Link.
+   */
+  status: SimplefinAccountStatus;
+  /** Target Finlynq account id (mapped/suggested), else null. */
+  accountId: number | null;
+  /** Decrypted name of the target account (mapped/suggested), else null. */
+  accountName: string | null;
+}
+
+export interface SimplefinPreview {
+  accounts: SimplefinAccountPlan[];
+  /** The user's Finlynq accounts — options for the "link to existing" picker. */
+  existingAccounts: Array<{ id: number; name: string; currency: string }>;
+  /** Provider + transform errors (non-fatal). */
+  errors: string[];
+}
+
+/** Per-account decision from the client at sync time. */
+export type SimplefinAccountChoice =
+  | { mode: "existing"; accountId: number }
+  | { mode: "create" };
+
+export interface SimplefinStagedResult {
+  stagedImportId: string;
+  accountId: number;
+  accountName: string;
+  rowCount: number;
+  newCount: number;
+  duplicateCount: number;
+}
+
+export interface SimplefinSyncResult {
+  /** One staged import per account that had rows. */
+  staged: SimplefinStagedResult[];
+  accountsCreated: number;
+  /** New accounts the caller sent no choice for — nothing staged for these. */
+  skippedNoChoice: Array<{ externalId: string; name: string }>;
+  /** Pending rows skipped by the transform. */
+  skippedPending: number;
+  errors: string[];
+}
+
 export interface SimplefinConnectResult {
   connected: true;
 }
 
-export interface SimplefinSyncResult {
-  /** Number of SimpleFIN accounts seen this sync. */
-  accountsSynced: number;
-  /** Finlynq accounts freshly created this sync. */
-  accountsCreated: number;
-  /** Bank-ledger rows freshly inserted. */
-  imported: number;
-  /** Rows skipped as already known (fitId or import_hash match). */
-  duplicates: number;
-  /** Pending rows skipped by the transform. */
-  skippedPending: number;
-  /** Provider + per-row errors (non-fatal). */
-  errors: string[];
-}
-
 export interface SimplefinStatus {
   connected: boolean;
-  /** ISO timestamp of the most recent connector batch, or null. */
+  /** ISO timestamp of the most recent connector staging run, or null. */
   lastSyncAt: string | null;
 }
+
+// ─── Account cache ──────────────────────────────────────────────────────────
+
+interface AccountInfo {
+  id: number;
+  name: string;
+  currency: string;
+}
+
+// ─── Connect ──────────────────────────────────────────────────────────────
 
 /**
  * Exchange a one-time setup token for an access URL and persist it (encrypted
@@ -96,200 +140,240 @@ export async function connectSimpleFin(
   return { connected: true };
 }
 
-/**
- * Which of `fitIds` already exist on THIS account's bank ledger. Account-scoped
- * (SimpleFIN ids are per-account, not per-user). Batched to stay under the
- * bound-parameter limit.
- */
-async function existingFitIdsForAccount(
-  userId: string,
-  accountId: number,
-  fitIds: string[],
-): Promise<Set<string>> {
-  const out = new Set<string>();
-  const batchSize = 900;
-  for (let i = 0; i < fitIds.length; i += batchSize) {
-    const batch = fitIds.slice(i, i + batchSize);
-    if (batch.length === 0) continue;
-    const rows = await db
-      .select({ fitId: schema.bankTransactions.fitId })
-      .from(schema.bankTransactions)
-      .where(
-        and(
-          eq(schema.bankTransactions.userId, userId),
-          eq(schema.bankTransactions.accountId, accountId),
-          inArray(schema.bankTransactions.fitId, batch),
-        ),
-      )
-      .all();
-    for (const r of rows) if (r.fitId) out.add(r.fitId);
-  }
-  return out;
-}
+// ─── Fetch + transform (shared by preview + sync) ───────────────────────────
 
-/**
- * Pull the last ~90 days of accounts + transactions and land them in
- * `bank_transactions` (source='connector'). Resolve-or-creates Finlynq accounts
- * for each SimpleFIN account and persists the id mapping.
- */
-export async function syncSimpleFin(
-  userId: string,
-  dek: Buffer,
-): Promise<SimplefinSyncResult> {
+async function fetchAndTransform(userId: string, dek: Buffer) {
   const creds = await loadConnectorCredentials<{ accessUrl: string }>(
     userId,
     CONNECTOR_ID,
     dek,
   );
   if (!creds?.accessUrl) throw new SimplefinNotConnectedError();
-
   const client = new simplefin.SimpleFINClient(creds.accessUrl);
   const startDate = Math.floor(Date.now() / 1000) - SYNC_LOOKBACK_DAYS * 24 * 60 * 60;
   const resp = await client.fetchAccounts({ startDate });
-  const { accounts, skippedPending, errors } = simplefin.simplefinToRawTransactions(resp);
+  return simplefin.simplefinToRawTransactions(resp);
+}
 
-  // Load the persisted SimpleFIN-account-id → Finlynq-account-id map.
+// ─── Preview (detect accounts + mapping status) ─────────────────────────────
+
+export async function previewSimpleFin(
+  userId: string,
+  dek: Buffer,
+): Promise<SimplefinPreview> {
+  const { accounts, errors } = await fetchAndTransform(userId, dek);
+  const { byId, byName } = await loadAccountsFull(userId, dek);
+  const map =
+    (await loadConnectorCredentials<Record<string, string>>(userId, ACCOUNT_MAP_ID, dek)) ?? {};
+
+  const plans: SimplefinAccountPlan[] = accounts.map((acct) => {
+    // Mapped (prior sync) — only if that account still exists.
+    const mappedId = map[acct.externalId] ? Number(map[acct.externalId]) : null;
+    if (mappedId && byId.has(mappedId)) {
+      return {
+        externalId: acct.externalId,
+        name: acct.name,
+        currency: acct.currency,
+        txCount: acct.rows.length,
+        status: "mapped",
+        accountId: mappedId,
+        accountName: byId.get(mappedId)!.name,
+      };
+    }
+    // Name-suggested — an existing Finlynq account with a matching name.
+    const suggestedId = byName.get(acct.name.toLowerCase().trim()) ?? null;
+    if (suggestedId) {
+      return {
+        externalId: acct.externalId,
+        name: acct.name,
+        currency: acct.currency,
+        txCount: acct.rows.length,
+        status: "suggested",
+        accountId: suggestedId,
+        accountName: byId.get(suggestedId)?.name ?? null,
+      };
+    }
+    return {
+      externalId: acct.externalId,
+      name: acct.name,
+      currency: acct.currency,
+      txCount: acct.rows.length,
+      status: "new",
+      accountId: null,
+      accountName: null,
+    };
+  });
+
+  const existingAccounts = Array.from(byId.values())
+    .map((a) => ({ id: a.id, name: a.name, currency: a.currency }))
+    .sort((x, y) => x.name.localeCompare(y.name));
+
+  return { accounts: plans, existingAccounts, errors };
+}
+
+/** loadAccounts variant returning both maps (byId + byName). */
+async function loadAccountsFull(
+  userId: string,
+  dek: Buffer,
+): Promise<{ byId: Map<number, AccountInfo>; byName: Map<string, number> }> {
+  const rows = await db
+    .select({
+      id: schema.accounts.id,
+      nameCt: schema.accounts.nameCt,
+      currency: schema.accounts.currency,
+    })
+    .from(schema.accounts)
+    .where(eq(schema.accounts.userId, userId))
+    .all();
+  const byId = new Map<number, AccountInfo>();
+  const byName = new Map<string, number>();
+  for (const a of rows) {
+    const name = a.nameCt ? tryDecryptField(dek, a.nameCt, "accounts.name_ct") : null;
+    if (!name) continue;
+    byId.set(a.id, { id: a.id, name, currency: a.currency });
+    const key = name.toLowerCase().trim();
+    if (key && !byName.has(key)) byName.set(key, a.id);
+  }
+  return { byId, byName };
+}
+
+// ─── Sync (resolve create/link choices → stage per account) ─────────────────
+
+/**
+ * Pull the last ~90 days and STAGE each SimpleFIN account's rows into its own
+ * account-bound `staged_imports` row (source='connector') for review at
+ * /import/pending. `choices` maps a SimpleFIN account id to Create-new or
+ * Link-to-existing; already-mapped accounts sync without a choice. A `new`
+ * account with no choice is skipped and reported.
+ */
+export async function syncSimpleFin(
+  userId: string,
+  dek: Buffer,
+  choices: Record<string, SimplefinAccountChoice> = {},
+): Promise<SimplefinSyncResult> {
+  const { accounts, skippedPending, errors } = await fetchAndTransform(userId, dek);
+  const { byId } = await loadAccountsFull(userId, dek);
   const accountMap =
     (await loadConnectorCredentials<Record<string, string>>(userId, ACCOUNT_MAP_ID, dek)) ?? {};
   let mapDirty = false;
 
-  let imported = 0;
-  let duplicates = 0;
+  const staged: SimplefinStagedResult[] = [];
+  const skippedNoChoice: Array<{ externalId: string; name: string }> = [];
   let accountsCreated = 0;
 
   for (const acct of accounts) {
-    // ── Resolve or create the Finlynq account for this SimpleFIN account ──
+    // ── Resolve the target Finlynq account ──
     let finAccountId: number | undefined;
-    const mapped = accountMap[acct.externalId];
-    if (mapped) {
-      const id = Number(mapped);
-      const exists = await db
-        .select({ id: schema.accounts.id })
-        .from(schema.accounts)
-        .where(and(eq(schema.accounts.id, id), eq(schema.accounts.userId, userId)))
-        .get();
-      if (exists) finAccountId = id;
+    let finAccountName: string | undefined;
+
+    const mappedId = accountMap[acct.externalId] ? Number(accountMap[acct.externalId]) : null;
+    if (mappedId && byId.has(mappedId)) {
+      finAccountId = mappedId;
+      finAccountName = byId.get(mappedId)!.name;
+    } else {
+      const choice = choices[acct.externalId];
+      if (choice?.mode === "existing") {
+        const info = byId.get(choice.accountId);
+        if (info) {
+          finAccountId = info.id;
+          finAccountName = info.name;
+        }
+      } else if (choice?.mode === "create") {
+        const enc = buildNameFields(dek, { name: acct.name });
+        const created = await createAccount(userId, {
+          type: "A",
+          group: "",
+          currency: acct.currency,
+          isInvestment: false,
+          ...enc,
+        } as Parameters<typeof createAccount>[1]);
+        finAccountId = created.id;
+        finAccountName = acct.name;
+        accountsCreated += 1;
+      }
     }
-    if (finAccountId === undefined) {
-      const enc = buildNameFields(dek, { name: acct.name });
-      const created = await createAccount(userId, {
-        type: "A",
-        group: "",
-        currency: acct.currency,
-        isInvestment: false,
-        ...enc,
-      } as Parameters<typeof createAccount>[1]);
-      finAccountId = created.id;
-      accountsCreated += 1;
+
+    if (finAccountId === undefined || finAccountName === undefined) {
+      // A new account the caller didn't decide on — skip + report.
+      skippedNoChoice.push({ externalId: acct.externalId, name: acct.name });
+      continue;
+    }
+
+    // Persist the mapping so re-syncs never re-prompt.
+    if (accountMap[acct.externalId] !== String(finAccountId)) {
       accountMap[acct.externalId] = String(finAccountId);
       mapDirty = true;
     }
 
     if (acct.rows.length === 0) continue;
 
-    // ── fitId-first dedup: drop rows already in this ACCOUNT's bank ledger ──
-    // SimpleFIN transaction ids are unique only WITHIN an account (the demo
-    // bridge even uses the posted-epoch as the id), so the check MUST be
-    // account-scoped — a user-scoped check drops account B's rows that happen
-    // to share an id with account A. import_hash's ON CONFLICT is already
-    // account-scoped (it hashes the accountId); this pre-check catches the case
-    // where a bank restates a posted row (id stable, amount/desc changed).
-    const fitIds = acct.rows
-      .map((r) => r.fitId)
-      .filter((f): f is string => !!f);
-    const existingFitIds = await existingFitIdsForAccount(userId, finAccountId, fitIds);
-    const toWrite = acct.rows.filter((r) => !(r.fitId && existingFitIds.has(r.fitId)));
-    duplicates += acct.rows.length - toWrite.length;
-    if (toWrite.length === 0) continue;
+    // ── Stage this account's rows (bound account, source='connector') ──
+    const rows = acct.rows.map((r) => ({ ...r, account: finAccountName! }));
+    const parseResult: ParseSuccess = {
+      rows,
+      errors: [],
+      // format is a placeholder — fileFormatOverride sets the displayed tag.
+      format: "csv",
+      statementBalance: null,
+      statementBalanceDate: null,
+      statementCurrency: acct.currency,
+      anchors: [],
+    };
+    const result = await writeStagedImport(parseResult, {
+      userId,
+      dek,
+      accountId: finAccountId,
+      fileName: `SimpleFIN — ${acct.name}`,
+      knobs: {
+        skipHeaderRows: 0,
+        skipFooterRows: 0,
+        dateFormatOverride: null,
+        defaultCurrency: acct.currency,
+      },
+      boundAccountCurrency: acct.currency,
+      source: "connector",
+      fileFormatOverride: "simplefin",
+    });
 
-    // ── One connector batch row for lineage (feeds the reconcile summary) ──
-    const [batch] = await db
-      .insert(schema.bankUploadBatches)
-      .values({
-        userId,
-        accountId: finAccountId,
-        source: "connector",
-        mode: "simplified",
-        // Encrypted at the user tier (FINLYNQ-120) — a batch label, not a real
-        // filename (SimpleFIN is a live feed). Satisfies the audit invariant
-        // `staging-metadata-encrypted` which guards every bank_upload_batches
-        // insert against plaintext metadata.
-        filename: encryptStagingMeta("SimpleFIN sync", "user", dek),
-        encryptionTier: "user",
-        rowCount: toWrite.length,
-      })
-      .returning({ id: schema.bankUploadBatches.id });
-
-    // ── Upsert each row into bank_transactions ──
-    const occ = new Map<string, number>();
-    for (const r of toWrite) {
-      const payee = (r.payee ?? "").trim();
-      const importHash = generateImportHash(r.date, finAccountId, r.amount, payee);
-      const occKey = `${finAccountId}:${importHash}`;
-      const occurrenceIndex = occ.get(occKey) ?? 0;
-      occ.set(occKey, occurrenceIndex + 1);
-
-      try {
-        const { wasInserted } = await upsertBankTransaction(dek, {
-          userId,
-          accountId: finAccountId,
-          importHash,
-          occurrenceIndex,
-          fitId: r.fitId ?? null,
-          date: r.date,
-          amount: r.amount,
-          currency: (r.currency ?? acct.currency).toUpperCase(),
-          payee,
-          note: r.note ?? null,
-          tags: null,
-          accountName: acct.name,
-          source: "connector",
-          filename: null,
-          uploadBatchId: batch.id,
-        });
-        if (wasInserted) imported += 1;
-        else duplicates += 1;
-      } catch (err) {
-        errors.push(
-          `Account "${acct.name}" row ${r.fitId ?? r.date}: ${err instanceof Error ? err.message : "write failed"}`,
-        );
-      }
-    }
+    staged.push({
+      stagedImportId: result.stagedImportId,
+      accountId: finAccountId,
+      accountName: finAccountName,
+      rowCount: result.rowCount,
+      newCount: result.newCount,
+      duplicateCount: result.duplicateCount,
+    });
   }
 
   if (mapDirty) {
     await saveConnectorCredentials(userId, ACCOUNT_MAP_ID, dek, accountMap);
   }
 
-  return {
-    accountsSynced: accounts.length,
-    accountsCreated,
-    imported,
-    duplicates,
-    skippedPending,
-    errors,
-  };
+  return { staged, accountsCreated, skippedNoChoice, skippedPending, errors };
 }
 
-/** Connected? + when the last connector sync ran (from bank_upload_batches). */
+// ─── Status / disconnect ────────────────────────────────────────────────────
+
+/** Connected? + when the last connector staging run happened. */
 export async function getSimpleFinStatus(userId: string): Promise<SimplefinStatus> {
   const connected = await hasConnectorCredentials(userId, CONNECTOR_ID);
   let lastSyncAt: string | null = null;
   if (connected) {
     const row = await db
-      .select({ uploadedAt: schema.bankUploadBatches.uploadedAt })
-      .from(schema.bankUploadBatches)
+      .select({ receivedAt: schema.stagedImports.receivedAt })
+      .from(schema.stagedImports)
       .where(
         and(
-          eq(schema.bankUploadBatches.userId, userId),
-          eq(schema.bankUploadBatches.source, "connector"),
+          eq(schema.stagedImports.userId, userId),
+          eq(schema.stagedImports.source, "connector"),
         ),
       )
-      .orderBy(desc(schema.bankUploadBatches.uploadedAt))
+      .orderBy(desc(schema.stagedImports.receivedAt))
       .limit(1)
       .get();
-    if (row?.uploadedAt) {
-      lastSyncAt = row.uploadedAt instanceof Date ? row.uploadedAt.toISOString() : String(row.uploadedAt);
+    if (row?.receivedAt) {
+      lastSyncAt =
+        row.receivedAt instanceof Date ? row.receivedAt.toISOString() : String(row.receivedAt);
     }
   }
   return { connected, lastSyncAt };

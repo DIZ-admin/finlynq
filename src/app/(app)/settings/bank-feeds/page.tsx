@@ -3,15 +3,15 @@
 /**
  * /settings/bank-feeds — SimpleFIN bank feed (on-demand sync).
  *
- * Paste a SimpleFIN setup token to connect, then "Sync now" pulls the last ~90
- * days into the bank ledger. Those rows appear on the /import reconciliation
- * page for matching against your ledger transactions. On-demand only (no
- * background pull) — the access URL is encrypted under your DEK, which is only
- * available while you're logged in. See finlynq-cloud/plan/simplefin-bank-feed.md.
+ * Paste a SimpleFIN setup token to connect, then "Sync now" DETECTS the bank's
+ * accounts. For each new account the user chooses to Create a Finlynq account or
+ * Link to an existing one; already-linked accounts sync silently. Confirming
+ * STAGES the transactions into /import/pending for review + approval (which
+ * promotes them to the bank ledger / reconciliation). On-demand only — the
+ * access URL is encrypted under your DEK, available only while logged in.
  *
- * Follows the settings-page convention: bespoke fetch/useState/useEffect (no
- * SWR), shared ConfirmDialog for the destructive disconnect, parseSaveError for
- * failed mutations.
+ * Settings-page convention: bespoke fetch/useState/useEffect (no SWR), shared
+ * ConfirmDialog for disconnect, parseSaveError for failed mutations.
  */
 
 import { useCallback, useEffect, useState } from "react";
@@ -22,18 +22,48 @@ import { Badge } from "@/components/ui/badge";
 import { ConfirmDialog } from "@/components/ui/confirm-dialog";
 import { parseSaveError } from "@/lib/save-error";
 import { cn } from "@/lib/utils";
-import { Landmark, Loader2, RefreshCw, CheckCircle2, ExternalLink } from "lucide-react";
+import { Landmark, Loader2, RefreshCw, CheckCircle2, ExternalLink, Link2, Plus } from "lucide-react";
 
 interface SimplefinStatus {
   connected: boolean;
   lastSyncAt: string | null;
 }
 
+type AccountStatus = "mapped" | "suggested" | "new";
+interface AccountPlan {
+  externalId: string;
+  name: string;
+  currency: string;
+  txCount: number;
+  status: AccountStatus;
+  accountId: number | null;
+  accountName: string | null;
+}
+interface ExistingAccount {
+  id: number;
+  name: string;
+  currency: string;
+}
+interface Preview {
+  accounts: AccountPlan[];
+  existingAccounts: ExistingAccount[];
+  errors: string[];
+}
+
+type Choice = { mode: "create" } | { mode: "existing"; accountId: number };
+
+interface StagedResult {
+  stagedImportId: string;
+  accountId: number;
+  accountName: string;
+  rowCount: number;
+  newCount: number;
+  duplicateCount: number;
+}
 interface SyncResult {
-  accountsSynced: number;
+  staged: StagedResult[];
   accountsCreated: number;
-  imported: number;
-  duplicates: number;
+  skippedNoChoice: Array<{ externalId: string; name: string }>;
   skippedPending: number;
   errors: string[];
 }
@@ -59,9 +89,14 @@ export default function BankFeedsSettingsPage() {
   const [connecting, setConnecting] = useState(false);
   const [connectError, setConnectError] = useState("");
 
-  const [syncing, setSyncing] = useState(false);
-  const [syncError, setSyncError] = useState("");
-  const [syncResult, setSyncResult] = useState<SyncResult | null>(null);
+  const [detecting, setDetecting] = useState(false);
+  const [preview, setPreview] = useState<Preview | null>(null);
+  const [choices, setChoices] = useState<Record<string, Choice>>({});
+  const [detectError, setDetectError] = useState("");
+
+  const [staging, setStaging] = useState(false);
+  const [stageError, setStageError] = useState("");
+  const [stageResult, setStageResult] = useState<SyncResult | null>(null);
 
   const [confirmDisconnect, setConfirmDisconnect] = useState(false);
   const [disconnecting, setDisconnecting] = useState(false);
@@ -112,22 +147,57 @@ export default function BankFeedsSettingsPage() {
     }
   }
 
-  async function handleSync() {
-    setSyncing(true);
-    setSyncError("");
-    setSyncResult(null);
+  async function handleDetect() {
+    setDetecting(true);
+    setDetectError("");
+    setStageResult(null);
+    setPreview(null);
     try {
-      const res = await fetch("/api/settings/bank-feeds/simplefin/sync", { method: "POST" });
+      const res = await fetch("/api/settings/bank-feeds/simplefin/preview", { method: "POST" });
       if (!res.ok) {
-        setSyncError(await parseSaveError(res, "Sync failed"));
+        setDetectError(await parseSaveError(res, "Failed to detect accounts"));
         return;
       }
-      setSyncResult(await res.json());
+      const data: Preview = await res.json();
+      setPreview(data);
+      // Seed default choices: suggested → link to the suggestion, new → create.
+      const seeded: Record<string, Choice> = {};
+      for (const a of data.accounts) {
+        if (a.status === "suggested" && a.accountId != null) {
+          seeded[a.externalId] = { mode: "existing", accountId: a.accountId };
+        } else if (a.status === "new") {
+          seeded[a.externalId] = { mode: "create" };
+        }
+      }
+      setChoices(seeded);
+    } catch {
+      setDetectError("Failed to detect accounts");
+    } finally {
+      setDetecting(false);
+    }
+  }
+
+  async function handleStage() {
+    if (!preview) return;
+    setStaging(true);
+    setStageError("");
+    try {
+      const res = await fetch("/api/settings/bank-feeds/simplefin/sync", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ choices }),
+      });
+      if (!res.ok) {
+        setStageError(await parseSaveError(res, "Import failed"));
+        return;
+      }
+      setStageResult(await res.json());
+      setPreview(null);
       await load();
     } catch {
-      setSyncError("Sync failed");
+      setStageError("Import failed");
     } finally {
-      setSyncing(false);
+      setStaging(false);
     }
   }
 
@@ -139,12 +209,23 @@ export default function BankFeedsSettingsPage() {
       });
       if (!res.ok) return;
       setConfirmDisconnect(false);
-      setSyncResult(null);
+      setPreview(null);
+      setStageResult(null);
       await load();
     } finally {
       setDisconnecting(false);
     }
   }
+
+  const setChoice = (externalId: string, choice: Choice) =>
+    setChoices((prev) => ({ ...prev, [externalId]: choice }));
+
+  const totalToStage = preview
+    ? preview.accounts.reduce(
+        (n, a) => (a.status === "mapped" || choices[a.externalId] ? n + a.txCount : n),
+        0,
+      )
+    : 0;
 
   return (
     <div className="max-w-2xl space-y-6">
@@ -172,8 +253,8 @@ export default function BankFeedsSettingsPage() {
               </CardTitle>
               <CardDescription>
                 An open bank-feed protocol. You link your banks at simplefin.org ($15/yr, paid
-                directly to SimpleFIN) and paste a one-time setup token here. Synced transactions
-                land in your bank ledger for reconciliation — Finlynq never sees your bank login.
+                directly to SimpleFIN) and paste a one-time setup token here. Synced transactions go
+                to your import review queue for approval — Finlynq never sees your bank login.
               </CardDescription>
             </div>
           </div>
@@ -193,6 +274,7 @@ export default function BankFeedsSettingsPage() {
             </div>
           ) : status?.connected ? (
             <div className="space-y-4">
+              {/* ── Header row: last sync + actions ── */}
               <div className="flex items-center justify-between gap-3">
                 <p className="text-sm text-muted-foreground">
                   {status.lastSyncAt
@@ -200,17 +282,19 @@ export default function BankFeedsSettingsPage() {
                     : "Not synced yet"}
                 </p>
                 <div className="flex items-center gap-2">
-                  <Button size="sm" onClick={handleSync} disabled={syncing}>
-                    {syncing ? (
-                      <>
-                        <Loader2 className="h-4 w-4 mr-1.5 animate-spin" /> Syncing…
-                      </>
-                    ) : (
-                      <>
-                        <RefreshCw className="h-4 w-4 mr-1.5" /> Sync now
-                      </>
-                    )}
-                  </Button>
+                  {!preview && (
+                    <Button size="sm" onClick={handleDetect} disabled={detecting}>
+                      {detecting ? (
+                        <>
+                          <Loader2 className="h-4 w-4 mr-1.5 animate-spin" /> Detecting…
+                        </>
+                      ) : (
+                        <>
+                          <RefreshCw className="h-4 w-4 mr-1.5" /> Sync now
+                        </>
+                      )}
+                    </Button>
+                  )}
                   <Button
                     variant="outline"
                     size="sm"
@@ -222,35 +306,140 @@ export default function BankFeedsSettingsPage() {
                 </div>
               </div>
 
-              {syncError && <p className="text-sm text-destructive">{syncError}</p>}
+              {detectError && <p className="text-sm text-destructive">{detectError}</p>}
+              {stageError && <p className="text-sm text-destructive">{stageError}</p>}
 
-              {syncResult && (
+              {/* ── Detected accounts: create/link mapping ── */}
+              {preview && (
+                <div className="rounded-xl border divide-y">
+                  <div className="px-4 py-2.5 text-sm font-medium bg-muted/30">
+                    Detected accounts — choose how each maps to Finlynq
+                  </div>
+                  {preview.accounts.map((a) => (
+                    <div key={a.externalId} className="px-4 py-3 space-y-2">
+                      <div className="flex items-center justify-between gap-3">
+                        <div className="min-w-0">
+                          <p className="text-sm font-medium truncate">{a.name}</p>
+                          <p className="text-xs text-muted-foreground">
+                            {a.currency} · {a.txCount} transaction{a.txCount === 1 ? "" : "s"}
+                          </p>
+                        </div>
+                        {a.status === "mapped" && (
+                          <Badge variant="outline" className="text-xs shrink-0">
+                            <Link2 className="h-3 w-3 mr-1" /> Linked to {a.accountName}
+                          </Badge>
+                        )}
+                      </div>
+
+                      {a.status !== "mapped" && (
+                        <div className="flex flex-wrap items-center gap-2">
+                          <Button
+                            type="button"
+                            size="sm"
+                            variant={choices[a.externalId]?.mode === "create" ? "default" : "outline"}
+                            onClick={() => setChoice(a.externalId, { mode: "create" })}
+                          >
+                            <Plus className="h-3.5 w-3.5 mr-1" /> Create new
+                          </Button>
+                          {preview.existingAccounts.length > 0 && (
+                            <>
+                              <Button
+                                type="button"
+                                size="sm"
+                                variant={
+                                  choices[a.externalId]?.mode === "existing" ? "default" : "outline"
+                                }
+                                onClick={() =>
+                                  setChoice(a.externalId, {
+                                    mode: "existing",
+                                    accountId:
+                                      a.accountId ?? preview.existingAccounts[0].id,
+                                  })
+                                }
+                              >
+                                <Link2 className="h-3.5 w-3.5 mr-1" /> Link existing
+                              </Button>
+                              {choices[a.externalId]?.mode === "existing" && (
+                                <select
+                                  value={
+                                    (choices[a.externalId] as { accountId: number }).accountId
+                                  }
+                                  onChange={(e) =>
+                                    setChoice(a.externalId, {
+                                      mode: "existing",
+                                      accountId: Number(e.target.value),
+                                    })
+                                  }
+                                  className={cn(
+                                    "h-8 rounded-lg border border-input bg-transparent px-2 text-sm outline-none",
+                                    "focus-visible:border-ring focus-visible:ring-3 focus-visible:ring-ring/50 dark:bg-input/30",
+                                  )}
+                                >
+                                  {preview.existingAccounts.map((ea) => (
+                                    <option key={ea.id} value={ea.id}>
+                                      {ea.name} ({ea.currency})
+                                    </option>
+                                  ))}
+                                </select>
+                              )}
+                            </>
+                          )}
+                        </div>
+                      )}
+                    </div>
+                  ))}
+
+                  <div className="px-4 py-3 flex items-center justify-between gap-3">
+                    <Button variant="ghost" size="sm" onClick={() => setPreview(null)} disabled={staging}>
+                      Cancel
+                    </Button>
+                    <Button size="sm" onClick={handleStage} disabled={staging}>
+                      {staging ? (
+                        <>
+                          <Loader2 className="h-4 w-4 mr-1.5 animate-spin" /> Importing…
+                        </>
+                      ) : (
+                        `Import ${totalToStage} to review`
+                      )}
+                    </Button>
+                  </div>
+                </div>
+              )}
+
+              {/* ── Result after staging ── */}
+              {stageResult && (
                 <div className="rounded-xl border bg-muted/30 p-4 space-y-2">
-                  <p className="text-sm font-medium">Sync complete</p>
+                  <p className="text-sm font-medium">Ready for review</p>
                   <p className="text-sm text-muted-foreground">
-                    {syncResult.imported} imported · {syncResult.duplicates} already known ·{" "}
-                    {syncResult.accountsCreated} account
-                    {syncResult.accountsCreated === 1 ? "" : "s"} created
-                    {syncResult.skippedPending > 0
-                      ? ` · ${syncResult.skippedPending} pending skipped`
+                    {stageResult.staged.reduce((n, s) => n + s.rowCount, 0)} transaction
+                    {stageResult.staged.reduce((n, s) => n + s.rowCount, 0) === 1 ? "" : "s"} staged
+                    across {stageResult.staged.length} account
+                    {stageResult.staged.length === 1 ? "" : "s"}
+                    {stageResult.accountsCreated > 0
+                      ? ` · ${stageResult.accountsCreated} account${stageResult.accountsCreated === 1 ? "" : "s"} created`
                       : ""}
+                    {stageResult.skippedPending > 0
+                      ? ` · ${stageResult.skippedPending} pending skipped`
+                      : ""}
+                    .
                   </p>
-                  {syncResult.errors.length > 0 && (
+                  {stageResult.skippedNoChoice.length > 0 && (
                     <p className="text-xs text-amber-600">
-                      {syncResult.errors.length} warning
-                      {syncResult.errors.length === 1 ? "" : "s"}: {syncResult.errors[0]}
+                      Skipped (no choice made):{" "}
+                      {stageResult.skippedNoChoice.map((s) => s.name).join(", ")}
                     </p>
                   )}
                   <Link
-                    href="/import"
+                    href="/import/pending"
                     className="inline-flex items-center gap-1 text-sm text-primary hover:underline"
                   >
-                    Reconcile in Import <ExternalLink className="h-3.5 w-3.5" />
+                    Review &amp; approve in Import <ExternalLink className="h-3.5 w-3.5" />
                   </Link>
                 </div>
               )}
             </div>
           ) : (
+            /* ── Not connected: paste setup token ── */
             <div className="space-y-3">
               <label htmlFor="simplefin-token" className="block text-sm font-medium">
                 Setup token
@@ -300,8 +489,8 @@ export default function BankFeedsSettingsPage() {
         description={
           <>
             Disconnect SimpleFIN? Your stored access is removed and no more transactions will be
-            pulled. Already-imported bank transactions are kept — you can reconnect later with a new
-            setup token.
+            pulled. Already-imported transactions are kept — you can reconnect later with a new setup
+            token.
           </>
         }
         confirmLabel="Disconnect"
