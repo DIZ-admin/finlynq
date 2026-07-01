@@ -274,7 +274,7 @@ export async function syncSimpleFin(
   choices: Record<string, SimplefinAccountChoice> = {},
 ): Promise<SimplefinSyncResult> {
   const { accounts, skippedPending, errors } = await fetchAndTransform(userId, dek);
-  const { byId } = await loadAccountsFull(userId, dek);
+  const { byId, byName } = await loadAccountsFull(userId, dek);
   const accountMap =
     (await loadConnectorCredentials<Record<string, string>>(userId, ACCOUNT_MAP_ID, dek)) ?? {};
   let mapDirty = false;
@@ -284,6 +284,10 @@ export async function syncSimpleFin(
   let accountsCreated = 0;
 
   for (const acct of accounts) {
+   // Per-account isolation: one account's failure (bad data, transient DB
+   // error) is collected and skipped so the rest of the sync still runs —
+   // important for the background login auto-sync.
+   try {
     // ── Resolve the target Finlynq account ──
     let finAccountId: number | undefined;
     let finAccountName: string | undefined;
@@ -307,18 +311,29 @@ export async function syncSimpleFin(
           finAccountMode = info.mode;
         }
       } else if (choice?.mode === "create") {
-        const enc = buildNameFields(dek, { name: acct.name });
-        const created = await createAccount(userId, {
-          type: "A",
-          group: "",
-          currency: acct.currency,
-          isInvestment: false,
-          ...enc,
-        } as Parameters<typeof createAccount>[1]);
-        finAccountId = created.id;
-        finAccountName = acct.name;
-        finAccountMode = "manual";
-        accountsCreated += 1;
+        // If an account with this exact name already exists (a prior sync, a
+        // manual create, or a name collision), LINK to it instead of hitting
+        // the unique (user_id, name_lookup) constraint — otherwise create.
+        const existingId = byName.get(acct.name.toLowerCase().trim());
+        const existing = existingId != null ? byId.get(existingId) : undefined;
+        if (existing) {
+          finAccountId = existing.id;
+          finAccountName = existing.name;
+          finAccountMode = existing.mode;
+        } else {
+          const enc = buildNameFields(dek, { name: acct.name });
+          const created = await createAccount(userId, {
+            type: "A",
+            group: "",
+            currency: acct.currency,
+            isInvestment: false,
+            ...enc,
+          } as Parameters<typeof createAccount>[1]);
+          finAccountId = created.id;
+          finAccountName = acct.name;
+          finAccountMode = "manual";
+          accountsCreated += 1;
+        }
       }
     }
 
@@ -396,6 +411,11 @@ export async function syncSimpleFin(
       stage: advance.stage,
       recorded: advance.recorded,
     });
+   } catch (err) {
+      errors.push(
+        `Account "${acct.name}": ${err instanceof Error ? err.message : "sync failed"}`,
+      );
+    }
   }
 
   if (mapDirty) {
