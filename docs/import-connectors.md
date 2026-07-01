@@ -199,8 +199,22 @@ stage) — all `requireEncryption`; `GET …/status` + `DELETE …/disconnect`
 connect → **"Sync now" (detect) → per-account Create/Link → "Import to review"** → link
 to `/import/pending`; Disconnect behind `ConfirmDialog`.
 
-**Deferred:** background scheduled pulls; balance anchors from SimpleFIN `balance`;
-MCP/mobile parity; asset-vs-liability inference (v1 defaults every account to Asset).
+**Dedup, balances, mcc.** Dedup is **account-scoped** — `writeStagedImport` uses
+`checkFitIdDuplicatesForAccount` for account-bound imports (SimpleFIN reuses the
+posted-epoch as the tx id, so accounts collide; OFX/QFX benefit too). Beyond exact
+fitId/hash, the feed **auto-skips duplicates you already have**: an opt-in
+`fuzzyDedupWindowDays` (connector-only, ±3d) marks a row `skipped_duplicate` when the
+bound account already has a transaction/bank row with the same amount within the
+window — even under a different payee — re-derived every sync (no stored state), and a
+false positive can still be force-loaded. SimpleFIN's account **balance** rides through
+as the staged `statementBalance` → approve seeds a `bank_daily_balances` anchor
+(populates the reconcile Calculated/Loaded columns; window-vs-all-time divergence is
+warn-but-allow). The transform maps **`mcc`** (merchant category code) to a `mcc:<code>`
+tag so rules can match it. The pending-imports list labels `connector` imports by
+`originalFilename` ("SimpleFIN — <account>"), not the email subject/from.
+
+**Deferred:** background scheduled pulls; asset-vs-liability inference (v1 defaults every
+account to Asset); investment/holdings (SimpleFIN is banking-only); MCP/mobile parity.
 
 ## Load-bearing rules (learned the hard way)
 
