@@ -168,6 +168,29 @@ async function fetchAndTransform(userId: string, dek: Buffer) {
   const client = new simplefin.SimpleFINClient(creds.accessUrl);
   const startDate = Math.floor(Date.now() / 1000) - SYNC_LOOKBACK_DAYS * 24 * 60 * 60;
   const resp = await client.fetchAccounts({ startDate });
+  // TEMP DIAGNOSTIC (remove after) — dump the RAW SimpleFIN transaction objects
+  // for the Walmart card only, so we can inspect posted / pending / extra against
+  // the spec. Scoped to one account; dev-only debugging at the user's request.
+  try {
+    for (const a of (resp?.accounts ?? []) as Array<{
+      id?: string;
+      name?: string;
+      balance?: string;
+      "balance-date"?: number;
+      transactions?: unknown[];
+    }>) {
+      if (/walmart|3733/i.test(a.name ?? "")) {
+        console.log(
+          `[simplefin-raw] acct="${a.name}" id="${a.id}" balance=${a.balance} balanceDate=${a["balance-date"]} txCount=${a.transactions?.length ?? 0}`,
+        );
+        for (const tx of a.transactions ?? []) {
+          console.log(`[simplefin-raw-tx] ${JSON.stringify(tx)}`);
+        }
+      }
+    }
+  } catch {
+    /* diagnostic only */
+  }
   return simplefin.simplefinToRawTransactions(resp);
 }
 
