@@ -45,15 +45,9 @@
 
 import { NextRequest, NextResponse } from "next/server";
 import { db, schema } from "@/db";
-import { and, eq, inArray } from "drizzle-orm";
+import { and, eq } from "drizzle-orm";
 import { requireEncryption } from "@/lib/auth/require-encryption";
 import { decryptName } from "@/lib/crypto/encrypted-columns";
-import {
-  generateImportHash,
-  checkDuplicates,
-  checkFitIdDuplicates,
-} from "@/lib/import-hash";
-import { normalizeDate } from "@/lib/csv-parser";
 import { isSupportedCurrency } from "@/lib/fx/supported-currencies";
 import type { DateFormatOverride } from "@/lib/csv-parser";
 import { findUnreasonableAmountError } from "@/lib/import-pipeline";
@@ -62,13 +56,11 @@ import { advanceStagedImportByMode } from "@/lib/import/advance-by-mode";
 import { getConfirmCsvMappingDefault } from "@/app/api/settings/confirm-csv-mapping/route";
 // FINLYNQ-221 — the parse + staged-import WRITE core lives in the shared
 // stage-statement-file chokepoint (so the MCP `upload_statement` tool stages
-// via the identical pipeline). The route imports them back: `parseStatement`
-// for the parse step (it needs the parsed rows to make the confirm-gate /
-// simplified-path decision), `buildAccountLookup` for the simplified-path
-// classifier, and `writeStagedImport` for the detailed-staging INSERT tail.
+// via the identical pipeline). The route imports `parseStatement` for the parse
+// step (+ its confirm-gate branches) and `writeStagedImport` for the staged
+// write; `advanceStagedImportByMode` then advances by the account's mode.
 import {
   parseStatement,
-  buildAccountLookup,
   writeStagedImport,
   type ParseSuccess,
 } from "@/lib/import/stage-statement-file";
@@ -383,216 +375,6 @@ export async function POST(request: NextRequest) {
       return NextResponse.json({ error: amountErr }, { status: 400 });
     }
 
-    // ─── Classify rows ──────────────────────────────────────────────────
-    // Replicates the three-way classifier from src/lib/reconcile.ts so the
-    // review UI can render NEW / EXISTING / PROBABLE_DUPLICATE counts
-    // without re-running on page load. Decision is persisted to
-    // staged_transactions.dedup_status.
-    const accountLookup = await buildAccountLookup(userId, dek);
-    type Shaped = {
-      rowIndex: number;
-      date: string;
-      account: string;
-      accountId: number | null;
-      amount: number;
-      payee: string;
-      category?: string;
-      currency?: string;
-      enteredAmount?: number;
-      enteredCurrency?: string;
-      note?: string;
-      tags?: string;
-      quantity?: number;
-      portfolioHolding?: string;
-      // FINLYNQ-195 — security TICKER/SYMBOL mapped on investment-account imports.
-      ticker?: string;
-      fitId?: string;
-      hash: string;
-      dedupStatus: "new" | "existing" | "probable_duplicate";
-    };
-    const shaped: Shaped[] = [];
-    const rowErrors: Array<{ rowIndex: number; message: string }> = [];
-
-    for (let i = 0; i < parseResult.rows.length; i++) {
-      const row = parseResult.rows[i];
-      if (!row.date) {
-        rowErrors.push({ rowIndex: i, message: "Missing date" });
-        continue;
-      }
-      const normalizedDate = normalizeDate(row.date);
-      if (!normalizedDate) {
-        rowErrors.push({
-          rowIndex: i,
-          message: `Invalid date "${row.date}". Expected YYYY-MM-DD, MM/DD/YYYY, or DD-MM-YYYY.`,
-        });
-        continue;
-      }
-      if (typeof row.amount !== "number" || Number.isNaN(row.amount)) {
-        rowErrors.push({ rowIndex: i, message: "Invalid amount" });
-        continue;
-      }
-      const accountKey = (row.account ?? "").toLowerCase().trim();
-      const acct = accountKey ? accountLookup.get(accountKey) : undefined;
-      const resolvedAccountId = acct?.id ?? null;
-      // Hash uses 0 when accountId is unknown — matches reconcile.ts. Real
-      // hash is recomputed (via generateImportHash) at approve time after the
-      // user has bound the account in the review UI.
-      const hash = generateImportHash(
-        normalizedDate,
-        resolvedAccountId ?? 0,
-        row.amount,
-        row.payee ?? "",
-      );
-      shaped.push({
-        rowIndex: i,
-        date: normalizedDate,
-        account: row.account ?? "",
-        accountId: resolvedAccountId,
-        amount: row.amount,
-        payee: row.payee ?? "",
-        category: row.category,
-        currency: row.currency,
-        enteredAmount: row.enteredAmount,
-        enteredCurrency: row.enteredCurrency,
-        note: row.note,
-        tags: row.tags,
-        quantity: row.quantity,
-        portfolioHolding: row.portfolioHolding,
-        ticker: row.ticker,
-        fitId: row.fitId,
-        hash,
-        dedupStatus: "new",
-      });
-    }
-
-    // ─── File → bank_transactions dedup (exact-only) ─────────────────────
-    //
-    // Two-ledger refactor (2026-05-22): file-to-bank-ledger dedup is
-    // exact-match only. The previous probable-duplicate (fuzzy) pass
-    // queried `transactions` for FX-spread / date-drift heuristics — but
-    // that conflated "what the bank reported" with "what's in my live
-    // view." Post-refactor:
-    //
-    //   - File → bank_transactions: exact match only (import_hash + fit_id
-    //     via checkDuplicates / checkFitIdDuplicates, both now reading
-    //     bank_transactions).
-    //   - bank_transactions → transactions: future reconciliation surface
-    //     with multiple match strategies (out of scope for this route;
-    //     the staged-detail GET surfaces auto-match suggestions between
-    //     staged rows and live transactions for the two-pane UI).
-    //
-    // `dedupStatus` stays a three-value column on staged_transactions for
-    // schema stability — the `'probable_duplicate'` value is no longer
-    // produced by this route but the DB CHECK constraint still permits it
-    // (legacy rows from before the refactor may still carry it).
-    const fitIds = shaped.filter((r) => r.fitId).map((r) => r.fitId!);
-    const hashes = shaped.filter((r) => r.accountId !== null).map((r) => r.hash);
-    const existingFitIds = await checkFitIdDuplicates(fitIds, userId);
-    const existingHashes = await checkDuplicates(hashes, userId);
-
-    for (const r of shaped) {
-      const isFitHit = !!r.fitId && existingFitIds.has(r.fitId);
-      const isHashHit = r.accountId !== null && existingHashes.has(r.hash);
-      if (isFitHit || isHashHit) {
-        r.dedupStatus = "existing";
-      }
-    }
-
-    // Period-bounds for staged_imports — derived from the parsed rows.
-    const allDates = shaped.map((r) => r.date).sort();
-    const statementPeriodStart = allDates[0] ?? null;
-    const statementPeriodEnd = allDates[allDates.length - 1] ?? null;
-    // FINLYNQ-58 — date_range_* mirrors the parsed-row span for overlap
-    // detection. Today they're identical to statement_period_* (both
-    // derived from min/max row date); the column split lets the OFX
-    // path diverge in future (where statement_period_* would come from
-    // <DTSTART>/<DTEND> while date_range_* stays row-derived).
-    const dateRangeStart = statementPeriodStart;
-    const dateRangeEnd = statementPeriodEnd;
-
-    // ─── F-53E overlap detection (FINLYNQ-58) ────────────────────────────
-    // First-pass (no `action` field): look for an existing pending
-    // staged_imports row for the same user+account whose [date_range_start,
-    // date_range_end] overlaps the new upload. If found, return a
-    // mergeCandidate descriptor WITHOUT inserting; the client renders the
-    // merge / create-new / cancel modal and re-fires with action set.
-    //
-    // Constraints from CLAUDE.md / item body:
-    //   - same user (cross-tenant guard via WHERE user_id = userId)
-    //   - same accountId (cross-account uploads don't overlap by definition)
-    //   - status='pending' (immutable batches don't accept merges)
-    //   - both date ranges must be populated (NULL rows are pre-FINLYNQ-58)
-    //   - overlap predicate: range_start <= new_end AND range_end >= new_start
-    //
-    // Skips when accountId is null (CSV without a bound account — no useful
-    // grain for overlap detection; the user reviews per-row in /import/pending).
-    // ─── F-53E already-imported probe (FINLYNQ-58) ───────────────────────
-    // Per-row: does any `transactions.import_hash` already match this
-    // user+account? If yes, the staged row lands at
-    // `reconcile_state='skipped_duplicate'` so the approve handler excludes
-    // it by default and the UI surfaces an "already imported" badge.
-    //
-    // Distinct from the existing dedup_status='existing' path (which is
-    // also driven by import_hash collisions): the marker is a per-row
-    // *user-overridable* state on the new column, while dedup_status is
-    // the parser-level classification. Both can be true (a row that was
-    // already imported is also classified existing); the marker is what
-    // the UI badge + approve-default-exclude reads.
-    //
-    // Skips when accountId is null (hash collision needs the account to be
-    // a stable key — the upload classifier uses `accountId ?? 0` in the
-    // hash, so cross-account hash collisions are noise).
-    const alreadyImportedHashes = new Set<string>();
-    if (accountId !== null) {
-      const hashesToProbe = shaped
-        .filter((r) => r.accountId !== null)
-        .map((r) => r.hash);
-      if (hashesToProbe.length > 0) {
-        // Two-ledger refactor (2026-05-22) — dedup source moved from
-        // `transactions.import_hash` to `bank_transactions.import_hash`.
-        // A deleted system-side transaction no longer creates a re-import
-        // gap; the bank ledger remembers every approved row.
-        const hits = await db
-          .select({ importHash: schema.bankTransactions.importHash })
-          .from(schema.bankTransactions)
-          .where(and(
-            eq(schema.bankTransactions.userId, userId),
-            inArray(schema.bankTransactions.importHash, hashesToProbe),
-          ))
-          .all();
-        for (const h of hits) {
-          if (h.importHash) alreadyImportedHashes.add(h.importHash);
-        }
-      }
-    }
-
-    // ─── Phase 2 of import-modes refactor (2026-05-25): simplified branch ──
-    //
-    // If the selected template is in `import_mode='simplified'`, skip the
-    // staged review and land rows directly in bank_transactions. The user
-    // goes straight to /reconcile to categorize.
-    //
-    // Inbox v4 Phase 3 (2026-05-27): the Approve-each account policy
-    // (`accounts.mode='approve'`) ALSO triggers the simplified path, even
-    // if the picked template is in `import_mode='detailed'`. The account-
-    // level policy override is intentional — Approve-each means "I trust
-    // the parser, but I want one click between bank-ledger and the real
-    // ledger entry." Detailed-staging would add a redundant parse-review
-    // gate before the card flow takes over on /inbox.
-    //
-    // Rules do NOT fire here — that's Phase 4 (Auto-pilot). The bank rows
-    // wait on /inbox's "To approve" tab; the user (or "Accept all
-    // suggested") commits each to the ledger via POST /approve.
-    //
-    // Preconditions:
-    //   - accountId must be set (bank-ledger uniqueness key is per-account).
-    //   - For the template-based simplified path: templateId must be set
-    //     (auto-detect stays on detailed for now).
-    //   - Row errors are still surfaced (we don't silently drop bad rows).
-    //
-    // The detailed path below remains the default and handles every case
-    // where the account is Manual and the template is Detailed (or no
-    // template is selected).
     // ─── Unified pipeline (2026-06-30) ───────────────────────────────────
     // ONE path for every account mode: stage the parsed rows into
     // `staged_imports` (writeStagedImport), then advance as far as the bound
@@ -661,7 +443,7 @@ export async function POST(request: NextRequest) {
       },
       statement: buildStatementSummary(parseResult),
       tolerance,
-      rowErrors,
+      rowErrors: staged.rowErrors,
       // Furthest stage the rows reached: pending | loaded | recorded.
       ...(advance ? { advanced: { mode: advance.mode, stage: advance.stage } } : {}),
     });
