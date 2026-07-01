@@ -43,6 +43,7 @@ A connector is the same shape regardless of provider — only the parse step dif
 | **IBKR** | Activity Statement XML / CSV | `ibkr` (`parse-xml`/`parse-csv`/`transform`) | XML preferred (deterministic). |
 | **Money Pro** | Transactions report CSV | `parseMoneyProCsv` / `moneyProRowsToRawTransactions` | See below — sign comes from a column, not the amount. |
 | **Generic CSV (full ledger)** | Any multi-account CSV | `parseGenericCsv` / `genericCsvRowsToRawTransactions` | See below — **mapping-driven** (not header-locked); for whole-portfolio exports the per-account `/import` mapper can't take. |
+| **SimpleFIN** | Live bank feed (JSON) | `exchangeSetupToken` / `SimpleFINClient` / `simplefinToRawTransactions` | See below — the ONLY **live feed** (not a file); on-demand sync, bank-ledger-only. |
 
 ## Money Pro (iBear) — the non-1:1 case
 
@@ -135,6 +136,64 @@ accepted).
 
 **Deferred:** using a per-row id column as `fitId` for idempotent re-import;
 MCP/mobile parity.
+
+## SimpleFIN — the live bank feed (not a file)
+
+SimpleFIN ([simplefin.org](https://www.simplefin.org)) is an open JSON-over-HTTP
+bank-feed protocol: the user pays SimpleFIN directly ($15/yr), links their banks,
+and pastes a one-time **setup token**. This is the FIRST connector that is a **live
+feed** rather than a file import — so it diverges from the four-layer file shape in
+two deliberate ways.
+
+**Layer 1 — pure package** [`packages/import-connectors/src/simplefin/`](../packages/import-connectors/src/simplefin/):
+- `client.ts` — `exchangeSetupToken(setupToken)`: the setup token is base64 of a
+  one-time *claim URL*; decode + `POST` (empty body) → the response body IS the
+  **access URL** (embeds HTTP Basic creds in its userinfo). `SimpleFINClient(accessUrl)`
+  splits the userinfo into an `Authorization: Basic` header (never sends creds in the
+  URL) and `fetchAccounts({ startDate })` GETs `{base}/accounts?start-date=<epoch>`.
+- `transform.ts` — `simplefinToRawTransactions(resp)` flattens the response into
+  **per-account** `RawTransaction[]` (`SimplefinAccountRows[]`): `date` from `posted`
+  epoch (→ `YYYY-MM-DD`), signed `amount` (SimpleFIN outflow negative — matches
+  Finlynq), `payee` = `payee ?? description` kept **plaintext** (`import_hash`),
+  `fitId` = transaction id, currency normalized (URL/non-fiat currencies fall back to
+  `defaultCurrency`). **Skips `pending: true` rows** by default; drops out-of-range
+  amounts (`isReasonableAmount`) into `errors` instead of throwing.
+
+**Divergence 1 — bank-ledger-only, NOT `executeImport`.** A bank feed must land ONLY
+in `bank_transactions` (`source='connector'`), never in the `transactions` ledger —
+writing ledger rows would double-count against the user's own manual entries. So the
+orchestrator [`simplefin-orchestrator.ts`](../src/lib/external-import/simplefin-orchestrator.ts)
+calls `upsertBankTransaction(dek, { …, source: "connector" })` per row (bank-only,
+the `send_to_bank_ledger` semantic) instead of `executeImport`. The synced rows
+surface on the `/import` **reconciliation** page for matching against ledger
+transactions. Dedup is **fitId-first** (`checkFitIdDuplicates` skips already-known
+rows) with `upsertBankTransaction`'s `(user, account, import_hash, occurrence_index)`
+ON CONFLICT as the fallback. One `bank_upload_batches` row (`source='connector'`,
+encrypted "SimpleFIN sync" label) is written per account per sync for lineage /
+reconcile-summary.
+
+**Divergence 2 — resolve-or-create with a PERSISTED id map.** SimpleFIN accounts are
+new to Finlynq, so `syncSimpleFin` resolve-or-creates a Finlynq account per SimpleFIN
+account (`buildNameFields`/`createAccount`, `type:'A'`) and persists the SimpleFIN
+account-id → Finlynq account-id map in a second encrypted credential slot
+(`connector:simplefin:accounts`). Re-syncs reuse the mapped account even after the
+user renames it; a mapped-but-deleted account falls back to create.
+
+**On-demand only.** The access URL is stored encrypted under the user's DEK
+([`credentials.ts`](../src/lib/external-import/credentials.ts), slot
+`connector:simplefin`); the DEK lives only in the in-memory session cache, so a
+session-less cron can't pull. Sync fires on user click while logged in. Background
+auto-feed (a server-side master/second-wrapper key) is deferred.
+
+Routes: `POST /api/settings/bank-feeds/simplefin/connect` (exchange + save,
+`requireEncryption`), `POST …/sync` (`requireEncryption`), `GET …/status`
+(`requireAuth`), `DELETE …/disconnect` (`requireAuth`). UI:
+[`/settings/bank-feeds`](../src/app/(app)/settings/bank-feeds/page.tsx) — paste token
+→ connect → "Sync now" → result + link to `/import`; Disconnect behind `ConfirmDialog`.
+
+**Deferred:** background scheduled pulls; balance anchors from SimpleFIN `balance`;
+account-mapping UI (v1 auto-creates); MCP/mobile parity; asset-vs-liability inference
+(v1 defaults every account to Asset).
 
 ## Load-bearing rules (learned the hard way)
 
