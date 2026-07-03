@@ -918,6 +918,20 @@ export function registerPortfolioTools(server: McpServer, ctx: PgToolContext) {
         : 0;
       const twrrAnnualized = annualizeReturn(twrr.periodReturn, periodDays);
 
+      // FINLYNQ-254: divergence sanity flag. TWRR (time-weighted) and MWRR
+      // (money-weighted) legitimately differ with flow timing, but a large
+      // spread signals that transfer/FX flows may be mis-stamped in the daily
+      // net_contribution (entering Dietz as performance rather than a pure
+      // flow). Compare the two on the SAME (annualized) basis — mwrr.irr is
+      // already annualized — and surface a flag + note when the gap exceeds
+      // the threshold, the way gapsFilledDays is surfaced. Only meaningful when
+      // the MWRR actually converged.
+      const DIVERGENCE_THRESHOLD = 0.15; // 15 percentage points, annualized
+      const divergenceAbs = mwrr.converged
+        ? Math.abs(twrrAnnualized - mwrr.irr)
+        : null;
+      const divergenceFlag = divergenceAbs != null && divergenceAbs > DIVERGENCE_THRESHOLD;
+
       return text({
         success: true,
         data: {
@@ -934,6 +948,12 @@ export function registerPortfolioTools(server: McpServer, ctx: PgToolContext) {
           },
           mwrr,
           gapsFilledDays: series.filter((p) => p.gapsFilled).length,
+          divergenceFlag,
+          divergenceThreshold: DIVERGENCE_THRESHOLD,
+          divergenceAbs,
+          divergenceNote: divergenceFlag
+            ? `Annualized TWRR (${(twrrAnnualized * 100).toFixed(1)}%) and MWRR (${(mwrr.irr * 100).toFixed(1)}%) differ by ${((divergenceAbs ?? 0) * 100).toFixed(1)}pp, exceeding the ${(DIVERGENCE_THRESHOLD * 100).toFixed(0)}pp sanity threshold. A large spread can be legitimate (heavy/early flows) but may also indicate transfer or FX-conversion flows mis-stamped in the daily net_contribution series — verify the flagged range.`
+            : null,
         },
       });
     },
