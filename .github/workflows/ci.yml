@@ -69,6 +69,17 @@ jobs:
             "SELECT 1 FROM pg_database WHERE datname='finlynq_test'" | grep -q 1 \
             || PGPASSWORD=postgres createdb -h localhost -U postgres finlynq_test
 
+      - name: Apply schema to finlynq_test
+        # FINLYNQ-260 follow-up — `createdb` above only provisions an empty
+        # database. The real-Postgres aggregator harness
+        # (tests/helpers/portfolio-fixtures.ts) TRUNCATEs/seeds tables that
+        # don't exist without a schema push, which fails any un-quarantined
+        # DB-backed test (e.g. tests/mcp/readonly-contract.test.ts). Push the
+        # Drizzle schema before vitest runs.
+        run: npx drizzle-kit push --config=drizzle-pg.config.ts --force
+        env:
+          DATABASE_URL: postgresql://postgres:postgres@localhost:5432/finlynq_test
+
       - name: Run tests
         # FINLYNQ-257 — `vitest run` gates the suite. The currently-red files are
         # quarantined in vitest.config.ts (QUARANTINE array); CI fails on any
