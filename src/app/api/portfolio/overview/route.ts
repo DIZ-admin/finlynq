@@ -54,6 +54,19 @@ export async function GET(request: NextRequest) {
   // 1. Get all holdings with account info. Stream D Phase 4: plaintext
   // name/symbol/accountName columns dropped; read ciphertext only and
   // decrypt in-memory before any name/symbol lookup.
+  //
+  // FINLYNQ-242: LEFT JOIN `securities` via `portfolio_holdings.security_id`
+  // and pull the security's own `name_ct` — a HUMAN display name (e.g.
+  // "Apple Inc.") written by the web Securities catalog. This is the DURABLE
+  // description source that survives a warm `price_cache` hit, unlike the live
+  // Yahoo `shortName` (null when the price is cache-served). Mobile has no
+  // securities read-flip infra, so we use `securities.name` DIRECTLY when the
+  // row is backfilled (`security_id` present) and the name is meaningful (non-
+  // empty + distinct from the ticker); un-backfilled rows (`security_id` null)
+  // keep `securityName = null` and fall back to the live `quoteName`/legacy
+  // name path, so their payload stays byte-identical. Mobile READS only —
+  // the web app owns all writes/backfill to `securities`.
+  const sec = alias(schema.securities, "sec");
   const rawHoldings = await db
     .select({
       id: schema.portfolioHoldings.id,
@@ -63,16 +76,20 @@ export async function GET(request: NextRequest) {
       symbolCt: schema.portfolioHoldings.symbolCt,
       currency: schema.portfolioHoldings.currency,
       isCrypto: schema.portfolioHoldings.isCrypto,
+      securityId: schema.portfolioHoldings.securityId,
+      securityNameCt: sec.nameCt,
       note: schema.portfolioHoldings.note,
     })
     .from(schema.portfolioHoldings)
     .leftJoin(schema.accounts, eq(schema.portfolioHoldings.accountId, schema.accounts.id))
+    .leftJoin(sec, eq(schema.portfolioHoldings.securityId, sec.id))
     .where(eq(schema.portfolioHoldings.userId, userId));
   const holdings = decryptNamedRows(rawHoldings, dek, {
     nameCt: "name",
     symbolCt: "symbol",
     accountNameCt: "accountName",
-  }) as Array<typeof rawHoldings[number] & { name: string | null; symbol: string | null; accountName: string | null }>;
+    securityNameCt: "securityName",
+  }) as Array<typeof rawHoldings[number] & { name: string | null; symbol: string | null; accountName: string | null; securityName: string | null }>;
 
   // 2. Classify holdings.
   //
@@ -563,12 +580,25 @@ export async function GET(request: NextRequest) {
       ? (totalReturn / lifetimeCostBasis) * 100
       : null;
 
+    // FINLYNQ-242: durable human name from the joined `securities` row.
+    // Present ONLY when the position is backfilled (`security_id` set) and the
+    // security carries a decrypted name distinct from the ticker — survives a
+    // warm price_cache hit. Null otherwise → falls back to `quoteName`/`name`.
+    const securityName = (() => {
+      if (h.securityId == null) return null;
+      const nm = (h.securityName ?? "").trim();
+      if (!nm) return null;
+      if (h.symbol && nm.toUpperCase() === h.symbol.toUpperCase()) return null;
+      return nm;
+    })();
+
     return {
       id: h.id,
       accountId: h.accountId,
       accountName: h.accountName ?? "Unknown",
       name: h.name,
       quoteName,
+      securityName,
       symbol: h.symbol,
       currency: h.currency,
       assetType,
@@ -847,12 +877,15 @@ export async function GET(request: NextRequest) {
   };
 
   // FINLYNQ-242: pure null-safe resolver mirroring web's holdingDescription
-  // (pf-app .../holding-description.ts). Prefers the Yahoo quote name, falls
-  // back to the user-stored name, and returns null when neither is a
-  // meaningful description distinct from the ticker code (cash/metals/custom,
-  // or a stored name that just echoes the symbol). Never throws (cold-DEK
-  // null defense).
+  // (pf-app .../holding-description.ts). Prefers the DURABLE `securityName`
+  // (joined `securities.name_ct`, survives a warm price_cache hit), then the
+  // live Yahoo `quoteName`, then the user-stored name; returns null when none
+  // is a meaningful description distinct from the ticker code (cash/metals/
+  // custom, or a stored name that just echoes the symbol). Never throws
+  // (cold-DEK null defense). `securityName` is the fix for the re-graduated
+  // bar — the previous quoteName-only source stayed null on a warm cache.
   const resolveHoldingDescription = (input: {
+    securityName?: string | null;
     quoteName?: string | null;
     name?: string | null;
     symbol?: string | null;
@@ -864,7 +897,7 @@ export async function GET(request: NextRequest) {
       if (sym && trimmed.toUpperCase() === sym) return null;
       return trimmed;
     };
-    return meaningful(input.quoteName) ?? meaningful(input.name);
+    return meaningful(input.securityName) ?? meaningful(input.quoteName) ?? meaningful(input.name);
   };
 
   type ByHoldingAccum = {
@@ -914,6 +947,7 @@ export async function GET(request: NextRequest) {
     // stored name that just echoes the ticker is dropped).
     if (acc.description == null) {
       acc.description = resolveHoldingDescription({
+        securityName: h.securityName,
         quoteName: h.quoteName,
         name: h.name,
         symbol: ck.symbol,

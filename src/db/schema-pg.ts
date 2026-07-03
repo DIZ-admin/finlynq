@@ -178,10 +178,51 @@ export const txCurrencyAudit = pgTable("tx_currency_audit", {
   resolution: text("resolution"), // 'converted' | 'kept' | 'edited'
 });
 
+// Securities master (Tier 2, 2026-06-16) — centralized per-(user, ticker)
+// identity table. Written + backfilled by the WEB app; mobile is a READ-ONLY
+// consumer here. FINLYNQ-242: mobile joins this via `portfolio_holdings.security_id`
+// to pull the security's decrypted `name_ct` (a HUMAN name like "Apple Inc.")
+// as a durable holding description that survives a warm `price_cache` hit —
+// unlike the live Yahoo `shortName`, which is null on a warm cache. Only the
+// columns mobile reads are declared. → plan/architecture/securities.md
+export const securities = pgTable(
+  "securities",
+  {
+    id: serial("id").primaryKey(),
+    userId: text("user_id").notNull(),
+    clusterKey: text("cluster_key").notNull(),
+    assetType: text("asset_type").notNull(),
+    priceSource: text("price_source").notNull().default("auto"),
+    currency: text("currency").notNull().default("USD"),
+    isCash: boolean("is_cash").notNull().default(false),
+    isCrypto: integer("is_crypto").default(0),
+    // Encrypted identity copied verbatim from the representative position.
+    // `name_ct` holds the human display name for equities/ETFs (verified on
+    // pf_dev: security 77 → "Apple Inc Test" while the position name is "AAPL").
+    symbolCt: text("symbol_ct"),
+    symbolLookup: text("symbol_lookup"),
+    nameCt: text("name_ct"),
+    nameLookup: text("name_lookup"),
+    image: text("image"),
+    createdAt: timestamp("created_at", { withTimezone: true }).notNull().defaultNow(),
+    updatedAt: timestamp("updated_at", { withTimezone: true }).notNull().defaultNow(),
+  },
+  (t) => [
+    uniqueIndex("securities_user_cluster_idx").on(t.userId, t.clusterKey),
+    index("securities_user_idx").on(t.userId),
+  ],
+);
+
 export const portfolioHoldings = pgTable("portfolio_holdings", {
   id: serial("id").primaryKey(),
   userId: text("user_id").notNull(),
   accountId: integer("account_id").references(() => accounts.id),
+  // Securities master (2026-06-16) — nullable FK lifting this position's
+  // identity up to the shared `securities` row. Written by the web app;
+  // mobile READS it (FINLYNQ-242) to source a durable holding description.
+  securityId: integer("security_id").references(() => securities.id, {
+    onDelete: "set null",
+  }),
   // Stream D Phase 4 (2026-05-03) — plaintext `name` and `symbol` columns
   // physically dropped. Reads via `name_ct`/`symbol_ct` + DEK; exact-match
   // queries via `name_lookup`/`symbol_lookup`.

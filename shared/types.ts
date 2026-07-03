@@ -349,6 +349,15 @@ export interface EnrichedHolding {
    * and the Top-movers / Holding-detail description line.
    */
   quoteName?: string | null;
+  /**
+   * FINLYNQ-242 (re-graduated): the DURABLE human name from the joined
+   * `securities.name_ct` (e.g. "Apple Inc."), present only when the position
+   * is backfilled (`security_id` set) and the name is distinct from the
+   * ticker. Unlike `quoteName` this survives a warm `price_cache` hit, so it
+   * is the PREFERRED source for `byHolding.description`. Null for un-backfilled
+   * rows / cash / metals / custom holdings — those fall back to `quoteName`.
+   */
+  securityName?: string | null;
   symbol: string | null;
   currency: string;
   assetType: "etf" | "stock" | "crypto" | "cash";
