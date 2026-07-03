@@ -52,6 +52,13 @@ jobs:
         # FINLYNQ-112 — promoted from advisory to blocking (passes 11/11 on HEAD).
         run: npm run audit:invariants
 
+      - name: Lint MCP tool descriptions
+        # FINLYNQ-266 — enumerate the registered HTTP tool surface and fail on
+        # duplicate first-60-char openings, first sentences >120 chars, or
+        # descriptions >900 chars. Keeps the verb-first style guide enforced so
+        # truncating clients never render two tools as the same string.
+        run: npm run lint:tool-descriptions
+
       - name: Build
         run: npm run build
         env:

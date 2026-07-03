@@ -309,7 +309,7 @@ export function registerAccountsTools(server: McpServer, ctx: PgToolContext) {
   // write → no invalidateUser. 0 rows (cross-tenant / missing) → "Not found".
   server.tool(
     "set_account_mode",
-    "Set an account's import pipeline mode: 'auto' (rules fire at upload), 'approve' (review each), or 'manual' (rules fire at materialize). Returns {id, mode}. Cross-tenant / missing id → Not found.",
+    "Set an account's import pipeline mode. 'auto' fires rules at upload, 'approve' reviews each row, 'manual' fires rules at materialize. Returns {id, mode}. Cross-tenant / missing id → Not found.",
     {
       accountId: z.number().int().positive().describe("accounts.id."),
       mode: z

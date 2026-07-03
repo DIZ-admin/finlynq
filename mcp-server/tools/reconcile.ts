@@ -204,7 +204,7 @@ export function registerReconcileTools(server: McpServer, ctx: PgToolContext) {
   // this is HTTP-only / DEK-required.
   server.tool(
     "find_duplicate_bank_rows",
-    "Bookkeeping only: Finlynq reads from your own database and never connects to a bank or brokerage or moves real money. Surface DUPLICATE bank-ledger rows for one account — distinct rows that describe the same economic event (overlapping statement imports). Returns an array of groups { canonicalId (oldest, keep this), duplicateIds[], date, amount, payee, seenCount, linkedTransactionId? }. Empty array when none. NOTE: seen_count is NOT the duplicate signal (re-importing the same row bumps it on the existing single row); grouping keys on (date, amount, payee) across DISTINCT ids. Read-only. Requires an unlocked DEK (payees are decrypted to group).",
+    "Surface duplicate bank-ledger rows for one account. Finds DISTINCT rows that describe the same economic event (overlapping statement imports) and groups them so you can pick a canonical to keep. Returns an array of groups { canonicalId (oldest, keep this), duplicateIds[], date, amount, payee, seenCount, linkedTransactionId? }. Empty array when none. NOTE: seen_count is NOT the duplicate signal (re-importing the same row bumps it on the existing single row); grouping keys on (date, amount, payee) across DISTINCT ids. Read-only. Requires an unlocked DEK (payees are decrypted to group).",
     {
       accountId: z.number().int().positive().describe("accounts.id to scan for duplicate bank rows."),
       lookbackDays: z
@@ -311,7 +311,7 @@ export function registerReconcileTools(server: McpServer, ctx: PgToolContext) {
   // is HTTP-only / DEK-required. readOnlyHint is inferred from the get_ prefix.
   server.tool(
     "get_reconciliation_summary",
-    "Bookkeeping only: Finlynq reads from your own database and never connects to a bank or brokerage or moves real money. Portfolio-wide reconcile health in ONE call (instead of one get_reconcile_suggestions per account). Returns an array of { accountId, accountName, linked, suggestions, bankOnly, txOnly, balanceMismatch, balanceDelta?, lastAnchorDate?, currency } — one row per account. balanceDelta = system/ledger balance − bank statement balance (the same delta the /import reconcile header shows; positive ⇒ ledger says MORE than the statement; null when the account has no balance anchor yet). Omit accountIds to summarize ALL non-investment accounts (investment reconcile is out of scope); pass accountIds to scope it (owner-scoped). Counts only — drill into a specific account with get_reconcile_suggestions. Intended split: use this for portfolio-wide per-account COUNTS in ONE call; use get_reconcile_suggestions for the detailed per-row match view of a single account. Read-only. Requires an unlocked DEK (payees are decrypted to score fuzzy matches; account names are decrypted).",
+    "Summarize reconcile health across all accounts in one call (instead of one get_reconcile_suggestions per account). Returns an array of { accountId, accountName, linked, suggestions, bankOnly, txOnly, balanceMismatch, balanceDelta?, lastAnchorDate?, currency } — one row per account. balanceDelta = system/ledger balance − bank statement balance (the same delta the /import reconcile header shows; positive ⇒ ledger says MORE than the statement; null when the account has no balance anchor yet). Omit accountIds to summarize ALL non-investment accounts (investment reconcile is out of scope); pass accountIds to scope it (owner-scoped). Counts only — drill into a specific account with get_reconcile_suggestions. Read-only. Requires an unlocked DEK (payees are decrypted to score fuzzy matches; account names are decrypted).",
     {
       accountIds: z
         .array(z.number().int().positive())
@@ -394,7 +394,7 @@ export function registerReconcileTools(server: McpServer, ctx: PgToolContext) {
   // annotations arg required.
   server.tool(
     "delete_bank_transaction",
-    "Bookkeeping only: Finlynq writes only to your own database — it never connects to a bank or brokerage and never moves real money. DELETE a single bank-ledger row (bank_transactions) by id — use this to remove duplicate bank rows surfaced by find_duplicate_bank_rows. Cascades automatically: any transaction↔bank links are removed and transactions.bank_transaction_id is cleared on affected ledger transactions (the `transactions` rows themselves are NOT deleted). Pass dryRun:true to preview the impact (the unlinkedTransactionIds) without committing. Returns { deleted, unlinkedTransactionIds, dryRun }. Owner-scoped; a non-existent or cross-user id returns a not-found error and changes nothing. Destructive — confirm with dryRun first.",
+    "Delete a single bank-ledger row (bank_transactions) by id. Use this to remove duplicate bank rows surfaced by find_duplicate_bank_rows. Cascades automatically: any transaction↔bank links are removed and transactions.bank_transaction_id is cleared on affected ledger transactions (the `transactions` rows themselves are NOT deleted). Pass dryRun:true to preview the impact (the unlinkedTransactionIds) without committing. Returns { deleted, unlinkedTransactionIds, dryRun }. Owner-scoped; a non-existent or cross-user id returns a not-found error and changes nothing. Destructive — confirm with dryRun first.",
     {
       bankTransactionId: z
         .string()
@@ -475,7 +475,7 @@ export function registerReconcileTools(server: McpServer, ctx: PgToolContext) {
   // cohort to HTTP for consistency).
   server.tool(
     "get_balance_anchors",
-    "Bookkeeping only: Finlynq reads from your own database and never connects to a bank or brokerage or moves real money. List the BANK BALANCE ANCHORS for one account — the bank's reported balance on a given date, which the reconcile engine validates the ledger against. Returns an array of { accountId, date, amount, currency, source, createdAt } ordered by date DESC. Anchors are keyed by (accountId, date) — there is no synthetic id. Pass dateMin/dateMax (inclusive ISO YYYY-MM-DD) to bound the window. Owner-scoped; a non-existent or cross-user accountId returns []. Read-only. Pair with upsert_balance_anchor to create/correct an anchor.",
+    "List the bank balance anchors for one account. An anchor is the bank's reported balance on a given date, which the reconcile engine validates the ledger against. Returns an array of { accountId, date, amount, currency, source, createdAt } ordered by date DESC. Anchors are keyed by (accountId, date) — there is no synthetic id. Pass dateMin/dateMax (inclusive ISO YYYY-MM-DD) to bound the window. Owner-scoped; a non-existent or cross-user accountId returns []. Read-only. Pair with upsert_balance_anchor to create/correct an anchor.",
     {
       accountId: z.number().int().positive().describe("accounts.id to list anchors for."),
       dateMin: ymdDate
@@ -522,7 +522,7 @@ export function registerReconcileTools(server: McpServer, ctx: PgToolContext) {
   // the same inputs is a no-op) + non-destructive annotations.
   server.tool(
     "upsert_balance_anchor",
-    "Bookkeeping only: Finlynq writes only to your own database — it never connects to a bank or brokerage and never moves real money. Create or correct a single BANK BALANCE ANCHOR (the bank's reported balance for an account on a date — the reference point the reconcile engine validates the ledger against). Anchors are keyed by (accountId, date) with no synthetic id, so re-calling with the same (accountId, date) UPDATES the existing anchor (newer balance wins). `amount` is the balance the bank reported on `date`. Returns { accountId, date, amount, currency, created } where created=true means a new anchor was inserted, false means an existing one was updated. The anchor immediately affects the balance check reported by get_reconcile_suggestions / get_reconciliation_summary for the account. Owner-scoped; a non-existent or cross-user accountId returns a not-found error. Stamps source='mcp_manual'.",
+    "Create or correct a single bank balance anchor. An anchor is the bank's reported balance for an account on a date — the reference point the reconcile engine validates the ledger against. Anchors are keyed by (accountId, date) with no synthetic id, so re-calling with the same (accountId, date) UPDATES the existing anchor (newer balance wins). `amount` is the balance the bank reported on `date`. Returns { accountId, date, amount, currency, created } where created=true means a new anchor was inserted, false means an existing one was updated. The anchor immediately affects the balance check reported by get_reconcile_suggestions / get_reconciliation_summary. Owner-scoped; a non-existent or cross-user accountId returns a not-found error. Stamps source='mcp_manual'.",
     {
       accountId: z.number().int().positive().describe("accounts.id the anchor belongs to."),
       date: ymdDate.describe("ISO YYYY-MM-DD date the bank reported this balance."),
@@ -689,7 +689,7 @@ export function registerReconcileTools(server: McpServer, ctx: PgToolContext) {
   // HTTP-only — needs the DEK to decrypt payee/note + re-encrypt at tier.
   server.tool(
     "send_to_bank_ledger",
-    "Bookkeeping only: Finlynq writes only to your own database — it never connects to a bank or brokerage and never moves real money. Promote staged import rows into the BANK LEDGER ONLY (bank_transactions) for reconciliation — it does NOT create any ledger transactions. Use this when the account already has manual/imported transactions covering the statement period (the normal case), so you load the bank side for reconciliation without duplicating existing ledger entries. Loads the statement balance anchor too. skipExistingMatches (default true) skips rows already in the bank ledger (dedup_status='existing'). Returns {loaded, skipped, skippedExisting, anchorLoaded, anchorDate, anchorAmount, batchId, rowErrors}. For a first-time import of a brand-new account with no transactions, use approve_staged_rows instead. Requires an unlocked DEK.",
+    "Promote staged import rows into the bank ledger only (bank_transactions) for reconciliation. It does NOT create any ledger transactions. Use this when the account already has manual/imported transactions covering the statement period (the normal case), so you load the bank side for reconciliation without duplicating existing ledger entries. Loads the statement balance anchor too. skipExistingMatches (default true) skips rows already in the bank ledger (dedup_status='existing'). Returns {loaded, skipped, skippedExisting, anchorLoaded, anchorDate, anchorAmount, batchId, rowErrors}. For a first-time import of a brand-new account with no transactions, use approve_staged_rows instead. Requires an unlocked DEK.",
     {
       stagedImportId: z.string().describe("staged_imports.id"),
       rowIds: z
@@ -777,7 +777,7 @@ export function registerReconcileTools(server: McpServer, ctx: PgToolContext) {
   const UPLOAD_STATEMENT_MAX_BYTES = 5 * 1024 * 1024; // 5 MB decoded
   server.tool(
     "upload_statement",
-    "Bookkeeping only: Finlynq writes only to your own database — it never connects to a bank or brokerage and never moves real money. Stage a bank/brokerage statement file (CSV, OFX, or QFX) over this MCP connection (no browser session needed). Pass the file bytes base64-encoded in fileContent; the format is detected from fileName's extension. Runs the STAGING pipeline and returns { stagedImportId, rowCount, duplicateCount, newCount, dateStart, dateEnd, statementBalance, statementBalanceDate, statementCurrency, detectedFormat } — feed the stagedImportId to get_staged_import (inspect) then send_to_bank_ledger (load the bank side) or approve_staged_rows (first import of a brand-new account). Max file size 5 MB decoded (~6.7 MB base64 in the message). accountId must be one of your accounts (required for OFX/QFX). On an unsupported/unparseable file you get an error with detectedFormat:'unrecognised' and NO staged import. Re-uploading the same file creates a NEW staged import (row-level dedup flags already-known rows). Requires an unlocked DEK.",
+    "Stage a bank/brokerage statement file (CSV, OFX, or QFX) over this MCP connection (no browser session needed). Pass the file bytes base64-encoded in fileContent; the format is detected from fileName's extension. Runs the STAGING pipeline and returns { stagedImportId, rowCount, duplicateCount, newCount, dateStart, dateEnd, statementBalance, statementBalanceDate, statementCurrency, detectedFormat } — feed the stagedImportId to get_staged_import (inspect) then send_to_bank_ledger (load the bank side) or approve_staged_rows (first import). Max file size 5 MB decoded (~6.7 MB base64). accountId must be one of your accounts (required for OFX/QFX). An unsupported/unparseable file returns an error with detectedFormat:'unrecognised' and NO staged import. Re-uploading the same file creates a NEW staged import (row-level dedup flags known rows). Requires an unlocked DEK.",
     {
       fileContent: z
         .string()
@@ -926,7 +926,7 @@ export function registerReconcileTools(server: McpServer, ctx: PgToolContext) {
   // passed explicitly — the name doesn't match the auto-annotation prefixes.
   server.tool(
     "accept_reconcile_suggestions",
-    "Bookkeeping only: links rows in the user's own Finlynq ledger (Finlynq never connects to a bank or moves real money). Bulk-accept reconcile suggestions: link MANY existing transactions to bank-ledger rows in ONE call. `pairs` is an array of {bankTransactionId, transactionId, linkType?} (linkType defaults to 'primary'). Each pair is independent: a bad/cross-account/unknown id carries an `error` and the rest still commit (partial commit). Idempotent — a re-submitted already-linked pair returns alreadyLinked:true with no error. Returns an array POSITIONAL with the input: {bankTransactionId, transactionId, linkId, setPrimaryFk, alreadyLinked, error?}. Reverse individual links with unlink_reconcile.",
+    "Bulk-accept reconcile suggestions: link MANY existing transactions to bank-ledger rows in ONE call. `pairs` is an array of {bankTransactionId, transactionId, linkType?} (linkType defaults to 'primary'). Each pair is independent: a bad/cross-account/unknown id carries an `error` and the rest still commit (partial commit). Idempotent — a re-submitted already-linked pair returns alreadyLinked:true with no error. Returns an array POSITIONAL with the input: {bankTransactionId, transactionId, linkId, setPrimaryFk, alreadyLinked, error?}. Reverse individual links with unlink_reconcile.",
     {
       pairs: z
         .array(
@@ -993,7 +993,7 @@ export function registerReconcileTools(server: McpServer, ctx: PgToolContext) {
   // invalidateUser. Requires a non-null DEK (the lib decrypts rule + row text).
   server.tool(
     "apply_rules_to_staged_import",
-    "Re-apply active transaction rules to a PENDING staged import in place (renames payees, flips tx_type to transfer, sets category/account, etc.) so the review surface reflects rule effects before approval. Optional rowIds = subset; optional onlyRuleId = a single rule. Returns {rowsTouched, matches}. Requires an unlocked DEK; staged import must be pending.",
+    "Re-apply active transaction rules to a PENDING staged import in place. Rewrites the staged rows (renames payees, flips tx_type to transfer, sets category/account, etc.) so the review surface reflects rule effects before approval. Optional rowIds = subset; optional onlyRuleId = a single rule. Returns {rowsTouched, matches}. Requires an unlocked DEK; staged import must be pending.",
     {
       stagedImportId: z.string().describe("staged_imports.id (must be status='pending')."),
       rowIds: z
@@ -1043,7 +1043,7 @@ export function registerReconcileTools(server: McpServer, ctx: PgToolContext) {
   // The lib invalidates the cache when it materializes anything.
   server.tool(
     "apply_rules_to_bank_rows",
-    "Auto-pilot bulk: fire active rules over a batch of bank-ledger rows and (on confirm) auto-materialize matched rows into transactions. Two-step: first call (no confirmation_token) runs a PREVIEW pass (autoMaterialize=false — no writes) and returns a summary + confirmationToken (5-min TTL); second call with the token + autoMaterialize:true commits. Returns {materialized, rulesFired, possibleDuplicates, perRow}. Requires an unlocked DEK when materializing.",
+    "Fire active rules over a batch of bank-ledger rows (Auto-pilot bulk). On confirm, auto-materializes matched rows into transactions. Two-step: first call (no confirmation_token) runs a PREVIEW pass (autoMaterialize=false — no writes) and returns a summary + confirmationToken (5-min TTL); second call with the token + autoMaterialize:true commits. Returns {materialized, rulesFired, possibleDuplicates, perRow}. Requires an unlocked DEK when materializing.",
     {
       bankRowIds: z
         .array(z.string().uuid())

@@ -6,7 +6,7 @@ import { registerCoreTools } from "./register-core-tools.js";
 import { registerV2Tools } from "./tools-v2.js";
 import { registerImportTemplateTools } from "./tools-import-templates.js";
 import { withAutoAnnotations } from "./auto-annotations.js";
-import { MCP_TOOL_COUNTS, MCP_SERVER_VERSION } from "../src/lib/mcp/tool-counts.js";
+import { MCP_TOOL_COUNTS, MCP_SERVER_VERSION, MCP_SERVER_INSTRUCTIONS } from "../src/lib/mcp/tool-counts.js";
 
 const databaseUrl = process.env.DATABASE_URL;
 if (!databaseUrl) {
@@ -59,6 +59,10 @@ const server = withAutoAnnotations(new McpServer({
   icons: [
     { src: "https://finlynq.com/favicon.svg", mimeType: "image/svg+xml", sizes: ["any"] },
   ],
+}, {
+  // FINLYNQ-266 — the bookkeeping-only trust posture is sent ONCE per session
+  // here instead of opening every write-tool description.
+  instructions: MCP_SERVER_INSTRUCTIONS,
 }));
 
 registerCoreTools(server, db, { userId });

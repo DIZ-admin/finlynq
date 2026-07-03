@@ -174,7 +174,7 @@ export function registerPortfolioTools(server: McpServer, ctx: PgToolContext) {
 
   server.tool(
     "portfolio_buy",
-    "Bookkeeping only: records a BUY entry in the user's own Finlynq tracking ledger. Finlynq never connects to a brokerage, places a real order, or moves real money or crypto. Buy shares/units of a holding in a brokerage account. Writes the canonical buy + buy_cash_leg pair (stock leg positive, cash leg negative, sum 0), opens a cost-basis lot, and debits the cash sleeve for the holding's currency — that sleeve must already exist (add_portfolio_holding a 'Cash' holding for the currency first if missing). Resolve the account by `account` name (strict fuzzy) or exact `account_id`, and the position by `holding` name/ticker or exact `holdingId`. CREATE-ONLY (edit on the web). Replaces the removed record_trade buy path.",
+    "Buy shares/units of a holding in a brokerage account. Writes the canonical buy + buy_cash_leg pair (stock leg positive, cash leg negative, sum 0), opens a cost-basis lot, and debits the cash sleeve for the holding's currency — that sleeve must already exist (add_portfolio_holding a 'Cash' holding for the currency first if missing). Resolve the account by `account` name (strict fuzzy) or exact `account_id`, and the position by `holding` name/ticker or exact `holdingId`. CREATE-ONLY (edit on the web). Replaces the removed record_trade buy path.",
     {
       account: z.string().optional().describe("Brokerage account name or alias (strict fuzzy). Pass this or account_id."),
       account_id: z.number().int().optional().describe("Brokerage account id (exact; wins over name)."),
@@ -212,7 +212,7 @@ export function registerPortfolioTools(server: McpServer, ctx: PgToolContext) {
 
   server.tool(
     "portfolio_sell",
-    "Bookkeeping only: records a SELL entry in the user's own Finlynq tracking ledger. No real order is placed and no real money or crypto moves. Sell shares/units of a holding in a brokerage account. Writes sell + sell_cash_leg (stock leg negative, cash leg positive, sum 0), closes cost-basis lots, and credits the cash sleeve. `lotSelection.method` is FIFO (default), HIFO, or SPECIFIC (SPECIFIC needs lotIds or per-lot lots[]). CREATE-ONLY. Replaces the removed record_trade sell path.",
+    "Sell shares/units of a holding in a brokerage account. Writes sell + sell_cash_leg (stock leg negative, cash leg positive, sum 0), closes cost-basis lots, and credits the cash sleeve. `lotSelection.method` is FIFO (default), HIFO, or SPECIFIC (SPECIFIC needs lotIds or per-lot lots[]). CREATE-ONLY. Replaces the removed record_trade sell path.",
     {
       account: z.string().optional().describe("Brokerage account name or alias. Pass this or account_id."),
       account_id: z.number().int().optional().describe("Brokerage account id (exact; wins over name)."),
@@ -258,7 +258,7 @@ export function registerPortfolioTools(server: McpServer, ctx: PgToolContext) {
 
   server.tool(
     "portfolio_swap",
-    "Bookkeeping only: records a swap entry in the user's own Finlynq ledger; no real trade occurs. Exchange one holding for another inside a SINGLE brokerage account in one atomic operation (an internal sell of the source + buy of the destination, sharing a swap_link_id). Both holdings must already exist in the account. CREATE-ONLY.",
+    "Swap one holding for another inside a SINGLE brokerage account in one atomic operation. Runs an internal sell of the source + buy of the destination, sharing a swap_link_id. Both holdings must already exist in the account. CREATE-ONLY.",
     {
       account: z.string().optional().describe("Brokerage account name or alias. Pass this or account_id."),
       account_id: z.number().int().optional().describe("Brokerage account id (exact; wins over name)."),
@@ -300,7 +300,7 @@ export function registerPortfolioTools(server: McpServer, ctx: PgToolContext) {
 
   server.tool(
     "portfolio_transfer",
-    "Bookkeeping only: records an in-kind move between two of the user's own tracked accounts; no real shares or money move. Move shares/units of the SAME holding between two different brokerage accounts (in-kind, no cash). Cascades cost basis from source to destination. The holding is resolved in the SOURCE account; source and destination accounts must differ. CREATE-ONLY.",
+    "Move shares/units of the SAME holding between two different brokerage accounts (in-kind, no cash). Cascades cost basis from source to destination. The holding is resolved in the SOURCE account; source and destination accounts must differ. CREATE-ONLY.",
     {
       sourceAccount: z.string().optional().describe("Source brokerage account name or alias. Pass this or sourceAccount_id."),
       sourceAccount_id: z.number().int().optional().describe("Source account id (exact; wins over name)."),
@@ -339,7 +339,7 @@ export function registerPortfolioTools(server: McpServer, ctx: PgToolContext) {
 
   server.tool(
     "portfolio_income_expense",
-    "Bookkeeping only: records an income/expense entry in the user's own Finlynq ledger; no real money moves. Record portfolio income (dividend/interest, amount > 0) or an expense (fee, amount < 0) on a brokerage cash sleeve. The cash sleeve for `currency` must already exist. `incomeType` resolves the canonical category (Dividends/Interest/Fees) when no explicit categoryId is given and the sign matches. Optionally tie the row to the holding that earned it via relatedHolding/relatedHoldingId. CREATE-ONLY.",
+    "Record portfolio income (dividend/interest, amount > 0) or an expense (fee, amount < 0) on a brokerage cash sleeve. The cash sleeve for `currency` must already exist. `incomeType` resolves the canonical category (Dividends/Interest/Fees) when no explicit categoryId is given and the sign matches. Optionally tie the row to the holding that earned it via relatedHolding/relatedHoldingId. CREATE-ONLY.",
     {
       account: z.string().optional().describe("Brokerage account name or alias. Pass this or account_id."),
       account_id: z.number().int().optional().describe("Brokerage account id (exact; wins over name)."),
@@ -391,7 +391,7 @@ export function registerPortfolioTools(server: McpServer, ctx: PgToolContext) {
 
   server.tool(
     "portfolio_fx_conversion",
-    "Bookkeeping only: records a currency-conversion entry between two of the user's own tracked cash sleeves; no real FX trade occurs. Convert cash from one currency to another inside a SINGLE brokerage account (e.g. USD sleeve → CAD sleeve). Writes fx_from + fx_to (+ optional fx_fee). Both currency sleeves (and the fee sleeve, if any) must already exist. CREATE-ONLY.",
+    "Convert cash from one currency to another inside a SINGLE brokerage account (e.g. USD sleeve → CAD sleeve). Writes fx_from + fx_to (+ optional fx_fee). Both currency sleeves (and the fee sleeve, if any) must already exist. CREATE-ONLY.",
     {
       account: z.string().optional().describe("Brokerage account name or alias. Pass this or account_id."),
       account_id: z.number().int().optional().describe("Brokerage account id (exact; wins over name)."),
@@ -428,7 +428,7 @@ export function registerPortfolioTools(server: McpServer, ctx: PgToolContext) {
 
   server.tool(
     "portfolio_deposit",
-    "Bookkeeping only: records a deposit entry between two of the user's own tracked accounts; no real bank or brokerage transfer occurs. Fund a brokerage cash sleeve from a non-investment (bank/chequing) account. Writes a brokerage_deposit_out / brokerage_deposit_in pair linked by link_id. The destination cash sleeve must already exist (or pass destCashSleeveHoldingId). CREATE-ONLY.",
+    "Fund a brokerage cash sleeve from a non-investment (bank/chequing) account. Writes a brokerage_deposit_out / brokerage_deposit_in pair linked by link_id. The destination cash sleeve must already exist (or pass destCashSleeveHoldingId). CREATE-ONLY.",
     {
       sourceAccount: z.string().optional().describe("Source (non-investment) account name or alias. Pass this or sourceAccount_id."),
       sourceAccount_id: z.number().int().optional().describe("Source account id (exact; wins over name)."),
@@ -465,7 +465,7 @@ export function registerPortfolioTools(server: McpServer, ctx: PgToolContext) {
 
   server.tool(
     "portfolio_withdrawal",
-    "Bookkeeping only: records a withdrawal entry between two of the user's own tracked accounts; no real bank or brokerage transfer occurs. Withdraw cash from a brokerage cash sleeve to a non-investment (bank/chequing) account. Writes a brokerage_withdrawal_out / brokerage_withdrawal_in pair linked by link_id. The source cash sleeve must already exist (or pass sourceCashSleeveHoldingId). CREATE-ONLY.",
+    "Withdraw cash from a brokerage cash sleeve to a non-investment (bank/chequing) account. Writes a brokerage_withdrawal_out / brokerage_withdrawal_in pair linked by link_id. The source cash sleeve must already exist (or pass sourceCashSleeveHoldingId). CREATE-ONLY.",
     {
       sourceAccount: z.string().optional().describe("Source brokerage account name or alias. Pass this or sourceAccount_id."),
       sourceAccount_id: z.number().int().optional().describe("Source brokerage account id (exact; wins over name)."),
@@ -828,7 +828,7 @@ export function registerPortfolioTools(server: McpServer, ctx: PgToolContext) {
   // populated by the nightly cron + backfill script.
   server.tool(
     "get_portfolio_performance_v2",
-    "(Distinct capability, not a newer version of get_portfolio_performance: that tool is per-holding average-cost realized P&L; this one is the portfolio time-series return series.) Time-series performance for the portfolio: daily market_value + cost_basis series, period TWRR (Modified Dietz chained daily), annualized TWRR, and MWRR / XIRR. Reads `portfolio_snapshots` populated by the nightly cron + admin backfill script. `gapsFilledDays` count flags any range where price_cache or fx_rates fell back to last-known values.",
+    "Compute a portfolio time-series return series. Returns daily market_value + cost_basis, period TWRR (Modified Dietz chained daily), annualized TWRR, and MWRR / XIRR. Distinct capability from get_portfolio_performance (which is per-holding average-cost realized P&L), NOT a newer version of it. Reads `portfolio_snapshots` populated by the nightly cron + admin backfill script. `gapsFilledDays` count flags any range where price_cache or fx_rates fell back to last-known values.",
     {
       period: z.enum(["1m", "3m", "6m", "ytd", "1y", "all"]).optional().describe("Lookback period; defaults to '1y'"),
       accountId: z.number().int().optional().describe("Scope to one accounts.id; omit for whole-portfolio aggregate"),
@@ -1025,7 +1025,7 @@ export function registerPortfolioTools(server: McpServer, ctx: PgToolContext) {
   // ── get_portfolio_analysis ─────────────────────────────────────────────────
   server.tool(
     "get_portfolio_analysis",
-    "Portfolio holdings with all investment metrics: quantity, cost basis, avg cost, unrealized/realized gain, dividends, total return, % of portfolio. Returns one row per `holdingId` — two holdings sharing a display name across accounts (e.g. VUN.TO in TFSA + RRSP) appear as separate rows. Per-row amounts stay in each holding's native currency; summary aggregates are converted to reportingCurrency (defaults to user's display currency). Pass `symbols` to filter to specific holdings; matching is case-insensitive substring against the row's `name + symbol + account` combination. Within a single entry, ALL whitespace/paren-separated tokens must match (AND); across multiple entries the result is the union (OR). Pass `account_id` (FK fast-path) or `account` (fuzzy name/alias) to scope results to a single account — `account_id` wins when both are passed. The response includes a `warnings` array listing any `symbols` / `account` filter entries that matched zero rows.",
+    "List portfolio holdings with all investment metrics. Each row carries quantity, cost basis, avg cost, unrealized/realized gain, dividends, total return, and % of portfolio, one row per `holdingId` — two holdings sharing a display name across accounts (e.g. VUN.TO in TFSA + RRSP) appear as separate rows. Per-row amounts stay in each holding's native currency; summary aggregates convert to reportingCurrency (defaults to user's display currency). Pass `symbols` to filter (case-insensitive substring against `name + symbol + account`; tokens within an entry AND, across entries OR). Pass `account_id` (FK fast-path) or `account` (fuzzy name/alias) to scope to one account — `account_id` wins. The response includes a `warnings` array listing any filter entries that matched zero rows.",
     {
       symbols: z.array(z.string()).optional().describe("Filter to specific holding names/symbols/accounts (omit for all). Substring match against the row's `name + symbol + account` combination. Within a single entry, ALL whitespace/paren-separated tokens must match (AND) — so 'VCN.TO (TFSA)' matches only holdings whose combined name/symbol/account contains both 'vcn.to' and 'tfsa'. Across multiple entries the result is the union (OR). Unmatched entries surface in `warnings`."),
       account_id: z.number().int().optional().describe("Account FK (accounts.id). Skips fuzzy matching; scopes results to holdings in this account only. Wins over `account` if both are passed. Bad/foreign id returns empty `holdings` plus a warning entry."),

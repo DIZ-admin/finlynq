@@ -237,7 +237,7 @@ export function registerSubscriptionsTools(server: McpServer, ctx: PgToolContext
   // ── detect_subscriptions ───────────────────────────────────────────────────
   server.tool(
     "detect_subscriptions",
-    "Scan recent transactions (via the decrypted tx cache) and return candidate subscriptions — payees with 3+ regular-cadence occurrences and stable amounts. Returns a confirmationToken for bulk_add_subscriptions. Issue #210 — `avgAmount` on each candidate is always positive (matches the `subscriptions.amount` storage convention).",
+    "Scan recent transactions and return candidate subscriptions. Candidates are payees with 3+ regular-cadence occurrences and stable amounts (read from the decrypted tx cache). Returns a confirmationToken for bulk_add_subscriptions. `avgAmount` on each candidate is always positive (matches the `subscriptions.amount` storage convention).",
     {
       lookback_months: z.number().optional().describe("Months of history to scan (default 6)"),
     },
