@@ -20,6 +20,8 @@ import { safeName } from "../lib/format";
 import {
   parseDropdownOrder,
   sortByUserOrder,
+  pickDefaultAccountId,
+  EMPTY_DROPDOWN_ORDER,
   type DropdownOrder,
 } from "../lib/sort-helpers";
 import { Icon } from "../components/icon";
@@ -80,6 +82,19 @@ export default function AddTransactionScreen() {
       endpoints.getDropdownOrder(),
     ])
       .then(([accRes, catRes, balRes, orderRes]) => {
+        // Parse the saved picker order first so the default account can be the
+        // FIRST SORTED account (matching what the picker shows), not raw-API-first.
+        // Failure is non-fatal — degrades to the web fallback comparator.
+        const parsedOrder = orderRes.success
+          ? parseDropdownOrder(orderRes.data)
+          : EMPTY_DROPDOWN_ORDER;
+        if (orderRes.success) {
+          setDropdownOrder(parsedOrder);
+        } else {
+          logger.warn("add-tx", "dropdown-order fetch failed — using fallback sort", {
+            error: orderRes.error,
+          });
+        }
         // Investment accounts use the dedicated Portfolio flow (buys/sells/etc.)
         // — exclude them here, mirroring the web Add Transaction picker. The
         // isInvestment flag lives on the dashboard balances payload.
@@ -91,14 +106,30 @@ export default function AddTransactionScreen() {
           setAccounts(usable);
           setHasInvestment(accRes.data.length !== usable.length);
           if (usable.length > 0) {
-            // Honor a preselected account (e.g. when launched from an account
-            // detail screen); otherwise default to the first account.
-            const preId = route.params?.preselectedAccountId;
+            const nameFallback = (a: (typeof usable)[number], b: (typeof usable)[number]) =>
+              safeName(a.name).localeCompare(safeName(b.name));
+            // Default = the FIRST account in the SORTED picker list (saved
+            // dropdown order leads, then name) — mirrors the order the account
+            // picker renders. A valid preselectedAccountId still wins.
             const defaultId =
-              preId != null && usable.some((a) => a.id === preId) ? preId : usable[0].id;
+              pickDefaultAccountId(
+                usable,
+                (a) => a.id,
+                parsedOrder.lists.account,
+                nameFallback,
+                route.params?.preselectedAccountId,
+              ) ?? usable[0].id;
             setSelectedAccountId(defaultId);
             setFromAccountId(defaultId);
-            const other = usable.find((a) => a.id !== defaultId);
+            // The transfer "to" default is the first sorted account that isn't the
+            // "from" default.
+            const sortedUsable = sortByUserOrder(
+              usable,
+              (a) => a.id,
+              parsedOrder.lists.account,
+              nameFallback,
+            );
+            const other = sortedUsable.find((a) => a.id !== defaultId);
             if (other) setToAccountId(other.id);
           }
         } else {
@@ -106,13 +137,6 @@ export default function AddTransactionScreen() {
         }
         if (catRes.success) setCategories(catRes.data);
         else logger.warn("add-tx", "categories fetch failed", { error: catRes.error });
-        if (orderRes.success) {
-          setDropdownOrder(parseDropdownOrder(orderRes.data));
-        } else {
-          logger.warn("add-tx", "dropdown-order fetch failed — using fallback sort", {
-            error: orderRes.error,
-          });
-        }
         setLoading(false);
       })
       .catch((e) => {

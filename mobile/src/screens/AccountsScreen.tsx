@@ -16,10 +16,14 @@ import { endpoints } from "../api/client";
 import { logger } from "../lib/logger";
 import { formatCurrency, safeName } from "../lib/format";
 import {
-  parseGroupOrder,
+  parseGroupOrderResponse,
+  parseDropdownOrder,
   orderGroups,
+  sortByUserOrder,
   OTHER_GROUP,
+  EMPTY_DROPDOWN_ORDER,
   type AccountGroupOrder,
+  type DropdownOrder,
 } from "../lib/sort-helpers";
 import { Icon } from "../components/icon";
 import type { AccountBalance } from "../../../shared/types";
@@ -34,15 +38,21 @@ interface Section {
 
 /**
  * Group account balances into SectionList sections, ordered by the user's saved
- * group order. Mirrors web's accounts/page.tsx:401 pattern:
+ * group order. Mirrors web's accounts/page.tsx groups() pattern:
  *   - Section (group) order: orderGroups(savedOrder) with "Other" always last.
- *   - Accounts within each group: localeCompare by display name.
+ *   - Accounts within each group: sortByUserOrder(saved account dropdown order),
+ *     falling back to localeCompare by display name — mirrors web's
+ *     useDropdownOrder("account") applied per-group.
  *
- * `savedOrder` comes from GET /api/settings/account-group-order and is parsed
- * via parseGroupOrder. A missing/failed fetch degrades to alpha sections with
- * "Other" last (the pure orderGroups fallback).
+ * `groupOrder` comes from GET /api/settings/account-group-order and `dropdownOrder`
+ * from GET /api/settings/dropdown-order. A missing/failed fetch degrades to alpha
+ * sections with "Other" last / plain name order (the pure fallbacks).
  */
-function groupAccounts(balances: AccountBalance[], groupOrder: AccountGroupOrder): Section[] {
+function groupAccounts(
+  balances: AccountBalance[],
+  groupOrder: AccountGroupOrder,
+  dropdownOrder: DropdownOrder,
+): Section[] {
   const groups = new Map<string, AccountBalance[]>();
   for (const b of balances) {
     const key = b.accountGroup || OTHER_GROUP;
@@ -60,10 +70,16 @@ function groupAccounts(balances: AccountBalance[], groupOrder: AccountGroupOrder
   const mergedSavedOrder = [...savedA, ...savedL];
   const orderedTitles = orderGroups(allGroupNames, mergedSavedOrder);
 
+  const nameFallback = (a: AccountBalance, z: AccountBalance) =>
+    safeName(a.accountName).localeCompare(safeName(z.accountName));
+
   return orderedTitles.map((title) => ({
     title,
-    data: (groups.get(title) ?? []).sort((a, z) =>
-      safeName(a.accountName).localeCompare(safeName(z.accountName))
+    data: sortByUserOrder(
+      groups.get(title) ?? [],
+      (a) => a.accountId,
+      dropdownOrder.lists.account,
+      nameFallback,
     ),
   }));
 }
@@ -73,6 +89,7 @@ export default function AccountsScreen({ navigation }: Props) {
   const isFocused = useIsFocused();
   const [balances, setBalances] = useState<AccountBalance[]>([]);
   const [groupOrder, setGroupOrder] = useState<AccountGroupOrder>({ A: [], L: [] });
+  const [dropdownOrder, setDropdownOrder] = useState<DropdownOrder>(EMPTY_DROPDOWN_ORDER);
   const [loading, setLoading] = useState(true);
   const [refreshing, setRefreshing] = useState(false);
   const [error, setError] = useState<string | null>(null);
@@ -81,11 +98,13 @@ export default function AccountsScreen({ navigation }: Props) {
     if (isRefresh) setRefreshing(true);
     else setLoading(true);
     try {
-      // Fetch balances and saved group order in parallel. Group-order failure is
-      // non-fatal — degrades to alpha sections with "Other" last.
-      const [res, orderRes] = await Promise.all([
+      // Fetch balances, saved group order, and the account dropdown order in
+      // parallel. Both ordering fetches are non-fatal — a failure degrades to
+      // alpha sections with "Other" last / plain name order.
+      const [res, orderRes, dropdownRes] = await Promise.all([
         endpoints.getAccountBalances(),
         endpoints.getAccountGroupOrder(),
+        endpoints.getDropdownOrder(),
       ]);
       if (res.success) {
         setBalances(res.data);
@@ -95,10 +114,23 @@ export default function AccountsScreen({ navigation }: Props) {
         setError(res.error);
       }
       if (orderRes.success) {
-        setGroupOrder(parseGroupOrder(orderRes.data));
+        // The route returns { order: {A,L} } — parseGroupOrderResponse unwraps
+        // the envelope before parsing (mirrors web's parseGroupOrder(d.order)).
+        // Passing the outer envelope would read .A/.L = undefined and silently
+        // fall back to alpha.
+        setGroupOrder(parseGroupOrderResponse(orderRes.data));
       } else {
         logger.warn("accounts", "group-order fetch failed — using fallback sort", {
           error: orderRes.error,
+        });
+      }
+      if (dropdownRes.success) {
+        // /api/settings/dropdown-order returns the DropdownOrder object directly
+        // (no envelope) — no unwrap.
+        setDropdownOrder(parseDropdownOrder(dropdownRes.data));
+      } else {
+        logger.warn("accounts", "dropdown-order fetch failed — using fallback sort", {
+          error: dropdownRes.error,
         });
       }
     } catch (e) {
@@ -117,7 +149,7 @@ export default function AccountsScreen({ navigation }: Props) {
 
   const displayCurrency = balances[0]?.displayCurrency ?? "CAD";
   const netWorth = balances.reduce((s, b) => s + (b.convertedBalance ?? b.balance), 0);
-  const sections = groupAccounts(balances, groupOrder);
+  const sections = groupAccounts(balances, groupOrder, dropdownOrder);
 
   if (loading) {
     return (

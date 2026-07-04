@@ -10,7 +10,9 @@ import {
   parseDropdownOrder,
   sortByUserOrder,
   parseGroupOrder,
+  parseGroupOrderResponse,
   orderGroups,
+  pickDefaultAccountId,
   OTHER_GROUP,
   EMPTY_DROPDOWN_ORDER,
   EMPTY_GROUP_ORDER,
@@ -146,6 +148,101 @@ describe("parseGroupOrder", () => {
   it("ignores non-string array entries", () => {
     const result = parseGroupOrder({ A: ["Cash", 42, null, true, "Savings"] });
     expect(result.A).toEqual(["Cash", "Savings"]);
+  });
+});
+
+// ─── parseGroupOrderResponse (Bug 2: envelope unwrap) ─────────────────────────
+
+describe("parseGroupOrderResponse", () => {
+  it("unwraps the { order: {A,L} } envelope so the saved order is honored", () => {
+    // This is the regression: the route returns { order: {...} }, NOT {A,L}.
+    const response = { order: { A: ["Cash", "Savings"], L: ["Mortgage"] } };
+    const result = parseGroupOrderResponse(response);
+    expect(result.A).toEqual(["Cash", "Savings"]);
+    expect(result.L).toEqual(["Mortgage"]);
+  });
+
+  it("differs from passing the raw envelope to parseGroupOrder (the bug)", () => {
+    const response = { order: { A: ["Cash"], L: [] } };
+    // The bug: parseGroupOrder(response) reads .A/.L off the wrapper → empty.
+    expect(parseGroupOrder(response)).toEqual(EMPTY_GROUP_ORDER);
+    // The fix: parseGroupOrderResponse unwraps → real order.
+    expect(parseGroupOrderResponse(response).A).toEqual(["Cash"]);
+  });
+
+  it("degrades to EMPTY_GROUP_ORDER for a missing/malformed envelope", () => {
+    expect(parseGroupOrderResponse(null)).toEqual(EMPTY_GROUP_ORDER);
+    expect(parseGroupOrderResponse(undefined)).toEqual(EMPTY_GROUP_ORDER);
+    expect(parseGroupOrderResponse({})).toEqual(EMPTY_GROUP_ORDER);
+    expect(parseGroupOrderResponse({ order: null })).toEqual(EMPTY_GROUP_ORDER);
+    expect(parseGroupOrderResponse([1, 2, 3])).toEqual(EMPTY_GROUP_ORDER);
+  });
+});
+
+// ─── pickDefaultAccountId (Bug 3: default = first sorted) ──────────────────────
+
+interface Acct {
+  id: number;
+  name: string;
+}
+
+describe("pickDefaultAccountId", () => {
+  const acctFallback = (a: Acct, b: Acct) => a.name.localeCompare(b.name);
+  // Raw API order intentionally does NOT match sorted order.
+  const usable: Acct[] = [
+    { id: 5, name: "Zebra" },
+    { id: 2, name: "Apple" },
+    { id: 9, name: "Mango" },
+  ];
+
+  it("returns null for an empty list", () => {
+    expect(pickDefaultAccountId([], (a: Acct) => a.id, undefined, acctFallback)).toBeNull();
+  });
+
+  it("defaults to the first SORTED account (name fallback), not raw-API-first", () => {
+    // Raw-first would be id=5 (Zebra); sorted-first is id=2 (Apple).
+    const result = pickDefaultAccountId(usable, (a) => a.id, undefined, acctFallback);
+    expect(result).toBe(2);
+  });
+
+  it("defaults to the first account of the saved dropdown order", () => {
+    // Saved order pins id=9 first → it wins over alpha.
+    const result = pickDefaultAccountId(usable, (a) => a.id, [9, 2], acctFallback);
+    expect(result).toBe(9);
+  });
+
+  it("honors a valid preselectedAccountId over the sorted default", () => {
+    const result = pickDefaultAccountId(usable, (a) => a.id, undefined, acctFallback, 5);
+    expect(result).toBe(5);
+  });
+
+  it("ignores an invalid preselectedAccountId and uses the sorted default", () => {
+    const result = pickDefaultAccountId(usable, (a) => a.id, undefined, acctFallback, 999);
+    expect(result).toBe(2);
+  });
+});
+
+// ─── groupAccounts within-group ordering (Bug 1, via helper composition) ──────
+
+describe("within-group account ordering (sortByUserOrder)", () => {
+  // Mirrors AccountsScreen.groupAccounts: accounts within a group honor the
+  // saved account dropdown order, then fall back to name.
+  const nameFallback = (a: Acct, b: Acct) => a.name.localeCompare(b.name);
+  const group: Acct[] = [
+    { id: 5, name: "Zebra" },
+    { id: 2, name: "Apple" },
+    { id: 9, name: "Mango" },
+  ];
+
+  it("orders by saved account dropdown order first, then name", () => {
+    // Pin id=9 (Mango) and id=5 (Zebra); id=2 (Apple) falls to alpha.
+    const result = sortByUserOrder(group, (a) => a.id, [9, 5], nameFallback);
+    expect(result.map((a) => a.id)).toEqual([9, 5, 2]);
+  });
+
+  it("falls back to name.localeCompare with no saved order", () => {
+    const result = sortByUserOrder(group, (a) => a.id, undefined, nameFallback);
+    expect(result.map((a) => a.name)).toEqual(["Apple", "Mango", "Zebra"]);
   });
 });
 

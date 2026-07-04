@@ -158,6 +158,22 @@ export function parseGroupOrder(value: unknown): AccountGroupOrder {
 }
 
 /**
+ * Parse the GET /api/settings/account-group-order response, unwrapping the
+ * `{ order: {A,L} }` envelope the route returns before handing the inner object
+ * to parseGroupOrder. Passing the raw envelope to parseGroupOrder would read
+ * .A/.L off the wrapper (both undefined) and silently fall back to alpha —
+ * that was the AccountsScreen section-ordering bug (FINLYNQ-240 re-graduation).
+ * Never throws — a missing/malformed envelope degrades to EMPTY_GROUP_ORDER.
+ */
+export function parseGroupOrderResponse(raw: unknown): AccountGroupOrder {
+  const inner =
+    raw && typeof raw === "object" && !Array.isArray(raw)
+      ? (raw as { order?: unknown }).order
+      : undefined;
+  return parseGroupOrder(inner);
+}
+
+/**
  * Order a set of group names by the user's saved order. Names in `savedOrder`
  * lead (in saved sequence); the rest follow by the fallback comparator (locale
  * alpha). "Other" is always sunk to the very end regardless of its position.
@@ -184,4 +200,32 @@ export function orderGroups(
     if (ra !== rb) return ra - rb;
     return fallbackCompare(a, b);
   });
+}
+
+// ─── Add-Transaction default account selection ───────────────────────────────
+
+/**
+ * Pick the default account id for the Add Transaction screen. A valid
+ * `preselectedAccountId` (e.g. launched from an account detail screen) always
+ * wins; otherwise the default is the FIRST account of the SORTED picker list
+ * (saved dropdown order leads, then the name fallback) — mirroring the order the
+ * picker renders, so the default matches what the user sees at the top
+ * (FINLYNQ-240 tc-2). Returns null for an empty list.
+ */
+export function pickDefaultAccountId<T>(
+  usable: ReadonlyArray<T>,
+  keyOf: (item: T) => number,
+  savedOrder: ReadonlyArray<DropdownOrderEntry> | undefined,
+  nameFallback: (a: T, b: T) => number,
+  preselectedAccountId?: number | null,
+): number | null {
+  if (usable.length === 0) return null;
+  if (
+    preselectedAccountId != null &&
+    usable.some((a) => keyOf(a) === preselectedAccountId)
+  ) {
+    return preselectedAccountId;
+  }
+  const sorted = sortByUserOrder(usable, keyOf, savedOrder, nameFallback);
+  return keyOf(sorted[0]);
 }
