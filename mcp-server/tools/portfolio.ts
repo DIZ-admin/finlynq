@@ -174,23 +174,28 @@ export function registerPortfolioTools(server: McpServer, ctx: PgToolContext) {
   };
   const today = () => new Date().toISOString().split("T")[0];
 
-  server.tool(
-    "portfolio_buy",
-    "Buy shares/units of a holding in a brokerage account. Writes the canonical buy + buy_cash_leg pair (stock leg positive, cash leg negative, sum 0), opens a cost-basis lot, and debits the cash sleeve for the holding's currency — that sleeve must already exist (add_portfolio_holding a 'Cash' holding for the currency first if missing). Resolve the account by `account` name (strict fuzzy) or exact `account_id`, and the position by `holding` name/ticker or exact `holdingId`. CREATE-ONLY (edit on the web). Replaces the removed record_trade buy path.",
-    {
-      account: z.string().optional().describe("Brokerage account name or alias (strict fuzzy). Pass this or account_id."),
-      account_id: z.number().int().optional().describe("Brokerage account id (exact; wins over name)."),
-      holding: z.string().optional().describe("Holding name or ticker to buy (must already exist in the account). Pass this or holdingId."),
-      holdingId: z.number().int().optional().describe("portfolio_holdings.id of the position (exact)."),
-      qty: z.number().positive().describe("Units acquired (> 0)."),
-      totalCost: z.number().positive().describe("Total cost in the holding's currency (> 0)."),
-      date: ymdDate.optional().describe("YYYY-MM-DD (default: today)."),
-      payee: z.string().optional(),
-      note: z.string().optional(),
-      tags: z.string().optional().describe("Comma-separated tags."),
-      cashSleeveHoldingId: z.number().int().optional().describe("Explicit cash sleeve to debit; defaults to the (account, holding-currency) sleeve."),
-    },
-    async ({ account, account_id, holding, holdingId, qty, totalCost, date, payee, note, tags, cashSleeveHoldingId }) => {
+  // ── portfolio_record_entry op handlers (lifted VERBATIM) ───────────────────
+  // FINLYNQ-263 phase 4 — the 8 portfolio_* write tools fold into
+  // portfolio_record_entry (entry_type discriminator). AUDIT INVARIANT #8
+  // preserved: each op still calls the sanctioned operations.ts helper
+  // (recordBuy/recordSell/…) — NEVER a raw INSERT. Cash-leg sign convention,
+  // DEK-gating, lot hooks, invalidateUser + markSnapshotsDirty all VERBATIM.
+  // add_snapshot stays STANDALONE (it writes portfolio_snapshots, not a ledger
+  // entry — owner decision #5).
+  async function opEntryBuy(argsObj: {
+    account?: string;
+    account_id?: number;
+    holding?: string;
+    holdingId?: number;
+    qty: number;
+    totalCost: number;
+    date?: string;
+    payee?: string;
+    note?: string;
+    tags?: string;
+    cashSleeveHoldingId?: number;
+  }): Promise<ToolResult> {
+      const { account, account_id, holding, holdingId, qty, totalCost, date, payee, note, tags, cashSleeveHoldingId } = argsObj;
       if (!dek) return err("portfolio_buy requires an active session DEK — log in again to encrypt the rows.");
       const accounts = await loadOpAccounts();
       const a = resolveOpAccount("account", account, account_id, accounts);
@@ -208,35 +213,27 @@ export function registerPortfolioTools(server: McpServer, ctx: PgToolContext) {
         if (m) return err(m);
         throw e;
       }
-    }
-  );
+  }
 
-
-  server.tool(
-    "portfolio_sell",
-    "Sell shares/units of a holding in a brokerage account. Writes sell + sell_cash_leg (stock leg negative, cash leg positive, sum 0), closes cost-basis lots, and credits the cash sleeve. `lotSelection.method` is FIFO (default), HIFO, or SPECIFIC (SPECIFIC needs lotIds or per-lot lots[]). CREATE-ONLY. Replaces the removed record_trade sell path.",
-    {
-      account: z.string().optional().describe("Brokerage account name or alias. Pass this or account_id."),
-      account_id: z.number().int().optional().describe("Brokerage account id (exact; wins over name)."),
-      holding: z.string().optional().describe("Holding name or ticker to sell (must already exist). Pass this or holdingId."),
-      holdingId: z.number().int().optional().describe("portfolio_holdings.id of the position (exact)."),
-      qty: z.number().positive().describe("Units sold (> 0)."),
-      totalProceeds: z.number().positive().describe("Total proceeds in the holding's currency (> 0)."),
-      date: ymdDate.optional().describe("YYYY-MM-DD (default: today)."),
-      lotSelection: z
-        .object({
-          method: z.enum(["FIFO", "HIFO", "SPECIFIC"]),
-          lotIds: z.array(z.number().int().positive()).optional(),
-          lots: z.array(z.object({ lotId: z.number().int().positive(), qty: z.number().positive() })).optional(),
-        })
-        .optional()
-        .describe("Lot disposal strategy (default FIFO). SPECIFIC requires lotIds or per-lot lots."),
-      payee: z.string().optional(),
-      note: z.string().optional(),
-      tags: z.string().optional(),
-      cashSleeveHoldingId: z.number().int().optional().describe("Explicit cash sleeve to credit; defaults to the (account, holding-currency) sleeve."),
-    },
-    async ({ account, account_id, holding, holdingId, qty, totalProceeds, date, lotSelection, payee, note, tags, cashSleeveHoldingId }) => {
+  async function opEntrySell(argsObj: {
+    account?: string;
+    account_id?: number;
+    holding?: string;
+    holdingId?: number;
+    qty: number;
+    totalProceeds: number;
+    date?: string;
+    lotSelection?: {
+      method: "FIFO" | "HIFO" | "SPECIFIC";
+      lotIds?: number[];
+      lots?: Array<{ lotId: number; qty: number }>;
+    };
+    payee?: string;
+    note?: string;
+    tags?: string;
+    cashSleeveHoldingId?: number;
+  }): Promise<ToolResult> {
+      const { account, account_id, holding, holdingId, qty, totalProceeds, date, lotSelection, payee, note, tags, cashSleeveHoldingId } = argsObj;
       if (!dek) return err("portfolio_sell requires an active session DEK — log in again to encrypt the rows.");
       const accounts = await loadOpAccounts();
       const a = resolveOpAccount("account", account, account_id, accounts);
@@ -254,29 +251,24 @@ export function registerPortfolioTools(server: McpServer, ctx: PgToolContext) {
         if (m) return err(m);
         throw e;
       }
-    }
-  );
+  }
 
-
-  server.tool(
-    "portfolio_swap",
-    "Swap one holding for another inside a SINGLE brokerage account in one atomic operation. Runs an internal sell of the source + buy of the destination, sharing a swap_link_id. Both holdings must already exist in the account. CREATE-ONLY.",
-    {
-      account: z.string().optional().describe("Brokerage account name or alias. Pass this or account_id."),
-      account_id: z.number().int().optional().describe("Brokerage account id (exact; wins over name)."),
-      sourceHolding: z.string().optional().describe("Holding being sold (name/ticker). Pass this or sourceHoldingId."),
-      sourceHoldingId: z.number().int().optional().describe("portfolio_holdings.id of the holding being sold."),
-      sourceQty: z.number().positive().describe("Units of the source holding disposed (> 0)."),
-      sourceProceeds: z.number().positive().describe("Proceeds realised from the source (> 0), in account/holding currency."),
-      destHolding: z.string().optional().describe("Holding being acquired (name/ticker). Pass this or destHoldingId."),
-      destHoldingId: z.number().int().optional().describe("portfolio_holdings.id of the holding being acquired."),
-      destQty: z.number().positive().describe("Units of the destination holding acquired (> 0)."),
-      destCost: z.number().positive().describe("Cost allocated to the destination (> 0)."),
-      date: ymdDate.optional().describe("YYYY-MM-DD (default: today)."),
-      payee: z.string().optional(),
-      note: z.string().optional(),
-    },
-    async ({ account, account_id, sourceHolding, sourceHoldingId, sourceQty, sourceProceeds, destHolding, destHoldingId, destQty, destCost, date, payee, note }) => {
+  async function opEntrySwap(argsObj: {
+    account?: string;
+    account_id?: number;
+    sourceHolding?: string;
+    sourceHoldingId?: number;
+    sourceQty: number;
+    sourceProceeds: number;
+    destHolding?: string;
+    destHoldingId?: number;
+    destQty: number;
+    destCost: number;
+    date?: string;
+    payee?: string;
+    note?: string;
+  }): Promise<ToolResult> {
+      const { account, account_id, sourceHolding, sourceHoldingId, sourceQty, sourceProceeds, destHolding, destHoldingId, destQty, destCost, date, payee, note } = argsObj;
       if (!dek) return err("portfolio_swap requires an active session DEK — log in again to encrypt the rows.");
       const accounts = await loadOpAccounts();
       const a = resolveOpAccount("account", account, account_id, accounts);
@@ -296,26 +288,21 @@ export function registerPortfolioTools(server: McpServer, ctx: PgToolContext) {
         if (m) return err(m);
         throw e;
       }
-    }
-  );
+  }
 
-
-  server.tool(
-    "portfolio_transfer",
-    "Move shares/units of the SAME holding between two different brokerage accounts (in-kind, no cash). Cascades cost basis from source to destination. The holding is resolved in the SOURCE account; source and destination accounts must differ. CREATE-ONLY.",
-    {
-      sourceAccount: z.string().optional().describe("Source brokerage account name or alias. Pass this or sourceAccount_id."),
-      sourceAccount_id: z.number().int().optional().describe("Source account id (exact; wins over name)."),
-      destAccount: z.string().optional().describe("Destination brokerage account name or alias. Pass this or destAccount_id."),
-      destAccount_id: z.number().int().optional().describe("Destination account id (exact; wins over name)."),
-      holding: z.string().optional().describe("Holding to move (name/ticker), resolved in the source account. Pass this or holdingId."),
-      holdingId: z.number().int().optional().describe("portfolio_holdings.id of the holding (in the source account)."),
-      qty: z.number().positive().describe("Units leaving source / arriving at destination (> 0)."),
-      date: ymdDate.optional().describe("YYYY-MM-DD (default: today)."),
-      payee: z.string().optional(),
-      note: z.string().optional(),
-    },
-    async ({ sourceAccount, sourceAccount_id, destAccount, destAccount_id, holding, holdingId, qty, date, payee, note }) => {
+  async function opEntryTransfer(argsObj: {
+    sourceAccount?: string;
+    sourceAccount_id?: number;
+    destAccount?: string;
+    destAccount_id?: number;
+    holding?: string;
+    holdingId?: number;
+    qty: number;
+    date?: string;
+    payee?: string;
+    note?: string;
+  }): Promise<ToolResult> {
+      const { sourceAccount, sourceAccount_id, destAccount, destAccount_id, holding, holdingId, qty, date, payee, note } = argsObj;
       if (!dek) return err("portfolio_transfer requires an active session DEK — log in again to encrypt the rows.");
       const accounts = await loadOpAccounts();
       const src = resolveOpAccount("sourceAccount", sourceAccount, sourceAccount_id, accounts);
@@ -335,28 +322,23 @@ export function registerPortfolioTools(server: McpServer, ctx: PgToolContext) {
         if (m) return err(m);
         throw e;
       }
-    }
-  );
+  }
 
-
-  server.tool(
-    "portfolio_income_expense",
-    "Record portfolio income (dividend/interest, amount > 0) or an expense (fee, amount < 0) on a brokerage cash sleeve. The cash sleeve for `currency` must already exist. `incomeType` resolves the canonical category (Dividends/Interest/Fees) when no explicit categoryId is given and the sign matches. Optionally tie the row to the holding that earned it via relatedHolding/relatedHoldingId. CREATE-ONLY.",
-    {
-      account: z.string().optional().describe("Brokerage account name or alias. Pass this or account_id."),
-      account_id: z.number().int().optional().describe("Brokerage account id (exact; wins over name)."),
-      currency: supportedCurrencyEnum.describe("Currency of the cash sleeve to credit/debit (ISO code)."),
-      amount: z.number().refine((v) => v !== 0, { message: "amount cannot be 0" }).describe("Positive = income (dividend/interest), negative = expense (fee)."),
-      incomeType: z.enum(["dividend", "interest", "fee", "other"]).optional().describe("Category hint. dividend/interest apply to income (amount>0); fee to expense (amount<0); other leaves the category unset. Ignored when categoryId is given."),
-      relatedHolding: z.string().optional().describe("Holding (name/ticker) this income/expense relates to, for reporting. Pass this or relatedHoldingId."),
-      relatedHoldingId: z.number().int().optional().describe("portfolio_holdings.id this relates to."),
-      categoryId: z.number().int().optional().describe("Explicit category id (overrides incomeType)."),
-      date: ymdDate.optional().describe("YYYY-MM-DD (default: today)."),
-      payee: z.string().optional(),
-      note: z.string().optional(),
-      tags: z.string().optional(),
-    },
-    async ({ account, account_id, currency, amount, incomeType, relatedHolding, relatedHoldingId, categoryId, date, payee, note, tags }) => {
+  async function opEntryIncomeExpense(argsObj: {
+    account?: string;
+    account_id?: number;
+    currency: string;
+    amount: number;
+    incomeType?: "dividend" | "interest" | "fee" | "other";
+    relatedHolding?: string;
+    relatedHoldingId?: number;
+    categoryId?: number;
+    date?: string;
+    payee?: string;
+    note?: string;
+    tags?: string;
+  }): Promise<ToolResult> {
+      const { account, account_id, currency, amount, incomeType, relatedHolding, relatedHoldingId, categoryId, date, payee, note, tags } = argsObj;
       if (!dek) return err("portfolio_income_expense requires an active session DEK — log in again to encrypt the rows.");
       const accounts = await loadOpAccounts();
       const a = resolveOpAccount("account", account, account_id, accounts);
@@ -387,28 +369,23 @@ export function registerPortfolioTools(server: McpServer, ctx: PgToolContext) {
         if (m) return err(m);
         throw e;
       }
-    }
-  );
+  }
 
-
-  server.tool(
-    "portfolio_fx_conversion",
-    "Convert cash from one currency to another inside a SINGLE brokerage account (e.g. USD sleeve → CAD sleeve). Writes fx_from + fx_to (+ optional fx_fee). Both currency sleeves (and the fee sleeve, if any) must already exist. CREATE-ONLY.",
-    {
-      account: z.string().optional().describe("Brokerage account name or alias. Pass this or account_id."),
-      account_id: z.number().int().optional().describe("Brokerage account id (exact; wins over name)."),
-      fromCurrency: supportedCurrencyEnum.describe("Currency debited (source sleeve)."),
-      fromAmount: z.number().positive().describe("Amount debited from the source sleeve (> 0)."),
-      toCurrency: supportedCurrencyEnum.describe("Currency credited (destination sleeve)."),
-      toAmount: z.number().positive().describe("Amount credited to the destination sleeve (> 0)."),
-      feeAmount: z.number().positive().optional().describe("Optional conversion fee (> 0)."),
-      feeCurrency: supportedCurrencyEnum.optional().describe("Currency of the fee."),
-      feeOnSleeveCurrency: supportedCurrencyEnum.optional().describe("Which sleeve currency absorbs the fee (defaults to feeCurrency)."),
-      date: ymdDate.optional().describe("YYYY-MM-DD (default: today)."),
-      payee: z.string().optional(),
-      note: z.string().optional(),
-    },
-    async ({ account, account_id, fromCurrency, fromAmount, toCurrency, toAmount, feeAmount, feeCurrency, feeOnSleeveCurrency, date, payee, note }) => {
+  async function opEntryFxConversion(argsObj: {
+    account?: string;
+    account_id?: number;
+    fromCurrency: string;
+    fromAmount: number;
+    toCurrency: string;
+    toAmount: number;
+    feeAmount?: number;
+    feeCurrency?: string;
+    feeOnSleeveCurrency?: string;
+    date?: string;
+    payee?: string;
+    note?: string;
+  }): Promise<ToolResult> {
+      const { account, account_id, fromCurrency, fromAmount, toCurrency, toAmount, feeAmount, feeCurrency, feeOnSleeveCurrency, date, payee, note } = argsObj;
       if (!dek) return err("portfolio_fx_conversion requires an active session DEK — log in again to encrypt the rows.");
       const accounts = await loadOpAccounts();
       const a = resolveOpAccount("account", account, account_id, accounts);
@@ -424,26 +401,21 @@ export function registerPortfolioTools(server: McpServer, ctx: PgToolContext) {
         if (m) return err(m);
         throw e;
       }
-    }
-  );
+  }
 
-
-  server.tool(
-    "portfolio_deposit",
-    "Fund a brokerage cash sleeve from a non-investment (bank/chequing) account. Writes a brokerage_deposit_out / brokerage_deposit_in pair linked by link_id. The destination cash sleeve must already exist (or pass destCashSleeveHoldingId). CREATE-ONLY.",
-    {
-      sourceAccount: z.string().optional().describe("Source (non-investment) account name or alias. Pass this or sourceAccount_id."),
-      sourceAccount_id: z.number().int().optional().describe("Source account id (exact; wins over name)."),
-      destAccount: z.string().optional().describe("Destination brokerage account name or alias. Pass this or destAccount_id."),
-      destAccount_id: z.number().int().optional().describe("Destination brokerage account id (exact; wins over name)."),
-      destCashSleeveHoldingId: z.number().int().optional().describe("Explicit destination cash sleeve; defaults to the brokerage's cash sleeve for the amount currency."),
-      amount: z.number().positive().describe("Amount transferred (> 0)."),
-      date: ymdDate.optional().describe("YYYY-MM-DD (default: today)."),
-      payee: z.string().optional(),
-      note: z.string().optional(),
-      tags: z.string().optional(),
-    },
-    async ({ sourceAccount, sourceAccount_id, destAccount, destAccount_id, destCashSleeveHoldingId, amount, date, payee, note, tags }) => {
+  async function opEntryDeposit(argsObj: {
+    sourceAccount?: string;
+    sourceAccount_id?: number;
+    destAccount?: string;
+    destAccount_id?: number;
+    destCashSleeveHoldingId?: number;
+    amount: number;
+    date?: string;
+    payee?: string;
+    note?: string;
+    tags?: string;
+  }): Promise<ToolResult> {
+      const { sourceAccount, sourceAccount_id, destAccount, destAccount_id, destCashSleeveHoldingId, amount, date, payee, note, tags } = argsObj;
       if (!dek) return err("portfolio_deposit requires an active session DEK — log in again to encrypt the rows.");
       const accounts = await loadOpAccounts();
       const src = resolveOpAccount("sourceAccount", sourceAccount, sourceAccount_id, accounts);
@@ -461,26 +433,21 @@ export function registerPortfolioTools(server: McpServer, ctx: PgToolContext) {
         if (m) return err(m);
         throw e;
       }
-    }
-  );
+  }
 
-
-  server.tool(
-    "portfolio_withdrawal",
-    "Withdraw cash from a brokerage cash sleeve to a non-investment (bank/chequing) account. Writes a brokerage_withdrawal_out / brokerage_withdrawal_in pair linked by link_id. The source cash sleeve must already exist (or pass sourceCashSleeveHoldingId). CREATE-ONLY.",
-    {
-      sourceAccount: z.string().optional().describe("Source brokerage account name or alias. Pass this or sourceAccount_id."),
-      sourceAccount_id: z.number().int().optional().describe("Source brokerage account id (exact; wins over name)."),
-      sourceCashSleeveHoldingId: z.number().int().optional().describe("Explicit source cash sleeve; defaults to the brokerage's cash sleeve for the amount currency."),
-      destAccount: z.string().optional().describe("Destination (non-investment) account name or alias. Pass this or destAccount_id."),
-      destAccount_id: z.number().int().optional().describe("Destination account id (exact; wins over name)."),
-      amount: z.number().positive().describe("Amount withdrawn (> 0)."),
-      date: ymdDate.optional().describe("YYYY-MM-DD (default: today)."),
-      payee: z.string().optional(),
-      note: z.string().optional(),
-      tags: z.string().optional(),
-    },
-    async ({ sourceAccount, sourceAccount_id, sourceCashSleeveHoldingId, destAccount, destAccount_id, amount, date, payee, note, tags }) => {
+  async function opEntryWithdrawal(argsObj: {
+    sourceAccount?: string;
+    sourceAccount_id?: number;
+    sourceCashSleeveHoldingId?: number;
+    destAccount?: string;
+    destAccount_id?: number;
+    amount: number;
+    date?: string;
+    payee?: string;
+    note?: string;
+    tags?: string;
+  }): Promise<ToolResult> {
+      const { sourceAccount, sourceAccount_id, sourceCashSleeveHoldingId, destAccount, destAccount_id, amount, date, payee, note, tags } = argsObj;
       if (!dek) return err("portfolio_withdrawal requires an active session DEK — log in again to encrypt the rows.");
       const accounts = await loadOpAccounts();
       const src = resolveOpAccount("sourceAccount", sourceAccount, sourceAccount_id, accounts);
@@ -498,7 +465,315 @@ export function registerPortfolioTools(server: McpServer, ctx: PgToolContext) {
         if (m) return err(m);
         throw e;
       }
-    }
+  }
+
+  // ── consolidated tool: portfolio_record_entry + hidden aliases ─────────────
+  // `entry_type` discriminator (owner decision #5 — the domain-appropriate
+  // exception to the `op` standard). Each variant carries its op's exact
+  // schema; the dispatcher routes to the verbatim handler (which still calls
+  // the sanctioned operations.ts helper — audit #8).
+  const accountRef = {
+    account: z.string().optional().describe("Brokerage account name or alias (strict fuzzy). Pass this or account_id."),
+    account_id: z.number().int().optional().describe("Brokerage account id (exact; wins over name)."),
+  };
+  registerManageTool(
+    server,
+    "portfolio_record_entry",
+    "Record a portfolio ledger entry: `entry_type` selects buy / sell / swap / transfer / income_expense / fx_conversion / deposit / withdrawal. Writes the canonical, sign-correct legs (stock +, cash −, sum 0) via the lot-aware operations engine — cash sleeves must already exist. CREATE-ONLY (edit on the web). For a net-worth snapshot use add_snapshot; for share moves between accounts use entry_type:transfer.",
+    z.discriminatedUnion("entry_type", [
+      z.object({
+        entry_type: z.literal("buy"),
+        ...accountRef,
+        holding: z.string().optional().describe("Holding name or ticker to buy (must already exist in the account). Pass this or holdingId."),
+        holdingId: z.number().int().optional().describe("portfolio_holdings.id of the position (exact)."),
+        qty: z.number().positive().describe("Units acquired (> 0)."),
+        totalCost: z.number().positive().describe("Total cost in the holding's currency (> 0)."),
+        date: ymdDate.optional().describe("YYYY-MM-DD (default: today)."),
+        payee: z.string().optional(),
+        note: z.string().optional(),
+        tags: z.string().optional().describe("Comma-separated tags."),
+        cashSleeveHoldingId: z.number().int().optional().describe("Explicit cash sleeve to debit; defaults to the (account, holding-currency) sleeve."),
+      }),
+      z.object({
+        entry_type: z.literal("sell"),
+        ...accountRef,
+        holding: z.string().optional().describe("Holding name or ticker to sell (must already exist). Pass this or holdingId."),
+        holdingId: z.number().int().optional().describe("portfolio_holdings.id of the position (exact)."),
+        qty: z.number().positive().describe("Units sold (> 0)."),
+        totalProceeds: z.number().positive().describe("Total proceeds in the holding's currency (> 0)."),
+        date: ymdDate.optional().describe("YYYY-MM-DD (default: today)."),
+        lotSelection: z.object({
+          method: z.enum(["FIFO", "HIFO", "SPECIFIC"]),
+          lotIds: z.array(z.number().int().positive()).optional(),
+          lots: z.array(z.object({ lotId: z.number().int().positive(), qty: z.number().positive() })).optional(),
+        }).optional().describe("Lot disposal strategy (default FIFO). SPECIFIC requires lotIds or per-lot lots."),
+        payee: z.string().optional(),
+        note: z.string().optional(),
+        tags: z.string().optional(),
+        cashSleeveHoldingId: z.number().int().optional().describe("Explicit cash sleeve to credit; defaults to the (account, holding-currency) sleeve."),
+      }),
+      z.object({
+        entry_type: z.literal("swap"),
+        ...accountRef,
+        sourceHolding: z.string().optional().describe("Holding being sold (name/ticker). Pass this or sourceHoldingId."),
+        sourceHoldingId: z.number().int().optional().describe("portfolio_holdings.id of the holding being sold."),
+        sourceQty: z.number().positive().describe("Units of the source holding disposed (> 0)."),
+        sourceProceeds: z.number().positive().describe("Proceeds realised from the source (> 0), in account/holding currency."),
+        destHolding: z.string().optional().describe("Holding being acquired (name/ticker). Pass this or destHoldingId."),
+        destHoldingId: z.number().int().optional().describe("portfolio_holdings.id of the holding being acquired."),
+        destQty: z.number().positive().describe("Units of the destination holding acquired (> 0)."),
+        destCost: z.number().positive().describe("Cost allocated to the destination (> 0)."),
+        date: ymdDate.optional().describe("YYYY-MM-DD (default: today)."),
+        payee: z.string().optional(),
+        note: z.string().optional(),
+      }),
+      z.object({
+        entry_type: z.literal("transfer"),
+        sourceAccount: z.string().optional().describe("Source brokerage account name or alias. Pass this or sourceAccount_id."),
+        sourceAccount_id: z.number().int().optional().describe("Source account id (exact; wins over name)."),
+        destAccount: z.string().optional().describe("Destination brokerage account name or alias. Pass this or destAccount_id."),
+        destAccount_id: z.number().int().optional().describe("Destination account id (exact; wins over name)."),
+        holding: z.string().optional().describe("Holding to move (name/ticker), resolved in the source account. Pass this or holdingId."),
+        holdingId: z.number().int().optional().describe("portfolio_holdings.id of the holding (in the source account)."),
+        qty: z.number().positive().describe("Units leaving source / arriving at destination (> 0)."),
+        date: ymdDate.optional().describe("YYYY-MM-DD (default: today)."),
+        payee: z.string().optional(),
+        note: z.string().optional(),
+      }),
+      z.object({
+        entry_type: z.literal("income_expense"),
+        ...accountRef,
+        currency: supportedCurrencyEnum.describe("Currency of the cash sleeve to credit/debit (ISO code)."),
+        amount: z.number().refine((v) => v !== 0, { message: "amount cannot be 0" }).describe("Positive = income (dividend/interest), negative = expense (fee)."),
+        incomeType: z.enum(["dividend", "interest", "fee", "other"]).optional().describe("Category hint. dividend/interest apply to income (amount>0); fee to expense (amount<0); other leaves the category unset. Ignored when categoryId is given."),
+        relatedHolding: z.string().optional().describe("Holding (name/ticker) this income/expense relates to, for reporting. Pass this or relatedHoldingId."),
+        relatedHoldingId: z.number().int().optional().describe("portfolio_holdings.id this relates to."),
+        categoryId: z.number().int().optional().describe("Explicit category id (overrides incomeType)."),
+        date: ymdDate.optional().describe("YYYY-MM-DD (default: today)."),
+        payee: z.string().optional(),
+        note: z.string().optional(),
+        tags: z.string().optional(),
+      }),
+      z.object({
+        entry_type: z.literal("fx_conversion"),
+        ...accountRef,
+        fromCurrency: supportedCurrencyEnum.describe("Currency debited (source sleeve)."),
+        fromAmount: z.number().positive().describe("Amount debited from the source sleeve (> 0)."),
+        toCurrency: supportedCurrencyEnum.describe("Currency credited (destination sleeve)."),
+        toAmount: z.number().positive().describe("Amount credited to the destination sleeve (> 0)."),
+        feeAmount: z.number().positive().optional().describe("Optional conversion fee (> 0)."),
+        feeCurrency: supportedCurrencyEnum.optional().describe("Currency of the fee."),
+        feeOnSleeveCurrency: supportedCurrencyEnum.optional().describe("Which sleeve currency absorbs the fee (defaults to feeCurrency)."),
+        date: ymdDate.optional().describe("YYYY-MM-DD (default: today)."),
+        payee: z.string().optional(),
+        note: z.string().optional(),
+      }),
+      z.object({
+        entry_type: z.literal("deposit"),
+        sourceAccount: z.string().optional().describe("Source (non-investment) account name or alias. Pass this or sourceAccount_id."),
+        sourceAccount_id: z.number().int().optional().describe("Source account id (exact; wins over name)."),
+        destAccount: z.string().optional().describe("Destination brokerage account name or alias. Pass this or destAccount_id."),
+        destAccount_id: z.number().int().optional().describe("Destination brokerage account id (exact; wins over name)."),
+        destCashSleeveHoldingId: z.number().int().optional().describe("Explicit destination cash sleeve; defaults to the brokerage's cash sleeve for the amount currency."),
+        amount: z.number().positive().describe("Amount transferred (> 0)."),
+        date: ymdDate.optional().describe("YYYY-MM-DD (default: today)."),
+        payee: z.string().optional(),
+        note: z.string().optional(),
+        tags: z.string().optional(),
+      }),
+      z.object({
+        entry_type: z.literal("withdrawal"),
+        sourceAccount: z.string().optional().describe("Source brokerage account name or alias. Pass this or sourceAccount_id."),
+        sourceAccount_id: z.number().int().optional().describe("Source brokerage account id (exact; wins over name)."),
+        sourceCashSleeveHoldingId: z.number().int().optional().describe("Explicit source cash sleeve; defaults to the brokerage's cash sleeve for the amount currency."),
+        destAccount: z.string().optional().describe("Destination (non-investment) account name or alias. Pass this or destAccount_id."),
+        destAccount_id: z.number().int().optional().describe("Destination account id (exact; wins over name)."),
+        amount: z.number().positive().describe("Amount withdrawn (> 0)."),
+        date: ymdDate.optional().describe("YYYY-MM-DD (default: today)."),
+        payee: z.string().optional(),
+        note: z.string().optional(),
+        tags: z.string().optional(),
+      }),
+    ]),
+    async (input) => {
+      switch (input.entry_type) {
+        case "buy":
+          return opEntryBuy(input);
+        case "sell":
+          return opEntrySell(input);
+        case "swap":
+          return opEntrySwap(input);
+        case "transfer":
+          return opEntryTransfer(input);
+        case "income_expense":
+          return opEntryIncomeExpense(input);
+        case "fx_conversion":
+          return opEntryFxConversion(input);
+        case "deposit":
+          return opEntryDeposit(input);
+        case "withdrawal":
+          return opEntryWithdrawal(input);
+      }
+    },
+  );
+
+  registerAlias(
+    server,
+    "portfolio_buy",
+    "Buy shares/units of a holding in a brokerage account. Writes the canonical buy + buy_cash_leg pair (stock leg positive, cash leg negative, sum 0), opens a cost-basis lot, and debits the cash sleeve for the holding's currency — that sleeve must already exist (add_portfolio_holding a 'Cash' holding for the currency first if missing). Resolve the account by `account` name (strict fuzzy) or exact `account_id`, and the position by `holding` name/ticker or exact `holdingId`. CREATE-ONLY (edit on the web). Replaces the removed record_trade buy path.",
+    {
+      account: z.string().optional().describe("Brokerage account name or alias (strict fuzzy). Pass this or account_id."),
+      account_id: z.number().int().optional().describe("Brokerage account id (exact; wins over name)."),
+      holding: z.string().optional().describe("Holding name or ticker to buy (must already exist in the account). Pass this or holdingId."),
+      holdingId: z.number().int().optional().describe("portfolio_holdings.id of the position (exact)."),
+      qty: z.number().positive().describe("Units acquired (> 0)."),
+      totalCost: z.number().positive().describe("Total cost in the holding's currency (> 0)."),
+      date: ymdDate.optional().describe("YYYY-MM-DD (default: today)."),
+      payee: z.string().optional(),
+      note: z.string().optional(),
+      tags: z.string().optional().describe("Comma-separated tags."),
+      cashSleeveHoldingId: z.number().int().optional().describe("Explicit cash sleeve to debit; defaults to the (account, holding-currency) sleeve."),
+    },
+    async (args) => opEntryBuy(args),
+  );
+  registerAlias(
+    server,
+    "portfolio_sell",
+    "Sell shares/units of a holding in a brokerage account. Writes sell + sell_cash_leg (stock leg negative, cash leg positive, sum 0), closes cost-basis lots, and credits the cash sleeve. `lotSelection.method` is FIFO (default), HIFO, or SPECIFIC (SPECIFIC needs lotIds or per-lot lots[]). CREATE-ONLY. Replaces the removed record_trade sell path.",
+    {
+      account: z.string().optional().describe("Brokerage account name or alias. Pass this or account_id."),
+      account_id: z.number().int().optional().describe("Brokerage account id (exact; wins over name)."),
+      holding: z.string().optional().describe("Holding name or ticker to sell (must already exist). Pass this or holdingId."),
+      holdingId: z.number().int().optional().describe("portfolio_holdings.id of the position (exact)."),
+      qty: z.number().positive().describe("Units sold (> 0)."),
+      totalProceeds: z.number().positive().describe("Total proceeds in the holding's currency (> 0)."),
+      date: ymdDate.optional().describe("YYYY-MM-DD (default: today)."),
+      lotSelection: z.object({
+        method: z.enum(["FIFO", "HIFO", "SPECIFIC"]),
+        lotIds: z.array(z.number().int().positive()).optional(),
+        lots: z.array(z.object({ lotId: z.number().int().positive(), qty: z.number().positive() })).optional(),
+      }).optional().describe("Lot disposal strategy (default FIFO). SPECIFIC requires lotIds or per-lot lots."),
+      payee: z.string().optional(),
+      note: z.string().optional(),
+      tags: z.string().optional(),
+      cashSleeveHoldingId: z.number().int().optional().describe("Explicit cash sleeve to credit; defaults to the (account, holding-currency) sleeve."),
+    },
+    async (args) => opEntrySell(args),
+  );
+  registerAlias(
+    server,
+    "portfolio_swap",
+    "Swap one holding for another inside a SINGLE brokerage account in one atomic operation. Runs an internal sell of the source + buy of the destination, sharing a swap_link_id. Both holdings must already exist in the account. CREATE-ONLY.",
+    {
+      account: z.string().optional().describe("Brokerage account name or alias. Pass this or account_id."),
+      account_id: z.number().int().optional().describe("Brokerage account id (exact; wins over name)."),
+      sourceHolding: z.string().optional().describe("Holding being sold (name/ticker). Pass this or sourceHoldingId."),
+      sourceHoldingId: z.number().int().optional().describe("portfolio_holdings.id of the holding being sold."),
+      sourceQty: z.number().positive().describe("Units of the source holding disposed (> 0)."),
+      sourceProceeds: z.number().positive().describe("Proceeds realised from the source (> 0), in account/holding currency."),
+      destHolding: z.string().optional().describe("Holding being acquired (name/ticker). Pass this or destHoldingId."),
+      destHoldingId: z.number().int().optional().describe("portfolio_holdings.id of the holding being acquired."),
+      destQty: z.number().positive().describe("Units of the destination holding acquired (> 0)."),
+      destCost: z.number().positive().describe("Cost allocated to the destination (> 0)."),
+      date: ymdDate.optional().describe("YYYY-MM-DD (default: today)."),
+      payee: z.string().optional(),
+      note: z.string().optional(),
+    },
+    async (args) => opEntrySwap(args),
+  );
+  registerAlias(
+    server,
+    "portfolio_transfer",
+    "Move shares/units of the SAME holding between two different brokerage accounts (in-kind, no cash). Cascades cost basis from source to destination. The holding is resolved in the SOURCE account; source and destination accounts must differ. CREATE-ONLY.",
+    {
+      sourceAccount: z.string().optional().describe("Source brokerage account name or alias. Pass this or sourceAccount_id."),
+      sourceAccount_id: z.number().int().optional().describe("Source account id (exact; wins over name)."),
+      destAccount: z.string().optional().describe("Destination brokerage account name or alias. Pass this or destAccount_id."),
+      destAccount_id: z.number().int().optional().describe("Destination account id (exact; wins over name)."),
+      holding: z.string().optional().describe("Holding to move (name/ticker), resolved in the source account. Pass this or holdingId."),
+      holdingId: z.number().int().optional().describe("portfolio_holdings.id of the holding (in the source account)."),
+      qty: z.number().positive().describe("Units leaving source / arriving at destination (> 0)."),
+      date: ymdDate.optional().describe("YYYY-MM-DD (default: today)."),
+      payee: z.string().optional(),
+      note: z.string().optional(),
+    },
+    async (args) => opEntryTransfer(args),
+  );
+  registerAlias(
+    server,
+    "portfolio_income_expense",
+    "Record portfolio income (dividend/interest, amount > 0) or an expense (fee, amount < 0) on a brokerage cash sleeve. The cash sleeve for `currency` must already exist. `incomeType` resolves the canonical category (Dividends/Interest/Fees) when no explicit categoryId is given and the sign matches. Optionally tie the row to the holding that earned it via relatedHolding/relatedHoldingId. CREATE-ONLY.",
+    {
+      account: z.string().optional().describe("Brokerage account name or alias. Pass this or account_id."),
+      account_id: z.number().int().optional().describe("Brokerage account id (exact; wins over name)."),
+      currency: supportedCurrencyEnum.describe("Currency of the cash sleeve to credit/debit (ISO code)."),
+      amount: z.number().refine((v) => v !== 0, { message: "amount cannot be 0" }).describe("Positive = income (dividend/interest), negative = expense (fee)."),
+      incomeType: z.enum(["dividend", "interest", "fee", "other"]).optional().describe("Category hint. dividend/interest apply to income (amount>0); fee to expense (amount<0); other leaves the category unset. Ignored when categoryId is given."),
+      relatedHolding: z.string().optional().describe("Holding (name/ticker) this income/expense relates to, for reporting. Pass this or relatedHoldingId."),
+      relatedHoldingId: z.number().int().optional().describe("portfolio_holdings.id this relates to."),
+      categoryId: z.number().int().optional().describe("Explicit category id (overrides incomeType)."),
+      date: ymdDate.optional().describe("YYYY-MM-DD (default: today)."),
+      payee: z.string().optional(),
+      note: z.string().optional(),
+      tags: z.string().optional(),
+    },
+    async (args) => opEntryIncomeExpense(args),
+  );
+  registerAlias(
+    server,
+    "portfolio_fx_conversion",
+    "Convert cash from one currency to another inside a SINGLE brokerage account (e.g. USD sleeve → CAD sleeve). Writes fx_from + fx_to (+ optional fx_fee). Both currency sleeves (and the fee sleeve, if any) must already exist. CREATE-ONLY.",
+    {
+      account: z.string().optional().describe("Brokerage account name or alias. Pass this or account_id."),
+      account_id: z.number().int().optional().describe("Brokerage account id (exact; wins over name)."),
+      fromCurrency: supportedCurrencyEnum.describe("Currency debited (source sleeve)."),
+      fromAmount: z.number().positive().describe("Amount debited from the source sleeve (> 0)."),
+      toCurrency: supportedCurrencyEnum.describe("Currency credited (destination sleeve)."),
+      toAmount: z.number().positive().describe("Amount credited to the destination sleeve (> 0)."),
+      feeAmount: z.number().positive().optional().describe("Optional conversion fee (> 0)."),
+      feeCurrency: supportedCurrencyEnum.optional().describe("Currency of the fee."),
+      feeOnSleeveCurrency: supportedCurrencyEnum.optional().describe("Which sleeve currency absorbs the fee (defaults to feeCurrency)."),
+      date: ymdDate.optional().describe("YYYY-MM-DD (default: today)."),
+      payee: z.string().optional(),
+      note: z.string().optional(),
+    },
+    async (args) => opEntryFxConversion(args),
+  );
+  registerAlias(
+    server,
+    "portfolio_deposit",
+    "Fund a brokerage cash sleeve from a non-investment (bank/chequing) account. Writes a brokerage_deposit_out / brokerage_deposit_in pair linked by link_id. The destination cash sleeve must already exist (or pass destCashSleeveHoldingId). CREATE-ONLY.",
+    {
+      sourceAccount: z.string().optional().describe("Source (non-investment) account name or alias. Pass this or sourceAccount_id."),
+      sourceAccount_id: z.number().int().optional().describe("Source account id (exact; wins over name)."),
+      destAccount: z.string().optional().describe("Destination brokerage account name or alias. Pass this or destAccount_id."),
+      destAccount_id: z.number().int().optional().describe("Destination brokerage account id (exact; wins over name)."),
+      destCashSleeveHoldingId: z.number().int().optional().describe("Explicit destination cash sleeve; defaults to the brokerage's cash sleeve for the amount currency."),
+      amount: z.number().positive().describe("Amount transferred (> 0)."),
+      date: ymdDate.optional().describe("YYYY-MM-DD (default: today)."),
+      payee: z.string().optional(),
+      note: z.string().optional(),
+      tags: z.string().optional(),
+    },
+    async (args) => opEntryDeposit(args),
+  );
+  registerAlias(
+    server,
+    "portfolio_withdrawal",
+    "Withdraw cash from a brokerage cash sleeve to a non-investment (bank/chequing) account. Writes a brokerage_withdrawal_out / brokerage_withdrawal_in pair linked by link_id. The source cash sleeve must already exist (or pass sourceCashSleeveHoldingId). CREATE-ONLY.",
+    {
+      sourceAccount: z.string().optional().describe("Source brokerage account name or alias. Pass this or sourceAccount_id."),
+      sourceAccount_id: z.number().int().optional().describe("Source brokerage account id (exact; wins over name)."),
+      sourceCashSleeveHoldingId: z.number().int().optional().describe("Explicit source cash sleeve; defaults to the brokerage's cash sleeve for the amount currency."),
+      destAccount: z.string().optional().describe("Destination (non-investment) account name or alias. Pass this or destAccount_id."),
+      destAccount_id: z.number().int().optional().describe("Destination account id (exact; wins over name)."),
+      amount: z.number().positive().describe("Amount withdrawn (> 0)."),
+      date: ymdDate.optional().describe("YYYY-MM-DD (default: today)."),
+      payee: z.string().optional(),
+      note: z.string().optional(),
+      tags: z.string().optional(),
+    },
+    async (args) => opEntryWithdrawal(args),
   );
 
 

@@ -125,6 +125,13 @@ const CASES: Array<{
     missingField: { op: "record" }, // missing amount
     good: { op: "delete", linkId: "x" },
   },
+  {
+    // Phase 4: uses the `entry_type` discriminator (owner decision #5), not `op`.
+    name: "portfolio_record_entry",
+    badOp: { entry_type: "short", holding: "AAPL" },
+    missingField: { entry_type: "buy", holding: "AAPL" }, // missing qty/totalCost
+    good: { entry_type: "buy", holding: "AAPL", qty: 10, totalCost: 1900 },
+  },
 ];
 
 describe("consolidated manage_* schema contracts (FINLYNQ-263 tc-2)", () => {

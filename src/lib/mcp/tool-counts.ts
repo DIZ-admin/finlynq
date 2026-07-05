@@ -5,8 +5,9 @@
 // from tools/list), which do NOT count here. Phase 1 folded 6 CRUD families
 // (goals/accounts/budgets/fx-overrides/categories/holdings): 117 → 104. Phase 2
 // folded rules/subscriptions/loans: 104 → 92. Phase 3 folded splits/transactions/
-// transfers: 92 → 83.
-export const MCP_TOOL_COUNTS = { http: 83, stdio: 93 } as const;
+// transfers: 92 → 83. Phase 4 folded the 8 portfolio_* writers into
+// portfolio_record_entry (entry_type union; add_snapshot stays standalone): 83 → 76.
+export const MCP_TOOL_COUNTS = { http: 76, stdio: 93 } as const;
 // 3.4.0 (FINLYNQ-264): destructive-tool safety pass — tier-1 deletes
 // (delete_transfer / delete_account / delete_portfolio_holding) now require a
 // preview→confirmation-token two-step, tier-2 single-row deletes accept an
