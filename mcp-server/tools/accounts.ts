@@ -34,6 +34,7 @@ import {
 import {
   invalidateUser as invalidateUserTxCache,
 } from "../../src/lib/mcp/user-tx-cache";
+import { withConfirmation, PreviewAbortError } from "./_confirm";
 
 export function registerAccountsTools(server: McpServer, ctx: PgToolContext) {
   const { db, userId, dek, encNote } = ctx;
@@ -217,90 +218,135 @@ export function registerAccountsTools(server: McpServer, ctx: PgToolContext) {
   // FK CASCADE remains DB-side: deleting an account drops its `transactions`,
   // `holding_accounts`, and `goal_accounts` rows automatically — no
   // application-layer child DELETEs needed.
+  // FINLYNQ-264 Phase 1 (tier-1 — biggest blast radius): a non-empty /
+  // force delete CASCADEs the account's transactions + holding_accounts +
+  // goal_accounts, so it now requires the preview→token two-step. A CLEAN,
+  // EMPTY account (no transactions) still deletes directly (the `required`
+  // predicate returns false → no token needed). Resolution (id/name, mismatch
+  // guard, DEK refusal) is unchanged and shared across every phase via the
+  // memoized `resolve()`; the token payload binds the resolved id + force flag.
+  type DeleteAccountArgs = {
+    accountId?: number;
+    account?: string;
+    force?: boolean;
+    confirmation_token?: string;
+    // memo slots (populated by resolve(), reused across required/preview/commit)
+    __acct?: Row;
+    __count?: number;
+  };
+
+  /**
+   * Resolve the target account + its transaction count ONCE per tool call,
+   * memoized on the args object so `required`/`tokenPayload`/`preview`/`commit`
+   * share the same result. Aborts (PreviewAbortError) on any resolution failure
+   * so the middleware surfaces a clean tool error and mints no token.
+   */
+  async function resolveDeleteAccount(a: DeleteAccountArgs): Promise<{ acct: Row; count: number }> {
+    if (a.__acct) return { acct: a.__acct, count: a.__count ?? 0 };
+    const { accountId, account } = a;
+    if (accountId == null && (account == null || account === "")) {
+      throw new PreviewAbortError("Pass `accountId` (numeric) or `account` (name/alias) to identify the account.");
+    }
+    // Resolve via id first when supplied — the safe path that never depends on
+    // the DEK. SELECT both encrypted columns so we can echo a name.
+    let acct: Row | null = null;
+    if (accountId != null) {
+      const rows = await q(db, sql`
+        SELECT id, name_ct, alias_ct FROM accounts WHERE user_id = ${userId} AND id = ${accountId}
+      `);
+      if (!rows.length) throw new PreviewAbortError(`Account #${accountId} not found.`);
+      acct = decryptNameish(rows, dek)[0];
+    }
+    // Resolve via name (fuzzy). Refuses without a DEK.
+    let resolvedByName: Row | null = null;
+    if (account != null && account !== "") {
+      if (!dek) {
+        throw new PreviewAbortError("Cannot resolve account by name without an unlocked DEK (Stream D Phase 4). Pass `accountId` instead.");
+      }
+      const rawAccounts = await q(db, sql`
+        SELECT id, name_ct, alias_ct FROM accounts WHERE user_id = ${userId}
+      `);
+      const allAccounts = decryptNameish(rawAccounts, dek);
+      resolvedByName = fuzzyFind(account, allAccounts);
+      if (!resolvedByName) {
+        throw new PreviewAbortError(`Account "${account}" not found. Did you mean: ${suggestionList(account, allAccounts)}?`);
+      }
+    }
+    // Both supplied — fail loud on mismatch.
+    if (acct && resolvedByName) {
+      if (Number(acct.id) !== Number(resolvedByName.id)) {
+        throw new PreviewAbortError(`Account mismatch: "${account}" resolves to #${Number(resolvedByName.id)}, but accountId=${Number(acct.id)} was supplied.`);
+      }
+    } else if (!acct && resolvedByName) {
+      acct = resolvedByName;
+    }
+    if (!acct) {
+      throw new PreviewAbortError("Pass `accountId` (numeric) or `account` (name/alias) to identify the account.");
+    }
+    const acctId = Number(acct.id);
+    const txnCount = await q(db, sql`SELECT COUNT(*) as cnt FROM transactions WHERE user_id = ${userId} AND account_id = ${acctId}`);
+    const count = Number(txnCount[0]?.cnt ?? 0);
+    a.__acct = acct;
+    a.__count = count;
+    return { acct, count };
+  }
+
   server.tool(
     "delete_account",
-    "Delete an account (only if it has no transactions). Pass exactly ONE of `accountId` (preferred, exact) or `account` (name/alias, fuzzy). Supplying both is allowed only when they resolve to the same account — a mismatch fails loud and does NOT delete.",
+    "Delete an account. Pass exactly ONE of `accountId` (preferred, exact) or `account` (name/alias, fuzzy). A non-empty account (has transactions) or `force=true` is DESTRUCTIVE — it CASCADEs the account's transactions, holding_accounts, and goal_accounts — so it requires a two-step: the first call returns a preview (name + tx/holding/goal counts) + a confirmationToken (single-use, 5-min TTL) and deletes NOTHING; call again with the token to commit. A CLEAN, empty account deletes directly. Supplying both id + name is allowed only when they resolve to the same account.",
     {
       accountId: z.number().int().positive().optional().describe("Account FK (accounts.id). Exact match — preferred and the only way to delete an account when the user's DEK is not unlocked."),
       account: z.string().optional().describe("Account name or alias (fuzzy matched against name; exact match on alias). Requires an unlocked DEK because account names live in encrypted columns post Stream D Phase 4. Pass `accountId` instead when no DEK is available."),
-      force: z.boolean().optional().describe("Delete even if transactions exist. FK CASCADE removes the account's transactions, holding_accounts, and goal_accounts rows — irreversible."),
+      force: z.boolean().optional().describe("Delete even if transactions exist. FK CASCADE removes the account's transactions, holding_accounts, and goal_accounts rows — irreversible. A non-empty delete ALWAYS requires the confirmation token regardless of this flag."),
+      confirmation_token: z.string().optional().describe("Omit to preview; pass the preview's token to commit a non-empty/force delete. Single-use, 5-min TTL. Not needed to delete a clean empty account."),
     },
-    async ({ accountId, account, force }) => {
-      if (accountId == null && (account == null || account === "")) {
-        return err("Pass `accountId` (numeric) or `account` (name/alias) to identify the account.");
-      }
-
-      // Resolve via id first when supplied — the safe path that never depends
-      // on the DEK. SELECT both encrypted columns so we can echo a name on
-      // success when a DEK happens to be available.
-      let acct: Row | null = null;
-      if (accountId != null) {
-        const rows = await q(db, sql`
-          SELECT id, name_ct, alias_ct FROM accounts WHERE user_id = ${userId} AND id = ${accountId}
-        `);
-        if (!rows.length) return err(`Account #${accountId} not found.`);
-        acct = decryptNameish(rows, dek)[0];
-      }
-
-      // Resolve via name (fuzzy). Refuses without a DEK — same shape as the
-      // stdio counterpart's refusal at register-core-tools.ts:1322-1326.
-      let resolvedByName: Row | null = null;
-      if (account != null && account !== "") {
-        if (!dek) {
-          return err("Cannot resolve account by name without an unlocked DEK (Stream D Phase 4). Pass `accountId` instead.");
-        }
-        const rawAccounts = await q(db, sql`
-          SELECT id, name_ct, alias_ct FROM accounts WHERE user_id = ${userId}
-        `);
-        const allAccounts = decryptNameish(rawAccounts, dek);
-        resolvedByName = fuzzyFind(account, allAccounts);
-        if (!resolvedByName) {
-          return err(`Account "${account}" not found. Did you mean: ${suggestionList(account, allAccounts)}?`);
-        }
-      }
-
-      // When BOTH params supplied, fail loud on mismatch — never silently
-      // prefer one. (Matching ids: pick the id-resolved row so the success
-      // message uses its decrypted name.)
-      if (acct && resolvedByName) {
-        if (Number(acct.id) !== Number(resolvedByName.id)) {
-          return err(`Account mismatch: "${account}" resolves to #${Number(resolvedByName.id)}, but accountId=${Number(acct.id)} was supplied.`);
-        }
-        // Same row — id branch already populated `acct`, keep it.
-      } else if (!acct && resolvedByName) {
-        acct = resolvedByName;
-      }
-
-      if (!acct) {
-        // Defense in depth — the input-shape guard above should have caught this.
-        return err("Pass `accountId` (numeric) or `account` (name/alias) to identify the account.");
-      }
-
-      const acctName = (acct.name as string | undefined) ?? "<encrypted>";
-      const acctId = Number(acct.id);
-
-      const txnCount = await q(db, sql`SELECT COUNT(*) as cnt FROM transactions WHERE user_id = ${userId} AND account_id = ${acctId}`);
-      const count = Number(txnCount[0]?.cnt ?? 0);
-      if (count > 0 && !force) {
-        return err(`Account #${acctId} ("${acctName}") has ${count} transaction(s). Pass force=true to delete anyway.`);
-      }
-
-      // FK CASCADE: this DELETE drops `transactions`, `holding_accounts`, and
-      // `goal_accounts` rows for this account in the same DB transaction. No
-      // application-layer child DELETEs needed (CLAUDE.md "wipe-account is
-      // single-transaction" gotcha).
-      await db.execute(sql`DELETE FROM accounts WHERE id = ${acctId} AND user_id = ${userId}`);
-      // CLAUDE.md invariant: every MCP tx-mutating write must invalidate the
-      // per-user tx cache. Mirrors `delete_budget` precedent at line ~4089.
-      invalidateUserTxCache(userId);
-      return text({
-        success: true,
-        data: {
+    withConfirmation<DeleteAccountArgs>(userId, {
+      operation: "delete_account",
+      tokenPayload: (a) => ({ accountId: a.__acct ? Number(a.__acct.id) : null, force: a.force === true }),
+      // Gate ON when force OR the account has transactions; skip (direct delete)
+      // for a clean empty account. resolve() runs here first, so the memo is
+      // primed for tokenPayload/preview/commit.
+      required: async (a) => {
+        const { count } = await resolveDeleteAccount(a);
+        return a.force === true || count > 0;
+      },
+      preview: async (a) => {
+        const { acct, count } = await resolveDeleteAccount(a);
+        const acctId = Number(acct.id);
+        const holdingCount = Number(
+          (await q(db, sql`SELECT COUNT(*) AS cnt FROM holding_accounts WHERE user_id = ${userId} AND account_id = ${acctId}`))[0]?.cnt ?? 0,
+        );
+        const goalCount = Number(
+          (await q(db, sql`SELECT COUNT(*) AS cnt FROM goal_accounts WHERE user_id = ${userId} AND account_id = ${acctId}`))[0]?.cnt ?? 0,
+        );
+        return {
           accountId: acctId,
-          message: `Account #${acctId} ("${acctName}") deleted${count > 0 ? ` (${count} transactions also removed)` : ""}`,
-        },
-      });
-    }
+          name: (acct.name as string | undefined) ?? "<encrypted>",
+          transactionCount: count,
+          holdingLinkCount: holdingCount,
+          goalLinkCount: goalCount,
+          cascades: "transactions, holding_accounts, goal_accounts",
+        };
+      },
+      commit: async (a) => {
+        const { acct, count } = await resolveDeleteAccount(a);
+        const acctId = Number(acct.id);
+        const acctName = (acct.name as string | undefined) ?? "<encrypted>";
+        // FK CASCADE: this DELETE drops `transactions`, `holding_accounts`, and
+        // `goal_accounts` rows for this account in the same DB transaction.
+        await db.execute(sql`DELETE FROM accounts WHERE id = ${acctId} AND user_id = ${userId}`);
+        // CLAUDE.md invariant: every MCP tx-mutating write must invalidate the
+        // per-user tx cache. Mirrors `delete_budget` precedent.
+        invalidateUserTxCache(userId);
+        return text({
+          success: true,
+          data: {
+            accountId: acctId,
+            message: `Account #${acctId} ("${acctName}") deleted${count > 0 ? ` (${count} transactions also removed)` : ""}`,
+          },
+        });
+      },
+    }),
   );
 
 

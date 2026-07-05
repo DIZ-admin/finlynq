@@ -25,6 +25,7 @@ import {
 } from "./_shared";
 import { aggregateHoldings } from "../../src/lib/portfolio/aggregate-holdings";
 import { getHoldingsValueByHolding } from "../../src/lib/holdings-value";
+import { withConfirmation, PreviewAbortError } from "./_confirm";
 import {
   sql,
 } from "drizzle-orm";
@@ -768,56 +769,95 @@ export function registerPortfolioTools(server: McpServer, ctx: PgToolContext) {
 
 
   // ── delete_portfolio_holding ───────────────────────────────────────────────
+  // FINLYNQ-264 Phase 1 (tier-1 when it has lots/tx): deleting a holding
+  // unlinks N transactions (FK SET NULL — they survive) AND cascade-deletes its
+  // holding_lots + closures (the lot IDENTITY is gone, not recoverable). So a
+  // holding with any linked transactions OR any lots now requires the
+  // preview→token two-step; a clean/empty holding (0 tx, 0 lots) deletes
+  // directly. Resolution (strict matcher, issue #127) is unchanged + memoized.
+  type DeleteHoldingArgs = {
+    holding: string;
+    confirmation_token?: string;
+    __h?: Row;
+    __txCount?: number;
+    __lotCount?: number;
+  };
+
+  async function resolveDeleteHolding(a: DeleteHoldingArgs): Promise<{ h: Row; txCount: number; lotCount: number }> {
+    if (a.__h) return { h: a.__h, txCount: a.__txCount ?? 0, lotCount: a.__lotCount ?? 0 };
+    const rawHoldings = await q(db, sql`
+      SELECT id, name_ct, symbol_ct
+      FROM portfolio_holdings
+      WHERE user_id = ${userId}
+    `);
+    const allHoldings = decryptNameish(rawHoldings, dek);
+    // Issue #127: strict matcher gated on token overlap so a tiny-named holding
+    // (e.g. "S") cannot swallow a longer input and DELETE the wrong row.
+    const resolved = resolvePortfolioHoldingStrict(a.holding, allHoldings);
+    if (!resolved.ok) {
+      if (resolved.reason === "low_confidence") {
+        const sName = String(resolved.suggestion.name ?? "");
+        throw new PreviewAbortError(`Holding "${a.holding}" did not match strongly — did you mean "${sName}" (id=${Number(resolved.suggestion.id)})? Re-call with the exact name to confirm.`);
+      }
+      throw new PreviewAbortError(`Holding "${a.holding}" not found`);
+    }
+    const h = resolved.holding;
+    const txCount = Number(
+      (await q(db, sql`SELECT COUNT(*) AS cnt FROM transactions WHERE user_id = ${userId} AND portfolio_holding_id = ${h.id}`))[0]?.cnt ?? 0,
+    );
+    const lotCount = Number(
+      (await q(db, sql`SELECT COUNT(*) AS cnt FROM holding_lots WHERE user_id = ${userId} AND holding_id = ${h.id}`))[0]?.cnt ?? 0,
+    );
+    a.__h = h;
+    a.__txCount = txCount;
+    a.__lotCount = lotCount;
+    return { h, txCount, lotCount };
+  }
+
   server.tool(
     "delete_portfolio_holding",
-    "Delete a portfolio holding. Transactions referencing it survive — the FK is set to NULL automatically (no data loss; they fall back to the orphan-aggregation path until reassigned).",
+    "Delete a portfolio holding. Transactions referencing it survive (the FK is set to NULL — they fall back to orphan aggregation), but its cost-basis LOTS cascade-delete. Two-step (destructive) when the holding has linked transactions OR lots: the first call returns a preview (name + tx/lot counts) + a confirmationToken (single-use, 5-min TTL) and deletes NOTHING; call again with the token to commit. A clean/empty holding deletes directly.",
     {
       holding: z.string().describe("Holding name OR symbol (fuzzy matched)"),
+      confirmation_token: z.string().optional().describe("Omit to preview; pass the preview's token to commit when the holding has transactions/lots. Single-use, 5-min TTL. Not needed for a clean/empty holding."),
     },
-    async ({ holding }) => {
-      const rawHoldings = await q(db, sql`
-        SELECT id, name_ct, symbol_ct
-        FROM portfolio_holdings
-        WHERE user_id = ${userId}
-      `);
-      const allHoldings = decryptNameish(rawHoldings, dek);
-      // Issue #127: resolve via strict matcher gated on token overlap so a
-      // tiny-named holding (e.g. "S") cannot silently swallow a longer input
-      // (e.g. "TESTV") via fuzzyFind's reverse-includes branch and DELETE
-      // the wrong row. Reads still tolerate fuzziness; destructive paths do not.
-      const resolved = resolvePortfolioHoldingStrict(holding, allHoldings);
-      if (!resolved.ok) {
-        if (resolved.reason === "low_confidence") {
-          const sName = String(resolved.suggestion.name ?? "");
-          return err(`Holding "${holding}" did not match strongly — did you mean "${sName}" (id=${Number(resolved.suggestion.id)})? Re-call with the exact name to confirm.`);
-        }
-        return err(`Holding "${holding}" not found`);
-      }
-      const h = resolved.holding;
-      // Capture decrypted name BEFORE the DELETE so the response renders
-      // truthful state, not whatever the matcher landed on after a stale read.
-      const matchedName = String(h.name ?? "");
-
-      const txnCount = await q(db, sql`
-        SELECT COUNT(*) AS cnt FROM transactions
-        WHERE user_id = ${userId} AND portfolio_holding_id = ${h.id}
-      `);
-      const count = Number(txnCount[0]?.cnt ?? 0);
-
-      await db.execute(sql`DELETE FROM portfolio_holdings WHERE id = ${h.id} AND user_id = ${userId}`);
-      // Per CLAUDE.md "Every MCP tx-mutating write must call invalidateUser":
-      // FK ON DELETE SET NULL mutates linked transactions' portfolio_holding_id,
-      // so the per-user tx cache must be invalidated.
-      invalidateUserTxCache(userId);
-      return text({
-        success: true,
-        data: {
-          message: count > 0
-            ? `Holding "${matchedName}" deleted; ${count} transaction(s) unlinked (still queryable, no longer aggregated under this holding).`
-            : `Holding "${matchedName}" deleted.`,
-        },
-      });
-    }
+    withConfirmation<DeleteHoldingArgs>(userId, {
+      operation: "delete_portfolio_holding",
+      tokenPayload: (a) => ({ holdingId: a.__h ? Number(a.__h.id) : null }),
+      required: async (a) => {
+        const { txCount, lotCount } = await resolveDeleteHolding(a);
+        return txCount > 0 || lotCount > 0;
+      },
+      preview: async (a) => {
+        const { h, txCount, lotCount } = await resolveDeleteHolding(a);
+        return {
+          holdingId: Number(h.id),
+          name: String(h.name ?? ""),
+          symbol: h.symbol ? String(h.symbol) : null,
+          transactionCount: txCount,
+          lotCount,
+          note: "Transactions survive (unlinked); lots cascade-delete.",
+        };
+      },
+      commit: async (a) => {
+        const { h, txCount } = await resolveDeleteHolding(a);
+        // Capture decrypted name BEFORE the DELETE so the response renders
+        // truthful state.
+        const matchedName = String(h.name ?? "");
+        await db.execute(sql`DELETE FROM portfolio_holdings WHERE id = ${h.id} AND user_id = ${userId}`);
+        // Per CLAUDE.md "Every MCP tx-mutating write must call invalidateUser":
+        // FK ON DELETE SET NULL mutates linked transactions' portfolio_holding_id.
+        invalidateUserTxCache(userId);
+        return text({
+          success: true,
+          data: {
+            message: txCount > 0
+              ? `Holding "${matchedName}" deleted; ${txCount} transaction(s) unlinked (still queryable, no longer aggregated under this holding).`
+              : `Holding "${matchedName}" deleted.`,
+          },
+        });
+      },
+    }),
   );
 
 

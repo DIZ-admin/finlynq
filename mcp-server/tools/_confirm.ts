@@ -117,41 +117,42 @@ export function withConfirmation<A extends { confirmation_token?: string }>(
   spec: ConfirmSpec<A>,
 ): (args: A) => Promise<ToolResult> {
   return async (args: A): Promise<ToolResult> => {
-    // Clean-case predicate: when required() is false, no token is needed.
-    if (spec.required) {
-      const gateOn = await spec.required(args);
-      if (!gateOn) return spec.commit(args);
-    }
-
-    const payload = spec.tokenPayload(args);
-
-    // ── Preview branch (no writes) ─────────────────────────────────────────
-    if (!args.confirmation_token) {
-      let summary: PreviewSummary;
-      try {
-        summary = await spec.preview(args);
-      } catch (e) {
-        // A preview builder may abort with PreviewAbortError (e.g. row not
-        // found) — surface a clean tool error, mint NO token, write NOTHING.
-        if (e instanceof PreviewAbortError) return err(e.message);
-        throw e;
+    // A PreviewAbortError thrown from ANY of the resolution helpers below
+    // (required / preview / tokenPayload) surfaces a clean tool error and
+    // mints NO token — preserving the pre-B "resolution failed → err()"
+    // surface (row not found, ambiguous, DEK-refusal, mismatch).
+    try {
+      // Clean-case predicate: when required() is false, no token is needed.
+      if (spec.required) {
+        const gateOn = await spec.required(args);
+        if (!gateOn) return spec.commit(args);
       }
-      const token = signPreviewToken(userId, spec.operation, payload);
-      return dataResponse({ preview: true, summary, confirmationToken: token });
-    }
 
-    // ── Commit branch ──────────────────────────────────────────────────────
-    const check = verifyPreviewToken(
-      args.confirmation_token,
-      userId,
-      spec.operation,
-      payload,
-    );
-    if (!check.valid) {
-      return err(
-        `Confirmation token invalid: ${check.reason}. Re-call without confirmation_token to refresh.`,
+      const payload = spec.tokenPayload(args);
+
+      // ── Preview branch (no writes) ───────────────────────────────────────
+      if (!args.confirmation_token) {
+        const summary = await spec.preview(args);
+        const token = signPreviewToken(userId, spec.operation, payload);
+        return dataResponse({ preview: true, summary, confirmationToken: token });
+      }
+
+      // ── Commit branch ────────────────────────────────────────────────────
+      const check = verifyPreviewToken(
+        args.confirmation_token,
+        userId,
+        spec.operation,
+        payload,
       );
+      if (!check.valid) {
+        return err(
+          `Confirmation token invalid: ${check.reason}. Re-call without confirmation_token to refresh.`,
+        );
+      }
+      return spec.commit(args);
+    } catch (e) {
+      if (e instanceof PreviewAbortError) return err(e.message);
+      throw e;
     }
-    return spec.commit(args);
   };
 }

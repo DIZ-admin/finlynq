@@ -79,6 +79,8 @@ import {
 import {
   signPreviewToken,
   verifyPreviewToken,
+  withConfirmation,
+  PreviewAbortError,
 } from "./_confirm";
 import {
   randomUUID,
@@ -1608,26 +1610,76 @@ export function registerTransactionsTools(server: McpServer, ctx: PgToolContext)
 
 
   // ── delete_transfer ────────────────────────────────────────────────────────
+  // FINLYNQ-264 Phase 1 (tier-1 — flagship tc-1 case): `delete_transfer`
+  // removes BOTH legs (≥2 rows, irreversible), so it now REQUIRES the
+  // preview→confirmation-token two-step via the shared `withConfirmation`
+  // middleware. A bare call reads both legs and returns
+  // `{ preview, summary, confirmationToken }` WITHOUT deleting; passing the
+  // token commits the identical `deleteTransferPair` body. The token payload
+  // binds the resolved link_id so it can't be replayed against another pair.
   server.tool(
     "delete_transfer",
-    "Permanently delete BOTH legs of a transfer pair in a single statement. Identify by linkId OR by either leg's id. Refuses if the rows don't form a clean transfer pair — use delete_transaction per-leg for non-symmetric multi-leg imports.",
+    "Permanently delete BOTH legs of a transfer pair. Identify by linkId OR by either leg's id. Two-step (destructive): first call returns a preview of BOTH legs (payee/amount/account) + a confirmationToken (single-use, 5-min TTL) and deletes NOTHING; call again with the token to commit. Refuses if the rows don't form a clean transfer pair — use delete_transaction per-leg for non-symmetric multi-leg imports.",
     {
       linkId: z.string().optional().describe("UUID link_id shared by the pair. Either this OR transactionId is required."),
       transactionId: z.number().int().optional().describe("Any one transaction id from the pair."),
+      confirmation_token: z.string().optional().describe("Omit to preview both legs; pass the preview's token to commit. Single-use, 5-min TTL."),
     },
-    async ({ linkId, transactionId }) => {
-      if (linkId == null && transactionId == null) return err("Either linkId or transactionId is required");
-      const result = await deleteTransferPair({ userId, linkId, transactionId });
-      if (!result.ok) return err(result.message);
-      return text({
-        success: true,
-        data: {
-          linkId: result.linkId,
-          deletedCount: result.deletedCount,
-          message: `Transfer deleted (${result.deletedCount} rows)`,
-        },
-      });
-    }
+    withConfirmation<{ linkId?: string; transactionId?: number; confirmation_token?: string }>(userId, {
+      operation: "delete_transfer",
+      // Payload binds the resolved identity — normalize the two inputs so the
+      // same pair hashes identically whether the caller passed linkId or a leg
+      // id at preview vs commit.
+      tokenPayload: ({ linkId, transactionId }) => ({
+        linkId: linkId ?? null,
+        transactionId: transactionId ?? null,
+      }),
+      preview: async ({ linkId, transactionId }) => {
+        if (linkId == null && transactionId == null) {
+          throw new PreviewAbortError("Either linkId or transactionId is required");
+        }
+        // Resolve the pair's link_id (read-only) from either input.
+        const seedRows = linkId != null
+          ? await q(db, sql`SELECT link_id FROM transactions WHERE user_id = ${userId} AND link_id = ${linkId} LIMIT 1`)
+          : await q(db, sql`SELECT link_id FROM transactions WHERE user_id = ${userId} AND id = ${transactionId}`);
+        if (!seedRows.length || !seedRows[0].link_id) {
+          throw new PreviewAbortError("No transfer pair found for the given linkId/transactionId");
+        }
+        const resolvedLinkId = String(seedRows[0].link_id);
+        // Read both legs + their account names for the human-readable summary.
+        const legRows = await q(db, sql`
+          SELECT t.id, t.amount, t.currency, t.date, t.payee, a.name_ct AS account_ct
+          FROM transactions t
+          LEFT JOIN accounts a ON a.id = t.account_id
+          WHERE t.user_id = ${userId} AND t.link_id = ${resolvedLinkId}
+          ORDER BY t.amount
+        `);
+        const legs = legRows.map((r) => ({
+          id: Number(r.id),
+          amount: Number(r.amount),
+          currency: r.currency,
+          date: r.date,
+          payee: dek ? (decryptField(dek, String(r.payee ?? "")) ?? "") : r.payee,
+          account: r.account_ct && dek ? decryptField(dek, String(r.account_ct)) : null,
+        }));
+        return { linkId: resolvedLinkId, deletedCount: legs.length, legs };
+      },
+      commit: async ({ linkId, transactionId }) => {
+        // Existing destructive body — verbatim. deleteTransferPair reverses
+        // both legs' lots then single-statement DELETEs on link_id, and calls
+        // invalidateUser itself.
+        const result = await deleteTransferPair({ userId, linkId, transactionId });
+        if (!result.ok) return err(result.message);
+        return text({
+          success: true,
+          data: {
+            linkId: result.linkId,
+            deletedCount: result.deletedCount,
+            message: `Transfer deleted (${result.deletedCount} rows)`,
+          },
+        });
+      },
+    }),
   );
 
 
