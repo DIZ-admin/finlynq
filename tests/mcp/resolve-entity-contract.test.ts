@@ -247,3 +247,124 @@ describe("FINLYNQ-267 tc-1 — add_subscription (Phase 1)", () => {
     expect(queries.filter((q) => INSERT_RE.subscription.test(q)).length).toBeGreaterThan(0);
   });
 });
+
+// ── Phase 2 — silent-first writes now ambiguous-aware + id fast-paths ─────────
+
+function fakeGoalRow(id: number, name: string, dek: Buffer): FixtureRow {
+  return { id, name_ct: encryptField(dek, name) };
+}
+function fakeCatRow(id: number, name: string, dek: Buffer): FixtureRow {
+  return { id, name_ct: encryptField(dek, name) };
+}
+function fakeHoldingRow(id: number, name: string, symbol: string, dek: Buffer): FixtureRow {
+  return { id, name_ct: encryptField(dek, name), symbol_ct: encryptField(dek, symbol) };
+}
+
+describe("FINLYNQ-267 tc-1 — delete_budget category (Phase 2)", () => {
+  it("(a) nonexistent category → not-found (no DELETE)", async () => {
+    const dek = randomBytes(32);
+    const { db, queries } = makeFixtureDb((t) =>
+      /FROM categories WHERE user_id/i.test(t) ? [fakeCatRow(1, "Groceries", dek)] : [],
+    );
+    const tool = getTool("delete_budget", db, dek);
+    const res = await tool.handler({ category: "_NOPE_", month: "2026-01" }, {});
+    expect(envelopeText(res)).toMatch(/matched no category|not found|no confident/i);
+    expect(queries.filter((q) => /DELETE FROM budgets/i.test(q))).toHaveLength(0);
+  });
+
+  it("(b) category name matching 2+ rows → ambiguous (no DELETE)", async () => {
+    const dek = randomBytes(32);
+    const { db, queries } = makeFixtureDb((t) =>
+      /FROM categories WHERE user_id/i.test(t)
+        ? [fakeCatRow(1, "Travel", dek), fakeCatRow(2, "Travel Insurance", dek)]
+        : [],
+    );
+    const tool = getTool("delete_budget", db, dek);
+    const res = await tool.handler({ category: "Trave", month: "2026-01" }, {});
+    expect(envelopeText(res)).toMatch(/ambiguous/i);
+    expect(queries.filter((q) => /DELETE FROM budgets/i.test(q))).toHaveLength(0);
+  });
+
+  it("(c) category_id + conflicting name → id wins", async () => {
+    const dek = randomBytes(32);
+    const { db } = makeFixtureDb((t) => {
+      if (/FROM categories WHERE user_id/i.test(t))
+        return [fakeCatRow(1, "Travel", dek), fakeCatRow(2, "Travel Insurance", dek)];
+      if (/FROM budgets WHERE user_id/i.test(t)) return [{ id: 9 }];
+      return [];
+    });
+    const tool = getTool("delete_budget", db, dek);
+    const res = await tool.handler({ category_id: 1, category: "Trave", month: "2026-01" }, {});
+    expect(envelopeText(res)).not.toMatch(/ambiguous|matched no category/i);
+  });
+});
+
+describe("FINLYNQ-267 tc-1 — update_goal (Phase 2)", () => {
+  it("(a) nonexistent goal name → not-found (no UPDATE goals)", async () => {
+    const dek = randomBytes(32);
+    const { db, queries } = makeFixtureDb((t) =>
+      /FROM goals WHERE user_id/i.test(t) ? [fakeGoalRow(1, "Retirement", dek)] : [],
+    );
+    const tool = getTool("update_goal", db, dek);
+    const res = await tool.handler({ goal: "_NOPE_", target_amount: 500 }, {});
+    expect(envelopeText(res)).toMatch(/matched no goal|not found|no confident/i);
+    expect(queries.filter((q) => /UPDATE goals SET/i.test(q))).toHaveLength(0);
+  });
+
+  it("(b) goal name matching 2+ rows → ambiguous (no UPDATE)", async () => {
+    const dek = randomBytes(32);
+    const { db, queries } = makeFixtureDb((t) =>
+      /FROM goals WHERE user_id/i.test(t)
+        ? [fakeGoalRow(1, "House Fund", dek), fakeGoalRow(2, "House Reno", dek)]
+        : [],
+    );
+    const tool = getTool("update_goal", db, dek);
+    const res = await tool.handler({ goal: "House", target_amount: 500 }, {});
+    expect(envelopeText(res)).toMatch(/ambiguous/i);
+    expect(queries.filter((q) => /UPDATE goals SET/i.test(q))).toHaveLength(0);
+  });
+
+  it("(c) goal_id + conflicting name → id wins (UPDATE)", async () => {
+    const dek = randomBytes(32);
+    const { db, queries } = makeFixtureDb((t) => {
+      if (/FROM goals WHERE user_id/i.test(t))
+        return [fakeGoalRow(1, "House Fund", dek), fakeGoalRow(2, "House Reno", dek)];
+      return [];
+    });
+    const tool = getTool("update_goal", db, dek);
+    const res = await tool.handler({ goal_id: 1, goal: "House", target_amount: 500 }, {});
+    expect(envelopeText(res)).not.toMatch(/ambiguous|matched no goal/i);
+    expect(queries.filter((q) => /UPDATE goals SET/i.test(q)).length).toBeGreaterThan(0);
+  });
+});
+
+describe("FINLYNQ-267 tc-1 — delete_portfolio_holding (Phase 2, ambiguous flip 5a)", () => {
+  it("(b) name matching 2 positions across accounts → ambiguous (no DELETE) — was silent-first", async () => {
+    const dek = randomBytes(32);
+    const { db, queries } = makeFixtureDb((t) =>
+      /FROM portfolio_holdings\s+WHERE user_id/i.test(t)
+        ? [fakeHoldingRow(10, "Vanguard All-World", "VWRL", dek), fakeHoldingRow(11, "Vanguard All-World", "VWRL", dek)]
+        : [],
+    );
+    const tool = getTool("delete_portfolio_holding", db, dek);
+    const res = await tool.handler({ holding: "Vanguard All-World" }, {});
+    expect(envelopeText(res)).toMatch(/ambiguous/i);
+    expect(queries.filter((q) => /DELETE FROM portfolio_holdings/i.test(q))).toHaveLength(0);
+  });
+
+  it("(c) holdingId bypasses fuzzy (resolves the id)", async () => {
+    const dek = randomBytes(32);
+    const { db } = makeFixtureDb((t) => {
+      if (/FROM portfolio_holdings\s+WHERE user_id/i.test(t))
+        return [fakeHoldingRow(10, "Vanguard All-World", "VWRL", dek), fakeHoldingRow(11, "Vanguard All-World", "VWRL", dek)];
+      if (/FROM transactions WHERE user_id/i.test(t)) return [{ cnt: 0 }];
+      if (/FROM holding_lots WHERE user_id/i.test(t)) return [{ cnt: 0 }];
+      return [];
+    });
+    const tool = getTool("delete_portfolio_holding", db, dek);
+    const res = await tool.handler({ holdingId: 11 }, {});
+    // No ambiguous error — the id resolved a single row (a clean 0-tx/0-lot
+    // holding deletes directly; the response is a success, not an ambiguity).
+    expect(envelopeText(res)).not.toMatch(/ambiguous/i);
+  });
+});

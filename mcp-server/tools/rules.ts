@@ -10,8 +10,9 @@ import {
   q,
   text,
   err,
-  fuzzyFind,
   decryptNameish,
+  resolveEntity,
+  resolveOrReport,
   type Row,
   type PgToolContext,
 } from "./_shared";
@@ -57,16 +58,21 @@ export function registerRulesTools(server: McpServer, ctx: PgToolContext) {
   // returning the first row.
   async function opCreate(args: {
     match_payee: string;
-    assign_category: string;
+    assign_category?: string;
+    category_id?: number;
     rename_to?: string;
     assign_tags?: string;
     priority?: number;
   }): Promise<ToolResult> {
-      const { match_payee, assign_category, rename_to, assign_tags, priority } = args;
+      const { match_payee, assign_category, category_id, rename_to, assign_tags, priority } = args;
+      // FINLYNQ-267: `category_id` FK fast-path wins; a name resolves via the
+      // shared envelope (mistyped → refuse, 2+ → ambiguous — was `fuzzyFind`
+      // silent-first). Issue #214: decryptNameish BEFORE the match is preserved.
       const rawCats = await q(db, sql`SELECT id, name_ct FROM categories WHERE user_id = ${userId}`);
       const allCats = decryptNameish(rawCats, dek);
-      const cat = fuzzyFind(assign_category, allCats);
-      if (!cat) return err(`Category "${assign_category}" not found`);
+      const out = resolveOrReport("category", resolveEntity({ entity: "category", id: category_id, name: assign_category, options: allCats }));
+      if ("report" in out) return out.report;
+      const cat = allCats.find((c) => Number(c.id) === out.id) ?? { id: out.id, name: null };
 
       // Strip legacy `%` wildcards — the new condition's `op='contains'`
       // is substring-only.
@@ -419,11 +425,14 @@ export function registerRulesTools(server: McpServer, ctx: PgToolContext) {
         }
         let assignCategoryId: number | null = null;
         if (assign_category !== "") {
+          // FINLYNQ-267: resolve via the shared envelope (mistyped → refuse,
+          // 2+ → ambiguous — was `fuzzyFind` silent-first). v2 `actions` carry a
+          // numeric categoryId directly; the FK fast-path lives there.
           const rawCats = await q(db, sql`SELECT id, name_ct FROM categories WHERE user_id = ${userId}`);
           const allCats = decryptNameish(rawCats, dek);
-          const cat = fuzzyFind(assign_category, allCats);
-          if (!cat) return err(`Category "${assign_category}" not found`);
-          assignCategoryId = Number(cat.id);
+          const out = resolveOrReport("category", resolveEntity({ entity: "category", name: assign_category, options: allCats }));
+          if ("report" in out) return out.report;
+          assignCategoryId = out.id;
         }
         const cleanedValue = match_payee.replace(/%/g, "");
         condsObj = { all: [{ field: "payee", op: "contains", value: cleanedValue }] };
@@ -603,7 +612,8 @@ export function registerRulesTools(server: McpServer, ctx: PgToolContext) {
       z.object({
         op: z.literal("create"),
         match_payee: z.string().describe("Payee pattern to match (substring, case-insensitive; legacy `%` wildcards are stripped)"),
-        assign_category: z.string().describe("Category name to assign (fuzzy matched)"),
+        assign_category: z.string().optional().describe("Category name to assign (fuzzy matched — mistyped/unmatched is REFUSED; 2+ → ambiguous). Pass this OR `category_id`."),
+        category_id: z.number().int().positive().optional().describe("Category FK fast-path — wins over the fuzzy `assign_category` name."),
         rename_to: z.string().optional().describe("Optionally rename matched payee to this"),
         assign_tags: z.string().optional().describe("Tags to assign (comma-separated)"),
         priority: z.number().optional().describe("Rule priority (higher = checked first, default 0)"),
@@ -655,7 +665,8 @@ export function registerRulesTools(server: McpServer, ctx: PgToolContext) {
     "Create an auto-categorization rule for future imports. Legacy shorthand (match_payee + assign_category) is synthesized into a v2 rule (FINLYNQ-84).",
     {
       match_payee: z.string().describe("Payee pattern to match (substring, case-insensitive; legacy `%` wildcards are stripped)"),
-      assign_category: z.string().describe("Category name to assign (fuzzy matched)"),
+      assign_category: z.string().optional().describe("Category name to assign (fuzzy matched — mistyped/unmatched is REFUSED; 2+ → ambiguous). Pass this OR `category_id`."),
+      category_id: z.number().int().positive().optional().describe("Category FK fast-path — wins over the fuzzy `assign_category` name."),
       rename_to: z.string().optional().describe("Optionally rename matched payee to this"),
       assign_tags: z.string().optional().describe("Tags to assign (comma-separated)"),
       priority: z.number().optional().describe("Rule priority (higher = checked first, default 0)"),

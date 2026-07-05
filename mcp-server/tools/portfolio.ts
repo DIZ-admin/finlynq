@@ -12,9 +12,9 @@ import {
   err,
   dataResponse,
   suggestionList,
-  fuzzyFind,
   resolveAccountStrict,
-  resolvePortfolioHoldingStrict,
+  resolveEntity,
+  resolveOrReport,
   decryptNameish,
   resolvePortfolioHoldingByName,
   supportedCurrencyEnum,
@@ -811,20 +811,25 @@ export function registerPortfolioTools(server: McpServer, ctx: PgToolContext) {
   type ToolResult = { content: Array<{ type: "text"; text: string }> };
   async function opHoldingAdd(args: {
     name: string;
-    account: string;
+    account?: string;
+    account_id?: number;
     symbol?: string;
     currency?: string;
     isCrypto?: boolean;
     note?: string;
   }): Promise<ToolResult> {
-      const { name, account, symbol, currency, isCrypto, note } = args;
+      const { name, account, account_id, symbol, currency, isCrypto, note } = args;
       const rawAccounts = await q(db, sql`
         SELECT id, currency, name_ct, alias_ct FROM accounts
         WHERE user_id = ${userId} AND archived = false
       `);
       const allAccounts = decryptNameish(rawAccounts, dek);
-      const acct = fuzzyFind(account, allAccounts);
-      if (!acct) return err(`Account "${account}" not found`);
+      // FINLYNQ-267: resolve via the shared envelope — a mistyped/unmatched name
+      // is REFUSED and a 2+ match returns an ambiguous list (was `fuzzyFind`
+      // silent-first); `account_id` is the FK fast-path.
+      const aout = resolveOrReport("account", resolveEntity({ entity: "account", id: account_id, name: account, options: allAccounts }));
+      if ("report" in aout) return aout.report;
+      const acct = allAccounts.find((a) => Number(a.id) === aout.id) ?? { id: aout.id, currency: undefined };
 
       // Stream D Phase 4: portfolio_holdings.name plaintext column dropped —
       // uniqueness gate now relies on name_lookup HMAC. No DEK ⇒ no lookup ⇒
@@ -922,7 +927,8 @@ export function registerPortfolioTools(server: McpServer, ctx: PgToolContext) {
 
   // ── op: update — lifted VERBATIM from update_portfolio_holding ─────────────
   async function opHoldingUpdate(args: {
-    holding: string;
+    holding?: string;
+    holdingId?: number;
     name?: string;
     symbol?: string;
     account?: string;
@@ -930,7 +936,7 @@ export function registerPortfolioTools(server: McpServer, ctx: PgToolContext) {
     isCrypto?: boolean;
     note?: string;
   }): Promise<ToolResult> {
-      const { holding, name, symbol, account, currency, isCrypto, note } = args;
+      const { holding, holdingId, name, symbol, account, currency, isCrypto, note } = args;
       // Issue #99: refuse account-move. Updating only portfolio_holdings.account_id
       // (the prior behavior) leaves a stale (holding, old_account) row in
       // holding_accounts (issue #25's JOIN grain) AND broken account
@@ -951,19 +957,14 @@ export function registerPortfolioTools(server: McpServer, ctx: PgToolContext) {
         WHERE user_id = ${userId}
       `);
       const allHoldings = decryptNameish(rawHoldings, dek);
-      // Match by name first (the existing fuzzyFind behavior), then by symbol
-      // exact-then-startsWith if name didn't hit. Symbol is a separate signal
-      // — matching it as if it were a name (substring on name) would surface
-      // a totally unrelated holding.
-      let h: Row | null = fuzzyFind(holding, allHoldings);
-      if (!h) {
-        const lo = holding.toLowerCase().trim();
-        h =
-          allHoldings.find((r) => String(r.symbol ?? "").toLowerCase() === lo) ??
-          allHoldings.find((r) => String(r.symbol ?? "").toLowerCase().startsWith(lo)) ??
-          null;
-      }
-      if (!h) return err(`Holding "${holding}" not found`);
+      // FINLYNQ-267: resolve by name OR symbol via the shared envelope — a
+      // name/symbol matching 2 positions across accounts now returns an
+      // ambiguous list (was `fuzzyFind` silent-first); `holdingId` is the FK
+      // fast-path. DEFAULT_STRICT.holding matches exact/startsWith on both
+      // name and symbol, replacing the manual symbol fallback.
+      const hout = resolveOrReport("holding", resolveEntity({ entity: "holding", id: holdingId, name: holding, options: allHoldings }));
+      if ("report" in hout) return hout.report;
+      const h = allHoldings.find((r) => Number(r.id) === hout.id)!;
 
       // Stream D Phase 4 — plaintext name/symbol dropped.
       const updates: ReturnType<typeof sql>[] = [];
@@ -1044,7 +1045,8 @@ export function registerPortfolioTools(server: McpServer, ctx: PgToolContext) {
   // preview→token two-step; a clean/empty holding (0 tx, 0 lots) deletes
   // directly. Resolution (strict matcher, issue #127) is unchanged + memoized.
   type DeleteHoldingArgs = {
-    holding: string;
+    holding?: string;
+    holdingId?: number;
     confirmation_token?: string;
     __h?: Row;
     __txCount?: number;
@@ -1059,17 +1061,21 @@ export function registerPortfolioTools(server: McpServer, ctx: PgToolContext) {
       WHERE user_id = ${userId}
     `);
     const allHoldings = decryptNameish(rawHoldings, dek);
-    // Issue #127: strict matcher gated on token overlap so a tiny-named holding
-    // (e.g. "S") cannot swallow a longer input and DELETE the wrong row.
-    const resolved = resolvePortfolioHoldingStrict(a.holding, allHoldings);
-    if (!resolved.ok) {
-      if (resolved.reason === "low_confidence") {
-        const sName = String(resolved.suggestion.name ?? "");
-        throw new PreviewAbortError(`Holding "${a.holding}" did not match strongly — did you mean "${sName}" (id=${Number(resolved.suggestion.id)})? Re-call with the exact name to confirm.`);
-      }
-      throw new PreviewAbortError(`Holding "${a.holding}" not found`);
+    // FINLYNQ-267: resolve via the shared envelope — a name/symbol matching 2
+    // positions across accounts now ABORTS with an ambiguous list (was
+    // `resolvePortfolioHoldingStrict` ambiguous:false silent-first, decision
+    // 5a); `holdingId` is the FK fast-path. Issue #127 token gate preserved via
+    // DEFAULT_STRICT.holding.
+    const env = resolveEntity({ entity: "holding", id: a.holdingId, name: a.holding, options: allHoldings });
+    if (env.status === "ambiguous") {
+      const list = env.candidates.map((c) => (c.symbol ? `"${c.name}" (${c.symbol}, id=${c.id})` : `"${c.name}" (id=${c.id})`)).join(", ");
+      throw new PreviewAbortError(`Holding is ambiguous — ${env.candidates.length} matches: ${list}. Pass holdingId to disambiguate.`);
     }
-    const h = resolved.holding;
+    if (env.status === "not_found") {
+      const hint = env.suggestion ? ` Did you mean "${env.suggestion.name}" (id=${env.suggestion.id})?` : "";
+      throw new PreviewAbortError(`${env.warning}.${hint}`);
+    }
+    const h = allHoldings.find((r) => Number(r.id) === env.id)!;
     const txCount = Number(
       (await q(db, sql`SELECT COUNT(*) AS cnt FROM transactions WHERE user_id = ${userId} AND portfolio_holding_id = ${h.id}`))[0]?.cnt ?? 0,
     );
@@ -1131,7 +1137,8 @@ export function registerPortfolioTools(server: McpServer, ctx: PgToolContext) {
       z.object({
         op: z.literal("add"),
         name: z.string().min(1).max(200).describe("Display name of the holding (e.g. 'Vanguard All-Equity ETF')"),
-        account: z.string().describe("Brokerage account name or alias (fuzzy matched against name; exact match on alias). Required because uniqueness is scoped per (account, name)."),
+        account: z.string().optional().describe("Brokerage account name or alias (fuzzy matched — mistyped/unmatched is REFUSED; 2+ → ambiguous). Pass this OR `account_id`. Uniqueness is scoped per (account, name)."),
+        account_id: z.number().int().positive().optional().describe("Brokerage-account FK fast-path — wins over the fuzzy `account` name."),
         symbol: z.string().max(50).optional().describe("Ticker symbol (e.g. 'VEQT.TO', 'BTC')"),
         currency: supportedCurrencyEnum.optional().describe("ISO 4217 currency (default: parent account's currency). Issue #206: full SUPPORTED_CURRENCIES list."),
         isCrypto: z.boolean().optional().describe("Flag this holding as crypto (default: false)"),
@@ -1139,7 +1146,8 @@ export function registerPortfolioTools(server: McpServer, ctx: PgToolContext) {
       }),
       z.object({
         op: z.literal("update"),
-        holding: z.string().describe("Current holding name OR symbol (fuzzy matched against decrypted name and symbol)"),
+        holding: z.string().optional().describe("Current holding name OR symbol (fuzzy matched against decrypted name and symbol — a name/symbol matching 2 positions across accounts returns an ambiguous list). Pass this OR `holdingId`."),
+        holdingId: z.number().int().positive().optional().describe("Holding FK fast-path — wins over the fuzzy `holding` name."),
         name: z.string().min(1).max(200).optional().describe("New name"),
         symbol: z.string().max(50).optional().describe("New symbol (pass empty string to clear)"),
         account: z.string().optional().describe("REFUSED (issue #99): account moves create stale state. Use portfolio_transfer (in-kind) to move shares between accounts."),
@@ -1149,7 +1157,8 @@ export function registerPortfolioTools(server: McpServer, ctx: PgToolContext) {
       }),
       z.object({
         op: z.literal("delete"),
-        holding: z.string().describe("Holding name OR symbol (fuzzy matched)"),
+        holding: z.string().optional().describe("Holding name OR symbol (fuzzy matched — a name/symbol matching 2 positions across accounts returns an ambiguous list). Pass this OR `holdingId`."),
+        holdingId: z.number().int().positive().optional().describe("Holding FK fast-path — wins over the fuzzy `holding` name."),
         confirmation_token: z.string().optional().describe("Omit to preview; pass the preview's token to commit when the holding has transactions/lots. Single-use, 5-min TTL. Not needed for a clean/empty holding."),
       }),
     ]),
@@ -1171,7 +1180,8 @@ export function registerPortfolioTools(server: McpServer, ctx: PgToolContext) {
     "Create a portfolio holding (a single position like 'VEQT.TO' inside a brokerage account). The import pipeline auto-creates these from CSV/ZIP uploads; this tool is for manually adding a position the user wants to track without an import.",
     {
       name: z.string().min(1).max(200).describe("Display name of the holding (e.g. 'Vanguard All-Equity ETF')"),
-      account: z.string().describe("Brokerage account name or alias (fuzzy matched against name; exact match on alias). Required because uniqueness is scoped per (account, name)."),
+      account: z.string().optional().describe("Brokerage account name or alias (fuzzy matched — mistyped/unmatched is REFUSED; 2+ → ambiguous). Pass this OR `account_id`. Uniqueness is scoped per (account, name)."),
+      account_id: z.number().int().positive().optional().describe("Brokerage-account FK fast-path — wins over the fuzzy `account` name."),
       symbol: z.string().max(50).optional().describe("Ticker symbol (e.g. 'VEQT.TO', 'BTC')"),
       currency: supportedCurrencyEnum.optional().describe("ISO 4217 currency (default: parent account's currency). Issue #206: full SUPPORTED_CURRENCIES list."),
       isCrypto: z.boolean().optional().describe("Flag this holding as crypto (default: false)"),
@@ -1184,7 +1194,8 @@ export function registerPortfolioTools(server: McpServer, ctx: PgToolContext) {
     "update_portfolio_holding",
     "Update a portfolio holding's name, symbol, currency, isCrypto, or note. Renames cascade to all transactions automatically because the portfolio aggregators (issue #86) group by FK holdingId, not by display name — two holdings sharing a name across accounts stay distinct rows in get_portfolio_analysis output. NOTE: the legacy `account` parameter is REFUSED (issue #99) — moving a holding to a different account would leave stale `holding_accounts` rows and orphaned account attribution on every historical transaction. To actually move shares between accounts, use record_transfer (in-kind); to re-attribute existing transactions, update them individually.",
     {
-      holding: z.string().describe("Current holding name OR symbol (fuzzy matched against decrypted name and symbol)"),
+      holding: z.string().optional().describe("Current holding name OR symbol (fuzzy matched against decrypted name and symbol — a name/symbol matching 2 positions across accounts returns an ambiguous list). Pass this OR `holdingId`."),
+      holdingId: z.number().int().positive().optional().describe("Holding FK fast-path — wins over the fuzzy `holding` name."),
       name: z.string().min(1).max(200).optional().describe("New name"),
       symbol: z.string().max(50).optional().describe("New symbol (pass empty string to clear)"),
       account: z.string().optional().describe("REFUSED (issue #99): account moves create stale state. Use record_transfer (in-kind) to move shares between accounts; update individual transactions to re-attribute history."),
@@ -1199,7 +1210,8 @@ export function registerPortfolioTools(server: McpServer, ctx: PgToolContext) {
     "delete_portfolio_holding",
     "Delete a portfolio holding. Transactions referencing it survive (the FK is set to NULL — they fall back to orphan aggregation), but its cost-basis LOTS cascade-delete. Two-step (destructive) when the holding has linked transactions OR lots: the first call returns a preview (name + tx/lot counts) + a confirmationToken (single-use, 5-min TTL) and deletes NOTHING; call again with the token to commit. A clean/empty holding deletes directly.",
     {
-      holding: z.string().describe("Holding name OR symbol (fuzzy matched)"),
+      holding: z.string().optional().describe("Holding name OR symbol (fuzzy matched — a name/symbol matching 2 positions across accounts returns an ambiguous list). Pass this OR `holdingId`."),
+      holdingId: z.number().int().positive().optional().describe("Holding FK fast-path — wins over the fuzzy `holding` name."),
       confirmation_token: z.string().optional().describe("Omit to preview; pass the preview's token to commit when the holding has transactions/lots. Single-use, 5-min TTL. Not needed for a clean/empty holding."),
     },
     async (args) => deleteHoldingHandler(args),

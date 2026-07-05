@@ -86,7 +86,9 @@ const CASES: Array<{
   {
     name: "manage_holdings",
     badOp: { op: "move", holding: "x" },
-    missingField: { op: "add", name: "VEQT" }, // missing account
+    // `account` is now optional (FINLYNQ-267 — pass `account`/`account_id`);
+    // `name` stays the unconditionally-required add field.
+    missingField: { op: "add", account: "TFSA" }, // missing name
     good: { op: "delete", holding: "VEQT" },
   },
   {

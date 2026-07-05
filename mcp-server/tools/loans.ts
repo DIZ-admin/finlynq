@@ -10,7 +10,6 @@ import {
   q,
   text,
   err,
-  fuzzyFind,
   decryptNameish,
   resolveEntity,
   resolveOrReport,
@@ -260,9 +259,10 @@ export function registerLoansTools(server: McpServer, ctx: PgToolContext) {
     extra_payment?: number;
     residual_value?: number;
     account?: string;
+    account_id?: number;
     note?: string;
   }): Promise<ToolResult> {
-      const { id, name, type, principal, annual_rate, term_months, start_date, payment_amount, payment_frequency, extra_payment, residual_value, account, note } = args;
+      const { id, name, type, principal, annual_rate, term_months, start_date, payment_amount, payment_frequency, extra_payment, residual_value, account, account_id, note } = args;
       const existing = await q(db, sql`
         SELECT id, principal, annual_rate, term_months, start_date, payment_amount,
                payment_frequency, extra_payment, residual_value
@@ -291,8 +291,18 @@ export function registerLoansTools(server: McpServer, ctx: PgToolContext) {
         }
       }
 
+      // FINLYNQ-267: `account_id` FK fast-path wins; a name resolves via the
+      // shared envelope (mistyped → refuse, 2+ → ambiguous). Empty NAME clears.
       let accountIdUpdate: number | null | undefined;
-      if (account !== undefined) {
+      if (account_id != null) {
+        const rawAccounts = await q(db, sql`
+          SELECT id, name_ct, alias_ct FROM accounts WHERE user_id = ${userId}
+        `);
+        const allAccounts = decryptNameish(rawAccounts, dek);
+        const out = resolveOrReport("account", resolveEntity({ entity: "account", id: account_id, options: allAccounts }));
+        if ("report" in out) return out.report;
+        accountIdUpdate = out.id;
+      } else if (account !== undefined) {
         if (account === "") {
           accountIdUpdate = null;
         } else {
@@ -300,9 +310,9 @@ export function registerLoansTools(server: McpServer, ctx: PgToolContext) {
             SELECT id, name_ct, alias_ct FROM accounts WHERE user_id = ${userId}
           `);
           const allAccounts = decryptNameish(rawAccounts, dek);
-          const acct = fuzzyFind(account, allAccounts);
-          if (!acct) return err(`Account "${account}" not found`);
-          accountIdUpdate = Number(acct.id);
+          const out = resolveOrReport("account", resolveEntity({ entity: "account", name: account, options: allAccounts }));
+          if ("report" in out) return out.report;
+          accountIdUpdate = out.id;
         }
       }
 
@@ -387,7 +397,8 @@ export function registerLoansTools(server: McpServer, ctx: PgToolContext) {
         payment_frequency: z.enum(PAYMENT_FREQUENCIES).optional().describe("weekly | biweekly | semi_monthly | monthly | quarterly | annual"),
         extra_payment: z.number().nonnegative().optional().describe("Extra principal per payment (must be >= 0)"),
         residual_value: z.number().nonnegative().optional().describe("Lease residual/buyout — balance remaining at term end (must be < principal)"),
-        account: z.string().optional().describe("Linked account — name or alias (fuzzy matched against name; exact match on alias). Pass empty string to clear."),
+        account: z.string().optional().describe("Linked account — name or alias (fuzzy matched — mistyped/unmatched is REFUSED; 2+ → ambiguous). Pass empty string to clear. PREFER `account_id`."),
+        account_id: z.number().int().positive().optional().describe("Linked-account FK fast-path — wins over the fuzzy `account` name."),
         note: z.string().optional(),
       }),
       z.object({
@@ -430,7 +441,8 @@ export function registerLoansTools(server: McpServer, ctx: PgToolContext) {
       annual_rate: z.number().nonnegative().describe("Annual interest rate, e.g. 5.5 for 5.5% (must be >= 0; zero allowed for 0% promo)"),
       term_months: z.number().int().positive().optional().describe("Loan term in months (optional when payment_amount is given — the term is solved from the payment)"),
       start_date: ymdDate.describe("Loan start date (YYYY-MM-DD)"),
-      account: z.string().optional().describe("Linked account — name or alias (fuzzy matched against name; exact match on alias). When linked, the account's ledger balance drives the outstanding balance."),
+      account: z.string().optional().describe("Linked account — name or alias (fuzzy matched — mistyped/unmatched is REFUSED, never silently unlinked). When linked, the account's ledger balance drives the outstanding balance. PREFER `account_id`."),
+      account_id: z.number().int().positive().optional().describe("Linked-account FK fast-path — wins over the fuzzy `account` name."),
       payment_amount: z.number().positive().optional().describe("Payment per period (must be > 0). Must exceed the period interest or the call is refused."),
       payment_frequency: z.enum(PAYMENT_FREQUENCIES).optional().describe("weekly | biweekly | semi_monthly | monthly | quarterly | annual (default monthly)"),
       extra_payment: z.number().nonnegative().optional().describe("Extra principal per payment (must be >= 0; default 0)"),
@@ -456,7 +468,8 @@ export function registerLoansTools(server: McpServer, ctx: PgToolContext) {
       payment_frequency: z.enum(PAYMENT_FREQUENCIES).optional().describe("weekly | biweekly | semi_monthly | monthly | quarterly | annual"),
       extra_payment: z.number().nonnegative().optional().describe("Extra principal per payment (must be >= 0)"),
       residual_value: z.number().nonnegative().optional().describe("Lease residual/buyout — balance remaining at term end (must be < principal)"),
-      account: z.string().optional().describe("Linked account — name or alias (fuzzy matched against name; exact match on alias). Pass empty string to clear."),
+      account: z.string().optional().describe("Linked account — name or alias (fuzzy matched — mistyped/unmatched is REFUSED; 2+ → ambiguous). Pass empty string to clear. PREFER `account_id`."),
+      account_id: z.number().int().positive().optional().describe("Linked-account FK fast-path — wins over the fuzzy `account` name."),
       note: z.string().optional(),
     },
     async (args) => opUpdate(args),

@@ -17,7 +17,6 @@ import {
   text,
   err,
   dataResponse,
-  fuzzyFind,
   decryptNameish,
   resolveEntity,
   resolveOrReport,
@@ -121,18 +120,22 @@ export function registerGoalsTools(server: McpServer, ctx: PgToolContext) {
   // ── op: update ─────────────────────────────────────────────────────────────
   // Lifted verbatim from the former `update_goal` tool.
   async function opUpdate(args: {
-    goal: string;
+    goal?: string;
+    goal_id?: number;
     target_amount?: number;
     deadline?: string;
     status?: "active" | "completed" | "paused";
     name?: string;
     account_ids?: number[];
   }): Promise<ToolResult> {
-    const { goal, target_amount, deadline, status, name, account_ids } = args;
+    const { goal, goal_id, target_amount, deadline, status, name, account_ids } = args;
+    // FINLYNQ-267: `goal_id` FK fast-path wins; a name resolves via the shared
+    // envelope (mistyped → refuse, 2+ → ambiguous — was `fuzzyFind` silent-first).
     const rawGoals = await q(db, sql`SELECT id, name_ct FROM goals WHERE user_id = ${userId}`);
     const allGoals = decryptNameish(rawGoals, dek);
-    const g = fuzzyFind(goal, allGoals);
-    if (!g) return err(`Goal "${goal}" not found`);
+    const gout = resolveOrReport("goal", resolveEntity({ entity: "goal", id: goal_id, name: goal, options: allGoals }));
+    if ("report" in gout) return gout.report;
+    const g = allGoals.find((x) => Number(x.id) === gout.id) ?? { id: gout.id, name: null };
 
     // Verify account ownership upfront so we don't half-apply.
     // Drizzle expands a JS array as separate scalars, so wrap in
@@ -198,15 +201,17 @@ export function registerGoalsTools(server: McpServer, ctx: PgToolContext) {
 
   // ── op: delete ─────────────────────────────────────────────────────────────
   // Lifted verbatim from the former `delete_goal` tool.
-  async function opDelete(args: { goal: string }): Promise<ToolResult> {
-    const { goal } = args;
+  async function opDelete(args: { goal?: string; goal_id?: number }): Promise<ToolResult> {
+    const { goal, goal_id } = args;
+    // FINLYNQ-267: `goal_id` FK fast-path wins; name via the shared envelope.
     const rawGoals = await q(db, sql`SELECT id, name_ct FROM goals WHERE user_id = ${userId}`);
     const allGoals = decryptNameish(rawGoals, dek);
-    const g = fuzzyFind(goal, allGoals);
-    if (!g) return err(`Goal "${goal}" not found`);
+    const gout = resolveOrReport("goal", resolveEntity({ entity: "goal", id: goal_id, name: goal, options: allGoals }));
+    if ("report" in gout) return gout.report;
+    const g = allGoals.find((x) => Number(x.id) === gout.id) ?? { id: gout.id, name: null };
 
     await db.execute(sql`DELETE FROM goals WHERE id = ${g.id} AND user_id = ${userId}`);
-    return text({ success: true, data: { message: `Goal "${g.name}" deleted` } });
+    return text({ success: true, data: { message: `Goal "${g.name ?? `#${g.id}`}" deleted` } });
   }
 
   // ── op: list ───────────────────────────────────────────────────────────────
@@ -283,7 +288,8 @@ export function registerGoalsTools(server: McpServer, ctx: PgToolContext) {
   });
   const updateVariant = z.object({
     op: z.literal("update"),
-    goal: z.string().describe("Goal name (fuzzy matched)"),
+    goal: z.string().optional().describe("Goal name (fuzzy matched — mistyped/unmatched is REFUSED; 2+ → ambiguous). Pass this OR `goal_id`."),
+    goal_id: z.number().int().positive().optional().describe("Goal FK fast-path — wins over the fuzzy `goal` name."),
     target_amount: z.number().positive().optional().describe("Target amount (must be > 0)"),
     deadline: ymdDate.optional().describe("YYYY-MM-DD"),
     status: z.enum(["active", "completed", "paused"]).optional(),
@@ -292,7 +298,8 @@ export function registerGoalsTools(server: McpServer, ctx: PgToolContext) {
   });
   const deleteVariant = z.object({
     op: z.literal("delete"),
-    goal: z.string().describe("Goal name (fuzzy matched)"),
+    goal: z.string().optional().describe("Goal name (fuzzy matched — mistyped/unmatched is REFUSED; 2+ → ambiguous). Pass this OR `goal_id`."),
+    goal_id: z.number().int().positive().optional().describe("Goal FK fast-path — wins over the fuzzy `goal` name."),
   });
   const listVariant = z.object({
     op: z.literal("list").describe("List all goals with progress."),
@@ -338,7 +345,8 @@ export function registerGoalsTools(server: McpServer, ctx: PgToolContext) {
     "update_goal",
     "Update a financial goal's target, deadline, status, or linked accounts. `account_ids` (issue #130) replaces the existing account-link set atomically — pass `[]` to unlink all, or omit to leave links unchanged.",
     {
-      goal: z.string().describe("Goal name (fuzzy matched)"),
+      goal: z.string().optional().describe("Goal name (fuzzy matched — mistyped/unmatched is REFUSED; 2+ → ambiguous). Pass this OR `goal_id`."),
+      goal_id: z.number().int().positive().optional().describe("Goal FK fast-path — wins over the fuzzy `goal` name."),
       target_amount: z.number().positive().optional().describe("Target amount (must be > 0)"),
       deadline: ymdDate.optional().describe("YYYY-MM-DD"),
       status: z.enum(["active", "completed", "paused"]).optional(),
@@ -350,9 +358,10 @@ export function registerGoalsTools(server: McpServer, ctx: PgToolContext) {
   registerAlias(
     server,
     "delete_goal",
-    "Delete a financial goal by name",
+    "Delete a financial goal by name or id",
     {
-      goal: z.string().describe("Goal name (fuzzy matched)"),
+      goal: z.string().optional().describe("Goal name (fuzzy matched — mistyped/unmatched is REFUSED; 2+ → ambiguous). Pass this OR `goal_id`."),
+      goal_id: z.number().int().positive().optional().describe("Goal FK fast-path — wins over the fuzzy `goal` name."),
     },
     async (args) => opDelete(args),
   );

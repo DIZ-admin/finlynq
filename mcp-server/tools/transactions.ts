@@ -14,6 +14,8 @@ import {
   fuzzyFind,
   resolveAccountStrict,
   resolveCategoryStrict,
+  resolveEntity,
+  resolveOrReport,
   decryptNameish,
   autoCategory,
   resolvePortfolioHoldingByName,
@@ -105,14 +107,17 @@ export function registerTransactionsTools(server: McpServer, ctx: PgToolContext)
   type ToolResult = { content: Array<{ type: "text"; text: string }> };
 
   // ── manage_budgets op handlers (lifted VERBATIM) ───────────────────────────
-  async function opBudgetSet(args: { category: string; month: string; amount: number }): Promise<ToolResult> {
-    const { category, month, amount } = args;
-    // Stream D Phase 4 — match by name_lookup HMAC.
-    if (!dek) return err("Cannot resolve category name without an unlocked DEK (Stream D Phase 4).");
-    const catLookup = nameLookup(dek, category);
-    const catRows = await q(db, sql`SELECT id FROM categories WHERE user_id = ${userId} AND name_lookup = ${catLookup}`);
-    if (!catRows.length) return err(`Category "${category}" not found`);
-    const cat = catRows[0] as { id: number };
+  async function opBudgetSet(args: { category?: string; category_id?: number; month: string; amount: number }): Promise<ToolResult> {
+    const { category, category_id, month, amount } = args;
+    // FINLYNQ-267: `category_id` FK fast-path wins; a name resolves via the
+    // shared envelope (mistyped → refuse, 2+ → ambiguous). Requires a DEK for
+    // the name path (categories are encrypted post Stream D Phase 4).
+    if (category_id == null && !dek) return err("Cannot resolve category name without an unlocked DEK (Stream D Phase 4). Pass `category_id`.");
+    const rawCats = await q(db, sql`SELECT id, name_ct FROM categories WHERE user_id = ${userId}`);
+    const allCats = decryptNameish(rawCats, dek);
+    const out = resolveOrReport("category", resolveEntity({ entity: "category", id: category_id, name: category, options: allCats }));
+    if ("report" in out) return out.report;
+    const cat = { id: out.id };
 
     const existing = await q(db, sql`SELECT id FROM budgets WHERE user_id = ${userId} AND category_id = ${cat.id} AND month = ${month}`);
     if (existing.length) {
@@ -120,31 +125,30 @@ export function registerTransactionsTools(server: McpServer, ctx: PgToolContext)
     } else {
       await db.execute(sql`INSERT INTO budgets (user_id, category_id, month, amount) VALUES (${userId}, ${cat.id}, ${month}, ${amount})`);
     }
-    return text({ success: true, data: { message: `Budget set: ${category} = $${amount} for ${month}` } });
+    return text({ success: true, data: { message: `Budget set: ${category ?? `category #${cat.id}`} = $${amount} for ${month}` } });
   }
 
-  async function opBudgetDelete(args: { category: string; month: string }): Promise<ToolResult> {
-    const { category, month } = args;
-    // Issue #211 (Bug a): the SELECT only returns `name_ct` (encrypted)
-    // after Stream D Phase 4. Without `decryptNameish`, `fuzzyFind` runs
-    // against ciphertext and never matches — so `cat` was always null
-    // and `delete_budget` was a tool outage for every caller.
-    if (!dek) return err("Cannot resolve category by name without an unlocked DEK (Stream D Phase 4).");
+  async function opBudgetDelete(args: { category?: string; category_id?: number; month: string }): Promise<ToolResult> {
+    const { category, category_id, month } = args;
+    // FINLYNQ-267: `category_id` FK fast-path wins; a name resolves via the
+    // shared envelope (mistyped → refuse, 2+ → ambiguous — was `fuzzyFind`
+    // silent-first). Requires a DEK for the name path (encrypted post Stream D
+    // Phase 4).
+    if (category_id == null && !dek) return err("Cannot resolve category by name without an unlocked DEK (Stream D Phase 4). Pass `category_id`.");
     const rawCats = await q(db, sql`SELECT id, name_ct FROM categories WHERE user_id = ${userId}`);
     const allCats = decryptNameish(rawCats, dek);
-    const cat = fuzzyFind(category, allCats);
-    if (!cat) {
-      return err(`Category "${category}" not found. Did you mean: ${suggestionList(category, allCats)}?`);
-    }
+    const out = resolveOrReport("category", resolveEntity({ entity: "category", id: category_id, name: category, options: allCats }));
+    if ("report" in out) return out.report;
+    const cat = allCats.find((c) => Number(c.id) === out.id) ?? { id: out.id, name: null };
 
     const existing = await q(db, sql`SELECT id FROM budgets WHERE user_id = ${userId} AND category_id = ${cat.id} AND month = ${month}`);
-    if (!existing.length) return err(`No budget found for "${cat.name}" in ${month}`);
+    if (!existing.length) return err(`No budget found for "${cat.name ?? `category #${cat.id}`}" in ${month}`);
 
     await db.execute(sql`DELETE FROM budgets WHERE id = ${existing[0].id} AND user_id = ${userId}`);
     // Issue #211: budgets are per-tx-cache-irrelevant but invalidate for
     // any future budget-aware tx surface.
     invalidateUserTxCache(userId);
-    return text({ success: true, data: { message: `Budget deleted: ${cat.name} for ${month}` } });
+    return text({ success: true, data: { message: `Budget deleted: ${cat.name ?? `category #${cat.id}`} for ${month}` } });
   }
 
   registerManageTool(
@@ -154,13 +158,15 @@ export function registerTransactionsTools(server: McpServer, ctx: PgToolContext)
     z.discriminatedUnion("op", [
       z.object({
         op: z.literal("set"),
-        category: z.string().describe("Category name"),
+        category: z.string().optional().describe("Category name (mistyped/unmatched is REFUSED; 2+ match → ambiguous). Pass this OR `category_id`."),
+        category_id: z.number().int().positive().optional().describe("Category FK fast-path — wins over the fuzzy `category` name."),
         month: ymPeriod.describe("Month (YYYY-MM)"),
         amount: z.number().positive().describe("Budget amount (must be > 0)"),
       }),
       z.object({
         op: z.literal("delete"),
-        category: z.string().describe("Category name"),
+        category: z.string().optional().describe("Category name (mistyped/unmatched is REFUSED; 2+ match → ambiguous). Pass this OR `category_id`."),
+        category_id: z.number().int().positive().optional().describe("Category FK fast-path — wins over the fuzzy `category` name."),
         month: ymPeriod.describe("Month (YYYY-MM)"),
       }),
     ]),
@@ -180,7 +186,8 @@ export function registerTransactionsTools(server: McpServer, ctx: PgToolContext)
     "set_budget",
     "Set or update a budget for a category in a specific month",
     {
-      category: z.string().describe("Category name"),
+      category: z.string().optional().describe("Category name (mistyped/unmatched is REFUSED). Pass this OR `category_id`."),
+      category_id: z.number().int().positive().optional().describe("Category FK fast-path — wins over the fuzzy `category` name."),
       month: ymPeriod.describe("Month (YYYY-MM)"),
       amount: z.number().positive().describe("Budget amount (must be > 0)"),
     },
@@ -1781,6 +1788,8 @@ export function registerTransactionsTools(server: McpServer, ctx: PgToolContext)
     transactionId?: number;
     fromAccount?: string;
     toAccount?: string;
+    from_account_id?: number;
+    to_account_id?: number;
     amount?: number;
     date?: string;
     receivedAmount?: number;
@@ -1792,26 +1801,29 @@ export function registerTransactionsTools(server: McpServer, ctx: PgToolContext)
     note?: string;
     tags?: string;
   }): Promise<ToolResult> {
-      const { linkId, transactionId, fromAccount, toAccount, amount, date, receivedAmount, holding, destHolding, quantity, destQuantity, holdingClear, note, tags } = argsObj;
+      const { linkId, transactionId, fromAccount, toAccount, from_account_id, to_account_id, amount, date, receivedAmount, holding, destHolding, quantity, destQuantity, holdingClear, note, tags } = argsObj;
       if (!dek) return err("Transfer updates require an active session DEK — log in again.");
       if (linkId == null && transactionId == null) return err("Either linkId or transactionId is required");
 
+      // FINLYNQ-267: each side resolves via the shared envelope — a mistyped/
+      // unmatched name is REFUSED and a 2+ match returns an ambiguous list
+      // (was `fuzzyFind` silent-first); `from/to_account_id` are FK fast-paths.
       let fromAccountId: number | undefined;
       let toAccountId: number | undefined;
-      if (fromAccount || toAccount) {
+      if (fromAccount || toAccount || from_account_id != null || to_account_id != null) {
         const rawAccounts = await q(db, sql`
           SELECT id, currency, name_ct, alias_ct FROM accounts WHERE user_id = ${userId}
         `);
         const allAccounts = decryptNameish(rawAccounts, dek);
-        if (fromAccount) {
-          const acct = fuzzyFind(fromAccount, allAccounts);
-          if (!acct) return err(`Source account "${fromAccount}" not found.`);
-          fromAccountId = Number(acct.id);
+        if (fromAccount || from_account_id != null) {
+          const out = resolveOrReport("fromAccount", resolveEntity({ entity: "account", id: from_account_id, name: fromAccount, options: allAccounts }));
+          if ("report" in out) return out.report;
+          fromAccountId = out.id;
         }
-        if (toAccount) {
-          const acct = fuzzyFind(toAccount, allAccounts);
-          if (!acct) return err(`Destination account "${toAccount}" not found.`);
-          toAccountId = Number(acct.id);
+        if (toAccount || to_account_id != null) {
+          const out = resolveOrReport("toAccount", resolveEntity({ entity: "account", id: to_account_id, name: toAccount, options: allAccounts }));
+          if ("report" in out) return out.report;
+          toAccountId = out.id;
         }
       }
 
@@ -1951,8 +1963,10 @@ export function registerTransactionsTools(server: McpServer, ctx: PgToolContext)
         op: z.literal("update"),
         linkId: z.string().optional().describe("UUID link_id shared by the pair. Either this OR transactionId is required."),
         transactionId: z.number().int().optional().describe("Any one transaction id from the pair; helper resolves the other side."),
-        fromAccount: z.string().optional().describe("New source account name or alias. Re-runs FX if currency changes."),
-        toAccount: z.string().optional().describe("New destination account name or alias."),
+        fromAccount: z.string().optional().describe("New source account name or alias (mistyped/unmatched is REFUSED; 2+ → ambiguous). Re-runs FX if currency changes. PREFER `from_account_id`."),
+        toAccount: z.string().optional().describe("New destination account name or alias (mistyped/unmatched is REFUSED; 2+ → ambiguous). PREFER `to_account_id`."),
+        from_account_id: z.number().int().positive().optional().describe("New source account FK — wins over the fuzzy `fromAccount` name."),
+        to_account_id: z.number().int().positive().optional().describe("New destination account FK — wins over the fuzzy `toAccount` name."),
         amount: z.number().nonnegative().optional().describe("New amount sent (source currency); 0 only allowed when in-kind side is set."),
         date: ymdDate.optional().describe("New date (YYYY-MM-DD); applied to both legs."),
         receivedAmount: z.number().nonnegative().optional().describe("Cross-currency override; rebuilds the destination leg's amount + locked FX rate."),
@@ -2011,8 +2025,10 @@ export function registerTransactionsTools(server: McpServer, ctx: PgToolContext)
     {
       linkId: z.string().optional().describe("UUID link_id shared by the pair. Either this OR transactionId is required."),
       transactionId: z.number().int().optional().describe("Any one transaction id from the pair; helper resolves the other side."),
-      fromAccount: z.string().optional().describe("New source account name or alias. Re-runs FX if currency changes."),
-      toAccount: z.string().optional().describe("New destination account name or alias."),
+      fromAccount: z.string().optional().describe("New source account name or alias (mistyped/unmatched is REFUSED; 2+ → ambiguous). Re-runs FX if currency changes. PREFER `from_account_id`."),
+      toAccount: z.string().optional().describe("New destination account name or alias (mistyped/unmatched is REFUSED; 2+ → ambiguous). PREFER `to_account_id`."),
+      from_account_id: z.number().int().positive().optional().describe("New source account FK — wins over the fuzzy `fromAccount` name."),
+      to_account_id: z.number().int().positive().optional().describe("New destination account FK — wins over the fuzzy `toAccount` name."),
       amount: z.number().nonnegative().optional().describe("New amount sent (source currency); 0 only allowed when in-kind side is set."),
       date: ymdDate.optional().describe("New date (YYYY-MM-DD); applied to both legs."),
       receivedAmount: z.number().nonnegative().optional().describe("Cross-currency override; rebuilds the destination leg's amount + locked FX rate."),
@@ -2045,7 +2061,8 @@ export function registerTransactionsTools(server: McpServer, ctx: PgToolContext)
     "delete_budget",
     "Delete a budget entry for a category/month",
     {
-      category: z.string().describe("Category name"),
+      category: z.string().optional().describe("Category name (mistyped/unmatched is REFUSED). Pass this OR `category_id`."),
+      category_id: z.number().int().positive().optional().describe("Category FK fast-path — wins over the fuzzy `category` name."),
       month: ymPeriod.describe("Month (YYYY-MM)"),
     },
     async (args) => opBudgetDelete(args),
