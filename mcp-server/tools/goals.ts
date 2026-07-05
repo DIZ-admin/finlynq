@@ -19,6 +19,8 @@ import {
   dataResponse,
   fuzzyFind,
   decryptNameish,
+  resolveEntity,
+  resolveOrReport,
   type PgToolContext,
 } from "./_shared";
 import {
@@ -52,21 +54,29 @@ export function registerGoalsTools(server: McpServer, ctx: PgToolContext) {
     target_amount: number;
     deadline?: string;
     account?: string;
+    account_id?: number;
     account_ids?: number[];
   }): Promise<ToolResult> {
-    const { name, type, target_amount, deadline, account, account_ids } = args;
-    // Resolve the canonical id list. account_ids wins; fall back to fuzzy-match
-    // on the legacy single `account` argument.
+    const { name, type, target_amount, deadline, account, account_id, account_ids } = args;
+    // Resolve the canonical id list. account_ids wins; then the legacy single
+    // `account`/`account_id`. FINLYNQ-267: a mistyped `account` name now REFUSES
+    // the create (via resolveEntity → resolveOrReport) instead of silently
+    // producing an UNLINKED goal (decision 5b — a user who typed a name intended
+    // a link). account_id is the FK fast-path (wins over the fuzzy name).
     let resolvedIds: number[] = [];
     if (account_ids !== undefined) {
       resolvedIds = account_ids;
-    } else if (account) {
+    } else if (account_id != null || account) {
       const rawAccounts = await q(db, sql`
         SELECT id, name_ct, alias_ct FROM accounts WHERE user_id = ${userId}
       `);
       const allAccounts = decryptNameish(rawAccounts, dek);
-      const acct = fuzzyFind(account, allAccounts);
-      if (acct) resolvedIds = [Number(acct.id)];
+      const out = resolveOrReport(
+        "account",
+        resolveEntity({ entity: "account", id: account_id, name: account, options: allAccounts }),
+      );
+      if ("report" in out) return out.report;
+      resolvedIds = [out.id];
     }
     // Verify ownership for every supplied id.
     // Drizzle expands a JS array as separate scalars, so wrap in
@@ -267,7 +277,8 @@ export function registerGoalsTools(server: McpServer, ctx: PgToolContext) {
     type: z.enum(["savings", "debt_payoff", "investment", "emergency_fund"]).describe("Goal type"),
     target_amount: z.number().positive().describe("Target amount (must be > 0)"),
     deadline: ymdDate.optional().describe("Deadline (YYYY-MM-DD)"),
-    account: z.string().optional().describe("Legacy single-account linker — name or alias (fuzzy matched). Prefer `account_ids` for multi-account goals."),
+    account: z.string().optional().describe("Legacy single-account linker — name or alias (fuzzy matched). A mistyped/unmatched name is REFUSED (never silently unlinked). Prefer `account_id` or `account_ids`."),
+    account_id: z.number().int().positive().optional().describe("Single-account linker FK fast-path — wins over the fuzzy `account` name. Prefer `account_ids` for multi-account goals."),
     account_ids: z.array(z.number().int()).optional().describe("Multi-account linker (issue #130). Goal progress sums transactions across every account id supplied. Each id must belong to the user. Empty array = unlinked (manual tracking)."),
   });
   const updateVariant = z.object({
@@ -316,7 +327,8 @@ export function registerGoalsTools(server: McpServer, ctx: PgToolContext) {
       type: z.enum(["savings", "debt_payoff", "investment", "emergency_fund"]).describe("Goal type"),
       target_amount: z.number().positive().describe("Target amount (must be > 0)"),
       deadline: ymdDate.optional().describe("Deadline (YYYY-MM-DD)"),
-      account: z.string().optional().describe("Legacy single-account linker — name or alias (fuzzy matched). Prefer `account_ids` for multi-account goals."),
+      account: z.string().optional().describe("Legacy single-account linker — name or alias (fuzzy matched). A mistyped/unmatched name is REFUSED (never silently unlinked). Prefer `account_id` or `account_ids`."),
+      account_id: z.number().int().positive().optional().describe("Single-account linker FK fast-path — wins over the fuzzy `account` name. Prefer `account_ids` for multi-account goals."),
       account_ids: z.array(z.number().int()).optional().describe("Multi-account linker (issue #130). Goal progress sums transactions across every account id supplied. Each id must belong to the user. Empty array = unlinked (manual tracking)."),
     },
     async (args) => opAdd(args),

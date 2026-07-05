@@ -11,8 +11,9 @@ import {
   text,
   err,
   dataResponse,
-  fuzzyFind,
   decryptNameish,
+  resolveEntity,
+  resolveOrReport,
   supportedCurrencyEnum,
   type Row,
   type PgToolContext,
@@ -103,10 +104,12 @@ export function registerSubscriptionsTools(server: McpServer, ctx: PgToolContext
     next_billing_date: string;
     currency?: string;
     category?: string;
+    category_id?: number;
     account?: string;
+    account_id?: number;
     notes?: string;
   }): Promise<ToolResult> {
-      const { name, amount, cadence, next_billing_date, currency, category, account, notes } = args;
+      const { name, amount, cadence, next_billing_date, currency, category, category_id, account, account_id, notes } = args;
       // Stream D Phase 4: subscriptions.name plaintext column dropped — uniqueness
       // gate now relies on name_lookup HMAC. No DEK ⇒ no lookup ⇒ refuse cleanly.
       if (!dek) return err("Cannot create subscription without an unlocked DEK (Stream D Phase 4).");
@@ -117,23 +120,26 @@ export function registerSubscriptionsTools(server: McpServer, ctx: PgToolContext
       `);
       if (existing.length) return err(`Subscription "${name}" already exists (id: ${existing[0].id})`);
 
+      // FINLYNQ-267: resolve category/account via the shared envelope — a
+      // mistyped name is REFUSED and a 2+ match returns an ambiguous list;
+      // `category_id`/`account_id` are FK fast-paths.
       let categoryId: number | null = null;
-      if (category) {
+      if (category_id != null || category) {
         const rawCats = await q(db, sql`SELECT id, name_ct FROM categories WHERE user_id = ${userId}`);
         const allCats = decryptNameish(rawCats, dek);
-        const cat = fuzzyFind(category, allCats);
-        if (!cat) return err(`Category "${category}" not found`);
-        categoryId = Number(cat.id);
+        const out = resolveOrReport("category", resolveEntity({ entity: "category", id: category_id, name: category, options: allCats }));
+        if ("report" in out) return out.report;
+        categoryId = out.id;
       }
       let accountId: number | null = null;
-      if (account) {
+      if (account_id != null || account) {
         const rawAccounts = await q(db, sql`
           SELECT id, name_ct, alias_ct FROM accounts WHERE user_id = ${userId}
         `);
         const allAccounts = decryptNameish(rawAccounts, dek);
-        const acct = fuzzyFind(account, allAccounts);
-        if (!acct) return err(`Account "${account}" not found`);
-        accountId = Number(acct.id);
+        const out = resolveOrReport("account", resolveEntity({ entity: "account", id: account_id, name: account, options: allAccounts }));
+        if ("report" in out) return out.report;
+        accountId = out.id;
       }
       const n = dek ? encryptName(dek, name) : { ct: null, lookup: null };
       // Stream D Phase 4 — plaintext name dropped.
@@ -154,37 +160,56 @@ export function registerSubscriptionsTools(server: McpServer, ctx: PgToolContext
     next_billing_date?: string;
     currency?: string;
     category?: string;
+    category_id?: number;
     account?: string;
+    account_id?: number;
     status?: "active" | "paused" | "cancelled";
     cancel_reminder_date?: string;
     notes?: string;
   }): Promise<ToolResult> {
-      const { id, name, amount, cadence, next_billing_date, currency, category, account, status, cancel_reminder_date, notes } = args;
+      const { id, name, amount, cadence, next_billing_date, currency, category, category_id, account, account_id, status, cancel_reminder_date, notes } = args;
       const existing = await q(db, sql`SELECT id FROM subscriptions WHERE id = ${id} AND user_id = ${userId}`);
       if (!existing.length) return err(`Subscription #${id} not found`);
 
+      // FINLYNQ-267: `*_id` FK fast-path wins; a name resolves via the shared
+      // envelope (mistyped → refuse, 2+ → ambiguous). Empty string on the NAME
+      // param still CLEARS the link (unchanged legacy behavior).
       let categoryIdUpdate: number | null | undefined;
-      if (category !== undefined) {
+      if (category_id != null) {
+        const rawCats = await q(db, sql`SELECT id, name_ct FROM categories WHERE user_id = ${userId}`);
+        const allCats = decryptNameish(rawCats, dek);
+        const out = resolveOrReport("category", resolveEntity({ entity: "category", id: category_id, options: allCats }));
+        if ("report" in out) return out.report;
+        categoryIdUpdate = out.id;
+      } else if (category !== undefined) {
         if (category === "") categoryIdUpdate = null;
         else {
           const rawCats = await q(db, sql`SELECT id, name_ct FROM categories WHERE user_id = ${userId}`);
           const allCats = decryptNameish(rawCats, dek);
-          const cat = fuzzyFind(category, allCats);
-          if (!cat) return err(`Category "${category}" not found`);
-          categoryIdUpdate = Number(cat.id);
+          const out = resolveOrReport("category", resolveEntity({ entity: "category", name: category, options: allCats }));
+          if ("report" in out) return out.report;
+          categoryIdUpdate = out.id;
         }
       }
       let accountIdUpdate: number | null | undefined;
-      if (account !== undefined) {
+      if (account_id != null) {
+        const rawAccounts = await q(db, sql`
+          SELECT id, name_ct, alias_ct FROM accounts WHERE user_id = ${userId}
+        `);
+        const allAccounts = decryptNameish(rawAccounts, dek);
+        const out = resolveOrReport("account", resolveEntity({ entity: "account", id: account_id, options: allAccounts }));
+        if ("report" in out) return out.report;
+        accountIdUpdate = out.id;
+      } else if (account !== undefined) {
         if (account === "") accountIdUpdate = null;
         else {
           const rawAccounts = await q(db, sql`
             SELECT id, name_ct, alias_ct FROM accounts WHERE user_id = ${userId}
           `);
           const allAccounts = decryptNameish(rawAccounts, dek);
-          const acct = fuzzyFind(account, allAccounts);
-          if (!acct) return err(`Account "${account}" not found`);
-          accountIdUpdate = Number(acct.id);
+          const out = resolveOrReport("account", resolveEntity({ entity: "account", name: account, options: allAccounts }));
+          if ("report" in out) return out.report;
+          accountIdUpdate = out.id;
         }
       }
 
@@ -510,8 +535,10 @@ export function registerSubscriptionsTools(server: McpServer, ctx: PgToolContext
         cadence: z.enum(["weekly", "monthly", "quarterly", "annual", "yearly"]).optional().describe("Billing frequency. For a single add."),
         next_billing_date: ymdDate.optional().describe("Next billing date (YYYY-MM-DD). For a single add."),
         currency: supportedCurrencyEnum.optional().describe("ISO 4217 currency code (default CAD). Issue #206: full SUPPORTED_CURRENCIES list."),
-        category: z.string().optional().describe("Category name (fuzzy matched). Single add."),
-        account: z.string().optional().describe("Account name or alias (fuzzy matched against name; exact match on alias). Single add."),
+        category: z.string().optional().describe("Category name (fuzzy matched — mistyped/unmatched is REFUSED, never silently unlinked). Single add."),
+        category_id: z.number().int().positive().optional().describe("Category FK fast-path — wins over the fuzzy `category` name. Single add."),
+        account: z.string().optional().describe("Account name or alias (fuzzy matched against name; exact match on alias — mistyped/unmatched is REFUSED). Single add."),
+        account_id: z.number().int().positive().optional().describe("Account FK fast-path — wins over the fuzzy `account` name. Single add."),
         notes: z.string().optional(),
         // Bulk-add fields (used when `items` is present):
         items: z.array(z.object({
@@ -531,8 +558,10 @@ export function registerSubscriptionsTools(server: McpServer, ctx: PgToolContext
         cadence: z.enum(["weekly", "monthly", "quarterly", "annual", "yearly"]).optional(),
         next_billing_date: ymdDate.optional().describe("YYYY-MM-DD"),
         currency: supportedCurrencyEnum.optional().describe("ISO 4217 currency code (issue #206: full SUPPORTED_CURRENCIES list)."),
-        category: z.string().optional().describe("Category name (fuzzy). Empty string clears."),
-        account: z.string().optional().describe("Account name or alias (fuzzy matched against name; exact match on alias). Empty string clears."),
+        category: z.string().optional().describe("Category name (fuzzy — mistyped/unmatched is REFUSED). Empty string clears."),
+        category_id: z.number().int().positive().optional().describe("Category FK fast-path — wins over the fuzzy `category` name."),
+        account: z.string().optional().describe("Account name or alias (fuzzy matched against name; exact match on alias — mistyped/unmatched is REFUSED). Empty string clears."),
+        account_id: z.number().int().positive().optional().describe("Account FK fast-path — wins over the fuzzy `account` name."),
         status: z.enum(["active", "paused", "cancelled"]).optional(),
         cancel_reminder_date: ymdDate.optional().describe("YYYY-MM-DD"),
         notes: z.string().optional(),
@@ -591,8 +620,10 @@ export function registerSubscriptionsTools(server: McpServer, ctx: PgToolContext
       cadence: z.enum(["weekly", "monthly", "quarterly", "annual", "yearly"]).describe("Billing frequency"),
       next_billing_date: ymdDate.describe("Next billing date (YYYY-MM-DD)"),
       currency: supportedCurrencyEnum.optional().describe("ISO 4217 currency code (default CAD). Issue #206: full SUPPORTED_CURRENCIES list."),
-      category: z.string().optional().describe("Category name (fuzzy matched)"),
-      account: z.string().optional().describe("Account name or alias (fuzzy matched against name; exact match on alias)"),
+      category: z.string().optional().describe("Category name (fuzzy matched — mistyped/unmatched is REFUSED)"),
+      category_id: z.number().int().positive().optional().describe("Category FK fast-path — wins over the fuzzy `category` name."),
+      account: z.string().optional().describe("Account name or alias (fuzzy matched against name; exact match on alias — mistyped/unmatched is REFUSED)"),
+      account_id: z.number().int().positive().optional().describe("Account FK fast-path — wins over the fuzzy `account` name."),
       notes: z.string().optional(),
     },
     async (args) => opAddSingle(args),
@@ -624,8 +655,10 @@ export function registerSubscriptionsTools(server: McpServer, ctx: PgToolContext
       cadence: z.enum(["weekly", "monthly", "quarterly", "annual", "yearly"]).optional(),
       next_billing_date: ymdDate.optional().describe("YYYY-MM-DD"),
       currency: supportedCurrencyEnum.optional().describe("ISO 4217 currency code (issue #206: full SUPPORTED_CURRENCIES list)."),
-      category: z.string().optional().describe("Category name (fuzzy). Empty string clears."),
-      account: z.string().optional().describe("Account name or alias (fuzzy matched against name; exact match on alias). Empty string clears."),
+      category: z.string().optional().describe("Category name (fuzzy — mistyped/unmatched is REFUSED). Empty string clears."),
+      category_id: z.number().int().positive().optional().describe("Category FK fast-path — wins over the fuzzy `category` name."),
+      account: z.string().optional().describe("Account name or alias (fuzzy matched against name; exact match on alias — mistyped/unmatched is REFUSED). Empty string clears."),
+      account_id: z.number().int().positive().optional().describe("Account FK fast-path — wins over the fuzzy `account` name."),
       status: z.enum(["active", "paused", "cancelled"]).optional(),
       cancel_reminder_date: ymdDate.optional().describe("YYYY-MM-DD"),
       notes: z.string().optional(),
