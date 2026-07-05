@@ -89,8 +89,10 @@ export const TOOL_ANNOTATION_OVERRIDES: Record<string, ToolAnnotations> = {
   manage_rules: { destructiveHint: true },
   manage_subscriptions: { destructiveHint: true },
   manage_loans: { destructiveHint: true },
-  // Later phases add manage_transactions / manage_transfers / manage_splits
-  // when they register.
+  // Phase 3 (splits / transactions / transfers):
+  manage_splits: { destructiveHint: true },
+  manage_transactions: { destructiveHint: true },
+  manage_transfers: { destructiveHint: true },
 };
 
 export function inferAnnotations(name: string): ToolAnnotations {

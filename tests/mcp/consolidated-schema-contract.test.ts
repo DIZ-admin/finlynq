@@ -107,6 +107,24 @@ const CASES: Array<{
     missingField: { op: "add", name: "Mortgage" }, // missing type/principal/rate/start_date
     good: { op: "delete", id: 1 },
   },
+  {
+    name: "manage_splits",
+    badOp: { op: "merge", transaction_id: 1 },
+    missingField: { op: "add", transaction_id: 1 }, // missing amount
+    good: { op: "list", transaction_id: 1 },
+  },
+  {
+    name: "manage_transactions",
+    badOp: { op: "categorize", id: 1 },
+    missingField: { op: "update" }, // missing id
+    good: { op: "delete", id: 1 },
+  },
+  {
+    name: "manage_transfers",
+    badOp: { op: "split", linkId: "x" },
+    missingField: { op: "record" }, // missing amount
+    good: { op: "delete", linkId: "x" },
+  },
 ];
 
 describe("consolidated manage_* schema contracts (FINLYNQ-263 tc-2)", () => {
