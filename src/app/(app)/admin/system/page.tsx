@@ -72,6 +72,7 @@ interface ActiveQuery {
 }
 interface Rebuild {
   userId: string;
+  username: string | null;
   running: boolean;
   daysProcessed: number;
   totalDays: number;
@@ -104,11 +105,11 @@ interface ApiResponse {
     cash: number;
     inv: number;
     latest: string | null;
-    topUsers: { userId: string; rows: number }[];
-    dirtyMarkers: { userId: string; markedAt: string; ageMs: number }[];
+    topUsers: { userId: string; username: string | null; rows: number }[];
+    dirtyMarkers: { userId: string; username: string | null; markedAt: string; ageMs: number }[];
   };
   rebuilds: Rebuild[];
-  cashRebuildsInFlight: string[];
+  cashRebuildsInFlight: { userId: string; username: string | null }[];
   api: { count: number; cap: number; errors: number; lastAt: string | null };
 }
 
@@ -139,6 +140,10 @@ function fmtUptime(sec: number): string {
 }
 function shortId(id: string): string {
   return id.length > 12 ? `${id.slice(0, 8)}…${id.slice(-4)}` : id;
+}
+// Prefer the plaintext username (admin-readable); fall back to the short id.
+function userLabel(username: string | null, id: string): string {
+  return username && username.trim() ? username : shortId(id);
 }
 function fmtMs(ms: number): string {
   if (ms < 1000) return `${Math.round(ms)}ms`;
@@ -629,7 +634,7 @@ export default function AdminSystemPage() {
                           <Badge variant="outline">done</Badge>
                         )}
                         <span className="font-mono text-xs" title={r.userId}>
-                          {shortId(r.userId)}
+                          {userLabel(r.username, r.userId)}
                         </span>
                         {r.running ? (
                           <span className="tabular-nums text-muted-foreground">
@@ -645,12 +650,12 @@ export default function AdminSystemPage() {
                     ))}
                     {data?.cashRebuildsInFlight.map((u) => (
                       <div
-                        key={`cash-${u}`}
+                        key={`cash-${u.userId}`}
                         className="flex items-center gap-3 rounded-md border px-3 py-1.5"
                       >
                         <Badge className="bg-amber-500/15 text-amber-700">cash running</Badge>
-                        <span className="font-mono text-xs" title={u}>
-                          {shortId(u)}
+                        <span className="font-mono text-xs" title={u.userId}>
+                          {userLabel(u.username, u.userId)}
                         </span>
                       </div>
                     ))}
@@ -673,7 +678,7 @@ export default function AdminSystemPage() {
                         className={m.ageMs > 86400000 ? "border-amber-400 text-amber-700" : ""}
                         title={`${m.userId} · marked ${m.markedAt}`}
                       >
-                        {shortId(m.userId)} · {fmtDuration(m.ageMs)} old
+                        {userLabel(m.username, m.userId)} · {fmtDuration(m.ageMs)} old
                       </Badge>
                     ))}
                   </div>
@@ -690,7 +695,7 @@ export default function AdminSystemPage() {
                   <div className="flex flex-wrap gap-1.5">
                     {data.snapshots.topUsers.map((u) => (
                       <Badge key={u.userId} variant="outline" title={u.userId}>
-                        {shortId(u.userId)} · {u.rows.toLocaleString()}
+                        {userLabel(u.username, u.userId)} · {u.rows.toLocaleString()}
                       </Badge>
                     ))}
                   </div>

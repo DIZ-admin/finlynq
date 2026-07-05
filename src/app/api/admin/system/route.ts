@@ -87,18 +87,21 @@ export async function GET(request: NextRequest) {
       FROM portfolio_snapshots
     `),
     db.execute(sql`
-      SELECT user_id, count(*)::int AS rows
-      FROM portfolio_snapshots
-      GROUP BY user_id
+      SELECT s.user_id, count(*)::int AS rows, u.username
+      FROM portfolio_snapshots s
+      LEFT JOIN users u ON u.id = s.user_id
+      GROUP BY s.user_id, u.username
       ORDER BY rows DESC
       LIMIT 8
     `),
     db.execute(sql`
-      SELECT user_id,
-             marked_at,
-             EXTRACT(EPOCH FROM (now() - marked_at)) * 1000 AS age_ms
-      FROM portfolio_snapshot_dirty
-      ORDER BY marked_at ASC
+      SELECT d.user_id,
+             d.marked_at,
+             EXTRACT(EPOCH FROM (now() - d.marked_at)) * 1000 AS age_ms,
+             u.username
+      FROM portfolio_snapshot_dirty d
+      LEFT JOIN users u ON u.id = d.user_id
+      ORDER BY d.marked_at ASC
       LIMIT 25
     `),
     // Durable 24h CPU/load history, downsampled to 5-minute buckets (avg + peak).
@@ -144,10 +147,12 @@ export async function GET(request: NextRequest) {
   const snap = normalizeDbRows(snapRes)[0] ?? {};
   const topUsers = normalizeDbRows(topUsersRes).map((r) => ({
     userId: (r.user_id as string) ?? "",
+    username: (r.username as string) ?? null,
     rows: num(r.rows),
   }));
   const dirtyMarkers = normalizeDbRows(dirtyRes).map((r) => ({
     userId: (r.user_id as string) ?? "",
+    username: (r.username as string) ?? null,
     markedAt: r.marked_at instanceof Date ? r.marked_at.toISOString() : String(r.marked_at),
     ageMs: Math.round(num(r.age_ms)),
   }));
@@ -168,8 +173,27 @@ export async function GET(request: NextRequest) {
   }));
 
   // --- Snapshot rebuilds (in-flight / recent) from the registry ---
-  const rebuilds = getAllRebuildProgress().map((p) => ({
+  // The registry is keyed by userId only, so resolve usernames (plaintext) in
+  // one lookup across every id we're about to display.
+  const rebuildProgress = getAllRebuildProgress();
+  const cashRebuildsInFlight = getCashRebuildsInFlight();
+  const rebuildUserIds = Array.from(
+    new Set([...rebuildProgress.map((p) => p.userId), ...cashRebuildsInFlight]),
+  ).filter(Boolean);
+  const usernameById = new Map<string, string>();
+  if (rebuildUserIds.length > 0) {
+    const nameRows = normalizeDbRows(
+      await db.execute(
+        sql`SELECT id, username FROM users WHERE id = ANY(${rebuildUserIds}::text[])`,
+      ),
+    );
+    for (const r of nameRows) {
+      if (r.username) usernameById.set(r.id as string, r.username as string);
+    }
+  }
+  const rebuilds = rebuildProgress.map((p) => ({
     userId: p.userId,
+    username: usernameById.get(p.userId) ?? null,
     running: p.running,
     daysProcessed: p.daysProcessed,
     totalDays: p.totalDays,
@@ -178,7 +202,6 @@ export async function GET(request: NextRequest) {
     error: p.error,
     lastResult: p.lastResult,
   }));
-  const cashRebuildsInFlight = getCashRebuildsInFlight();
 
   // --- Outbound API summary (full log at /admin/api-log) ---
   const apiLog = getOutboundLog();
@@ -204,7 +227,10 @@ export async function GET(request: NextRequest) {
       dirtyMarkers,
     },
     rebuilds,
-    cashRebuildsInFlight,
+    cashRebuildsInFlight: cashRebuildsInFlight.map((userId) => ({
+      userId,
+      username: usernameById.get(userId) ?? null,
+    })),
     api: {
       count: apiMeta.count,
       cap: apiMeta.cap,
