@@ -77,9 +77,9 @@ import {
   InvestmentHoldingRequiredError,
 } from "../../src/lib/investment-account";
 import {
-  signConfirmationToken,
-  verifyConfirmationToken,
-} from "../../src/lib/mcp/confirmation-token";
+  signPreviewToken,
+  verifyPreviewToken,
+} from "./_confirm";
 import {
   randomUUID,
 } from "crypto";
@@ -2215,7 +2215,7 @@ export function registerTransactionsTools(server: McpServer, ctx: PgToolContext)
     // can't widen the scope between preview and execute. We sign the
     // user-supplied `changes` (not the resolved form) so the execute caller
     // can pass the same payload back unchanged; execute re-runs resolution.
-    const token = signConfirmationToken(userId, op, { ids, changes });
+    const token = signPreviewToken(userId, op, { ids, changes });
     return { affectedCount: ids.length, sampleBefore: before, sampleAfter: after, unappliedChanges: unapplied, ids, confirmationToken: token };
   }
 
@@ -2334,7 +2334,7 @@ export function registerTransactionsTools(server: McpServer, ctx: PgToolContext)
     async ({ filter, changes, confirmation_token }) => {
       try {
         const ids = await resolveFilterToIds(filter);
-        const check = verifyConfirmationToken(confirmation_token, userId, "bulk_update", { ids, changes });
+        const check = verifyPreviewToken(confirmation_token, userId, "bulk_update", { ids, changes });
         if (!check.valid) return err(`Confirmation token invalid: ${check.reason}. Re-run preview_bulk_update.`);
 
         // Issue #61: resolve names → ids HERE so the commit only ever writes
@@ -2399,7 +2399,7 @@ export function registerTransactionsTools(server: McpServer, ctx: PgToolContext)
           };
         });
         const sample = rows.map((r) => decryptTxRowFields(dek, r as Record<string, unknown>));
-        const token = signConfirmationToken(userId, "bulk_delete", { ids });
+        const token = signPreviewToken(userId, "bulk_delete", { ids });
         return text({ success: true, data: { affectedCount: ids.length, sample, confirmationToken: token } });
       } catch (e) {
         return err(String(e instanceof Error ? e.message : e));
@@ -2419,7 +2419,7 @@ export function registerTransactionsTools(server: McpServer, ctx: PgToolContext)
     async ({ filter, confirmation_token }) => {
       try {
         const ids = await resolveFilterToIds(filter);
-        const check = verifyConfirmationToken(confirmation_token, userId, "bulk_delete", { ids });
+        const check = verifyPreviewToken(confirmation_token, userId, "bulk_delete", { ids });
         if (!check.valid) return err(`Confirmation token invalid: ${check.reason}. Re-run preview_bulk_delete.`);
         if (ids.length === 0) return text({ success: true, data: { deleted: 0 } });
         // Defense-in-depth: parameterized ANY(ARRAY[...]::int[]) instead of CSV.
@@ -2482,7 +2482,7 @@ export function registerTransactionsTools(server: McpServer, ctx: PgToolContext)
       try {
         const ids = await resolveFilterToIds(filter);
         const changes: BulkChanges = { category_id };
-        const check = verifyConfirmationToken(confirmation_token, userId, "bulk_categorize", { ids, changes });
+        const check = verifyPreviewToken(confirmation_token, userId, "bulk_categorize", { ids, changes });
         if (!check.valid) return err(`Confirmation token invalid: ${check.reason}. Re-run preview_bulk_categorize.`);
         // Issue #61: commit takes the resolved shape now. category_id is
         // already an int so resolution is a no-op for this code path.

@@ -30,9 +30,9 @@ import {
   invalidateUser as invalidateUserTxCache,
 } from "../../src/lib/mcp/user-tx-cache";
 import {
-  signConfirmationToken,
-  verifyConfirmationToken,
-} from "../../src/lib/mcp/confirmation-token";
+  signPreviewToken,
+  verifyPreviewToken,
+} from "./_confirm";
 
 export function registerCategoriesTools(server: McpServer, ctx: PgToolContext) {
   const { db, userId, dek, encNote } = ctx;
@@ -94,7 +94,7 @@ export function registerCategoriesTools(server: McpServer, ctx: PgToolContext) {
       // Sign the confirmation token even when FKs are non-zero — execute will
       // re-check and refuse atomically. This way the preview shape is stable
       // and Claude can decide whether to reassign first or pick a new target.
-      const confirmationToken = signConfirmationToken(userId, "delete_category", { id: catId });
+      const confirmationToken = signPreviewToken(userId, "delete_category", { id: catId });
 
       return text({
         success: true,
@@ -127,7 +127,7 @@ export function registerCategoriesTools(server: McpServer, ctx: PgToolContext) {
       confirmation_token: z.string().describe("Token returned by `preview_delete_category` for this exact id. Single-use; 5-minute TTL."),
     },
     async ({ id, confirmation_token }) => {
-      const check = verifyConfirmationToken(confirmation_token, userId, "delete_category", { id });
+      const check = verifyPreviewToken(confirmation_token, userId, "delete_category", { id });
       if (!check.valid) return err(`Confirmation token invalid: ${check.reason}. Re-run preview_delete_category.`);
 
       const existing = await q(db, sql`SELECT id, name_ct FROM categories WHERE user_id = ${userId} AND id = ${id}`);

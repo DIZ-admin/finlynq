@@ -34,9 +34,9 @@ import {
   getUserTransactions,
 } from "../../src/lib/mcp/user-tx-cache";
 import {
-  signConfirmationToken,
-  verifyConfirmationToken,
-} from "../../src/lib/mcp/confirmation-token";
+  signPreviewToken,
+  verifyPreviewToken,
+} from "./_confirm";
 import {
   ymdDate,
 } from "../lib/date-validators";
@@ -340,7 +340,7 @@ export function registerSubscriptionsTools(server: McpServer, ctx: PgToolContext
         cadence: c.cadence,
       }));
       const token = candidates.length
-        ? signConfirmationToken(userId, "bulk_add_subscriptions", { candidates: approvable })
+        ? signPreviewToken(userId, "bulk_add_subscriptions", { candidates: approvable })
         : "";
 
       return text({
@@ -378,7 +378,7 @@ export function registerSubscriptionsTools(server: McpServer, ctx: PgToolContext
         amount: c.amount,
         cadence: c.cadence,
       }));
-      const check = verifyConfirmationToken(confirmation_token, userId, "bulk_add_subscriptions", { candidates: approvable });
+      const check = verifyPreviewToken(confirmation_token, userId, "bulk_add_subscriptions", { candidates: approvable });
       if (!check.valid) return err(`Confirmation token invalid: ${check.reason}. Re-run detect_subscriptions.`);
 
       const today = new Date();
