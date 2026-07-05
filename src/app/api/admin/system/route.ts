@@ -184,7 +184,7 @@ export async function GET(request: NextRequest) {
   if (rebuildUserIds.length > 0) {
     const nameRows = normalizeDbRows(
       await db.execute(
-        sql`SELECT id, username FROM users WHERE id = ANY(${rebuildUserIds}::uuid[])`,
+        sql`SELECT id, username FROM users WHERE id = ANY(${rebuildUserIds}::text[])`,
       ),
     );
     for (const r of nameRows) {
