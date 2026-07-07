@@ -688,7 +688,7 @@ export function registerSubscriptionsTools(server: McpServer, ctx: PgToolContext
   registerAlias(
     server,
     "delete_subscription",
-    "Permanently delete a subscription by id or name (FINLYNQ-273 — `name` resolves via the shared envelope; `id` fast-path wins).",
+    "Permanently delete a subscription by id or name (`name` resolves via the shared envelope; `id` fast-path wins).",
     {
       id: z.number().int().positive().optional().describe("Subscription FK fast-path — wins over `name`. Pass this OR `name`."),
       name: z.string().optional().describe("Subscription name (fuzzy matched — mistyped/unmatched is REFUSED; 2+ → ambiguous). Requires an unlocked DEK."),
