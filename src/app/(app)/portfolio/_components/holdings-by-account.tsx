@@ -236,17 +236,27 @@ export function HoldingsByAccount({
                                     : <span className="text-muted-foreground text-xs">--</span>}
                                 </TableCell>
                                 <TableCell className="text-right">
-                                  {hasMetrics && h.unrealizedGain != null ? (
-                                    <div>
-                                      <p className={`text-xs font-mono font-medium ${h.unrealizedGain >= 0 ? "text-emerald-600 dark:text-emerald-400" : "text-rose-600 dark:text-rose-400"}`}>
-                                        {h.unrealizedGain >= 0 ? "+" : ""}{formatCurrency(h.unrealizedGain, h.quoteCurrency ?? h.currency)}
-                                      </p>
-                                      {h.unrealizedGainPct != null && (
-                                        <p className={`text-[10px] font-mono ${h.unrealizedGainPct >= 0 ? "text-emerald-600 dark:text-emerald-400" : "text-rose-600 dark:text-rose-400"}`}>
-                                          {h.unrealizedGainPct >= 0 ? "+" : ""}{h.unrealizedGainPct.toFixed(2)}%
-                                        </p>
-                                      )}
-                                    </div>
+                                  {/* FINLYNQ-279: this panel shows Mkt Value in the display
+                                      currency, so Unrealized must be the display-currency value
+                                      too (it includes the FX-on-cost gain for foreign holdings)
+                                      — native $0.000 next to a CAD market value was the mismatch.
+                                      Pct is derived from the display figures so $ and % agree. */}
+                                  {hasMetrics && h.unrealizedGainDisplay != null ? (
+                                    (() => {
+                                      const pct = h.costBasisDisplay ? (h.unrealizedGainDisplay / h.costBasisDisplay) * 100 : null;
+                                      return (
+                                        <div>
+                                          <p className={`text-xs font-mono font-medium ${h.unrealizedGainDisplay >= 0 ? "text-emerald-600 dark:text-emerald-400" : "text-rose-600 dark:text-rose-400"}`}>
+                                            {h.unrealizedGainDisplay >= 0 ? "+" : ""}{formatCurrency(h.unrealizedGainDisplay, displayCurrency)}
+                                          </p>
+                                          {pct != null && (
+                                            <p className={`text-[10px] font-mono ${pct >= 0 ? "text-emerald-600 dark:text-emerald-400" : "text-rose-600 dark:text-rose-400"}`}>
+                                              {pct >= 0 ? "+" : ""}{pct.toFixed(2)}%
+                                            </p>
+                                          )}
+                                        </div>
+                                      );
+                                    })()
                                   ) : <span className="text-muted-foreground text-xs">--</span>}
                                 </TableCell>
                                 <TableCell className="text-right">
