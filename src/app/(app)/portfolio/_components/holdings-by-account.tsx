@@ -222,13 +222,20 @@ export function HoldingsByAccount({
                                     ? h.quantity.toLocaleString("en-CA", { minimumFractionDigits: 0, maximumFractionDigits: h.quantity % 1 === 0 ? 0 : 4 })
                                     : <span className="text-muted-foreground text-xs">--</span>}
                                 </TableCell>
+                                {/* FINLYNQ-279: this panel always renders Mkt Value in the
+                                    display currency, so Avg Cost + Price are shown in the display
+                                    currency too (derived from the *Display fields ÷ qty) — a
+                                    USD cash sleeve reads C$1.36 avg / C$1.42 price, matching the
+                                    combined row, instead of a native $1.00 next to a CAD value. */}
                                 <TableCell className="text-right font-mono text-sm">
-                                  {hasMetrics && h.avgCostPerShare != null
-                                    ? formatCurrency(h.avgCostPerShare, h.quoteCurrency ?? h.currency)
+                                  {hasMetrics && h.costBasisDisplay != null && h.quantity != null && h.quantity !== 0
+                                    ? formatCurrency(h.costBasisDisplay / h.quantity, displayCurrency)
                                     : <span className="text-muted-foreground text-xs">--</span>}
                                 </TableCell>
                                 <TableCell className="text-right font-mono text-sm">
-                                  {h.price != null ? formatCurrency(h.price, h.quoteCurrency ?? h.currency) : "--"}
+                                  {hasMetrics && h.marketValueDisplay != null && h.quantity != null && h.quantity !== 0
+                                    ? formatCurrency(h.marketValueDisplay / h.quantity, displayCurrency)
+                                    : "--"}
                                 </TableCell>
                                 <TableCell className="text-right font-mono text-sm font-medium">
                                   {hasMetrics && h.marketValueDisplay != null

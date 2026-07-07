@@ -435,6 +435,16 @@ export function HoldingsTable({
                                     const rowCcy = showNative ? nativeCcy : reportCcy;
                                     const rowUnreal = showNative ? h.unrealizedGain : h.unrealizedGainDisplay;
                                     const rowRealized = showNative ? h.realizedGain : h.realizedGainDisplay;
+                                    // Avg Cost follows the toggle too: native = per-unit cost in
+                                    // the holding's own currency ($1.00 for USD cash); display =
+                                    // costBasisDisplay / qty = the historical-FX avg cost in the
+                                    // display currency (~C$1.36 for USD cash), matching the
+                                    // combined row's Avg Cost.
+                                    const rowAvgCost = showNative
+                                      ? h.avgCostPerShare
+                                      : (h.costBasisDisplay != null && h.quantity != null && h.quantity !== 0
+                                          ? h.costBasisDisplay / h.quantity
+                                          : null);
                                     return (
                                       <TableRow key={h.id} className="hover:bg-muted/30 border-border/60">
                                         <TableCell className="text-xs">
@@ -456,8 +466,8 @@ export function HoldingsTable({
                                           )}
                                         </TableCell>
                                         <TableCell className="text-right font-mono text-xs">
-                                          {hasMetrics && h.avgCostPerShare != null
-                                            ? formatCurrencyAdaptive(h.avgCostPerShare, nativeCcy)
+                                          {hasMetrics && rowAvgCost != null
+                                            ? formatCurrencyAdaptive(rowAvgCost, rowCcy)
                                             : <span className="text-muted-foreground">--</span>}
                                         </TableCell>
                                         <TableCell className="text-right font-mono text-xs font-medium">
