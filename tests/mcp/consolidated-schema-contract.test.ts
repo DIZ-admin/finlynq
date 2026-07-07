@@ -189,3 +189,154 @@ describe("consolidated manage_* schema contracts (FINLYNQ-263 tc-2)", () => {
     });
   }
 });
+
+// ─── FINLYNQ-270: stringified-param coercion contract (tc-2-coerce-contract) ──
+//
+// Many MCP clients (Claude's) stringify top-level scalar params; on the 2020-12
+// `oneOf` schema they stringify EVERYTHING — numbers, booleans, whole JSON
+// arrays. `registerManageTool` now pre-parses the input against the selected
+// variant and coerces those strings before the union parse. This block proves,
+// against the REAL registered schemas, that:
+//   1. a stringified numeric scalar parses AND coerces to a number,
+//   2. a native number parses to the identical result (no behavior change),
+//   3. empty-string / non-numeric on a number field is STILL rejected (no
+//      silent 0/NaN write),
+//   4. a stringified boolean coerces to the right boolean (not the z.coerce
+//      truthy-string footgun),
+//   5. a stringified JSON array coerces to a native array.
+type CoerceCase = {
+  name: string;
+  // A payload with a numeric scalar supplied as a STRING; must parse and the
+  // named field must coerce to `expectNumber`.
+  numericStringPayload: Record<string, unknown>;
+  numericField: string;
+  expectNumber: number;
+  // The SAME payload with the numeric field as a native number.
+  numericTypedPayload: Record<string, unknown>;
+  // The SAME payload with the numeric field as "" (must REJECT) and "abc".
+  emptyStringPayload: Record<string, unknown>;
+  nonNumericPayload: Record<string, unknown>;
+  // Optional boolean coercion probe.
+  booleanStringPayload?: Record<string, unknown>;
+  booleanField?: string;
+  expectBoolean?: boolean;
+  // Optional stringified-JSON-array probe.
+  arrayStringPayload?: Record<string, unknown>;
+  arrayField?: string;
+  expectArray?: unknown[];
+};
+
+const COERCE_CASES: CoerceCase[] = [
+  {
+    name: "manage_goals",
+    numericStringPayload: { op: "update", goal_id: "5", target_amount: "999" },
+    numericField: "target_amount",
+    expectNumber: 999,
+    numericTypedPayload: { op: "update", goal_id: 5, target_amount: 999 },
+    emptyStringPayload: { op: "update", goal_id: "5", target_amount: "" },
+    nonNumericPayload: { op: "update", goal_id: "5", target_amount: "abc" },
+    arrayStringPayload: { op: "update", goal_id: "5", account_ids: "[1,2,3]" },
+    arrayField: "account_ids",
+    expectArray: [1, 2, 3],
+  },
+  {
+    name: "manage_holdings",
+    // The FINLYNQ-267 id fast-path — a stringified holdingId was unusable pre-270.
+    numericStringPayload: { op: "update", holdingId: "1115", symbol: "X" },
+    numericField: "holdingId",
+    expectNumber: 1115,
+    numericTypedPayload: { op: "update", holdingId: 1115, symbol: "X" },
+    emptyStringPayload: { op: "update", holdingId: "", symbol: "X" },
+    nonNumericPayload: { op: "update", holdingId: "abc", symbol: "X" },
+  },
+  {
+    name: "manage_subscriptions",
+    // No numeric-only variant is convenient; probe the boolean coercion here.
+    numericStringPayload: { op: "list", include_summary: "true" },
+    numericField: "__none__",
+    expectNumber: NaN,
+    numericTypedPayload: { op: "list", include_summary: true },
+    emptyStringPayload: { op: "update" }, // missing id → reject (unrelated to numeric)
+    nonNumericPayload: { op: "update" },
+    booleanStringPayload: { op: "list", include_summary: "false" },
+    booleanField: "include_summary",
+    expectBoolean: false,
+  },
+  {
+    name: "portfolio_record_entry",
+    numericStringPayload: { entry_type: "buy", holding: "AAPL", qty: "10", totalCost: "1900" },
+    numericField: "qty",
+    expectNumber: 10,
+    numericTypedPayload: { entry_type: "buy", holding: "AAPL", qty: 10, totalCost: 1900 },
+    emptyStringPayload: { entry_type: "buy", holding: "AAPL", qty: "", totalCost: "1900" },
+    nonNumericPayload: { entry_type: "buy", holding: "AAPL", qty: "abc", totalCost: "1900" },
+  },
+  {
+    name: "manage_transactions",
+    // Whole JSON array supplied as a string (the escalation-matrix worst case).
+    numericStringPayload: { op: "delete", id: "42" },
+    numericField: "id",
+    expectNumber: 42,
+    numericTypedPayload: { op: "delete", id: 42 },
+    emptyStringPayload: { op: "delete", id: "" },
+    nonNumericPayload: { op: "delete", id: "abc" },
+    arrayStringPayload: { op: "record", transactions: '[{"amount":-5,"payee":"X","account":"Chq"}]' },
+    arrayField: "transactions",
+    expectArray: [{ amount: -5, payee: "X", account: "Chq" }],
+  },
+];
+
+describe("consolidated tools coerce stringified params (FINLYNQ-270 tc-2)", () => {
+  let tools: Record<string, RegTool>;
+
+  beforeAll(() => {
+    const server = buildServer();
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
+    tools = (server as any)._registeredTools as Record<string, RegTool>;
+  });
+
+  for (const c of COERCE_CASES) {
+    describe(c.name, () => {
+      it("accepts a stringified numeric scalar and coerces it to a number", () => {
+        if (c.numericField === "__none__") return;
+        const schema = tools[c.name]?.inputSchema;
+        const r = schema.safeParse(c.numericStringPayload);
+        expect(r.success, `${c.name} stringified numeric`).toBe(true);
+        expect((r.data as Record<string, unknown>)[c.numericField]).toBe(c.expectNumber);
+      });
+
+      it("parses a native numeric identically (no behavior change)", () => {
+        if (c.numericField === "__none__") return;
+        const schema = tools[c.name]?.inputSchema;
+        const r = schema.safeParse(c.numericTypedPayload);
+        expect(r.success, `${c.name} native numeric`).toBe(true);
+        expect((r.data as Record<string, unknown>)[c.numericField]).toBe(c.expectNumber);
+      });
+
+      it("still REJECTS empty-string / non-numeric on a number field (no silent 0/NaN)", () => {
+        if (c.numericField === "__none__") return;
+        const schema = tools[c.name]?.inputSchema;
+        expect(schema.safeParse(c.emptyStringPayload).success, `${c.name} empty-string`).toBe(false);
+        expect(schema.safeParse(c.nonNumericPayload).success, `${c.name} non-numeric`).toBe(false);
+      });
+
+      if (c.booleanStringPayload && c.booleanField) {
+        it("coerces a stringified boolean to the correct boolean (not truthy-string)", () => {
+          const schema = tools[c.name]?.inputSchema;
+          const r = schema.safeParse(c.booleanStringPayload);
+          expect(r.success, `${c.name} stringified boolean`).toBe(true);
+          expect((r.data as Record<string, unknown>)[c.booleanField!]).toBe(c.expectBoolean);
+        });
+      }
+
+      if (c.arrayStringPayload && c.arrayField) {
+        it("coerces a stringified JSON array to a native array", () => {
+          const schema = tools[c.name]?.inputSchema;
+          const r = schema.safeParse(c.arrayStringPayload);
+          expect(r.success, `${c.name} stringified array`).toBe(true);
+          expect((r.data as Record<string, unknown>)[c.arrayField!]).toEqual(c.expectArray);
+        });
+      }
+    });
+  }
+});
