@@ -717,7 +717,7 @@ async function handleGet(request: NextRequest) {
     const txData = metricsByHoldingId.get(h.id) ?? null;
     const quantity = txData?.qty ?? null;
     // avgCostPerShare / totalCostBasis are `let` because a fiat cash sleeve
-    // pegs them to $1 / the balance below (FINLYNQ-283): a same-currency cash
+    // pegs them to $1 / the balance below (FINLYNQ-277): a same-currency cash
     // position has no in-currency unrealized gain, so its cost basis MUST equal
     // its market value regardless of any lot-engine drift.
     let avgCostPerShare = txData?.avgCostPerShare ?? null;
@@ -782,16 +782,17 @@ async function handleGet(request: NextRequest) {
         quoteCurrency = cashCurrency;
         marketValue = quantity; // in cashCurrency
         marketValueDisplay = quantity * fxRate; // in displayCurrency despite the legacy field name
-        // FINLYNQ-283: a same-currency cash sleeve has NO in-currency unrealized
+        // FINLYNQ-277: a same-currency cash sleeve has NO in-currency unrealized
         // gain — one unit of C always costs exactly one C. Peg cost basis to the
         // balance (price is 1, so market value == qty) so Unrealized G/L =
         // marketValue − totalCostBasis = 0. This is immune to cash-lot drift: the
         // lot engine can accumulate phantom OPEN long cash lots when an outflow
         // runs ahead of inflows (a shortfall the cash close-hook drops instead of
-        // opening a short lot — see cash-hooks.ts), and with the lots read-flip on
-        // that inflated remaining cost basis was surfacing as large phantom losses
-        // on Cash rows. Realized FX gain on the sleeve (a FLOW figure from lot
-        // closures) is untouched — only the point-in-time cost basis is corrected.
+        // opening a short lot — see cash-hooks.ts; the root reconcile is
+        // FINLYNQ-278), and with the lots read-flip on that inflated remaining
+        // cost basis was surfacing as large phantom losses on Cash rows. Realized
+        // FX gain on the sleeve (a FLOW figure from lot closures) is untouched —
+        // only the point-in-time cost basis is corrected.
         totalCostBasis = marketValue;
         avgCostPerShare = 1;
         // FINLYNQ-246: foreign-currency cash has a DISPLAY-currency day change
