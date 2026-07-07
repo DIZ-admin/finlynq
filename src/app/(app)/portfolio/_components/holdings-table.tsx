@@ -426,6 +426,15 @@ export function HoldingsTable({
                                   {memberHoldings.map(h => {
                                     const hasMetrics = h.quantity !== null && h.quantity !== 0;
                                     const nativeCcy = h.quoteCurrency ?? h.currency;
+                                    // FINLYNQ-279: Unrealized / Realized G/L must follow the
+                                    // same native-vs-display toggle as Mkt Value. In display
+                                    // mode use the *Display fields (which include the FX gain on
+                                    // cost for a foreign holding) so a per-account row reconciles
+                                    // with the combined row + account header; native $0.000 next
+                                    // to a CAD market value (the Cash USD case) was the mismatch.
+                                    const rowCcy = showNative ? nativeCcy : reportCcy;
+                                    const rowUnreal = showNative ? h.unrealizedGain : h.unrealizedGainDisplay;
+                                    const rowRealized = showNative ? h.realizedGain : h.realizedGainDisplay;
                                     return (
                                       <TableRow key={h.id} className="hover:bg-muted/30 border-border/60">
                                         <TableCell className="text-xs">
@@ -457,16 +466,16 @@ export function HoldingsTable({
                                             : <span className="text-muted-foreground">--</span>}
                                         </TableCell>
                                         <TableCell className="text-right text-xs">
-                                          {hasMetrics && h.unrealizedGain != null ? (
-                                            <span className={`font-mono ${h.unrealizedGain >= 0 ? "text-emerald-600 dark:text-emerald-400" : "text-rose-600 dark:text-rose-400"}`}>
-                                              {h.unrealizedGain >= 0 ? "+" : ""}{formatCurrencyAdaptive(h.unrealizedGain, nativeCcy)}
+                                          {hasMetrics && rowUnreal != null ? (
+                                            <span className={`font-mono ${rowUnreal >= 0 ? "text-emerald-600 dark:text-emerald-400" : "text-rose-600 dark:text-rose-400"}`}>
+                                              {rowUnreal >= 0 ? "+" : ""}{formatCurrencyAdaptive(rowUnreal, rowCcy)}
                                             </span>
                                           ) : <span className="text-muted-foreground">--</span>}
                                         </TableCell>
                                         <TableCell className="text-right text-xs">
-                                          {h.realizedGain != null && h.realizedGain !== 0 ? (
-                                            <span className={`font-mono ${h.realizedGain >= 0 ? "text-emerald-600 dark:text-emerald-400" : "text-rose-600 dark:text-rose-400"}`}>
-                                              {h.realizedGain >= 0 ? "+" : ""}{formatCurrencyAdaptive(h.realizedGain, nativeCcy)}
+                                          {rowRealized != null && rowRealized !== 0 ? (
+                                            <span className={`font-mono ${rowRealized >= 0 ? "text-emerald-600 dark:text-emerald-400" : "text-rose-600 dark:text-rose-400"}`}>
+                                              {rowRealized >= 0 ? "+" : ""}{formatCurrencyAdaptive(rowRealized, rowCcy)}
                                             </span>
                                           ) : <span className="text-muted-foreground">--</span>}
                                         </TableCell>
