@@ -195,6 +195,12 @@ export function signConfirmationToken(
 }
 
 export type ConfirmationVerifyFailure =
+  // Empty / absent / whitespace-only token. Distinct from `malformed` (a
+  // non-empty but garbled token) so the execute path can name the zero-match
+  // case: a zero-match preview mints NO token, so an agent that threads an
+  // empty string here should be told to "run preview first", not that its
+  // token was corrupt (FINLYNQ-274).
+  | "no_token"
   | "malformed"
   | "bad-signature"
   | "expired"
@@ -220,7 +226,15 @@ export function verifyConfirmationToken(
   operation: string,
   payload: unknown
 ): ConfirmationVerifyResult {
-  if (typeof token !== "string" || !token.includes(".")) {
+  // Empty / absent / whitespace-only token → `no_token`, BEFORE the malformed
+  // check. A zero-match preview mints no token (FINLYNQ-274), so an agent that
+  // mechanically threads an empty `confirmationToken` into execute must be told
+  // to run preview first — not that its token is corrupt. A non-empty but
+  // garbled token still falls through to `malformed` below.
+  if (typeof token !== "string" || token.trim() === "") {
+    return { valid: false, reason: "no_token" };
+  }
+  if (!token.includes(".")) {
     return { valid: false, reason: "malformed" };
   }
   const [payloadPart, macPart] = token.split(".");

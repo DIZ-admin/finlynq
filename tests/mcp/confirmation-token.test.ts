@@ -77,6 +77,39 @@ describe("confirmation-token", () => {
     expect(res.reason).toBe("malformed");
   });
 
+  // FINLYNQ-274: a zero-match preview mints NO token, so an empty / absent /
+  // whitespace-only `confirmation_token` on execute must surface `no_token`
+  // ("run preview first"), distinct from `malformed` (a garbled non-empty
+  // token, still covered above).
+  it.each(["", "   ", "\t\n"])(
+    "returns no_token (not malformed) for an empty/whitespace token %j",
+    (empty) => {
+      const res = verifyConfirmationToken(empty, userId, op, payload);
+      expect(res.valid).toBe(false);
+      expect(res.reason).toBe("no_token");
+    }
+  );
+
+  it("returns no_token for a non-string (absent) token", () => {
+    // A missing arg arrives as undefined at the crypto boundary.
+    const res = verifyConfirmationToken(
+      undefined as unknown as string,
+      userId,
+      op,
+      payload
+    );
+    expect(res.valid).toBe(false);
+    expect(res.reason).toBe("no_token");
+  });
+
+  it("a garbled NON-empty token still reports malformed (regression)", () => {
+    // Guard: the no_token guard must not swallow the malformed case. A
+    // non-empty string with no `.` separator is malformed, not no_token.
+    const res = verifyConfirmationToken("garbage-no-dot", userId, op, payload);
+    expect(res.valid).toBe(false);
+    expect(res.reason).toBe("malformed");
+  });
+
   it("rejects tampered signatures", () => {
     const [p] = token.split(".");
     const forged = `${p}.${"A".repeat(43)}`;
