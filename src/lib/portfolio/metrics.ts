@@ -74,12 +74,26 @@ export interface ComputeHoldingMetricsInput {
   asOfDate: string;
   /** Holding-id → holding-currency map (so we can pin output currency). */
   holdingCurrencies: Map<number, string>;
+  /**
+   * FINLYNQ-279: when set, each open lot's cost basis is ALSO valued in this
+   * currency at the historical rate on the lot's `open_date` via `fxAtDate`,
+   * summed into `PerHoldingMetrics.costBasisReporting`. Omit to make
+   * costBasisReporting === costBasis (native), a byte-identical no-op for the
+   * callers that don't need the reporting-currency (FX-on-cost) basis.
+   */
+  reportingCurrency?: string;
+  /**
+   * Historical FX converter: rate on a SPECIFIC date (the lot's open date),
+   * used only for `costBasisReporting`. Callers pre-resolve every distinct
+   * (lotCcy, reportingCcy, openDate) triple into a map and pass a lookup here.
+   */
+  fxAtDate?: (amount: number, from: string, to: string, date: string) => number;
 }
 
 export function computeHoldingMetricsFromLots(
   input: ComputeHoldingMetricsInput,
 ): PerHoldingMetrics[] {
-  const { lots, closures, dividends, prices, fx, asOfDate, holdingCurrencies } = input;
+  const { lots, closures, dividends, prices, fx, asOfDate, holdingCurrencies, reportingCurrency, fxAtDate } = input;
   const yearStart = `${asOfDate.slice(0, 4)}-01-01`;
 
   // Group lots + closures by (holdingId, accountId). Both arrays are
@@ -162,13 +176,29 @@ export function computeHoldingMetricsFromLots(
     // fx returns 1.
     let qty = 0;
     let costBasisInHolding = 0;
+    // FINLYNQ-279: cost basis in the reporting currency, each open lot valued
+    // at the historical rate on its OWN open date. Falls back to the native
+    // holding-currency conversion when no reportingCurrency/fxAtDate is passed,
+    // so `costBasisReporting === costBasis` for those callers.
+    let costBasisReporting = 0;
     let firstPurchaseDate: string | null = null;
     for (const l of cell.lots) {
       if (l.status !== "open" || l.qtyRemaining <= 0) continue;
-      qty += l.qtyRemaining;
+      // FINLYNQ-278: SHORT lots reduce the net position and represent a
+      // negative cost basis (cash overdraft / short sale), so sign them −1.
+      // Without this a short lot's qtyRemaining was added as a positive long,
+      // inflating qty + cost. For a net-negative cash sleeve (long − short =
+      // balance) this makes qty/costBasis reconcile to the ledger balance
+      // (metrics.ts is overview-only, so the blast radius is the overview).
+      const sign = l.side === "short" ? -1 : 1;
+      qty += sign * l.qtyRemaining;
       const lotCost = l.qtyRemaining * l.costPerShare;
-      costBasisInHolding += fx(lotCost, l.currency, holdingCurrency);
-      if (firstPurchaseDate == null || l.openDate < firstPurchaseDate) {
+      costBasisInHolding += sign * fx(lotCost, l.currency, holdingCurrency);
+      costBasisReporting += sign * (reportingCurrency && fxAtDate
+        ? fxAtDate(lotCost, l.currency, reportingCurrency, l.openDate)
+        : fx(lotCost, l.currency, holdingCurrency));
+      // firstPurchaseDate tracks acquisition — a short OPEN is not a purchase.
+      if (l.side !== "short" && (firstPurchaseDate == null || l.openDate < firstPurchaseDate)) {
         firstPurchaseDate = l.openDate;
       }
     }
@@ -219,6 +249,7 @@ export function computeHoldingMetricsFromLots(
       accountId: cell.accountId,
       qty,
       costBasis: costBasisInHolding,
+      costBasisReporting,
       unrealizedGain,
       marketValue,
       realizedGainYtd,

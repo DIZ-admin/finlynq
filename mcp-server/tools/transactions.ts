@@ -80,6 +80,7 @@ import {
 import {
   signPreviewToken,
   verifyPreviewToken,
+  renderTokenError,
   withConfirmation,
   PreviewAbortError,
   checkExpectedEcho,
@@ -2372,6 +2373,10 @@ export function registerTransactionsTools(server: McpServer, ctx: PgToolContext)
 
   // ─── Wave 2: bulk edit + detect_subscriptions + upload flow ────────────────
 
+  // FINLYNQ-274: the note carried on a zero-match preview (no rows matched the
+  // filter). Single-sourced so all three bulk families use the same wording.
+  const NO_MATCH_NOTE = "No rows matched; nothing to confirm.";
+
   // Zod schema for the filter shape used by preview_bulk_*. Mirrors the logic
   // supported by /api/transactions/bulk but extended with range filters so
   // Claude doesn't have to fetch ids first.
@@ -2682,7 +2687,18 @@ export function registerTransactionsTools(server: McpServer, ctx: PgToolContext)
     if (error) throw new Error(error);
 
     if (ids.length === 0) {
-      return { affectedCount: 0, sampleBefore: [], sampleAfter: [], unappliedChanges: unapplied, ids: [], confirmationToken: "" };
+      // FINLYNQ-274: a zero-match preview mints NO token. Omit the
+      // `confirmationToken` key entirely (the tool wrappers spread it
+      // conditionally) and carry an explanatory `note` so an agent doesn't
+      // thread an empty string into execute_bulk_* and get `malformed`.
+      return {
+        affectedCount: 0,
+        sampleBefore: [],
+        sampleAfter: [],
+        unappliedChanges: unapplied,
+        ids: [],
+        note: NO_MATCH_NOTE,
+      };
     }
 
     const sampleIds = ids.slice(0, 10);
@@ -2829,8 +2845,14 @@ export function registerTransactionsTools(server: McpServer, ctx: PgToolContext)
     },
     async ({ filter, changes }) => {
       try {
-        const { affectedCount, sampleBefore, sampleAfter, unappliedChanges, confirmationToken } = await previewBulk(filter, changes, "bulk_update");
-        return text({ success: true, data: { affectedCount, sampleBefore, sampleAfter, unappliedChanges, confirmationToken } });
+        const { affectedCount, sampleBefore, sampleAfter, unappliedChanges, confirmationToken, note } = await previewBulk(filter, changes, "bulk_update");
+        // FINLYNQ-274: omit `confirmationToken` when it wasn't minted (zero
+        // match); carry `note` when present. `>0`-match path is byte-identical.
+        return text({ success: true, data: {
+          affectedCount, sampleBefore, sampleAfter, unappliedChanges,
+          ...(confirmationToken != null ? { confirmationToken } : {}),
+          ...(note != null ? { note } : {}),
+        } });
       } catch (e) {
         return err(String(e instanceof Error ? e.message : e));
       }
@@ -2854,7 +2876,7 @@ export function registerTransactionsTools(server: McpServer, ctx: PgToolContext)
       try {
         const ids = await resolveFilterToIds(filter);
         const check = verifyPreviewToken(confirmation_token, userId, "bulk_update", { ids, changes });
-        if (!check.valid) return err(`Confirmation token invalid: ${check.reason}. Re-run preview_bulk_update.`);
+        if (!check.valid) return err(renderTokenError(check, "preview_bulk_update"));
 
         // Issue #61: resolve names → ids HERE so the commit only ever writes
         // FK ints. Refuse hard conflicts (id-vs-name disagreement). Refuse if
@@ -2893,7 +2915,10 @@ export function registerTransactionsTools(server: McpServer, ctx: PgToolContext)
       try {
         const ids = await resolveFilterToIds(filter);
         if (ids.length === 0) {
-          return text({ success: true, data: { affectedCount: 0, sample: [], confirmationToken: "" } });
+          // FINLYNQ-274: a zero-match preview mints NO token. Omit the
+          // `confirmationToken` key entirely + carry an explanatory note so an
+          // agent doesn't thread an empty string into execute_bulk_delete.
+          return text({ success: true, data: { affectedCount: 0, sample: [], note: NO_MATCH_NOTE } });
         }
         const sampleIds = ids.slice(0, 10);
         // Stream D Phase 4: a.name + c.name dropped — read *_ct only.
@@ -2939,7 +2964,7 @@ export function registerTransactionsTools(server: McpServer, ctx: PgToolContext)
       try {
         const ids = await resolveFilterToIds(filter);
         const check = verifyPreviewToken(confirmation_token, userId, "bulk_delete", { ids });
-        if (!check.valid) return err(`Confirmation token invalid: ${check.reason}. Re-run preview_bulk_delete.`);
+        if (!check.valid) return err(renderTokenError(check, "preview_bulk_delete"));
         if (ids.length === 0) return text({ success: true, data: { deleted: 0 } });
         // Defense-in-depth: parameterized ANY(ARRAY[...]::int[]) instead of CSV.
         const idsExpr = sql.join(ids.map((id) => sql`${Number(id)}`), sql`, `);
@@ -2969,7 +2994,9 @@ export function registerTransactionsTools(server: McpServer, ctx: PgToolContext)
         const ct = cat[0].name_ct as string | null | undefined;
         const categoryName = ct && dek ? decryptField(dek, String(ct)) : null;
         const changes: BulkChanges = { category_id };
-        const { affectedCount, sampleBefore, sampleAfter, confirmationToken } = await previewBulk(filter, changes, "bulk_categorize");
+        const { affectedCount, sampleBefore, sampleAfter, confirmationToken, note } = await previewBulk(filter, changes, "bulk_categorize");
+        // FINLYNQ-274: omit `confirmationToken` on a zero-match preview; carry
+        // the explanatory `note`. The `>0`-match path stays byte-identical.
         return text({
           success: true,
           data: {
@@ -2978,7 +3005,8 @@ export function registerTransactionsTools(server: McpServer, ctx: PgToolContext)
             affectedCount,
             sampleBefore,
             sampleAfter,
-            confirmationToken,
+            ...(confirmationToken != null ? { confirmationToken } : {}),
+            ...(note != null ? { note } : {}),
           },
         });
       } catch (e) {
@@ -3002,7 +3030,7 @@ export function registerTransactionsTools(server: McpServer, ctx: PgToolContext)
         const ids = await resolveFilterToIds(filter);
         const changes: BulkChanges = { category_id };
         const check = verifyPreviewToken(confirmation_token, userId, "bulk_categorize", { ids, changes });
-        if (!check.valid) return err(`Confirmation token invalid: ${check.reason}. Re-run preview_bulk_categorize.`);
+        if (!check.valid) return err(renderTokenError(check, "preview_bulk_categorize"));
         // Issue #61: commit takes the resolved shape now. category_id is
         // already an int so resolution is a no-op for this code path.
         const resolved: ResolvedChanges = { category_id };

@@ -195,6 +195,12 @@ export function signConfirmationToken(
 }
 
 export type ConfirmationVerifyFailure =
+  // Empty / absent / whitespace-only token. Distinct from `malformed` (a
+  // non-empty but garbled token) so the execute path can name the zero-match
+  // case: a zero-match preview mints NO token, so an agent that threads an
+  // empty string here should be told to "run preview first", not that its
+  // token was corrupt (FINLYNQ-274).
+  | "no_token"
   | "malformed"
   | "bad-signature"
   | "expired"
@@ -220,7 +226,15 @@ export function verifyConfirmationToken(
   operation: string,
   payload: unknown
 ): ConfirmationVerifyResult {
-  if (typeof token !== "string" || !token.includes(".")) {
+  // Empty / absent / whitespace-only token → `no_token`, BEFORE the malformed
+  // check. A zero-match preview mints no token (FINLYNQ-274), so an agent that
+  // mechanically threads an empty `confirmationToken` into execute must be told
+  // to run preview first — not that its token is corrupt. A non-empty but
+  // garbled token still falls through to `malformed` below.
+  if (typeof token !== "string" || token.trim() === "") {
+    return { valid: false, reason: "no_token" };
+  }
+  if (!token.includes(".")) {
     return { valid: false, reason: "malformed" };
   }
   const [payloadPart, macPart] = token.split(".");
@@ -270,18 +284,33 @@ export function verifyConfirmationToken(
   if (claims.operation !== operation) {
     return { valid: false, reason: "operation-mismatch", claims };
   }
+
+  // M-2: single-use jti replay check — MUST run BEFORE the payload-hash compare
+  // (FINLYNQ-272). A spent token replayed against the SAME logical operation is
+  // a `replay`, not a `payload-mismatch`, even if the recomputed payload no
+  // longer matches: after a bulk delete commits, `resolveFilterToIds` returns []
+  // for the now-deleted rows, so the replay's payload hash (`{ids:[]}`) differs
+  // from the token's (`{ids:[90203]}`). Checking payload-mismatch first would
+  // then mislabel the replay as `payload-mismatch` — telling the agent to
+  // "rebuild your filter" instead of "already done, check state before retry".
+  // We only CHECK is-used here (returns `replay` for a burned jti); the jti is
+  // MARKED used at the very end, on an otherwise-fully-valid verify, so a fresh
+  // token that fails a later check (payload-mismatch) is NOT burned and can be
+  // retried with the correct payload.
+  const hasJti = typeof claims.jti === "string" && claims.jti.length > 0;
+  if (hasJti && isJtiUsed(claims.jti as string)) {
+    return { valid: false, reason: "replay", claims };
+  }
+
   if (claims.payloadHash !== hashPayload(payload)) {
     return { valid: false, reason: "payload-mismatch", claims };
   }
 
-  // M-2: single-use jti. Tokens minted before this change carry no jti — they
-  // can still verify (defensive) but they aren't replay-protected. New tokens
-  // always carry one and are rejected on second use.
-  if (typeof claims.jti === "string" && claims.jti.length > 0) {
-    if (isJtiUsed(claims.jti)) {
-      return { valid: false, reason: "replay", claims };
-    }
-    markJtiUsed(claims.jti, claims.expiresAt);
+  // Tokens minted before M-2 carry no jti — they still verify (defensive) but
+  // aren't replay-protected. New tokens always carry one and are burned here on
+  // first fully-valid verify so a second use is rejected as `replay` above.
+  if (hasJti) {
+    markJtiUsed(claims.jti as string, claims.expiresAt);
   }
 
   return { valid: true, claims };

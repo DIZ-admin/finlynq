@@ -55,6 +55,167 @@ export const CONSOLIDATED_JSON_SCHEMAS: Map<string, unknown> = new Map();
  */
 export const ALIAS_NAMES: Set<string> = new Set();
 
+// ── FINLYNQ-270: stringified-param coercion for the consolidated unions ──────
+//
+// Many MCP clients (Claude's included) stringify top-level scalar params, and on
+// the 2020-12 `oneOf` schema the consolidated tools advertise, clients that
+// can't infer a per-param type across the union stringify EVERYTHING — numbers,
+// booleans, even whole JSON arrays/objects (see the FINLYNQ-270 escalation
+// matrix). Strict `z.number()` / `z.array()` then reject with -32602, making the
+// entire v4 write surface unusable from those clients.
+//
+// The fix is a SCHEMA-AWARE pre-parse applied ONCE in `registerManageTool`,
+// before the `discriminatedUnion` parse: for the variant selected by the
+// discriminator, walk each field's declared (unwrapped) type and, when a STRING
+// arrived where a non-string was expected, coerce it — number-string → number,
+// "true"/"false" → boolean, JSON array/object string → parsed value (recursing
+// into the parsed structure). Correctly-typed inputs are passed through
+// UNTOUCHED, and anything that can't be coerced (e.g. "" or "abc" for a number)
+// is left as-is so the union parse still rejects it with a real validation error
+// — no silent 0/NaN writes.
+//
+// This is deliberately conservative: it never throws (introspection failures
+// pass the value through), never touches the discriminator (a literal stays a
+// literal), and never coerces a value into a `z.string()` field.
+
+/** Unwrap optional / nullable / default / non-discriminated pipe wrappers to the inner schema + its zod type name. */
+function unwrapZod(schema: unknown): { type: string | undefined; schema: unknown } {
+  let cur = schema as { _zod?: { def?: { type?: string; innerType?: unknown; in?: unknown } } } | undefined;
+  // Bound the loop to avoid any pathological cycle.
+  for (let i = 0; i < 10 && cur?._zod?.def; i++) {
+    const def = cur._zod.def!;
+    const t = def.type;
+    if ((t === "optional" || t === "nullable" || t === "default") && def.innerType) {
+      cur = def.innerType as typeof cur;
+      continue;
+    }
+    // `z.pipe` (e.g. z.string().pipe(...)) — unwrap to the input schema so we
+    // classify by what the caller supplies, not the transform output.
+    if (t === "pipe" && def.in) {
+      cur = def.in as typeof cur;
+      continue;
+    }
+    return { type: t, schema: cur };
+  }
+  return { type: cur?._zod?.def?.type, schema: cur };
+}
+
+/** Coerce ONE raw value toward the target schema. Returns the (possibly-coerced) value; never throws. */
+function coerceValue(raw: unknown, schema: unknown): unknown {
+  try {
+    const { type, schema: inner } = unwrapZod(schema);
+    if (type === "number") {
+      if (typeof raw === "string") {
+        const trimmed = raw.trim();
+        // Only coerce a genuinely numeric string; leave "" / "abc" so the
+        // union parse rejects them (no silent 0 / NaN write).
+        if (trimmed !== "" && Number.isFinite(Number(trimmed))) return Number(trimmed);
+      }
+      return raw;
+    }
+    if (type === "boolean") {
+      // z.coerce.boolean treats any non-empty string as true — that footgun is
+      // exactly why we DON'T use it. Map the literal tokens explicitly.
+      if (typeof raw === "string") {
+        const t = raw.trim().toLowerCase();
+        if (t === "true") return true;
+        if (t === "false") return false;
+      }
+      return raw;
+    }
+    if (type === "array") {
+      let arr = raw;
+      if (typeof raw === "string") {
+        const parsed = tryJsonParse(raw);
+        if (Array.isArray(parsed)) arr = parsed;
+      }
+      if (Array.isArray(arr)) {
+        // Recurse into elements against the element schema when introspectable.
+        const elementSchema = (inner as { _zod?: { def?: { element?: unknown } } })?._zod?.def?.element;
+        return elementSchema ? arr.map((el) => coerceValue(el, elementSchema)) : arr;
+      }
+      return raw;
+    }
+    if (type === "object") {
+      let obj = raw;
+      if (typeof raw === "string") {
+        const parsed = tryJsonParse(raw);
+        if (parsed && typeof parsed === "object" && !Array.isArray(parsed)) obj = parsed;
+      }
+      if (obj && typeof obj === "object" && !Array.isArray(obj)) {
+        const shape = (inner as { _zod?: { def?: { shape?: Record<string, unknown> } } })?._zod?.def?.shape;
+        return shape ? coerceShape(obj as Record<string, unknown>, shape) : obj;
+      }
+      return raw;
+    }
+    // string / enum / literal / anything else → leave untouched.
+    return raw;
+  } catch {
+    return raw;
+  }
+}
+
+/** JSON.parse that returns undefined instead of throwing (so callers can guard the shape). */
+function tryJsonParse(s: string): unknown {
+  const trimmed = s.trim();
+  if (!(trimmed.startsWith("[") || trimmed.startsWith("{"))) return undefined;
+  try {
+    return JSON.parse(trimmed);
+  } catch {
+    return undefined;
+  }
+}
+
+/** Coerce every field of `obj` against the matching field schema in `shape`. */
+function coerceShape(obj: Record<string, unknown>, shape: Record<string, unknown>): Record<string, unknown> {
+  const out: Record<string, unknown> = { ...obj };
+  for (const key of Object.keys(shape)) {
+    if (key in out) out[key] = coerceValue(out[key], shape[key]);
+  }
+  return out;
+}
+
+/**
+ * Pre-parse the raw MCP input against a `z.discriminatedUnion`, coercing
+ * stringified scalars/arrays/objects toward the schema of the variant selected
+ * by the discriminator. Returns the raw input unchanged on any structural
+ * surprise (non-object input, missing/unknown discriminator) so the subsequent
+ * union parse produces the authoritative validation error. Never throws.
+ */
+export function coerceUnionInput(union: unknown, raw: unknown): unknown {
+  try {
+    if (!raw || typeof raw !== "object" || Array.isArray(raw)) return raw;
+    const def = (union as { _zod?: { def?: { type?: string; discriminator?: string; options?: unknown[] } } })?._zod?.def;
+    if (!def || def.type !== "union") return raw;
+    const discriminator = def.discriminator;
+    const options = def.options ?? [];
+    const rawObj = raw as Record<string, unknown>;
+    // Pick the variant whose discriminator literal matches the supplied value.
+    // The discriminator itself is NEVER coerced (a literal stays a literal).
+    const discVal = discriminator ? rawObj[discriminator] : undefined;
+    let shape: Record<string, unknown> | undefined;
+    for (const opt of options) {
+      const optShape = (opt as { _zod?: { def?: { shape?: Record<string, unknown> } } })?._zod?.def?.shape;
+      if (!optShape) continue;
+      const litSchema = discriminator ? optShape[discriminator] : undefined;
+      const litVal = (litSchema as { _zod?: { def?: { values?: unknown[] } } })?._zod?.def?.values?.[0];
+      if (litVal !== undefined && litVal === discVal) {
+        shape = optShape;
+        break;
+      }
+    }
+    if (!shape) return raw; // unknown/missing discriminator → let the union parse reject.
+    const out: Record<string, unknown> = { ...rawObj };
+    for (const key of Object.keys(shape)) {
+      if (key === discriminator) continue; // never coerce the discriminant.
+      if (key in out) out[key] = coerceValue(out[key], shape[key]);
+    }
+    return out;
+  } catch {
+    return raw;
+  }
+}
+
 /**
  * Register a consolidated `manage_*` tool from a discriminated union. The union
  * drives VALIDATION (a bad op+field combo is rejected — tc-2); its native
@@ -74,7 +235,9 @@ export function registerManageTool<U extends AnyZod>(
   union: U,
   handler: (input: z.infer<U>) => Promise<ToolResult>,
 ): void {
-  // Record the native-v4 oneOf JSON schema for tools/list advertisement.
+  // Record the native-v4 oneOf JSON schema for tools/list advertisement. Built
+  // from the RAW union so the advertised `oneOf` is byte-identical to pre-270
+  // (the coercion preprocess below does not change the declared JSON Schema).
   try {
     CONSOLIDATED_JSON_SCHEMAS.set(name, z.toJSONSchema(union));
   } catch {
@@ -82,10 +245,19 @@ export function registerManageTool<U extends AnyZod>(
     // (empty) rendering — validation is unaffected. Non-fatal.
     CONSOLIDATED_JSON_SCHEMAS.delete(name);
   }
+  // FINLYNQ-270: wrap the union in a preprocess that coerces stringified
+  // scalars/arrays/objects BEFORE the discriminatedUnion validation the SDK runs
+  // in `registerTool`. Validation semantics are unchanged (a bad op+field combo
+  // still rejects — tc-2), and `z.toJSONSchema` of the wrapped schema still emits
+  // the same `oneOf` — but we advertise the RAW union's schema above anyway.
+  const validationSchema = z.preprocess(
+    (raw) => coerceUnionInput(union, raw),
+    union,
+  );
   // eslint-disable-next-line @typescript-eslint/no-explicit-any
   (server as any).registerTool(
     name,
-    { description, inputSchema: union },
+    { description, inputSchema: validationSchema },
     // eslint-disable-next-line @typescript-eslint/no-explicit-any
     async (input: any) => handler(input as z.infer<U>),
   );

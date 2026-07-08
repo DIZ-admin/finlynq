@@ -77,6 +77,39 @@ describe("confirmation-token", () => {
     expect(res.reason).toBe("malformed");
   });
 
+  // FINLYNQ-274: a zero-match preview mints NO token, so an empty / absent /
+  // whitespace-only `confirmation_token` on execute must surface `no_token`
+  // ("run preview first"), distinct from `malformed` (a garbled non-empty
+  // token, still covered above).
+  it.each(["", "   ", "\t\n"])(
+    "returns no_token (not malformed) for an empty/whitespace token %j",
+    (empty) => {
+      const res = verifyConfirmationToken(empty, userId, op, payload);
+      expect(res.valid).toBe(false);
+      expect(res.reason).toBe("no_token");
+    }
+  );
+
+  it("returns no_token for a non-string (absent) token", () => {
+    // A missing arg arrives as undefined at the crypto boundary.
+    const res = verifyConfirmationToken(
+      undefined as unknown as string,
+      userId,
+      op,
+      payload
+    );
+    expect(res.valid).toBe(false);
+    expect(res.reason).toBe("no_token");
+  });
+
+  it("a garbled NON-empty token still reports malformed (regression)", () => {
+    // Guard: the no_token guard must not swallow the malformed case. A
+    // non-empty string with no `.` separator is malformed, not no_token.
+    const res = verifyConfirmationToken("garbage-no-dot", userId, op, payload);
+    expect(res.valid).toBe(false);
+    expect(res.reason).toBe("malformed");
+  });
+
   it("rejects tampered signatures", () => {
     const [p] = token.split(".");
     const forged = `${p}.${"A".repeat(43)}`;
@@ -132,6 +165,66 @@ describe("confirmation-token", () => {
       // Both replays rejected.
       expect(verifyConfirmationToken(t1, userId, op, payload).reason).toBe("replay");
       expect(verifyConfirmationToken(t2, userId, op, payload).reason).toBe("replay");
+    });
+  });
+
+  // ── FINLYNQ-272: replay label must beat payload-mismatch ───────────────────
+  // The bug: after a bulk delete commits, the deleted rows no longer resolve,
+  // so a replay of the spent token verifies against a DIFFERENT payload
+  // (`{ids:[]}`) than it was signed for (`{ids:[90203]}`). The payload-mismatch
+  // check used to run before the jti-replay check, so a spent-but-mutated-state
+  // token was mislabeled `payload-mismatch` — telling the agent to rebuild its
+  // (already-correct) filter instead of "already done, check state".
+  describe("FINLYNQ-272: replay vs payload-mismatch vs expired", () => {
+    it("replay: spent token + IDENTICAL payload → 'replay' (not payload-mismatch)", () => {
+      const tok = signConfirmationToken(userId, op, { ids: [90203] });
+      // First (successful) commit burns the jti.
+      expect(verifyConfirmationToken(tok, userId, op, { ids: [90203] }).valid).toBe(true);
+      // Replay with the SAME payload → replay, never payload-mismatch.
+      const res = verifyConfirmationToken(tok, userId, op, { ids: [90203] });
+      expect(res.valid).toBe(false);
+      expect(res.reason).toBe("replay");
+      expect(res.reason).not.toBe("payload-mismatch");
+    });
+
+    it("replay: spent token whose payload CHANGED post-commit → 'replay' (the bug's exact shape)", () => {
+      // Reproduces the item's scenario: the token is signed for {ids:[90203]},
+      // committed once, then the row is deleted so the replay re-resolves to
+      // {ids:[]}. The recomputed hash no longer matches, but because the jti is
+      // spent the answer must be `replay`, not `payload-mismatch`.
+      const tok = signConfirmationToken(userId, op, { ids: [90203] });
+      expect(verifyConfirmationToken(tok, userId, op, { ids: [90203] }).valid).toBe(true);
+      const res = verifyConfirmationToken(tok, userId, op, { ids: [] });
+      expect(res.valid).toBe(false);
+      expect(res.reason).toBe("replay");
+      expect(res.reason).not.toBe("payload-mismatch");
+    });
+
+    it("payload-mismatch: FRESH (unconsumed) token + wrong payload → still 'payload-mismatch'", () => {
+      const tok = signConfirmationToken(userId, op, { ids: [90203] });
+      // Never committed → jti unconsumed → the payload-hash check governs.
+      const res = verifyConfirmationToken(tok, userId, op, { ids: [90202] });
+      expect(res.valid).toBe(false);
+      expect(res.reason).toBe("payload-mismatch");
+      // And the failed verify did NOT burn the jti — the correct payload still verifies.
+      const retry = verifyConfirmationToken(tok, userId, op, { ids: [90203] });
+      expect(retry.valid).toBe(true);
+    });
+
+    it("expired: backdated exp → 'expired' (distinct from replay and payload-mismatch)", () => {
+      // Advance the clock past the 5-min TTL rather than waiting.
+      const tok = signConfirmationToken(userId, op, { ids: [90203] });
+      const realNow = Date.now;
+      try {
+        Date.now = () => realNow() + CONFIRMATION_TOKEN_TTL_MS + 1000;
+        const res = verifyConfirmationToken(tok, userId, op, { ids: [90203] });
+        expect(res.valid).toBe(false);
+        expect(res.reason).toBe("expired");
+        expect(res.reason).not.toBe("replay");
+        expect(res.reason).not.toBe("payload-mismatch");
+      } finally {
+        Date.now = realNow;
+      }
     });
   });
 });

@@ -72,6 +72,27 @@ export function verifyPreviewToken(
   return verifyConfirmationToken(token, userId, operation, payload);
 }
 
+/**
+ * Render a failed token verification into a human-readable error string.
+ *
+ * Special-cases `no_token` (FINLYNQ-274): a zero-match preview mints NO token,
+ * so an empty/absent `confirmation_token` on execute should tell the agent to
+ * run preview first — NOT that its token was `malformed` (which reads like a
+ * serialization bug). All other reasons keep the "invalid: <reason>, re-run
+ * preview" phrasing.
+ *
+ * `refreshHint` names the preview tool to re-run (e.g. "preview_bulk_delete").
+ */
+export function renderTokenError(
+  check: ConfirmationVerifyResult,
+  refreshHint: string,
+): string {
+  if (check.reason === "no_token") {
+    return `no_token: run ${refreshHint} first (a zero-match preview mints no token).`;
+  }
+  return `Confirmation token invalid: ${check.reason}. Re-run ${refreshHint}.`;
+}
+
 /** The human-readable preview summary — any JSON-serializable value. */
 export type PreviewSummary = unknown;
 
@@ -180,6 +201,14 @@ export function withConfirmation<A extends { confirmation_token?: string }>(
         payload,
       );
       if (!check.valid) {
+        // `no_token` can't occur on the convention-(S) path (an absent token
+        // routes to the preview branch above), but map it defensively so the
+        // taxonomy is consistent everywhere.
+        if (check.reason === "no_token") {
+          return err(
+            `no_token: re-call ${spec.operation} without confirmation_token to get a fresh preview + token.`,
+          );
+        }
         return err(
           `Confirmation token invalid: ${check.reason}. Re-call without confirmation_token to refresh.`,
         );
