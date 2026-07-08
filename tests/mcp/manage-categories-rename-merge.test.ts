@@ -183,7 +183,8 @@ describeDb("manage_categories rename + merge (seeded DB)", () => {
     const tgt = await createCategory({ userId, name: "Keeper", type: "E" });
     // Unknown source name → clean not-found err (no token).
     const nf = await handler({ op: "merge", source: "Nonexistent", target: tgt }, { requestId: 1 });
-    expect(errText(nf)).toMatch(/not found/i);
+    // FINLYNQ-273 unified refusal envelope: not-found renders "matched no <label>. Did you mean: …".
+    expect(errText(nf)).toMatch(/matched no category/i);
   });
 
   it("merge: ambiguous source name → ambiguous candidate list (no token)", async () => {
