@@ -32,6 +32,11 @@ import {
   type HoldingOption,
 } from "@/components/staging/staged-row-editor";
 import { RowBadge, type ReconcileState } from "./row-badge";
+import {
+  matchBorderClass,
+  MatchStatusBadge,
+  type PaneMatchStatus,
+} from "./match-status";
 
 const RowFragment = Fragment;
 
@@ -63,6 +68,10 @@ export interface FilePaneProps {
   onRowClick?: (stagedId: string) => void;
   /** Staged row ids currently highlighted by a click-through. */
   highlightedStagedIds?: ReadonlySet<string>;
+  /** Persistent cross-pane match status per staged id (computePanePairing).
+   *  'matched' = a bank row covers it; 'only_file' = new (no bank counterpart).
+   *  Absent → no tint. */
+  matchStatus?: ReadonlyMap<string, PaneMatchStatus>;
 }
 
 export function FilePane({
@@ -80,6 +89,7 @@ export function FilePane({
   anchorsByDate,
   onRowClick,
   highlightedStagedIds,
+  matchStatus,
 }: FilePaneProps) {
   if (rows.length === 0) {
     return (
@@ -98,9 +108,21 @@ export function FilePane({
   // the most recent transaction of that day).
   const balanceShownForDate = new Set<string>();
   const hasAnyAnchor = (anchorsByDate?.size ?? 0) > 0;
-  // Rows already pushed to the bank ledger (row_status='approved') stay
-  // visible but aren't re-sendable — exclude them from select-all.
-  const selectableRows = rows.filter((r) => r.rowStatus !== "approved");
+  // Select-all is the "default automatic path" — it should tick only the rows
+  // that still need loading. Exclude:
+  //   • row_status='approved'  — already pushed to the bank ledger
+  //   • reconcileState='linked' — already matched to an existing ledger tx
+  //   • reconcileState='skipped_duplicate' — an exact/fuzzy duplicate we already
+  //     have (the fuzzy net catches email-loaded charges under a drifted payee)
+  // Any of these can still be picked individually via its own row checkbox
+  // (linked → Unlink, skipped → Un-skip/force-load) — they're just kept out of
+  // the bulk select so the user can't re-load a duplicate by accident.
+  const selectableRows = rows.filter(
+    (r) =>
+      r.rowStatus !== "approved" &&
+      r.reconcileState !== "linked" &&
+      r.reconcileState !== "skipped_duplicate",
+  );
   // colSpan for the expanded editor row must cover every header column.
   // Columns: checkbox (1) + chevron (2) + Date (3) + Payee (4) + Type (5)
   //          + Amount (6) [+ Balance (7)] [+ Actions (last)]
@@ -172,11 +194,12 @@ export function FilePane({
               const highlightClass = highlighted
                 ? "bg-sky-500/10 outline outline-2 outline-sky-500/40"
                 : "";
+              const ms = matchStatus?.get(r.id);
               const clickable = onRowClick != null;
               return (
                 <RowFragment key={r.id}>
                   <TableRow
-                    className={`${dimmed} ${importedClass} ${highlightClass} ${clickable ? "cursor-pointer" : ""}`}
+                    className={`${dimmed} ${importedClass} ${matchBorderClass(ms)} ${highlightClass} ${clickable ? "cursor-pointer" : ""}`}
                     onClick={
                       clickable
                         ? (e) => {
@@ -228,6 +251,7 @@ export function FilePane({
                     </TableCell>
                     <TableCell className="text-xs">
                       <div className="flex items-center gap-1 flex-wrap">
+                        <MatchStatusBadge status={ms} />
                         {r.txType === "R" ? (
                           <Badge variant="outline" className="text-[10px]">
                             Transfer

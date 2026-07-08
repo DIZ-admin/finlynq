@@ -32,6 +32,11 @@ import {
 } from "@/components/ui/table";
 import { Badge } from "@/components/ui/badge";
 import { formatCurrency } from "@/lib/currency";
+import {
+  matchBorderClass,
+  MatchStatusBadge,
+  type PaneMatchStatus,
+} from "./match-status";
 
 export interface DbTransactionRow {
   /**
@@ -86,6 +91,7 @@ export function DbPane({
   header,
   onRowClick,
   highlightedBankIds,
+  matchStatus,
 }: {
   rows: DbTransactionRow[];
   loading: boolean;
@@ -96,6 +102,10 @@ export function DbPane({
   onRowClick?: (bankId: string) => void;
   /** Bank ids currently highlighted by a click-through. */
   highlightedBankIds?: ReadonlySet<string>;
+  /** Persistent cross-pane match status per bank id (computePanePairing).
+   *  'matched' = a file row covers it; 'only_ledger' = in-period, not in the
+   *  file. Absent (out-of-window / no batch) → no tint. */
+  matchStatus?: ReadonlyMap<string, PaneMatchStatus>;
 }) {
   if (loading) {
     return (
@@ -184,11 +194,12 @@ export function DbPane({
               const highlightClass = highlighted
                 ? "bg-sky-500/10 outline outline-2 outline-sky-500/40"
                 : "";
+              const ms = matchStatus?.get(r.id);
               const clickable = onRowClick != null;
               return (
                 <TableRow
                   key={r.id}
-                  className={`${dimmed} ${highlightClass} ${clickable ? "cursor-pointer" : ""}`}
+                  className={`${dimmed} ${matchBorderClass(ms)} ${highlightClass} ${clickable ? "cursor-pointer" : ""}`}
                   onClick={
                     clickable
                       ? (e) => {
@@ -214,6 +225,7 @@ export function DbPane({
                   </TableCell>
                   <TableCell className="text-xs">
                     <div className="flex items-center gap-1 flex-wrap">
+                      <MatchStatusBadge status={ms} />
                       {r.txType === "R" ? (
                         <Badge variant="outline" className="text-[10px]">
                           Transfer

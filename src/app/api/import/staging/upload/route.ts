@@ -395,6 +395,10 @@ export async function POST(request: NextRequest) {
       knobs: { skipHeaderRows, skipFooterRows, dateFormatOverride, defaultCurrency },
       boundAccountCurrency,
       userStatementBalance,
+      // fuzzyDedupWindowDays defaults to 3 inside writeStagedImport (the shared
+      // chokepoint) so every ingest path — manual/approve/auto uploads, the
+      // SimpleFIN feed, and the MCP upload_statement tool — gets the same
+      // payee-agnostic duplicate net without any caller having to opt in.
     });
 
     // approve/auto need a bound account; boundAccountMode is null when

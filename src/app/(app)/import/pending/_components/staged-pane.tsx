@@ -22,6 +22,7 @@ import {
   SuggestionsGroup,
   type SuggestionDisplay,
 } from "@/components/import/reconcile/suggestions-group";
+import { type PaneMatchStatus } from "@/components/import/reconcile/match-status";
 
 export function StagedPane({
   stagedImportId,
@@ -35,6 +36,7 @@ export function StagedPane({
   onRowUpdated,
   onStagedRowClick,
   highlightedStagedIds,
+  matchStatus,
   anchorsByDate,
   displaySuggestions,
   acceptSuggestion,
@@ -57,6 +59,7 @@ export function StagedPane({
   onRowUpdated: (updated: StagedEditableRow) => void;
   onStagedRowClick: (stagedId: string) => void;
   highlightedStagedIds: ReadonlySet<string>;
+  matchStatus?: ReadonlyMap<string, PaneMatchStatus>;
   anchorsByDate: Map<string, number>;
   displaySuggestions: SuggestionDisplay[];
   acceptSuggestion: (s: SuggestionDisplay) => void;
@@ -81,6 +84,7 @@ export function StagedPane({
       onRowUpdated={onRowUpdated}
       onRowClick={onStagedRowClick}
       highlightedStagedIds={highlightedStagedIds}
+      matchStatus={matchStatus}
       anchorsByDate={anchorsByDate}
       header={
         displaySuggestions.length > 0 && (

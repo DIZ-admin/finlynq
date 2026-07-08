@@ -51,6 +51,8 @@ import {
   sendableDelta,
 } from "@/lib/import/bank-ledger-projection";
 import { type DbTransactionRow } from "@/components/import/reconcile/db-pane";
+import { computePanePairing } from "@/lib/reconcile/pane-pairing";
+import { MatchStatusLegend } from "@/components/import/reconcile/match-status";
 import {
   type SuggestionDisplay,
 } from "@/components/import/reconcile/suggestions-group";
@@ -123,6 +125,9 @@ export function StagedReviewSurface({
   /** Anchor encoded as `staged:<id>` or `bank:<uuid>`. Null = no
    *  active highlight; second click on the same row clears it. */
   const [highlightAnchor, setHighlightAnchor] = useState<string | null>(null);
+  /** "Show only unmatched" — hides matched rows on BOTH panes so the user can
+   *  focus on what's new in the file / missing from it (R3). Component state. */
+  const [showOnlyUnmatched, setShowOnlyUnmatched] = useState(false);
 
   /** Per-row bank-transaction delete (2026-05-27). Mirrors /reconcile's
    *  flow: first fetch sends empty body; server returns 409 +
@@ -303,6 +308,43 @@ export function StagedReviewSurface({
       return !rn || rn === account.name;
     });
   }, [detail, accountId, accounts]);
+
+  // R3 — persistent cross-pane pairing. Derives, for every staged + bank row,
+  // whether it has a counterpart on the other side (matched / only-in-file /
+  // only-in-ledger) so both panes are tinted persistently (not just on click)
+  // and "Show only unmatched" can hide the matched noise. Computed from the
+  // FULL account-scoped staged set + full bank ledger (NOT the filtered display
+  // rows) so the toggle never changes the pairing itself.
+  const panePairing = useMemo(
+    () => computePanePairing(filteredStagedRows, dbRows),
+    [filteredStagedRows, dbRows],
+  );
+
+  // Rows actually rendered: when "Show only unmatched" is on, drop the matched
+  // rows on each side (staged → keep only-in-file; bank → keep only-in-ledger).
+  const visibleStagedRows = useMemo(() => {
+    if (!showOnlyUnmatched) return filteredStagedRows;
+    return filteredStagedRows.filter(
+      (r) => panePairing.stagedStatus.get(r.id) !== "matched",
+    );
+  }, [showOnlyUnmatched, filteredStagedRows, panePairing]);
+  const visibleBankRows = useMemo(() => {
+    if (!showOnlyUnmatched) return dbRows;
+    return dbRows.filter(
+      (r) => panePairing.bankStatus.get(r.id) === "only_ledger",
+    );
+  }, [showOnlyUnmatched, dbRows, panePairing]);
+  const unmatchedCounts = useMemo(() => {
+    let onlyFile = 0;
+    for (const v of panePairing.stagedStatus.values()) {
+      if (v === "only_file") onlyFile += 1;
+    }
+    let onlyLedger = 0;
+    for (const v of panePairing.bankStatus.values()) {
+      if (v === "only_ledger") onlyLedger += 1;
+    }
+    return { onlyFile, onlyLedger };
+  }, [panePairing]);
 
   // 2026-05-24 — parsed anchors → date map for the FilePane's per-day
   // Balance column. Plus the upload-form statement_balance lifted as a
@@ -1249,14 +1291,34 @@ export function StagedReviewSurface({
             setDetailLoading={setDetailLoading}
           />
         ) : detail ? (
-          <TwoPaneLayout
-            leftLabel="Bank ledger (continuous)"
+          <>
+            {/* R3 — persistent match legend + "show only unmatched" toggle. */}
+            <div className="flex flex-wrap items-center justify-between gap-2 px-1 pb-2">
+              <MatchStatusLegend />
+              <div className="flex items-center gap-2">
+                <span className="text-[11px] text-muted-foreground">
+                  {unmatchedCounts.onlyFile} new · {unmatchedCounts.onlyLedger} only in ledger
+                </span>
+                <Button
+                  size="sm"
+                  variant={showOnlyUnmatched ? "default" : "outline"}
+                  onClick={() => setShowOnlyUnmatched((v) => !v)}
+                  className="h-7"
+                  title="Hide rows that already have a counterpart on the other side"
+                >
+                  {showOnlyUnmatched ? "Showing unmatched only" : "Show only unmatched"}
+                </Button>
+              </div>
+            </div>
+            <TwoPaneLayout
+              leftLabel="Bank ledger (continuous)"
             left={
               <BankPane
-                dbRows={dbRows}
+                dbRows={visibleBankRows}
                 dbRowsLoading={dbRowsLoading}
                 onDbRowClick={onDbRowClick}
                 highlightedBankIds={highlightedBankIds}
+                matchStatus={panePairing.bankStatus}
                 linkMode={linkMode}
                 busyKey={busyKey}
                 deleteBankRow={deleteBankRow}
@@ -1269,7 +1331,7 @@ export function StagedReviewSurface({
             right={
               <StagedPane
                 stagedImportId={detail.staged.id}
-                rows={filteredStagedRows}
+                rows={visibleStagedRows}
                 selected={selected}
                 expanded={expandedRows}
                 accounts={accounts}
@@ -1279,6 +1341,7 @@ export function StagedReviewSurface({
                 onRowUpdated={onRowUpdated}
                 onStagedRowClick={onStagedRowClick}
                 highlightedStagedIds={highlightedStagedIds}
+                matchStatus={panePairing.stagedStatus}
                 anchorsByDate={stagedAnchorsByDate}
                 displaySuggestions={displaySuggestions}
                 acceptSuggestion={acceptSuggestion}
@@ -1291,7 +1354,8 @@ export function StagedReviewSurface({
                 unlinkStagedRow={unlinkStagedRow}
               />
             }
-          />
+            />
+          </>
         ) : null}
       </div>
 
