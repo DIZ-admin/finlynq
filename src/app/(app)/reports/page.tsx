@@ -1281,6 +1281,40 @@ function PeriodCell({ value, currency, colorClass }: { value: number | undefined
   );
 }
 
+/** Bottom totals row: per-period column sums + grand total, aligned to the table columns. */
+function TotalsRow({
+  label,
+  items,
+  visibleTs,
+  total,
+  currency,
+  colorClass,
+  leadingCol,
+}: {
+  label: string;
+  items: BreakdownItem[];
+  visibleTs: TimeseriesPoint[];
+  total: number;
+  currency: string;
+  colorClass: string;
+  leadingCol: boolean;
+}) {
+  return (
+    <TableRow className="border-t-2 bg-muted/40 font-semibold hover:bg-muted/40">
+      {leadingCol && <TableCell className="w-8 pr-0"></TableCell>}
+      <TableCell className="text-sm font-semibold">{label}</TableCell>
+      {visibleTs.map((pt) => {
+        const periodSum = items.reduce((s, item) => s + (item.periods[pt.period] ?? 0), 0);
+        return <PeriodCell key={pt.period} value={periodSum} currency={currency} colorClass={`${colorClass} font-semibold`} />;
+      })}
+      <TableCell className={`text-right font-mono text-sm font-bold ${colorClass}`}>
+        {formatCurrency(total, currency)}
+      </TableCell>
+      <TableCell className="text-right text-xs text-muted-foreground">100%</TableCell>
+    </TableRow>
+  );
+}
+
 /** Truncation notice rendered above the table when the series was capped. */
 function TruncationNotice({ visible, shown, total }: { visible: boolean; shown: number; total: number }) {
   if (!visible) return null;
@@ -1354,6 +1388,15 @@ function GroupedTable({
                 />
               );
             })}
+            <TotalsRow
+              label="Total"
+              items={groups.flatMap((g) => g.items)}
+              visibleTs={visibleTs}
+              total={total}
+              currency={currency}
+              colorClass={colorClass}
+              leadingCol
+            />
           </TableBody>
         </Table>
       </div>
@@ -1509,6 +1552,15 @@ function FlatTable({
                 </TableRow>
               );
             })}
+            <TotalsRow
+              label="Total"
+              items={items}
+              visibleTs={visibleTs}
+              total={total}
+              currency={currency}
+              colorClass={colorClass}
+              leadingCol={false}
+            />
           </TableBody>
         </Table>
       </div>
