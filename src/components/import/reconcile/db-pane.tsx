@@ -32,11 +32,7 @@ import {
 } from "@/components/ui/table";
 import { Badge } from "@/components/ui/badge";
 import { formatCurrency } from "@/lib/currency";
-import {
-  matchBorderClass,
-  MatchStatusBadge,
-  type PaneMatchStatus,
-} from "./match-status";
+import { matchRowClass, type PaneMatchStatus } from "./match-status";
 
 export interface DbTransactionRow {
   /**
@@ -191,15 +187,17 @@ export function DbPane({
                 r.anchorBalance == null && !dayFirstSeenForLoaded.has(r.date);
               if (isFirstOfDayLoadedEmpty) dayFirstSeenForLoaded.add(r.date);
               const highlighted = highlightedBankIds?.has(r.id) ?? false;
+              // Ring (not a bg) so the click highlight layers cleanly over the
+              // persistent full-row match tint.
               const highlightClass = highlighted
-                ? "bg-sky-500/10 outline outline-2 outline-sky-500/40"
+                ? "ring-2 ring-inset ring-sky-500/60"
                 : "";
               const ms = matchStatus?.get(r.id);
               const clickable = onRowClick != null;
               return (
                 <TableRow
                   key={r.id}
-                  className={`${dimmed} ${matchBorderClass(ms)} ${highlightClass} ${clickable ? "cursor-pointer" : ""}`}
+                  className={`h-11 ${dimmed} ${matchRowClass(ms)} ${highlightClass} ${clickable ? "cursor-pointer" : ""}`}
                   onClick={
                     clickable
                       ? (e) => {
@@ -224,8 +222,7 @@ export function DbPane({
                     )}
                   </TableCell>
                   <TableCell className="text-xs">
-                    <div className="flex items-center gap-1 flex-wrap">
-                      <MatchStatusBadge status={ms} />
+                    <div className="flex items-center gap-1 flex-nowrap">
                       {r.txType === "R" ? (
                         <Badge variant="outline" className="text-[10px]">
                           Transfer

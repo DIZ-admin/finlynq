@@ -32,11 +32,7 @@ import {
   type HoldingOption,
 } from "@/components/staging/staged-row-editor";
 import { RowBadge, type ReconcileState } from "./row-badge";
-import {
-  matchBorderClass,
-  MatchStatusBadge,
-  type PaneMatchStatus,
-} from "./match-status";
+import { matchRowClass, type PaneMatchStatus } from "./match-status";
 
 const RowFragment = Fragment;
 
@@ -191,15 +187,17 @@ export function FilePane({
                 !balanceShownForDate.has(r.date);
               if (showBalance) balanceShownForDate.add(r.date);
               const highlighted = highlightedStagedIds?.has(r.id) ?? false;
+              // Ring (not a bg) so the click highlight layers cleanly over the
+              // persistent full-row match tint.
               const highlightClass = highlighted
-                ? "bg-sky-500/10 outline outline-2 outline-sky-500/40"
+                ? "ring-2 ring-inset ring-sky-500/60"
                 : "";
               const ms = matchStatus?.get(r.id);
               const clickable = onRowClick != null;
               return (
                 <RowFragment key={r.id}>
                   <TableRow
-                    className={`${dimmed} ${importedClass} ${matchBorderClass(ms)} ${highlightClass} ${clickable ? "cursor-pointer" : ""}`}
+                    className={`h-11 ${dimmed} ${importedClass} ${matchRowClass(ms)} ${highlightClass} ${clickable ? "cursor-pointer" : ""}`}
                     onClick={
                       clickable
                         ? (e) => {
@@ -250,8 +248,7 @@ export function FilePane({
                       )}
                     </TableCell>
                     <TableCell className="text-xs">
-                      <div className="flex items-center gap-1 flex-wrap">
-                        <MatchStatusBadge status={ms} />
+                      <div className="flex items-center gap-1 flex-nowrap">
                         {r.txType === "R" ? (
                           <Badge variant="outline" className="text-[10px]">
                             Transfer
