@@ -14,7 +14,7 @@ import pg from "pg";
 import { createHash } from "crypto";
 import bcrypt from "bcryptjs";
 import {
-  createWrappedDEKForPassword,
+  rewrapDEKForNewPassword,
   encryptField,
 } from "../src/lib/crypto/envelope";
 import { encryptName } from "../src/lib/crypto/encrypted-columns";
@@ -49,6 +49,21 @@ const DEMO_USERNAME = "demo";
 const DEMO_PASSWORD = "finlynq-demo";
 const DEMO_USER_ID = "00000000-0000-0000-0000-00000000demo";
 const DEMO_DISPLAY_NAME = "Finlynq Demo";
+
+// FINLYNQ-281 — pin the demo account's DEK to a FIXED, deterministic value.
+//
+// Historically each nightly reseed generated a RANDOM DEK, re-encrypting every
+// demo row under a fresh key. Any long-lived session that had cached the
+// previous DEK — notably the public claude.ai MCP connector — then failed to
+// decrypt the newly-seeded rows with "unable to authenticate data" until it
+// reconnected (this masqueraded as a SEV-1 crypto outage; see FINLYNQ-281). A
+// stable DEK means the cached key keeps working across reseeds. Safe ONLY
+// because the demo data is public and non-sensitive — NEVER pin a real user's
+// DEK. The wrap (salt/iv/tag) is still regenerated each run; it merely unwraps
+// to this same DEK.
+const DEMO_DEK = createHash("sha256")
+  .update("finlynq-demo-account-fixed-dek-v1")
+  .digest();
 
 const databaseUrl: string = (() => {
   const url = process.env.DATABASE_URL ?? process.env.PF_DATABASE_URL;
@@ -346,12 +361,14 @@ async function main() {
 
     // 1. Upsert demo user (with envelope-encryption DEK).
     //
-    // Every reseed rotates the wrapped DEK — crucially, also rotating the DEK
-    // itself — because we're inserting freshly-encrypted ciphertext using
-    // whichever DEK we generate here. That means old rows wouldn't decrypt,
-    // but the wipe step below drops them first so there's no mismatch.
+    // FINLYNQ-281 — the demo DEK is now a FIXED constant (DEMO_DEK), NOT a fresh
+    // random key per reseed. Every reseed re-wraps the SAME DEK under a new
+    // salt/iv (so `dek_wrapped` still changes) but unwraps back to DEMO_DEK, so
+    // a session that cached the DEK before a reseed keeps decrypting the
+    // freshly-seeded rows. The wipe step below still drops the old rows first.
     const passwordHash = await bcrypt.hash(DEMO_PASSWORD, 12);
-    const { dek: demoDek, wrapped: demoWrap } = createWrappedDEKForPassword(DEMO_PASSWORD);
+    const demoDek = DEMO_DEK;
+    const demoWrap = rewrapDEKForNewPassword(demoDek, DEMO_PASSWORD);
     // ON CONFLICT now targets the primary key (id). The old `(email)` target
     // assumed a hard UNIQUE on the email column, but that constraint was
     // replaced by a partial unique index on lower(email) when usernames

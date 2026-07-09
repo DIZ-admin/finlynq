@@ -51,6 +51,7 @@ import {
 } from "../../src/lib/financial-health";
 import {
   getHoldingsValueByAccount,
+  verifyHoldingDecryptHealth,
 } from "../../src/lib/holdings-value";
 import {
   applyInvestmentMarketOverlay,
@@ -130,6 +131,10 @@ export function registerReadsTools(server: McpServer, ctx: PgToolContext) {
             overlayRows,
             dek,
             () => getHoldingsValueByAccount(userId, dek),
+            // FINLYNQ-281 — withhold market value (fall back to ledger + note)
+            // when a present-but-stale/corrupt DEK fails to decrypt holdings,
+            // instead of returning garbage market numbers.
+            () => verifyHoldingDecryptHealth(userId, dek),
           );
 
       const reporting = await resolveReportingCurrency(db, userId, reportingCurrency);
@@ -612,6 +617,11 @@ export function registerReadsTools(server: McpServer, ctx: PgToolContext) {
               nwOverlayRows,
               dek,
               () => getHoldingsValueByAccount(userId, dek),
+              // FINLYNQ-281 — same decrypt-health gate as get_account_balances
+              // so a stale/corrupt DEK yields ledger + note, not a silently
+              // wrong `basis:"market"` net-worth total (the #210 parity holds:
+              // both tools fall back together).
+              () => verifyHoldingDecryptHealth(userId, dek),
             );
 
         // Roll up per-currency assets/liabilities/net from the OVERLAID

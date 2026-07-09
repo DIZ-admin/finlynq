@@ -56,14 +56,30 @@ export type OverlayResult = {
    * investment row). When false, every row carries `balanceBasis:"ledger"`. */
   marketApplied: boolean;
   /** Set only when investment rows exist but the overlay could not run
-   * (dek == null) — surfaced as a top-level `note` by the caller. */
+   * (dek == null, or FINLYNQ-281 decrypt failure) — surfaced as a top-level
+   * `note` by the caller. */
   note?: string;
+  /** FINLYNQ-281 — set when the DEK is present but ≥1 holding ciphertext failed
+   * to decrypt, so the overlay deliberately fell back to ledger rather than
+   * returning a garbage `basis:"market"` total. */
+  decryptionFailed?: boolean;
 };
 
 const DEK_NULL_NOTE =
   "Investment accounts are valued at ledger (net contributions), not market value, " +
   "because this connection has no decryption key (pf_ API key). Connect via OAuth " +
   "(or use the built-in AI chat) for market-valued investment balances.";
+
+// FINLYNQ-281 — the DEK is present but at least one holding's ciphertext failed
+// to authenticate (stale MCP session key after the demo DEK rotation, or a
+// corrupt row). Pricing an undecryptable symbol yields qty×1 garbage, so we
+// withhold market value entirely and fall back to ledger + this note instead of
+// reporting silently-wrong money.
+const DECRYPT_FAILED_NOTE =
+  "Investment holdings could not be decrypted, so accounts are shown at ledger " +
+  "(net contributions), NOT market value. This usually means this connection's " +
+  "decryption key is stale — reconnect the MCP connection — or a holding row is " +
+  "corrupt. Market totals were withheld to avoid reporting wrong numbers.";
 
 /**
  * Apply the market-value overlay to a set of per-account ledger rows.
@@ -81,6 +97,7 @@ export async function applyInvestmentMarketOverlay(
   rows: OverlayInputRow[],
   dek: Buffer | null,
   fetchHoldings: () => Promise<Map<number, { value: number; costBasis: number }>>,
+  verifyDecrypt?: () => Promise<{ failed: number; total: number }>,
 ): Promise<OverlayResult> {
   const hasInvestment = rows.some((r) => r.isInvestment);
 
@@ -94,6 +111,28 @@ export async function applyInvestmentMarketOverlay(
       marketApplied: false,
       note: dek == null && hasInvestment ? DEK_NULL_NOTE : undefined,
     };
+  }
+
+  // FINLYNQ-281 — the DEK is present, but verify it actually decrypts the
+  // user's holdings BEFORE pricing. A stale/wrong DEK decrypts symbols to null,
+  // and `fetchHoldings` (getHoldingsValueByAccount) then prices them at qty×1
+  // (garbage) — which the caller would return as a wrong `basis:"market"`
+  // total. On any decrypt failure, fall back to ledger + an explicit note and
+  // NEVER call `fetchHoldings` (skip the qty×1 path entirely).
+  if (verifyDecrypt) {
+    const health = await verifyDecrypt();
+    if (health.failed > 0) {
+      return {
+        rows: rows.map((r) => ({
+          ...r,
+          balance: r.ledgerBalance,
+          balanceBasis: "ledger" as const,
+        })),
+        marketApplied: false,
+        note: DECRYPT_FAILED_NOTE,
+        decryptionFailed: true,
+      };
+    }
   }
 
   const map = await fetchHoldings();
