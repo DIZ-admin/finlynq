@@ -32,6 +32,7 @@ import {
 } from "@/components/ui/table";
 import { Badge } from "@/components/ui/badge";
 import { formatCurrency } from "@/lib/currency";
+import { matchRowClass, type PaneMatchStatus } from "./match-status";
 
 export interface DbTransactionRow {
   /**
@@ -86,6 +87,7 @@ export function DbPane({
   header,
   onRowClick,
   highlightedBankIds,
+  matchStatus,
 }: {
   rows: DbTransactionRow[];
   loading: boolean;
@@ -96,6 +98,10 @@ export function DbPane({
   onRowClick?: (bankId: string) => void;
   /** Bank ids currently highlighted by a click-through. */
   highlightedBankIds?: ReadonlySet<string>;
+  /** Persistent cross-pane match status per bank id (computePanePairing).
+   *  'matched' = a file row covers it; 'only_ledger' = in-period, not in the
+   *  file. Absent (out-of-window / no batch) → no tint. */
+  matchStatus?: ReadonlyMap<string, PaneMatchStatus>;
 }) {
   if (loading) {
     return (
@@ -181,14 +187,17 @@ export function DbPane({
                 r.anchorBalance == null && !dayFirstSeenForLoaded.has(r.date);
               if (isFirstOfDayLoadedEmpty) dayFirstSeenForLoaded.add(r.date);
               const highlighted = highlightedBankIds?.has(r.id) ?? false;
+              // Ring (not a bg) so the click highlight layers cleanly over the
+              // persistent full-row match tint.
               const highlightClass = highlighted
-                ? "bg-sky-500/10 outline outline-2 outline-sky-500/40"
+                ? "ring-2 ring-inset ring-sky-500/60"
                 : "";
+              const ms = matchStatus?.get(r.id);
               const clickable = onRowClick != null;
               return (
                 <TableRow
                   key={r.id}
-                  className={`${dimmed} ${highlightClass} ${clickable ? "cursor-pointer" : ""}`}
+                  className={`h-11 ${dimmed} ${matchRowClass(ms)} ${highlightClass} ${clickable ? "cursor-pointer" : ""}`}
                   onClick={
                     clickable
                       ? (e) => {
@@ -213,7 +222,7 @@ export function DbPane({
                     )}
                   </TableCell>
                   <TableCell className="text-xs">
-                    <div className="flex items-center gap-1 flex-wrap">
+                    <div className="flex items-center gap-1 flex-nowrap">
                       {r.txType === "R" ? (
                         <Badge variant="outline" className="text-[10px]">
                           Transfer

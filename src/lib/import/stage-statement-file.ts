@@ -69,6 +69,19 @@ import { findUnreasonableAmountError } from "@/lib/import-pipeline";
 /** 60 days — matches the route + stage-email-import.ts. */
 const STAGE_TTL_MS = 60 * 24 * 60 * 60 * 1000;
 
+/**
+ * Default fuzzy-dedup window (days) applied to EVERY ingest path. The exact
+ * import_hash is payee-sensitive, so a charge already loaded under a different
+ * descriptor (e.g. an email-connector alert "Spotify" vs the statement's
+ * "Spotify P43795D0D1", posted a day or two later) slips past it and would
+ * re-create a duplicate bank_transactions row. This payee-agnostic amount +
+ * date net catches those. Skipping a real transaction is recoverable (force-load
+ * from /import/pending); a duplicate is expensive to find and clean up — so the
+ * default leans toward over-skipping. A caller may widen it (connectors pass 3
+ * explicitly for the same reason); it is never silently disabled.
+ */
+const DEFAULT_FUZZY_DEDUP_WINDOW_DAYS = 3;
+
 /** "YYYY-MM-DD" → whole-day epoch number (UTC), or null if unparseable. */
 function isoToEpochDay(iso: string): number | null {
   const t = Date.parse(`${iso}T00:00:00Z`);
@@ -416,12 +429,18 @@ export interface WriteStagedImportContext {
    *  pass a provider tag (e.g. "simplefin") so the pending list labels them. */
   fileFormatOverride?: string | null;
   /**
-   * When set (live bank feeds), a still-`new` row is additionally marked
-   * `existing` (skipped by default) if the bound account already has a
-   * transaction OR bank-ledger row with the same amount within ±this many days
-   * — even under a different payee. This is the feed "auto-skip duplicates I
-   * already have" pass; it's re-derived every sync (no stored state), and a
-   * false match can still be force-loaded. Off (undefined) for file uploads.
+   * Fuzzy-dedup window (days). A still-`new` row is additionally marked
+   * `existing` (→ reconcile_state 'skipped_duplicate', excluded from the send by
+   * default) if the bound account already has a transaction OR bank-ledger row
+   * with the same amount within ±this many days — EVEN under a different payee.
+   * This is the payee-agnostic "auto-skip duplicates I already have" pass; it's
+   * re-derived every run (no stored state), and a false match can still be
+   * force-loaded from /import/pending.
+   *
+   * Defaults to {@link DEFAULT_FUZZY_DEDUP_WINDOW_DAYS} when omitted, so it runs
+   * on EVERY account-bound ingest (manual/approve/auto uploads, connectors, MCP)
+   * — the deliberate "never re-load a duplicate by mistake" default. Only skipped
+   * when the import isn't account-bound (cross-account CSV, accountId null).
    */
   fuzzyDedupWindowDays?: number;
 }
@@ -548,8 +567,11 @@ export async function writeStagedImport(
   // the SAME amount within ±window days. Re-derived every sync → a match stays
   // skipped with no stored state; a false positive can still be force-loaded.
   const fuzzySkip = new Set<number>();
-  if (ctx.fuzzyDedupWindowDays != null && accountId !== null) {
-    const windowDays = ctx.fuzzyDedupWindowDays;
+  // Defaults on for every account-bound ingest (see DEFAULT_FUZZY_DEDUP_WINDOW_DAYS);
+  // only cross-account CSVs (accountId null) skip it, since it's account-scoped.
+  const fuzzyWindowDays = ctx.fuzzyDedupWindowDays ?? DEFAULT_FUZZY_DEDUP_WINDOW_DAYS;
+  if (accountId !== null) {
+    const windowDays = fuzzyWindowDays;
     const candidates = shaped.filter(
       (r) => r.dedupStatus === "new" && r.accountId === accountId,
     );

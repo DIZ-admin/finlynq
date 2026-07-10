@@ -12,12 +12,14 @@
 import { Button } from "@/components/ui/button";
 import { Check, Flag, X as XIcon, Trash2 } from "lucide-react";
 import { DbPane, type DbTransactionRow } from "@/components/import/reconcile/db-pane";
+import { type PaneMatchStatus } from "@/components/import/reconcile/match-status";
 
 export function BankPane({
   dbRows,
   dbRowsLoading,
   onDbRowClick,
   highlightedBankIds,
+  matchStatus,
   linkMode,
   busyKey,
   deleteBankRow,
@@ -29,6 +31,7 @@ export function BankPane({
   dbRowsLoading: boolean;
   onDbRowClick: (bankId: string) => void;
   highlightedBankIds: ReadonlySet<string>;
+  matchStatus?: ReadonlyMap<string, PaneMatchStatus>;
   linkMode: { stagedRowId: string } | null;
   busyKey: string | null;
   deleteBankRow: (bankId: string, deleteLinkedTransactions: boolean | null) => void;
@@ -42,6 +45,7 @@ export function BankPane({
       loading={dbRowsLoading}
       onRowClick={onDbRowClick}
       highlightedBankIds={highlightedBankIds}
+      matchStatus={matchStatus}
       rowActions={(r) => {
         // In link-mode: show a Pick button on rows that aren't
         // already linked to a DIFFERENT staged row. The staged

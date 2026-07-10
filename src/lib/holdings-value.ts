@@ -435,6 +435,61 @@ export async function getHoldingsValueByAccount(
 }
 
 /**
+ * FINLYNQ-281 — decrypt-health probe for the market-valuation path.
+ *
+ * The market overlay cannot otherwise tell a VALID DEK from a present-but-WRONG
+ * one: a long-lived MCP session whose cached DEK went stale after the demo
+ * account's nightly DEK rotation, or a single corrupt ciphertext row. In that
+ * state `valueHoldingsAtDate` decrypts a holding's symbol to `null` and prices
+ * it at qty×1 (garbage — the `else if (h.symbol)` branch never matches), so
+ * `get_net_worth` returns a plausible-looking but WRONG `basis:"market"` total
+ * with no warning.
+ *
+ * This runs ONE tiny query (id + the two ciphertext columns — no pricing, FX,
+ * or joins) and counts holdings whose ciphertext is present (`v1:` prefix) but
+ * decrypts to `null` — the AES-GCM auth-tag failure signature (`decryptName`
+ * catches it and returns null; it never throws). The overlay uses a non-zero
+ * `failed` to fall back to ledger + an explicit note instead of emitting
+ * silently-wrong market money. Byte-neutral when decryption is healthy
+ * (`failed: 0` ⇒ the market path proceeds unchanged).
+ */
+export async function verifyHoldingDecryptHealth(
+  userId: string,
+  dek: Buffer | null,
+): Promise<{ failed: number; total: number }> {
+  // A null DEK is already handled by the overlay's dek==null → ledger + note
+  // branch; this probe only distinguishes a present-but-invalid DEK.
+  if (dek == null) return { failed: 0, total: 0 };
+  const rows = await db
+    .select({
+      id: schema.portfolioHoldings.id,
+      nameCt: schema.portfolioHoldings.nameCt,
+      symbolCt: schema.portfolioHoldings.symbolCt,
+    })
+    .from(schema.portfolioHoldings)
+    .where(eq(schema.portfolioHoldings.userId, userId));
+  if (rows.length === 0) return { failed: 0, total: 0 };
+  const decrypted = decryptNamedRows(rows, dek, {
+    nameCt: "name",
+    symbolCt: "symbol",
+  }) as Array<(typeof rows)[number] & { name: string | null; symbol: string | null }>;
+  // Only a real v1 ciphertext that decrypted to null counts as a failure —
+  // guards against false positives on empty/legacy/plaintext values.
+  const isCiphertext = (v: string | null | undefined): boolean =>
+    typeof v === "string" && v.startsWith("v1:");
+  let failed = 0;
+  for (const r of decrypted) {
+    if (
+      (isCiphertext(r.nameCt) && r.name == null) ||
+      (isCiphertext(r.symbolCt) && r.symbol == null)
+    ) {
+      failed++;
+    }
+  }
+  return { failed, total: rows.length };
+}
+
+/**
  * Per-HOLDING market value at `asOfDate` (FINLYNQ-129 stacked Performance view).
  * Optionally restricted to one account. The per-account sum of these rows equals
  * `getHoldingsValueByAccount`, so a stacked per-holding chart's outer edge ties

@@ -28,8 +28,12 @@ process.env.PF_STAGING_KEY = process.env.PF_STAGING_KEY ?? "test-staging-key-32c
 // the qty×1 hazard never executes. The overlay's dek-null guard means this is
 // only consulted on the dek-present pass.
 const holdingsMap = new Map<number, { value: number; costBasis: number }>();
+// FINLYNQ-281 — the handlers now also call verifyHoldingDecryptHealth via the
+// overlay's `verifyDecrypt` probe; default to healthy so the market path (and
+// every pre-existing handler assertion) is unchanged.
 vi.mock("../../src/lib/holdings-value", () => ({
   getHoldingsValueByAccount: vi.fn(async () => holdingsMap),
+  verifyHoldingDecryptHealth: vi.fn(async () => ({ failed: 0, total: 0 })),
 }));
 
 // Mock FX so reporting conversion is the identity (every rate = 1). Lets the
@@ -113,6 +117,60 @@ describe("applyInvestmentMarketOverlay (pure)", () => {
     expect(res.marketApplied).toBe(false);
     expect(res.note).toBeUndefined();
     expect(res.rows[0]).toMatchObject({ balance: 42, balanceBasis: "ledger" });
+  });
+
+  // FINLYNQ-281 — a present-but-invalid DEK (stale MCP session cache after the
+  // demo DEK rotation, or a corrupt ciphertext row) must NOT produce a garbage
+  // `basis:"market"` total. The probe reports failures → fall back to ledger +
+  // note, and NEVER call the qty×1 pricing path.
+  it("decrypt failure (dek present): ledger + note + decryptionFailed, fetch NEVER called", async () => {
+    const fetchHoldings = vi.fn(async () => new Map([[2, { value: 15000, costBasis: 9000 }]]));
+    const verifyDecrypt = vi.fn(async () => ({ failed: 1, total: 3 }));
+    const res = await applyInvestmentMarketOverlay(
+      [
+        { id: 1, currency: "USD", isInvestment: false, ledgerBalance: 500 },
+        { id: 2, currency: "USD", isInvestment: true, ledgerBalance: 1234.56 },
+      ],
+      dek,
+      fetchHoldings,
+      verifyDecrypt,
+    );
+    expect(verifyDecrypt).toHaveBeenCalledTimes(1);
+    expect(fetchHoldings).not.toHaveBeenCalled(); // qty×1 garbage path skipped
+    expect(res.marketApplied).toBe(false);
+    expect(res.decryptionFailed).toBe(true);
+    expect(res.note).toBeTruthy();
+    // Investment row falls back to its ledger (net-contribution) balance.
+    expect(res.rows[1]).toMatchObject({ id: 2, balance: 1234.56, balanceBasis: "ledger" });
+    expect(res.rows[1].costBasis).toBeUndefined();
+  });
+
+  it("healthy decrypt (failed:0): market path proceeds unchanged", async () => {
+    const fetchHoldings = vi.fn(async () => new Map([[2, { value: 15000, costBasis: 9000 }]]));
+    const verifyDecrypt = vi.fn(async () => ({ failed: 0, total: 3 }));
+    const res = await applyInvestmentMarketOverlay(
+      [{ id: 2, currency: "USD", isInvestment: true, ledgerBalance: 0 }],
+      dek,
+      fetchHoldings,
+      verifyDecrypt,
+    );
+    expect(verifyDecrypt).toHaveBeenCalledTimes(1);
+    expect(fetchHoldings).toHaveBeenCalledTimes(1);
+    expect(res.marketApplied).toBe(true);
+    expect(res.decryptionFailed).toBeUndefined();
+    expect(res.rows[0]).toMatchObject({ id: 2, balance: 15000, balanceBasis: "market", costBasis: 9000 });
+  });
+
+  it("decrypt probe is skipped when omitted (back-compat 3-arg call still market)", async () => {
+    const fetchHoldings = vi.fn(async () => new Map([[2, { value: 15000, costBasis: 9000 }]]));
+    const res = await applyInvestmentMarketOverlay(
+      [{ id: 2, currency: "USD", isInvestment: true, ledgerBalance: 0 }],
+      dek,
+      fetchHoldings,
+    );
+    expect(fetchHoldings).toHaveBeenCalledTimes(1);
+    expect(res.marketApplied).toBe(true);
+    expect(res.decryptionFailed).toBeUndefined();
   });
 });
 

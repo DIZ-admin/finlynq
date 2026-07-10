@@ -12,6 +12,9 @@ import {
   computeAllAccountsUnrealizedPnL,
   summarizeUnrealizedPnL,
 } from "@/lib/unrealized-pnl";
+import { getAccountBalances } from "@/lib/queries";
+import { getHoldingsValueByAccount } from "@/lib/holdings-value";
+import { applyInvestmentMarketOverlay } from "../../../../mcp-server/investment-balance-overlay";
 
 export async function GET(request: NextRequest) {
   const auth = await requireAuth(request); if (!auth.authenticated) return auth.response;
@@ -169,29 +172,40 @@ export async function GET(request: NextRequest) {
 
   if (type === "balance-sheet") {
     // Stream D Phase 4 â€” plaintext name dropped.
-    const balances = await db
-      .select({
-        accountId: schema.accounts.id,
-        accountType: schema.accounts.type,
-        accountGroup: schema.accounts.group,
-        accountNameCt: schema.accounts.nameCt,
-        currency: schema.accounts.currency,
-        balance: sql<number>`COALESCE(SUM(${schema.transactions.amount}), 0)`,
-      })
-      .from(schema.accounts)
-      .leftJoin(schema.transactions, eq(schema.accounts.id, schema.transactions.accountId))
-      .where(eq(schema.accounts.userId, userId))
-      .groupBy(schema.accounts.id, schema.accounts.type, schema.accounts.group, schema.accounts.nameCt, schema.accounts.currency)
-      .orderBy(schema.accounts.type, schema.accounts.group)
-      .all();
+    //
+    // Account balances follow the load-bearing invariant "account with holdings
+    // = holdings.value": investment accounts are marked to MARKET via the SAME
+    // overlay the MCP balance tools + the reconcile summary use
+    // (applyInvestmentMarketOverlay, FINLYNQ-151/196), NEVER a naive
+    // SUM(transactions.amount) (which for an investment account is net
+    // contributions, not market value). This is a web-session route
+    // (requireAuth, DEK present) so the overlay can price holdings; a DEK-null
+    // caller degrades to the ledger balance per the overlay's own guard. Cash
+    // accounts keep their ledger balance. includeArchived preserves the prior
+    // account set (the old bespoke query had no archived filter).
+    const ledgerBalances = await getAccountBalances(userId, { includeArchived: true });
+    const overlay = await applyInvestmentMarketOverlay(
+      ledgerBalances.map((b) => ({
+        id: b.accountId,
+        currency: b.currency,
+        isInvestment: b.isInvestment === true,
+        ledgerBalance: Number(b.balance),
+      })),
+      dek,
+      () => getHoldingsValueByAccount(userId, dek),
+    );
+    const balanceByAccount = new Map(overlay.rows.map((r) => [r.id, r.balance]));
 
-    const converted = balances.map((b) => {
-      const { accountNameCt: _ct, ...rest } = b;
-      void _ct;
+    const converted = ledgerBalances.map((b) => {
+      const balance = balanceByAccount.get(b.accountId) ?? Number(b.balance);
       return {
-        ...rest,
+        accountId: b.accountId,
+        accountType: b.accountType,
+        accountGroup: b.accountGroup,
+        currency: b.currency,
+        balance,
         accountName: decryptName(b.accountNameCt, dek, null) ?? "",
-        convertedBalance: convertWithRateMap(b.balance, b.currency, rateMap),
+        convertedBalance: convertWithRateMap(balance, b.currency, rateMap),
         displayCurrency,
       };
     });
