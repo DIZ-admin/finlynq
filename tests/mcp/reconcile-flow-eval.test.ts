@@ -159,16 +159,47 @@ describeDb("AI-native reconciliation e2e eval (FINLYNQ-271)", () => {
     expect(up.data.rowCount).toBe(ROW_COUNT);
     const stagedImportId = up.data.stagedImportId;
 
-    // ─── Phase 2: stage + dedup (bank ledger empty → no dups) ──────────────
+    // ─── Phase 2: stage + dedup (find_duplicate_bank_rows finds no dup GROUPS —
+    //     the 200 rows are all distinct) ─────────────────────────────────────
     const dup = await call<unknown[]>("find_duplicate_bank_rows", { accountId });
     expect(Array.isArray(dup.data)).toBe(true);
     expect(dup.data.length).toBe(0);
 
-    // ─── Phase 4a: load the bank side ──────────────────────────────────────
-    const sent = await call<{ loaded: number }>("send_to_bank_ledger", { stagedImportId });
-    expect(sent.data.loaded).toBe(ROW_COUNT);
+    // Trace the real row lifecycle (test-harness DB reads — NOT counted tool
+    // calls). The unified staging pipeline is subtle: confirm the staged import
+    // is bound to our account, and grab the staged row ids so Phase 4a can
+    // force-load EVERY row regardless of any dedup flag (the no-rowIds
+    // send_to_bank_ledger path excludes reconcileState='skipped_duplicate' rows
+    // AND the default skipExistingMatches drops dedup_status='existing' rows —
+    // both would silently promote 0 rows, the cycle-1 failure).
+    const { db, schema } = await import("@/db");
+    const { eq } = await import("drizzle-orm");
+    const importRow = await db
+      .select({ boundAccountId: schema.stagedImports.boundAccountId })
+      .from(schema.stagedImports)
+      .where(eq(schema.stagedImports.id, stagedImportId))
+      .get();
+    expect(importRow?.boundAccountId).toBe(accountId);
+    const stagedRows = await db
+      .select({ id: schema.stagedTransactions.id })
+      .from(schema.stagedTransactions)
+      .where(eq(schema.stagedTransactions.stagedImportId, stagedImportId))
+      .all();
+    const stagedRowIds = stagedRows.map((r) => r.id);
+    expect(stagedRowIds.length).toBe(ROW_COUNT);
 
-    // ─── Phase 3: match → buckets (all no-match against an empty ledger) ───
+    // ─── Phase 4a: load the bank side (explicit rowIds + skipExistingMatches
+    //     false bypass BOTH staging filters). loaded may be 0 if the rows were
+    //     already promoted elsewhere — the authoritative check is that the bank
+    //     rows EXIST + are unmatched, asserted via get_reconcile_suggestions. ─
+    await call("send_to_bank_ledger", {
+      stagedImportId,
+      rowIds: stagedRowIds,
+      skipExistingMatches: false,
+    });
+
+    // ─── Phase 3: match → buckets. Every bank row is no-match against the empty
+    //     ledger, so noMatch carries all 200 — the real "bank rows exist" check. ─
     const sug = await call<{ buckets: { noMatch: { bankTransactionIds: string[] } } }>(
       "get_reconcile_suggestions",
       { accountId },
