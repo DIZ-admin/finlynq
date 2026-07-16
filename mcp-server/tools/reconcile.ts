@@ -59,6 +59,9 @@ import {
   type ReconcileThresholds,
 } from "../../src/lib/reconcile/match-engine";
 import {
+  bucketSuggestions,
+} from "../../src/lib/reconcile/bucket-suggestions";
+import {
   materializeBankRowAsTransaction,
 } from "../../src/lib/reconcile/materialize-transaction";
 import {
@@ -145,7 +148,7 @@ export function registerReconcileTools(server: McpServer, ctx: PgToolContext) {
   // ── get_reconcile_suggestions ───────────────────────────────────────────────
   server.tool(
     "get_reconcile_suggestions",
-    "Reconcile snapshot for one account's bank ledger vs. its transactions (the /import page's three-layer match engine). Returns { linked, suggestions, bankOnly, txOnly, transactions, bankTransactions }. Each bankTransactions[id] carries suggestedCategoryId / suggestedTransferAccountId (rule-engine defaults for materialize) and duplicateOfTransactionId (strict possible-duplicate flag). Read-only. Requires an unlocked DEK (payees are decrypted to score fuzzy matches). Intended split: use this for the DETAILED per-row match view of ONE account; use get_reconciliation_summary for portfolio-wide per-account COUNTS in one call (run summary first at session start, then drill into the off accounts here).",
+    "Reconcile one account's bank ledger vs. its transactions (the /import page's three-layer match engine), rollups-first. LEADS with buckets: { exact:{count,pairs[{bankTransactionId,transactionId,score}]}, fuzzy:{count,pairs[{…,reason}]}, noMatch:{count,bankTransactionIds}, alreadyLinked:{count} } — exact pairs are batch-approve material (accept_reconcile_suggestions), fuzzy pairs are a user confirm/reject list (NEVER auto-commit), noMatch bank rows need a new transaction. Then legacy detail: { linked, suggestions, bankOnly, txOnly, transactions, bankTransactions } — each bankTransactions[id] carries suggestedCategoryId / suggestedTransferAccountId / duplicateOfTransactionId. Read-only. Requires an unlocked DEK. Intended split: this = DETAILED per-row view of ONE account; get_reconciliation_summary = portfolio-wide COUNTS (run it first, then drill here).",
     {
       accountId: z.number().int().positive().describe("accounts.id to reconcile."),
       dateMin: z
@@ -191,7 +194,12 @@ export function registerReconcileTools(server: McpServer, ctx: PgToolContext) {
         dateMin: dateMin ?? lookbackMin,
         dateMax: dateMax ?? null,
       });
-      return dataResponse({ ...result, thresholds });
+      // FINLYNQ-271 phase 3 — rollups-first: PREPEND the three decision buckets
+      // (exact / fuzzy / noMatch / alreadyLinked) so an agent can act per bucket.
+      // Additive — every legacy key below is byte-identical; buckets is a pure
+      // re-grouping of suggestions/bankOnly/linked (no engine change).
+      const buckets = bucketSuggestions(result, thresholds);
+      return dataResponse({ buckets, ...result, thresholds });
     },
   );
 
