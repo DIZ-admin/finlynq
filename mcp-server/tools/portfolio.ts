@@ -834,7 +834,7 @@ export function registerPortfolioTools(server: McpServer, ctx: PgToolContext) {
       if ("report" in aout) return aout.report;
       const acct = allAccounts.find((a) => Number(a.id) === aout.id) ?? { id: aout.id, currency: undefined };
       const cur = String(currency ?? acct.currency ?? "CAD").toUpperCase();
-      const holdingName = isCash ? `Cash ${cur}` : name;
+      const holdingName = isCash ? `Cash ${cur}` : (name ?? "");
       const symbolValue = isCash ? null : (symbol && symbol.trim() ? symbol.trim() : null);
       if (isCash) {
         const existingCash = await q(db, sql`
