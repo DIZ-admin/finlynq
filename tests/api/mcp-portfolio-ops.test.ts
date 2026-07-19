@@ -81,7 +81,7 @@ function makeResolverDb() {
     execute: async (q: unknown) => {
       const text = serializeSqlTemplate(q);
       if (/FROM\s+accounts/i.test(text)) {
-        return { rows: [{ id: 7, currency: "USD", name_ct: acctNameCt, alias_ct: null }], rowCount: 1 };
+        return { rows: [{ id: 7, currency: "USD", is_investment: true, name_ct: acctNameCt, alias_ct: null }], rowCount: 1 };
       }
       if (/FROM\s+portfolio_holdings/i.test(text)) {
         return { rows: [{ ok: 1 }], rowCount: 1 };
