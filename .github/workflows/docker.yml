@@ -2,7 +2,7 @@ name: Fork Docker image
 
 on:
   push:
-    branches: [main]
+    branches: [main, 'ops/**']
     tags: ['v*']
   workflow_dispatch:
 
