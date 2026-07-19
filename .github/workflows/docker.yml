@@ -1,8 +1,8 @@
 name: Docker
 
 on:
+  workflow_dispatch:
   push:
-    branches: [main]
     tags: ['v*']
 
 jobs:
@@ -49,3 +49,7 @@ jobs:
           tags: ${{ steps.meta.outputs.tags }}
           labels: ${{ steps.meta.outputs.labels }}
           platforms: linux/amd64,linux/arm64
+          cache-from: type=gha,scope=finlynq
+          cache-to: type=gha,mode=max,scope=finlynq
+          sbom: true
+          provenance: mode=max

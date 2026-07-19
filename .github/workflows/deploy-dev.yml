@@ -1,12 +1,8 @@
 name: Deploy Dev
 
 on:
-  push:
-    branches: [dev]
-    # A mobile-only commit must NOT trigger a web build + SSH redeploy of
-    # dev.finlynq.com. Commits that touch any non-mobile path still deploy.
-    paths-ignore:
-      - 'mobile/**'
+  # Dev deployment is intentionally not automatic in the fork.
+  workflow_dispatch:
 
 concurrency:
   group: deploy-dev
@@ -15,6 +11,7 @@ concurrency:
 jobs:
   validate:
     name: Typecheck & Build
+    if: github.repository == 'finlynq/finlynq'
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4.3.1
