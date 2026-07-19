@@ -1,17 +1,21 @@
-name: Docker
+name: Fork Docker image
 
 on:
   push:
     branches: [main]
     tags: ['v*']
+  workflow_dispatch:
 
 jobs:
   build:
     name: Build & Push Docker Image
+    if: github.repository == 'DIZ-admin/finlynq'
     runs-on: ubuntu-latest
     permissions:
       contents: read
       packages: write
+      attestations: write
+      id-token: write
 
     steps:
       - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4.3.1
@@ -27,17 +31,34 @@ jobs:
         id: meta
         uses: docker/metadata-action@c299e40c65443455700f0fdfc63efafe5b349051 # v5.10.0
         with:
-          images: ghcr.io/finlynq/finlynq
+          images: ghcr.io/diz-admin/finlynq
           tags: |
             type=ref,event=branch
+            type=sha,prefix=sha-
             type=semver,pattern={{version}}
             type=semver,pattern={{major}}.{{minor}}
             type=raw,value=latest,enable={{is_default_branch}}
 
       - name: Build and push
+        id: build
         uses: docker/build-push-action@ca052bb54ab0790a636c9b5f226502c73d547a25 # v5.4.0
         with:
           context: .
           push: true
           tags: ${{ steps.meta.outputs.tags }}
           labels: ${{ steps.meta.outputs.labels }}
+          provenance: mode=max
+          sbom: true
+          outputs: type=image,name-canonical=true,push-by-digest=false
+
+      - name: Record immutable image digest
+        env:
+          IMAGE_DIGEST: ${{ steps.build.outputs.digest }}
+        run: |
+          test -n "$IMAGE_DIGEST"
+          {
+            echo "### Fork image"
+            echo "- Repository: $GITHUB_REPOSITORY"
+            echo "- Commit: $GITHUB_SHA"
+            echo "- Image: ghcr.io/diz-admin/finlynq@$IMAGE_DIGEST"
+          } >> "$GITHUB_STEP_SUMMARY"
