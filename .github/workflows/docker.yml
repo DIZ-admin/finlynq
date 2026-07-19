@@ -1,13 +1,14 @@
 name: Docker
 
 on:
+  workflow_dispatch:
   push:
-    branches: [main]
     tags: ['v*']
 
 jobs:
   build:
     name: Build & Push Docker Image
+    if: github.repository == 'DIZ-admin/finlynq'
     runs-on: ubuntu-latest
     permissions:
       contents: read
@@ -15,6 +16,12 @@ jobs:
 
     steps:
       - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4.3.1
+
+      - name: Set up QEMU
+        uses: docker/setup-qemu-action@96fe6ef7f33517b61c61be40b68a1882f3264fb8 # v4.2.0
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@bb05f3f5519dd87d3ba754cc423b652a5edd6d2c # v4.2.0
 
       - name: Log in to GitHub Container Registry
         uses: docker/login-action@c94ce9fb468520275223c153574b00df6fe4bcc9 # v3.7.0
@@ -27,7 +34,7 @@ jobs:
         id: meta
         uses: docker/metadata-action@c299e40c65443455700f0fdfc63efafe5b349051 # v5.10.0
         with:
-          images: ghcr.io/finlynq/finlynq
+          images: ghcr.io/diz-admin/finlynq
           tags: |
             type=ref,event=branch
             type=semver,pattern={{version}}
@@ -41,3 +48,8 @@ jobs:
           push: true
           tags: ${{ steps.meta.outputs.tags }}
           labels: ${{ steps.meta.outputs.labels }}
+          platforms: linux/amd64,linux/arm64
+          cache-from: type=gha,scope=finlynq
+          cache-to: type=gha,mode=max,scope=finlynq
+          sbom: true
+          provenance: mode=max
