@@ -10,6 +10,7 @@
  */
 
 import { ConnectedApps } from "./connected-apps";
+import { McpImportToolsetCard } from "./mcp-import-toolset";
 
 export default function IntegrationsSettingsPage() {
   return (
@@ -20,6 +21,7 @@ export default function IntegrationsSettingsPage() {
       </div>
 
       <ConnectedApps />
+      <McpImportToolsetCard />
     </div>
   );
 }
