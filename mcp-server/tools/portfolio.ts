@@ -810,15 +810,18 @@ export function registerPortfolioTools(server: McpServer, ctx: PgToolContext) {
   // ── op: add — lifted VERBATIM from add_portfolio_holding ───────────────────
   type ToolResult = { content: Array<{ type: "text"; text: string }> };
   async function opHoldingAdd(args: {
-    name: string;
+    name?: string;
     account?: string;
     account_id?: number;
     symbol?: string;
     currency?: string;
     isCrypto?: boolean;
+    isCash?: boolean;
     note?: string;
   }): Promise<ToolResult> {
-      const { name, account, account_id, symbol, currency, isCrypto, note } = args;
+      const { name, account, account_id, symbol, currency, isCrypto, isCash, note } = args;
+      if (isCash && isCrypto) return err("`isCash` and `isCrypto` cannot both be true.");
+      if (!isCash && (!name || !name.trim())) return err("`name` is required for a non-cash holding.");
       const rawAccounts = await q(db, sql`
         SELECT id, currency, name_ct, alias_ct FROM accounts
         WHERE user_id = ${userId} AND archived = false
@@ -830,12 +833,25 @@ export function registerPortfolioTools(server: McpServer, ctx: PgToolContext) {
       const aout = resolveOrReport("account", resolveEntity({ entity: "account", id: account_id, name: account, options: allAccounts }));
       if ("report" in aout) return aout.report;
       const acct = allAccounts.find((a) => Number(a.id) === aout.id) ?? { id: aout.id, currency: undefined };
+      const cur = String(currency ?? acct.currency ?? "CAD").toUpperCase();
+      const holdingName = isCash ? `Cash ${cur}` : name;
+      const symbolValue = isCash ? null : (symbol && symbol.trim() ? symbol.trim() : null);
+      if (isCash) {
+        const existingCash = await q(db, sql`
+          SELECT id FROM portfolio_holdings
+          WHERE user_id = ${userId} AND account_id = ${acct.id}
+            AND currency = ${cur} AND is_cash = true
+        `);
+        if (existingCash.length) {
+          return text({ success: true, data: { holdingId: Number(existingCash[0].id), created: false, isCash: true, currency: cur } });
+        }
+      }
 
       // Stream D Phase 4: portfolio_holdings.name plaintext column dropped —
       // uniqueness gate now relies on name_lookup HMAC. No DEK ⇒ no lookup ⇒
       // we cannot run the pre-check, so let the DB UNIQUE backstop raise
       // 23505 (caught below as `unique`) instead of silently inserting a dup.
-      const lookup = dek ? nameLookup(dek, name) : null;
+      const lookup = isCash ? null : (dek ? nameLookup(dek, holdingName) : null);
       if (lookup) {
         const existing = await q(db, sql`
           SELECT id FROM portfolio_holdings
@@ -843,23 +859,21 @@ export function registerPortfolioTools(server: McpServer, ctx: PgToolContext) {
             AND name_lookup = ${lookup}
         `);
         if (existing.length) {
-          return err(`Holding "${name}" already exists in account "${acct.name}" (id: ${existing[0].id})`);
+          return err(`Holding "${holdingName}" already exists in account "${acct.name}" (id: ${existing[0].id})`);
         }
       }
 
-      const symbolValue = symbol && symbol.trim() ? symbol.trim() : null;
-      const nameEnc = dek ? encryptName(dek, name) : { ct: null, lookup: null };
+      const nameEnc = dek ? encryptName(dek, holdingName) : { ct: null, lookup: null };
       const symbolEnc = dek ? encryptName(dek, symbolValue) : { ct: null, lookup: null };
-      const cur = currency ?? String(acct.currency ?? "CAD");
       // Securities master (Phase B) — dual-write security_id. MCP read-flip is
       // deferred (the legacy path stays), but populating it now means no extra
       // backfill when the MCP read tools flip later. Null DEK (stdio) ⇒ null;
       // the login-time backfill reconciles on the user's next web login.
       const securityId = await resolveOrCreateSecurity(userId, dek, {
         symbol: symbolValue,
-        name,
+        name: holdingName,
         isCryptoFlag: !!isCrypto,
-        isCash: false,
+        isCash: !!isCash,
         currency: cur,
       });
 
@@ -879,18 +893,18 @@ export function registerPortfolioTools(server: McpServer, ctx: PgToolContext) {
         // Stream D Phase 4 — plaintext name/symbol dropped.
         const result = await q(db, sql`
           INSERT INTO portfolio_holdings (
-            user_id, account_id, currency, is_crypto, security_id, note,
+            user_id, account_id, currency, is_crypto, is_cash, security_id, note,
             name_ct, name_lookup, symbol_ct, symbol_lookup
           )
           VALUES (
-            ${userId}, ${acct.id}, ${cur}, ${isCrypto ? 1 : 0}, ${securityId}, ${note ?? ""},
+            ${userId}, ${acct.id}, ${cur}, ${isCrypto ? 1 : 0}, ${isCash ? 1 : 0}, ${securityId}, ${note ?? ""},
             ${nameEnc.ct}, ${nameEnc.lookup}, ${symbolEnc.ct}, ${symbolEnc.lookup}
           )
           RETURNING id
         `);
         const holdingId = Number(result[0]?.id);
         if (!holdingId) {
-          return err(`Failed to create holding "${name}" in "${acct.name}"`);
+          return err(`Failed to create holding "${holdingName}" in "${acct.name}"`);
         }
         // qty=0 / cost_basis=0 match migrate-holding-accounts.sql's fresh-row
         // defaults; aggregators derive live qty/cost from transactions
@@ -911,7 +925,7 @@ export function registerPortfolioTools(server: McpServer, ctx: PgToolContext) {
           success: true,
           data: {
             holdingId,
-            message: `Holding "${name}" created in "${acct.name}"${symbolValue ? ` (${symbolValue})` : ""} — pass holdingId=${holdingId} as portfolioHoldingId on record_transaction to bind transactions.`,
+            message: `${isCash ? "Cash sleeve" : "Holding"} "${holdingName}" created in "${acct.name}"${symbolValue ? ` (${symbolValue})` : ""} — pass holdingId=${holdingId} as portfolioHoldingId on record_transaction to bind transactions.`,
           },
         });
       } catch (e) {
@@ -919,7 +933,7 @@ export function registerPortfolioTools(server: McpServer, ctx: PgToolContext) {
         // concurrent add for the same name in the same account).
         const msg = e instanceof Error ? e.message : String(e);
         if (msg.includes("23505") || msg.toLowerCase().includes("unique")) {
-          return err(`Holding "${name}" already exists in account "${acct.name}"`);
+          return err(`Holding "${holdingName}" already exists in account "${acct.name}"`);
         }
         throw e;
       }
@@ -1136,12 +1150,13 @@ export function registerPortfolioTools(server: McpServer, ctx: PgToolContext) {
     z.discriminatedUnion("op", [
       z.object({
         op: z.literal("add"),
-        name: z.string().min(1).max(200).describe("Display name of the holding (e.g. 'Vanguard All-Equity ETF')"),
+        name: z.string().min(1).max(200).optional().describe("Display name of the holding; omitted only when isCash=true (canonical name becomes Cash <CURRENCY>)"),
         account: z.string().optional().describe("Brokerage account name or alias (fuzzy matched — mistyped/unmatched is REFUSED; 2+ → ambiguous). Pass this OR `account_id`. Uniqueness is scoped per (account, name)."),
         account_id: z.number().int().positive().optional().describe("Brokerage-account FK fast-path — wins over the fuzzy `account` name."),
         symbol: z.string().max(50).optional().describe("Ticker symbol (e.g. 'VEQT.TO', 'BTC')"),
         currency: supportedCurrencyEnum.optional().describe("ISO 4217 currency (default: parent account's currency). Issue #206: full SUPPORTED_CURRENCIES list."),
         isCrypto: z.boolean().optional().describe("Flag this holding as crypto (default: false)"),
+        isCash: z.boolean().optional().describe("Create the canonical per-account, per-currency cash sleeve (Cash <CURRENCY>); idempotent. Do not combine with isCrypto."),
         note: z.string().max(500).optional(),
       }),
       z.object({
@@ -1185,6 +1200,7 @@ export function registerPortfolioTools(server: McpServer, ctx: PgToolContext) {
       symbol: z.string().max(50).optional().describe("Ticker symbol (e.g. 'VEQT.TO', 'BTC')"),
       currency: supportedCurrencyEnum.optional().describe("ISO 4217 currency (default: parent account's currency). Issue #206: full SUPPORTED_CURRENCIES list."),
       isCrypto: z.boolean().optional().describe("Flag this holding as crypto (default: false)"),
+      isCash: z.boolean().optional().describe("Create the canonical per-account, per-currency cash sleeve (Cash <CURRENCY>); idempotent. Do not combine with isCrypto."),
       note: z.string().max(500).optional(),
     },
     async (args) => opHoldingAdd(args),

@@ -52,10 +52,11 @@ export function registerAccountsTools(server: McpServer, ctx: PgToolContext) {
     type: "A" | "L";
     group?: string;
     currency?: string;
+    isInvestment?: boolean;
     note?: string;
     alias?: string;
   }): Promise<ToolResult> {
-    const { name, type, group, currency, note, alias } = args;
+    const { name, type, group, currency, isInvestment, note, alias } = args;
     // Stream D Phase 4 — plaintext name dropped; lookup-only collision check.
     const lookup = dek ? nameLookup(dek, name) : null;
     if (!lookup) return err("Cannot create account without an unlocked DEK (Stream D Phase 4).");
@@ -78,11 +79,11 @@ export function registerAccountsTools(server: McpServer, ctx: PgToolContext) {
     // Stream D Phase 4 — plaintext name/alias columns dropped.
     const result = await q(db, sql`
       INSERT INTO accounts (
-        user_id, type, "group", currency, note,
+        user_id, type, "group", currency, is_investment, note,
         name_ct, name_lookup, alias_ct, alias_lookup
       )
       VALUES (
-        ${userId}, ${type}, ${resolvedGroup}, ${currency ?? "CAD"}, ${encNote(note)},
+        ${userId}, ${type}, ${resolvedGroup}, ${currency ?? "CAD"}, ${isInvestment ?? false}, ${encNote(note)},
         ${nameEnc.ct}, ${nameEnc.lookup}, ${aliasEnc.ct}, ${aliasEnc.lookup}
       )
       RETURNING id
@@ -98,10 +99,11 @@ export function registerAccountsTools(server: McpServer, ctx: PgToolContext) {
     name?: string;
     group?: string;
     currency?: string;
+    isInvestment?: boolean;
     note?: string;
     alias?: string;
   }): Promise<ToolResult> {
-    const { accountId, account, name, group, currency, note, alias } = args;
+    const { accountId, account, name, group, currency, isInvestment, note, alias } = args;
     if (accountId == null && (account == null || account === "")) {
       return err("Pass `accountId` (numeric) or `account` (name/alias) to identify the account.");
     }
@@ -165,6 +167,7 @@ export function registerAccountsTools(server: McpServer, ctx: PgToolContext) {
     }
     if (group !== undefined) updates.push(sql`"group" = ${group}`);
     if (currency !== undefined) updates.push(sql`currency = ${currency}`);
+    if (isInvestment !== undefined) updates.push(sql`is_investment = ${isInvestment}`);
     if (note !== undefined) updates.push(sql`note = ${encNote(note)}`);
     if (alias !== undefined) {
       const trimmed = alias.trim();
@@ -347,6 +350,7 @@ export function registerAccountsTools(server: McpServer, ctx: PgToolContext) {
         type: z.enum(["A", "L"]).describe("Account type: 'A' for asset, 'L' for liability"),
         group: z.string().optional().describe("Account group (e.g. 'Banks', 'Credit Cards', 'Investment')"),
         currency: supportedCurrencyEnum.optional().describe("ISO 4217 currency code (default CAD). Issue #206: any currency in SUPPORTED_CURRENCIES is accepted; FX engine triangulates through USD."),
+        isInvestment: z.boolean().optional().describe("Set true for a brokerage/investment account. Required for canonical deposit/buy/sell/dividend/withdrawal flows; defaults false."),
         note: z.string().optional().describe("Optional note"),
         alias: z.string().max(64).optional().describe("Optional short alias used to match the account when receipts or imports reference it by a non-canonical name (e.g. last 4 digits of a card, or a receipt label)."),
       }),
@@ -357,6 +361,7 @@ export function registerAccountsTools(server: McpServer, ctx: PgToolContext) {
         name: z.string().optional().describe("New name"),
         group: z.string().optional().describe("New group"),
         currency: supportedCurrencyEnum.optional().describe("New ISO 4217 currency code (issue #206: full SUPPORTED_CURRENCIES list)."),
+        isInvestment: z.boolean().optional().describe("Enable or disable the investment-account flag. Use accountId for an exact, idempotent update."),
         note: z.string().optional().describe("New note"),
         alias: z.string().max(64).optional().describe("New alias — short shorthand used to match receipts/imports. Pass an empty string to clear."),
       }),
@@ -397,7 +402,8 @@ export function registerAccountsTools(server: McpServer, ctx: PgToolContext) {
       type: z.enum(["A", "L"]).describe("Account type: 'A' for asset, 'L' for liability"),
       group: z.string().optional().describe("Account group (e.g. 'Banks', 'Credit Cards', 'Investment')"),
       currency: supportedCurrencyEnum.optional().describe("ISO 4217 currency code (default CAD). Issue #206: any currency in SUPPORTED_CURRENCIES is accepted; FX engine triangulates through USD."),
-      note: z.string().optional().describe("Optional note"),
+      isInvestment: z.boolean().optional().describe("Set true for a brokerage/investment account. Defaults false."),
+      note: z.string().optional(),
       alias: z.string().max(64).optional().describe("Optional short alias used to match the account when receipts or imports reference it by a non-canonical name (e.g. last 4 digits of a card, or a receipt label)."),
     },
     async (args) => opAdd(args),
@@ -405,13 +411,14 @@ export function registerAccountsTools(server: McpServer, ctx: PgToolContext) {
   registerAlias(
     server,
     "update_account",
-    "Update name, group, currency, note, or alias of an account. Pass exactly ONE of `accountId` (preferred, exact) or `account` (name/alias, fuzzy). Supplying both is allowed only when they resolve to the same account — a mismatch fails loud and does NOT update.",
+    "Update name, group, currency, investment flag, note, or alias of an account. Pass exactly ONE of `accountId` (preferred, exact) or `account` (name/alias, fuzzy). Supplying both is allowed only when they resolve to the same account — a mismatch fails loud and does NOT update.",
     {
       accountId: z.number().int().positive().optional().describe("Account FK (accounts.id). Exact match — preferred. The only path that works without an unlocked DEK."),
       account: z.string().optional().describe("Current account name or alias (fuzzy matched against name; exact match on alias). Requires an unlocked DEK because account names live in encrypted columns post Stream D Phase 4. Pass `accountId` instead when no DEK is available."),
       name: z.string().optional().describe("New name"),
       group: z.string().optional().describe("New group"),
       currency: supportedCurrencyEnum.optional().describe("New ISO 4217 currency code (issue #206: full SUPPORTED_CURRENCIES list)."),
+      isInvestment: z.boolean().optional().describe("Enable or disable the investment-account flag. Use accountId for an exact update."),
       note: z.string().optional().describe("New note"),
       alias: z.string().max(64).optional().describe("New alias — short shorthand used to match receipts/imports (e.g. last 4 digits of a card). Pass an empty string to clear."),
     },

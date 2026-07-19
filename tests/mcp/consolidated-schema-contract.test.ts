@@ -86,9 +86,8 @@ const CASES: Array<{
   {
     name: "manage_holdings",
     badOp: { op: "move", holding: "x" },
-    // `account` is now optional (FINLYNQ-267 — pass `account`/`account_id`);
-    // `name` stays the unconditionally-required add field.
-    missingField: { op: "add", account: "TFSA" }, // missing name
+    // `name` is optional only for the canonical cash sleeve; reject an unsupported currency.
+    missingField: { op: "add", account: "TFSA", isCash: true, currency: "NOT_A_CURRENCY" }, // invalid currency
     good: { op: "delete", holding: "VEQT" },
   },
   {
@@ -188,6 +187,11 @@ describe("consolidated manage_* schema contracts (FINLYNQ-263 tc-2)", () => {
       });
     });
   }
+
+  it("accepts a cash sleeve add without name", () => {
+    const schema = tools["manage_holdings"]?.inputSchema;
+    expect(schema.safeParse({ op: "add", account_id: 1, currency: "USD", isCash: true }).success).toBe(true);
+  });
 });
 
 // ─── FINLYNQ-270: stringified-param coercion contract (tc-2-coerce-contract) ──
