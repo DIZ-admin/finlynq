@@ -26,7 +26,17 @@ on:
       - 'eslint.config.*'
       - 'Dockerfile'
       - '.dockerignore'
-      - '.github/workflows/ci.yml'
+      - 'docker-compose*.yml'
+      - 'docker-compose*.yaml'
+      - 'drizzle/**'
+      - 'drizzle*.ts'
+      - 'drizzle*.json'
+      - 'migrations/**'
+      - 'release/**'
+      - 'CHANGELOG.md'
+      - 'CLA.md'
+      - 'CONTRIBUTING.md'
+      - '.github/workflows/**'
 
 concurrency:
   group: ci-${{ github.event.pull_request.number || github.ref }}
