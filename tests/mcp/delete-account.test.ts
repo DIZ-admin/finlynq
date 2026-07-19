@@ -295,6 +295,46 @@ describe("MCP HTTP delete_account (issue #230 hotfix)", () => {
     expect(queries.filter((q) => /DELETE FROM accounts/i.test(q.text))).toHaveLength(1);
   });
 
+  it("refuses to delete an account that owns a legacy portfolio holding", async () => {
+    const { db, queries } = makeFixtureDb((sqlText) => {
+      if (/FROM accounts WHERE user_id/i.test(sqlText) && /AND id = /i.test(sqlText)) {
+        return [{ id: 686, name_ct: "v1:abcd:efgh:ijkl", alias_ct: null }];
+      }
+      if (/COUNT\(\*\)/i.test(sqlText) && /FROM transactions/i.test(sqlText)) {
+        return [{ cnt: 0 }];
+      }
+      if (/FROM portfolio_holdings/i.test(sqlText)) {
+        return [{ holding_id: 77 }];
+      }
+      return [];
+    });
+    const tool = getDeleteAccountTool(db, null);
+    const result = await tool.handler({ accountId: 686 }, {});
+    const text = envelopeText(result);
+    expect(text).toMatch(/Cannot delete account #686 while it owns portfolio holdings/);
+    expect(queries.filter((q) => /DELETE FROM accounts/i.test(q.text))).toHaveLength(0);
+  });
+
+  it("refuses to delete an account referenced by holding_accounts", async () => {
+    const { db, queries } = makeFixtureDb((sqlText) => {
+      if (/FROM accounts WHERE user_id/i.test(sqlText) && /AND id = /i.test(sqlText)) {
+        return [{ id: 686, name_ct: "v1:abcd:efgh:ijkl", alias_ct: null }];
+      }
+      if (/COUNT\(\*\)/i.test(sqlText) && /FROM transactions/i.test(sqlText)) {
+        return [{ cnt: 0 }];
+      }
+      if (/FROM holding_accounts/i.test(sqlText)) {
+        return [{ holding_id: 88 }];
+      }
+      return [];
+    });
+    const tool = getDeleteAccountTool(db, null);
+    const result = await tool.handler({ accountId: 686 }, {});
+    const text = envelopeText(result);
+    expect(text).toMatch(/Cannot delete account #686 while it owns portfolio holdings/);
+    expect(queries.filter((q) => /DELETE FROM accounts/i.test(q.text))).toHaveLength(0);
+  });
+
   // FINLYNQ-264 Phase 1: a NON-EMPTY account (transactions exist) is now
   // gated by the preview→confirmation-token two-step regardless of `force`.
   // A bare call returns a preview + token and deletes NOTHING; the caller
