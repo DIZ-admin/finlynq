@@ -6,11 +6,19 @@ import { describe, expect, it, vi } from "vitest";
 import { readFileSync } from "node:fs";
 import { resolve } from "node:path";
 
+type TestMarketResponse = {
+  ok: boolean;
+  json: () => Promise<unknown>;
+};
+
 const { insertMock, marketFetchMock, selectMock } = vi.hoisted(() => ({
   insertMock: vi.fn(() => {
     throw new Error("fx_rates unavailable");
   }),
-  marketFetchMock: vi.fn(async () => ({ ok: false })),
+  marketFetchMock: vi.fn(async (): Promise<TestMarketResponse> => ({
+    ok: false,
+    json: async () => ({}),
+  })),
   selectMock: vi.fn(() => {
     throw new Error("legacy fx_rates schema");
   }),
@@ -57,7 +65,7 @@ describe("FX cache fallback (FINLYNQ-130)", () => {
     marketFetchMock.mockResolvedValueOnce({
       ok: true,
       json: async () => ({ chart: { result: [{ meta: { regularMarketPrice: 1.25 } }] } }),
-    });
+    } as TestMarketResponse);
 
     const result = await getRateToUsdDetailed("EUR", "2026-07-19", "user-1");
 
