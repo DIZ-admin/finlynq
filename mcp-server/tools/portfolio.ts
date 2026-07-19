@@ -105,9 +105,13 @@ export function registerPortfolioTools(server: McpServer, ctx: PgToolContext) {
   type PortfolioAcctResolve = { ok: true; acct: Row } | { ok: false; error: string };
   const loadOpAccounts = async (): Promise<Row[]> =>
     decryptNameish(
-      await q(db, sql`SELECT id, currency, name_ct, alias_ct FROM accounts WHERE user_id = ${userId}`),
+      await q(db, sql`SELECT id, currency, is_investment, name_ct, alias_ct FROM accounts WHERE user_id = ${userId}`),
       dek,
     );
+  const investmentAccountError = (acct: Row): string | null =>
+    Boolean(acct.is_investment)
+      ? null
+      : `Account #${Number(acct.id)} is not marked as an investment account. Set isInvestment=true before using portfolio operations.`;
   const resolveOpAccount = (
     label: string,
     name: string | undefined,
@@ -200,6 +204,8 @@ export function registerPortfolioTools(server: McpServer, ctx: PgToolContext) {
       const accounts = await loadOpAccounts();
       const a = resolveOpAccount("account", account, account_id, accounts);
       if (!a.ok) return err(a.error);
+      const investmentError = investmentAccountError(a.acct);
+      if (investmentError) return err(investmentError);
       const h = await resolveOpHolding("holding", Number(a.acct.id), holding, holdingId);
       if (!h.ok) return err(h.error);
       const txDate = date ?? today();
@@ -238,6 +244,8 @@ export function registerPortfolioTools(server: McpServer, ctx: PgToolContext) {
       const accounts = await loadOpAccounts();
       const a = resolveOpAccount("account", account, account_id, accounts);
       if (!a.ok) return err(a.error);
+      const investmentError = investmentAccountError(a.acct);
+      if (investmentError) return err(investmentError);
       const h = await resolveOpHolding("holding", Number(a.acct.id), holding, holdingId);
       if (!h.ok) return err(h.error);
       const txDate = date ?? today();
@@ -273,6 +281,8 @@ export function registerPortfolioTools(server: McpServer, ctx: PgToolContext) {
       const accounts = await loadOpAccounts();
       const a = resolveOpAccount("account", account, account_id, accounts);
       if (!a.ok) return err(a.error);
+      const investmentError = investmentAccountError(a.acct);
+      if (investmentError) return err(investmentError);
       const src = await resolveOpHolding("sourceHolding", Number(a.acct.id), sourceHolding, sourceHoldingId);
       if (!src.ok) return err(src.error);
       const dst = await resolveOpHolding("destHolding", Number(a.acct.id), destHolding, destHoldingId);
@@ -343,6 +353,8 @@ export function registerPortfolioTools(server: McpServer, ctx: PgToolContext) {
       const accounts = await loadOpAccounts();
       const a = resolveOpAccount("account", account, account_id, accounts);
       if (!a.ok) return err(a.error);
+      const investmentError = investmentAccountError(a.acct);
+      if (investmentError) return err(investmentError);
       let relatedId: number | null = null;
       if (relatedHolding != null || relatedHoldingId != null) {
         const rh = await resolveOpHolding("relatedHolding", Number(a.acct.id), relatedHolding, relatedHoldingId);
@@ -390,6 +402,8 @@ export function registerPortfolioTools(server: McpServer, ctx: PgToolContext) {
       const accounts = await loadOpAccounts();
       const a = resolveOpAccount("account", account, account_id, accounts);
       if (!a.ok) return err(a.error);
+      const investmentError = investmentAccountError(a.acct);
+      if (investmentError) return err(investmentError);
       const txDate = date ?? today();
       try {
         const result = await recordFxConversion({ userId, dek, accountId: Number(a.acct.id), fromCurrency, fromAmount, toCurrency, toAmount, feeAmount, feeCurrency, feeOnSleeveCurrency, date: txDate, payee, note, source: "mcp_http" });
@@ -823,7 +837,7 @@ export function registerPortfolioTools(server: McpServer, ctx: PgToolContext) {
       if (isCash && isCrypto) return err("`isCash` and `isCrypto` cannot both be true.");
       if (!isCash && (!name || !name.trim())) return err("`name` is required for a non-cash holding.");
       const rawAccounts = await q(db, sql`
-        SELECT id, currency, name_ct, alias_ct FROM accounts
+        SELECT id, currency, is_investment, name_ct, alias_ct FROM accounts
         WHERE user_id = ${userId} AND archived = false
       `);
       const allAccounts = decryptNameish(rawAccounts, dek);
@@ -833,6 +847,8 @@ export function registerPortfolioTools(server: McpServer, ctx: PgToolContext) {
       const aout = resolveOrReport("account", resolveEntity({ entity: "account", id: account_id, name: account, options: allAccounts }));
       if ("report" in aout) return aout.report;
       const acct = allAccounts.find((a) => Number(a.id) === aout.id) ?? { id: aout.id, currency: undefined };
+      const investmentError = investmentAccountError(acct);
+      if (investmentError) return err(investmentError);
       const cur = String(currency ?? acct.currency ?? "CAD").toUpperCase();
       const holdingName = isCash ? `Cash ${cur}` : (name ?? "");
       const symbolValue = isCash ? null : (symbol && symbol.trim() ? symbol.trim() : null);

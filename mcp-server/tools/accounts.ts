@@ -266,6 +266,21 @@ export function registerAccountsTools(server: McpServer, ctx: PgToolContext) {
     const acctId = Number(acct.id);
     const txnCount = await q(db, sql`SELECT COUNT(*) as cnt FROM transactions WHERE user_id = ${userId} AND account_id = ${acctId}`);
     const count = Number(txnCount[0]?.cnt ?? 0);
+    const holdings = await q(db, sql`
+      SELECT id AS holding_id
+      FROM portfolio_holdings
+      WHERE user_id = ${userId} AND account_id = ${acctId}
+      UNION
+      SELECT holding_id
+      FROM holding_accounts
+      WHERE user_id = ${userId} AND account_id = ${acctId}
+      LIMIT 1
+    `);
+    if (holdings.length > 0) {
+      throw new PreviewAbortError(
+        `Cannot delete account #${acctId} while it owns portfolio holdings. Remove or transfer the holdings first.`,
+      );
+    }
     a.__acct = acct;
     a.__count = count;
     return { acct, count };
