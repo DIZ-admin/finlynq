@@ -388,15 +388,20 @@ async function writeCached(
   date: string,
   rate: number,
   source: "yahoo" | "coingecko" | "stooq" | "manual" | "fallback"
-): Promise<void> {
-  await db
-    .insert(schema.fxRates)
-    .values({ currency, date, rateToUsd: rate, source })
-    .onConflictDoUpdate({
-      target: [schema.fxRates.currency, schema.fxRates.date],
-      set: { rateToUsd: rate, source, fetchedAt: new Date() },
-    })
-    .catch(() => {});
+): Promise<boolean> {
+  try {
+    await db
+      .insert(schema.fxRates)
+      .values({ currency, date, rateToUsd: rate, source })
+      .onConflictDoUpdate({
+        target: [schema.fxRates.currency, schema.fxRates.date],
+        set: { rateToUsd: rate, source, fetchedAt: new Date() },
+      });
+    return true;
+  } catch {
+    // Cache persistence is best-effort; callers still receive the live rate.
+    return false;
+  }
 }
 
 // ─── Core API ───────────────────────────────────────────────────────────
@@ -476,7 +481,8 @@ export async function getRateToUsdDetailed(
     // current spot price; the cron at src/lib/cron/settle-future-fx.ts
     // re-locks future-dated transaction rows when their date arrives.
     if (date <= todayISO()) {
-      await writeCached(code, date, fetched, liveSource);
+      const cached = await writeCached(code, date, fetched, liveSource);
+      if (!cached) markCacheUnavailable();
     }
     return annotate({ rate: fetched, source: liveSource, effectiveDate: date });
   }

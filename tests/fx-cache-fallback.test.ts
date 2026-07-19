@@ -6,7 +6,11 @@ import { describe, expect, it, vi } from "vitest";
 import { readFileSync } from "node:fs";
 import { resolve } from "node:path";
 
-const { selectMock } = vi.hoisted(() => ({
+const { insertMock, marketFetchMock, selectMock } = vi.hoisted(() => ({
+  insertMock: vi.fn(() => {
+    throw new Error("fx_rates unavailable");
+  }),
+  marketFetchMock: vi.fn(async () => ({ ok: false })),
   selectMock: vi.fn(() => {
     throw new Error("legacy fx_rates schema");
   }),
@@ -14,6 +18,7 @@ const { selectMock } = vi.hoisted(() => ({
 
 vi.mock("@/db", () => ({
   db: {
+    insert: insertMock,
     select: selectMock,
   },
   schema: {
@@ -33,7 +38,7 @@ vi.mock("@/db", () => ({
 }));
 
 vi.mock("@/lib/market-fetch", () => ({
-  marketFetch: vi.fn(async () => ({ ok: false })),
+  marketFetch: marketFetchMock,
 }));
 
 import { getRateToUsdDetailed } from "@/lib/fx-service";
@@ -46,6 +51,20 @@ describe("FX cache fallback (FINLYNQ-130)", () => {
     expect(result.rate).toBe(1.13);
     expect(result.warning).toBe("FX cache unavailable; using live or fallback rate.");
     expect(selectMock).toHaveBeenCalled();
+  });
+
+  it("keeps a live rate when cache read and write both fail", async () => {
+    marketFetchMock.mockResolvedValueOnce({
+      ok: true,
+      json: async () => ({ chart: { result: [{ meta: { regularMarketPrice: 1.25 } }] } }),
+    });
+
+    const result = await getRateToUsdDetailed("EUR", "2026-07-19", "user-1");
+
+    expect(result.source).toBe("yahoo");
+    expect(result.rate).toBe(1.25);
+    expect(result.warning).toBe("FX cache unavailable; using live or fallback rate.");
+    expect(insertMock).toHaveBeenCalled();
   });
 
   it("tracks a canonical migration instead of assuming the legacy pair schema", () => {
