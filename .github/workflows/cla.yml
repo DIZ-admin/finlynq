@@ -46,4 +46,4 @@ jobs:
           path-to-signatures: '.github/cla/signatures.json'
           path-to-document: 'https://github.com/finlynq/finlynq/blob/main/CLA.md'
           branch: 'cla-signatures'
-          allowlist: 'HussienH,*[bot]'
+          allowlist: 'HussienH,DIZ-admin,*[bot]'
