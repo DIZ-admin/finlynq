@@ -3,9 +3,44 @@ name: CI
 on:
   pull_request:
     branches: [main, dev]
-    # Mobile-only PRs are covered by mobile-ci.yml — skip the web build for them.
-    paths-ignore:
-      - 'mobile/**'
+    # Keep expensive validation focused on web/runtime changes. Mobile-only,
+    # documentation-only, and policy-only PRs use their own lighter gates.
+    paths:
+      - 'src/**'
+      - 'app/**'
+      - 'components/**'
+      - 'lib/**'
+      - 'mcp-server/**'
+      - 'packages/**'
+      - 'shared/**'
+      - 'tests/**'
+      - 'scripts/**'
+      - 'public/**'
+      - 'drizzle*.ts'
+      - 'drizzle*.json'
+      - 'package.json'
+      - 'package-lock.json'
+      - 'tsconfig*.json'
+      - 'next.config.*'
+      - 'vitest.config.*'
+      - 'eslint.config.*'
+      - 'Dockerfile'
+      - '.dockerignore'
+      - 'docker-compose*.yml'
+      - 'docker-compose*.yaml'
+      - 'drizzle/**'
+      - 'drizzle*.ts'
+      - 'drizzle*.json'
+      - 'migrations/**'
+      - 'release/**'
+      - 'CHANGELOG.md'
+      - 'CLA.md'
+      - 'CONTRIBUTING.md'
+      - '.github/workflows/**'
+
+concurrency:
+  group: ci-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: true
 
 jobs:
   validate:
