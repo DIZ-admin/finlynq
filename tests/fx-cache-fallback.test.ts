@@ -67,7 +67,8 @@ describe("FX cache fallback (FINLYNQ-130)", () => {
       json: async () => ({ chart: { result: [{ meta: { regularMarketPrice: 1.25 } }] } }),
     } as TestMarketResponse);
 
-    const result = await getRateToUsdDetailed("EUR", "2026-07-19", "user-1");
+    const today = new Date().toISOString().split("T")[0];
+    const result = await getRateToUsdDetailed("EUR", today, "user-1");
 
     expect(result.source).toBe("yahoo");
     expect(result.rate).toBe(1.25);
