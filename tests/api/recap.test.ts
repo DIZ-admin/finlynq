@@ -67,7 +67,7 @@ describe("getWeekBounds", () => {
   it("tc-1 — no endDate: returns the last completed Sun→Sat week, never a future day (Tuesday clock)", () => {
     // Freeze clock at Tuesday 2026-06-16 local midnight.
     vi.useFakeTimers();
-    vi.setSystemTime(new Date("2026-06-16T00:00:00"));
+    vi.setSystemTime(new Date("2026-06-16T00:00:00Z"));
 
     const { weekStart, weekEnd, prevWeekStart, prevWeekEnd } = getWeekBounds();
 
@@ -87,7 +87,7 @@ describe("getWeekBounds", () => {
   it("tc-1 — no endDate: correct last completed week on a Sunday clock", () => {
     vi.useFakeTimers();
     // Sunday 2026-06-14 — the week that JUST ended is Sun 06-07 → Sat 06-13.
-    vi.setSystemTime(new Date("2026-06-14T00:00:00"));
+    vi.setSystemTime(new Date("2026-06-14T00:00:00Z"));
 
     const { weekStart, weekEnd } = getWeekBounds();
 
@@ -101,7 +101,7 @@ describe("getWeekBounds", () => {
     vi.useFakeTimers();
     // Saturday 2026-06-13 — the week that JUST ended is Sun 06-06? No:
     // dayOfWeek=6 → subtract 7 → 2026-06-06 (last Saturday), weekStart = 2026-05-31
-    vi.setSystemTime(new Date("2026-06-13T00:00:00"));
+    vi.setSystemTime(new Date("2026-06-13T00:00:00Z"));
 
     const { weekStart, weekEnd } = getWeekBounds();
 

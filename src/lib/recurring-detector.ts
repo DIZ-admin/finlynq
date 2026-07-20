@@ -9,6 +9,16 @@ type Transaction = {
   categoryId: number | null;
 };
 
+function parseDateOnly(value: string): Date {
+  const [year, month, day] = value.split("-").map(Number);
+  return new Date(Date.UTC(year, month - 1, day));
+}
+
+function todayDateOnly(): Date {
+  const now = new Date();
+  return new Date(Date.UTC(now.getUTCFullYear(), now.getUTCMonth(), now.getUTCDate()));
+}
+
 export type DetectedRecurring = {
   payee: string;
   avgAmount: number;
@@ -23,7 +33,7 @@ export type DetectedRecurring = {
 
 function daysBetween(d1: string, d2: string): number {
   return Math.abs(
-    (new Date(d1 + "T00:00:00").getTime() - new Date(d2 + "T00:00:00").getTime()) / 86400000
+    (parseDateOnly(d1).getTime() - parseDateOnly(d2).getTime()) / 86400000
   );
 }
 
@@ -36,12 +46,12 @@ function guessFrequency(avgDays: number): "weekly" | "biweekly" | "monthly" | "y
 }
 
 function addFrequency(date: string, frequency: string): string {
-  const d = new Date(date + "T00:00:00");
+  const d = parseDateOnly(date);
   switch (frequency) {
-    case "weekly": d.setDate(d.getDate() + 7); break;
-    case "biweekly": d.setDate(d.getDate() + 14); break;
-    case "monthly": d.setMonth(d.getMonth() + 1); break;
-    case "yearly": d.setFullYear(d.getFullYear() + 1); break;
+    case "weekly": d.setUTCDate(d.getUTCDate() + 7); break;
+    case "biweekly": d.setUTCDate(d.getUTCDate() + 14); break;
+    case "monthly": d.setUTCMonth(d.getUTCMonth() + 1); break;
+    case "yearly": d.setUTCFullYear(d.getUTCFullYear() + 1); break;
   }
   return d.toISOString().split("T")[0];
 }
@@ -109,14 +119,14 @@ export function forecastCashFlow(
   currentBalance: number,
   daysAhead: number = 90
 ): { date: string; balance: number; transactions: { payee: string; amount: number }[] }[] {
-  const today = new Date();
+  const today = todayDateOnly();
   const forecast: { date: string; balance: number; transactions: { payee: string; amount: number }[] }[] = [];
   let balance = currentBalance;
 
   const upcoming: { date: string; payee: string; amount: number }[] = [];
 
   for (const r of recurring) {
-    let nextDate = new Date(r.nextDate + "T00:00:00");
+    let nextDate = parseDateOnly(r.nextDate);
 
     while (nextDate <= new Date(today.getTime() + daysAhead * 86400000)) {
       if (nextDate >= today) {
@@ -128,7 +138,7 @@ export function forecastCashFlow(
       }
       // Advance to next occurrence
       const next = addFrequency(nextDate.toISOString().split("T")[0], r.frequency);
-      nextDate = new Date(next + "T00:00:00");
+      nextDate = parseDateOnly(next);
     }
   }
 

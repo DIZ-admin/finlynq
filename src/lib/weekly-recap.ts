@@ -10,6 +10,16 @@ const { categories, transactions, budgets } = schema;
 
 type RateCtx = { displayCurrency: string; rateMap: Map<string, number> };
 
+function parseDateOnly(value: string): Date {
+  const [year, month, day] = value.split("-").map(Number);
+  return new Date(Date.UTC(year, month - 1, day));
+}
+
+function todayDateOnly(): Date {
+  const now = new Date();
+  return new Date(Date.UTC(now.getUTCFullYear(), now.getUTCMonth(), now.getUTCDate()));
+}
+
 export type WeeklyRecap = {
   weekStart: string;
   weekEnd: string;
@@ -31,12 +41,12 @@ export type WeeklyRecap = {
 };
 
 export function getWeekBounds(endDate?: string): { weekStart: string; weekEnd: string; prevWeekStart: string; prevWeekEnd: string } {
-  const anchor = endDate ? new Date(endDate + "T00:00:00") : new Date();
-  const dayOfWeek = anchor.getDay();
+  const anchor = endDate ? parseDateOnly(endDate) : todayDateOnly();
+  const dayOfWeek = anchor.getUTCDay();
   const weekEnd = new Date(anchor);
   if (endDate) {
     // Explicit-date callers (e.g. MCP get_weekly_recap): return the week CONTAINING the given date.
-    weekEnd.setDate(weekEnd.getDate() + (6 - dayOfWeek));
+    weekEnd.setUTCDate(weekEnd.getUTCDate() + (6 - dayOfWeek));
   } else {
     // No-arg / default path (web widget): anchor on the last COMPLETED Sun→Sat week so
     // the recap never includes future days. Shift back to the most recent past Saturday
@@ -44,15 +54,15 @@ export function getWeekBounds(endDate?: string): { weekStart: string; weekEnd: s
     //   Sun (0) → -1 → last Saturday ✓
     //   Tue (2) → -3 → last Saturday ✓
     //   Sat (6) → -7 → the Saturday one week ago ✓
-    weekEnd.setDate(weekEnd.getDate() - (dayOfWeek + 1));
+    weekEnd.setUTCDate(weekEnd.getUTCDate() - (dayOfWeek + 1));
   }
   const weekStart = new Date(weekEnd);
-  weekStart.setDate(weekStart.getDate() - 6);
+  weekStart.setUTCDate(weekStart.getUTCDate() - 6);
 
   const prevWeekEnd = new Date(weekStart);
-  prevWeekEnd.setDate(prevWeekEnd.getDate() - 1);
+  prevWeekEnd.setUTCDate(prevWeekEnd.getUTCDate() - 1);
   const prevWeekStart = new Date(prevWeekEnd);
-  prevWeekStart.setDate(prevWeekStart.getDate() - 6);
+  prevWeekStart.setUTCDate(prevWeekStart.getUTCDate() - 6);
 
   return {
     weekStart: weekStart.toISOString().split("T")[0],
@@ -162,11 +172,11 @@ export async function generateWeeklyRecap(userId: string, endDate?: string, dek?
   const netCashFlow = Math.round((currentIncome - currentSpending.total) * 100) / 100;
 
   // Budget status for current month
-  const now = new Date(weekEnd + "T00:00:00");
-  const month = `${now.getFullYear()}-${String(now.getMonth() + 1).padStart(2, "0")}`;
+  const now = parseDateOnly(weekEnd);
+  const month = `${now.getUTCFullYear()}-${String(now.getUTCMonth() + 1).padStart(2, "0")}`;
   const [y, m] = month.split("-").map(Number);
   const monthStart = `${month}-01`;
-  const monthEnd = `${month}-${new Date(y, m, 0).getDate()}`;
+  const monthEnd = `${month}-${new Date(Date.UTC(y, m, 0)).getUTCDate()}`;
 
   // Stream D Phase 4 — plaintext name dropped.
   // FINLYNQ-123 — budget "spent" is a month-to-date FLOW figure compared against
@@ -261,7 +271,7 @@ export async function generateWeeklyRecap(userId: string, endDate?: string, dek?
     .slice(0, 5);
 
   // Upcoming bills (subscriptions in next 7 days from weekEnd)
-  const weekAhead = new Date(new Date(weekEnd + "T00:00:00").getTime() + 7 * 86400000)
+  const weekAhead = new Date(parseDateOnly(weekEnd).getTime() + 7 * 86400000)
     .toISOString()
     .split("T")[0];
 
