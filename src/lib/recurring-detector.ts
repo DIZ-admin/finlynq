@@ -1,5 +1,7 @@
 // Feature 6: Recurring Transaction Detection
 
+import { formatLocalISODate } from "@/lib/utils/date";
+
 type Transaction = {
   id: number;
   date: string;
@@ -43,7 +45,7 @@ function addFrequency(date: string, frequency: string): string {
     case "monthly": d.setMonth(d.getMonth() + 1); break;
     case "yearly": d.setFullYear(d.getFullYear() + 1); break;
   }
-  return d.toISOString().split("T")[0];
+  return formatLocalISODate(d);
 }
 
 export function detectRecurringTransactions(transactions: Transaction[]): DetectedRecurring[] {
@@ -121,13 +123,13 @@ export function forecastCashFlow(
     while (nextDate <= new Date(today.getTime() + daysAhead * 86400000)) {
       if (nextDate >= today) {
         upcoming.push({
-          date: nextDate.toISOString().split("T")[0],
+          date: formatLocalISODate(nextDate),
           payee: r.payee,
           amount: r.avgAmount,
         });
       }
       // Advance to next occurrence
-      const next = addFrequency(nextDate.toISOString().split("T")[0], r.frequency);
+      const next = addFrequency(formatLocalISODate(nextDate), r.frequency);
       nextDate = new Date(next + "T00:00:00");
     }
   }

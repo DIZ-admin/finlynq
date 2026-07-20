@@ -5,6 +5,7 @@ import { eq, and, gte, lte, sql } from "drizzle-orm";
 import { tryDecryptField } from "@/lib/crypto/envelope";
 import { getDisplayCurrency, getRateMap, convertWithRateMap } from "@/lib/fx-service";
 import { convertReportingSlice } from "@/lib/fx/reporting-amount";
+import { formatLocalISODate } from "@/lib/utils/date";
 
 const { categories, transactions, budgets } = schema;
 
@@ -55,10 +56,10 @@ export function getWeekBounds(endDate?: string): { weekStart: string; weekEnd: s
   prevWeekStart.setDate(prevWeekStart.getDate() - 6);
 
   return {
-    weekStart: weekStart.toISOString().split("T")[0],
-    weekEnd: weekEnd.toISOString().split("T")[0],
-    prevWeekStart: prevWeekStart.toISOString().split("T")[0],
-    prevWeekEnd: prevWeekEnd.toISOString().split("T")[0],
+    weekStart: formatLocalISODate(weekStart),
+    weekEnd: formatLocalISODate(weekEnd),
+    prevWeekStart: formatLocalISODate(prevWeekStart),
+    prevWeekEnd: formatLocalISODate(prevWeekEnd),
   };
 }
 
