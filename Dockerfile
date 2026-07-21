@@ -1,18 +1,6 @@
-# ── Stage 1: Install dependencies ────────────────────────────────────────────
+# ── Stage 1: Build the application ───────────────────────────────────────────
 # TODO(security): pin node:22-alpine to a digest (e.g. node:22-alpine@sha256:...)
 # so a tag rebase can't silently swap the base image we publish from.
-FROM node:22-alpine AS deps
-RUN apk add --no-cache libc6-compat python3 make g++
-WORKDIR /app
-
-COPY package.json package-lock.json ./
-# --ignore-scripts: the `postinstall` hook runs scripts/generate-mcp-tool-catalog.mjs
-# which needs files we haven't COPY'd yet. The builder stage regenerates the
-# catalog via the `prebuild` script before `npm run build` once the source is in.
-RUN npm ci --omit=dev --ignore-scripts
-
-# ── Stage 2: Build the application ───────────────────────────────────────────
-# TODO(security): pin node:22-alpine to a digest — see deps stage.
 FROM node:22-alpine AS builder
 RUN apk add --no-cache libc6-compat python3 make g++
 WORKDIR /app
@@ -33,8 +21,8 @@ ENV NEXT_BASE_PATH=$NEXT_BASE_PATH
 ENV NEXT_TELEMETRY_DISABLED=1
 RUN npm run build
 
-# ── Stage 3: Production image ─────────────────────────────────────────────────
-# TODO(security): pin node:22-alpine to a digest — see deps stage.
+# ── Stage 2: Production image ─────────────────────────────────────────────────
+# TODO(security): pin node:22-alpine to a digest — see build stage.
 FROM node:22-alpine AS runner
 RUN apk add --no-cache curl netcat-openbsd
 WORKDIR /app
