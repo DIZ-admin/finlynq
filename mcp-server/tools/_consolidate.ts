@@ -239,7 +239,14 @@ export function registerManageTool<U extends AnyZod>(
   // from the RAW union so the advertised `oneOf` is byte-identical to pre-270
   // (the coercion preprocess below does not change the declared JSON Schema).
   try {
-    CONSOLIDATED_JSON_SCHEMAS.set(name, z.toJSONSchema(union));
+    const schema = z.toJSONSchema(union) as Record<string, unknown>;
+    // JSON Schema permits a root-level `oneOf` without `type`, but the MCP
+    // Tool.inputSchema contract requires an object schema with an explicit
+    // type. Hermes rejects the otherwise valid union with a validation error.
+    CONSOLIDATED_JSON_SCHEMAS.set(
+      name,
+      schema.type === "object" ? schema : { type: "object", ...schema },
+    );
   } catch {
     // If schema generation ever fails, tools/list falls back to the SDK's
     // (empty) rendering — validation is unaffected. Non-fatal.

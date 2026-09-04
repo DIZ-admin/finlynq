@@ -217,6 +217,14 @@ export function withAutoAnnotations(server: McpServer): McpServer {
       args[2] !== null &&
       typeof args[2] === "object"
     ) {
+      // The SDK's raw-shape detector intentionally does not recognize an
+      // empty object as a shape. Passing `{}` as the schema plus a separate
+      // annotations argument therefore shifts the callback into the wrong
+      // slot and can emit an inputSchema without the required `type`. Omit
+      // the empty shape; the SDK then emits its standard empty object schema.
+      if (Object.keys(args[2]).length === 0) {
+        return originalTool(args[0], args[1], annotations, args[3]);
+      }
       return originalTool(args[0], args[1], args[2], annotations, args[3]);
     }
 
