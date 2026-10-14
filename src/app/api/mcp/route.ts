@@ -18,9 +18,8 @@ import { WebStandardStreamableHTTPServerTransport } from "@modelcontextprotocol/
 import { db } from "@/db";
 import { requireAuth } from "@/lib/auth/require-auth";
 import { accountStrategy } from "@/lib/auth/require-auth";
-import { validateOauthToken, getIssuer } from "@/lib/oauth";
+import { validateOauthToken, bearerChallenge } from "@/lib/oauth";
 import { DEFAULT_SCOPE, parseScope, isToolAllowedForScope, enabledToolsetsForRequest } from "@/lib/oauth-scopes";
-import { getImportToolsetEnabled } from "@/lib/mcp/import-toolset-setting";
 import { checkRateLimit } from "@/lib/rate-limit";
 import { ListToolsRequestSchema } from "@modelcontextprotocol/sdk/types.js";
 import { registerPgTools } from "../../../../mcp-server/register-tools-pg";
@@ -50,16 +49,20 @@ const ALLOWED_ORIGIN_HOSTS = new Set([
 ]);
 
 /**
- * Narrow view of an `McpServer` whose `tool(...)` method is writable, so the
- * per-request OAuth-scope filter can wrap it (FINLYNQ-114 — replaces the old
- * untyped `server.tool` monkey-patch). The wrapped method returns `undefined`
- * for out-of-scope tools (the SDK callers in `registerPgTools` ignore the
- * return value, so a no-op registration is safe). `McpServer.tool` is a
- * read-only overloaded method in the SDK types, so we cast through this
- * single, named interface at the patch site instead of an untyped escape.
+ * Narrow view of an `McpServer` whose `tool(...)` / `registerTool(...)` methods
+ * are writable, so the per-request OAuth-scope filter can wrap BOTH (FINLYNQ-114
+ * — replaces the old untyped monkey-patch; the reconcile-consolidation D-1 fix
+ * extends the gate to `registerTool`, which the consolidated `manage_*`/
+ * `reconcile` union tools register through). The wrapped methods return
+ * `undefined` for out-of-scope tools (the SDK callers in `registerPgTools` +
+ * `registerManageTool` ignore the return value, so a no-op registration is
+ * safe). Both are read-only overloaded methods in the SDK types, so we cast
+ * through this single, named interface at the patch site instead of an untyped
+ * escape.
  */
 interface ScopeFilterableServer {
   tool(name: string, ...args: unknown[]): RegisteredTool | undefined;
+  registerTool(name: string, ...args: unknown[]): RegisteredTool | undefined;
 }
 
 function isAllowedOrigin(origin: string | null): boolean {
@@ -93,12 +96,11 @@ async function authenticateMcp(request: NextRequest) {
         context: { userId: result.userId, method: "oauth" as const, mfaVerified: false, dek: result.dek, sessionId: null as string | null, scope: result.scope },
       };
     }
-    const issuer = getIssuer();
     return {
       authenticated: false as const,
       response: NextResponse.json(
         { error: "invalid_token", error_description: "OAuth access token is invalid or expired" },
-        { status: 401, headers: { "WWW-Authenticate": `Bearer realm="${issuer}", error="invalid_token"` } }
+        { status: 401, headers: { "WWW-Authenticate": bearerChallenge({ error: "invalid_token" }) } }
       ),
     };
   }
@@ -114,17 +116,11 @@ async function authenticateMcp(request: NextRequest) {
   const sessionResult = await accountStrategy.authenticate(request);
   if (sessionResult.authenticated) return sessionResult;
 
-  const issuer = getIssuer();
   return {
     authenticated: false as const,
     response: NextResponse.json(
       { error: "unauthorized", error_description: "Authentication required" },
-      {
-        status: 401,
-        headers: {
-          "WWW-Authenticate": `Bearer realm="${issuer}", resource_metadata="${issuer}/api/mcp/.well-known/oauth-protected-resource"`,
-        },
-      }
+      { status: 401, headers: { "WWW-Authenticate": bearerChallenge() } }
     ),
   };
 }
@@ -187,23 +183,31 @@ export async function POST(request: NextRequest) {
   const scopeString = "scope" in auth.context ? auth.context.scope : DEFAULT_SCOPE;
   const scopeSet = parseScope(scopeString);
 
-  // FINLYNQ-263 phase 5 — resolve the session toolsets. Default profile is
-  // analytics + ledger-write; the import-pipeline set (the 25 statement-import +
-  // bank-reconcile tools) is added ONLY when the token carries the `mcp:import`
-  // scope (a) OR the per-user connection setting opts in (b). An out-of-toolset
-  // tool is NEVER registered → it is neither listed NOR callable this session.
-  const importSettingEnabled = await getImportToolsetEnabled(auth.context.userId);
-  const enabledSets = enabledToolsetsForRequest(scopeSet, { importSettingEnabled });
+  // Resolve the session toolsets. Every connection gets the same default profile
+  // now (analytics + ledger-write) — the import/reconcile cohort was folded into
+  // default-ON union tools (reconcile-consolidation), so there is no opt-in set.
+  // An out-of-toolset tool is NEVER registered → neither listed NOR callable.
+  const enabledSets = enabledToolsetsForRequest(scopeSet);
 
-  // The SDK types `tool` as a read-only overloaded method, so reach it through
-  // a single named interface (ScopeFilterableServer) rather than `any`. The
-  // wrap composes the OAuth scope gate (read/write) with the toolset gate.
+  // The SDK types `tool` / `registerTool` as read-only overloaded methods, so
+  // reach them through a single named interface (ScopeFilterableServer) rather
+  // than `any`. The wrap composes the OAuth scope gate (read/write) with the
+  // toolset gate. D-1: BOTH registration paths are gated — legacy `server.tool`
+  // tools AND the consolidated `manage_*` / `reconcile` union tools (which
+  // register via `server.registerTool`). Without the registerTool patch a
+  // read-only token would get every union write tool registered + callable.
   const scopable = server as unknown as ScopeFilterableServer;
+  const gate = (name: string): boolean =>
+    isToolAllowedForScope(name, scopeSet) && isToolInEnabledToolsets(name, enabledSets);
   const originalTool = scopable.tool.bind(server);
   scopable.tool = (name: string, ...args: unknown[]) => {
-    if (!isToolAllowedForScope(name, scopeSet)) return undefined;
-    if (!isToolInEnabledToolsets(name, enabledSets)) return undefined;
+    if (!gate(name)) return undefined;
     return originalTool(name, ...args);
+  };
+  const originalRegisterTool = scopable.registerTool.bind(server);
+  scopable.registerTool = (name: string, ...args: unknown[]) => {
+    if (!gate(name)) return undefined;
+    return originalRegisterTool(name, ...args);
   };
 
   const dek = "dek" in auth.context ? auth.context.dek : null;
@@ -211,11 +215,11 @@ export async function POST(request: NextRequest) {
   registerPgTools(server, db as any, auth.context.userId, dek);
 
   // Post-process `tools/list`: hide back-compat aliases (callable but not
-  // advertised, decision #1) + substitute the pre-computed `oneOf` JSON schema
-  // for consolidated tools (the SDK renders a union input as an empty object).
-  // Out-of-toolset tools are already unregistered above, so the list filter's
-  // toolset predicate is a no-op belt-and-braces pass.
-  const toolFilter = (name: string) => isToolInEnabledToolsets(name, enabledSets);
+  // advertised) + substitute the pre-computed `oneOf` JSON schema for
+  // consolidated tools (the SDK renders a union input as an empty object).
+  // Out-of-scope / out-of-toolset tools are already unregistered above, so this
+  // predicate (D-1: scope AND toolset) is a belt-and-braces pass.
+  const toolFilter = (name: string) => gate(name);
   {
     // eslint-disable-next-line @typescript-eslint/no-explicit-any
     const inner = server.server as any;
@@ -248,17 +252,31 @@ export async function POST(request: NextRequest) {
   return transport.handleRequest(request);
 }
 
+/**
+ * GH #318 (bug 4, the fatal one) — this endpoint runs the Streamable HTTP
+ * transport in STATELESS mode (`sessionIdGenerator: undefined`,
+ * `enableJsonResponse: true`), so there is no server-initiated SSE stream to
+ * open here. The MCP Streamable HTTP spec says a server that does not offer an
+ * SSE stream at its endpoint MUST answer the GET with 405 Method Not Allowed.
+ *
+ * This used to return 401 UNCONDITIONALLY — it never even read the
+ * Authorization header. `StreamableHTTPClientTransport._startOrAuthSse` opens
+ * this GET before any POST, read the 401 as "credentials rejected", and ran a
+ * full re-auth; the re-auth succeeded, issued a token, and hit the same
+ * blanket 401 again — an infinite loop that never reached the POST that would
+ * have worked. It also explains why `oauth_access_tokens.last_used_at` stayed
+ * NULL across the storm: this path never calls `validateOauthToken` at all.
+ * A real prod user minted 133 tokens in 26 minutes this way (2026-07-23).
+ *
+ * 405 tells the SDK "no SSE here, use POST" and it proceeds normally. Do NOT
+ * reintroduce a WWW-Authenticate header: this is not an auth failure, and
+ * advertising one re-arms the same re-auth reflex. Mirrors DELETE below.
+ */
 export async function GET(request: NextRequest) {
   if (!isAllowedOrigin(request.headers.get("origin"))) return rejectBadOrigin();
-  const issuer = getIssuer();
   return NextResponse.json(
-    { error: "Finlynq MCP requires authentication. Use POST with a valid Bearer token." },
-    {
-      status: 401,
-      headers: {
-        "WWW-Authenticate": `Bearer realm="${issuer}", resource_metadata="${issuer}/api/mcp/.well-known/oauth-protected-resource"`,
-      },
-    }
+    { error: "Stateless mode — no SSE stream. Use POST with a valid Bearer token." },
+    { status: 405, headers: { Allow: "POST" } }
   );
 }
 

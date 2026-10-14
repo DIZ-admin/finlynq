@@ -1,7 +1,7 @@
 import { describe, it, expect, vi, beforeEach } from "vitest";
 
 const mockDbChain: Record<string, ReturnType<typeof vi.fn>> = {};
-const chainMethods = ["select", "from", "where", "orderBy"];
+const chainMethods = ["select", "from", "leftJoin", "where", "orderBy"];
 for (const m of chainMethods) {
   mockDbChain[m] = vi.fn().mockReturnValue(mockDbChain);
 }
@@ -18,6 +18,7 @@ vi.mock("@/db", () => ({
   }),
   schema: {
     transactions: { id: "id", date: "date", payee: "payee", amount: "amount", accountId: "accountId", categoryId: "categoryId", userId: "userId" },
+    categories: { id: "id", type: "type" },
   },
 }));
 
@@ -25,10 +26,16 @@ vi.mock("@/lib/auth/require-auth", () => ({
   requireAuth: vi.fn(async () => ({ authenticated: true, context: { userId: "default", method: "passphrase" as const, mfaVerified: false, dek: Buffer.alloc(32, 0xaa), sessionId: "test-session-jti" } })),
 }));
 
+vi.mock("@/lib/fx-service", () => ({
+  getDisplayCurrency: vi.fn(async (_userId: string, override?: string | null) => override ?? "USD"),
+  getRateMap: vi.fn(async () => new Map()),
+  convertWithRateMap: vi.fn((amount: number) => amount),
+}));
+
 vi.mock("@/lib/recurring-detector", () => ({
   detectRecurringTransactions: vi.fn(() => [
-    { payee: "Netflix", avgAmount: -15.99, frequency: "monthly", count: 6, lastDate: "2024-01-01", nextDate: "2024-02-01", accountId: 1, categoryId: 2 },
-    { payee: "Employer", avgAmount: 5000, frequency: "biweekly", count: 12, lastDate: "2024-01-15", nextDate: "2024-01-29", accountId: 1, categoryId: 3 },
+    { payee: "Netflix", avgAmount: -15.99, currency: "USD", frequency: "monthly", count: 6, lastDate: "2024-01-01", nextDate: "2024-02-01", accountId: 1, categoryId: 2 },
+    { payee: "Employer", avgAmount: 5000, currency: "USD", frequency: "biweekly", count: 12, lastDate: "2024-01-15", nextDate: "2024-01-29", accountId: 1, categoryId: 3 },
   ]),
   forecastCashFlow: vi.fn(() => []),
 }));
@@ -36,6 +43,7 @@ vi.mock("@/lib/recurring-detector", () => ({
 vi.mock("drizzle-orm", () => ({ sql: vi.fn(), and: vi.fn(), eq: vi.fn() }));
 
 import { GET } from "@/app/api/recurring/route";
+import { detectRecurringTransactions } from "@/lib/recurring-detector";
 import { createMockRequest, parseResponse } from "../helpers/api-test-utils";
 
 describe("API /api/recurring", () => {
@@ -64,5 +72,11 @@ describe("API /api/recurring", () => {
     const d = data as { monthlyRecurringTotal: number };
     // Only Netflix (-15.99 monthly) should count
     expect(d.monthlyRecurringTotal).toBe(15.99);
+  });
+
+  it("asks the detector to drop lapsed series as of today", async () => {
+    await GET(createMockRequest("http://localhost:3000/api/recurring"));
+    const opts = vi.mocked(detectRecurringTransactions).mock.calls[0][1];
+    expect(opts?.asOf).toMatch(/^\d{4}-\d{2}-\d{2}$/);
   });
 });

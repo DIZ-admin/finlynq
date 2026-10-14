@@ -33,16 +33,29 @@ import {
   calculateDebtPayoff,
   LoanValidationError,
   PAYMENT_FREQUENCIES,
+  INTEREST_METHODS,
+  loanScheduleExtras,
   type Debt,
+  type InterestMethod,
 } from "../../src/lib/loan-calculator";
 import {
   resolveReportingCurrency,
 } from "../reporting-currency";
 import {
+  getRateMap,
+  convertWithRateMap,
+} from "../../src/lib/fx-service";
+import { pickRecordCurrency } from "../../src/lib/fx/record-currency";
+import {
   ymdDate,
   parseYmdSafe,
 } from "../lib/date-validators";
-import { registerManageTool, registerAlias } from "./_consolidate";
+import { registerManageTool } from "./_consolidate";
+import { postLoanInterest, readLoanInterest } from "../../src/lib/loans/interest-entries";
+import { dueUnpostedInterest, matchInterestToSchedule } from "../../src/lib/loans/interest-plan";
+import { saveLoanSchedule, type ScheduleChange } from "../../src/lib/loans/schedule-store";
+import { assessLoanInterest, assessmentWindowNote } from "../../src/lib/loans/interest-check";
+import { todayISO } from "../../src/lib/utils/date";
 
 type ToolResult = { content: Array<{ type: "text"; text: string }> };
 
@@ -63,7 +76,8 @@ export function registerLoansTools(server: McpServer, ctx: PgToolContext) {
       const rawRows = await q(db, sql`
         SELECT l.id, l.name_ct, l.type, l.principal, l.annual_rate, l.term_months,
                l.start_date, l.payment_amount, l.payment_frequency, l.extra_payment,
-               l.residual_value, l.note, l.account_id, a.name_ct AS account_name_ct
+               l.residual_value, l.manual_schedule, l.interest_overrides, l.interest_method, l.interest_amount, l.note, l.account_id, l.currency,
+               a.name_ct AS account_name_ct
         FROM loans l
         LEFT JOIN accounts a ON a.id = l.account_id
         WHERE l.user_id = ${userId}
@@ -92,10 +106,22 @@ export function registerLoansTools(server: McpServer, ctx: PgToolContext) {
           acctBalances.set(Number(b.account_id), { balance: Number(b.balance), txCount: Number(b.tx_count) });
         }
       }
+      // FINLYNQ-123 dual basis: amounts stay in each loan's own currency and
+      // each row also carries a current-rate conversion, so an assistant can
+      // both quote a loan correctly and total a mixed-currency book.
+      const reporting = await resolveReportingCurrency(db, userId, null);
+      const rateMap = await getRateMap(reporting, userId);
       const today = new Date().toISOString().split("T")[0];
       const enriched = rows.map((r) => {
+        const loanCurrency = String(r.currency ?? reporting).toUpperCase();
+        const toReporting = (amount: number | null) =>
+          amount == null ? null : Math.round(convertWithRateMap(amount, loanCurrency, rateMap) * 100) / 100;
         const integrityRow = (error: string, value: unknown) => ({
           ...r,
+          currency: loanCurrency,
+          reportingCurrency: reporting,
+          remainingBalanceReporting: null,
+          monthlyEquivalentPaymentReporting: null,
           monthlyPayment: null,
           totalInterest: null,
           payoffDate: null,
@@ -123,6 +149,7 @@ export function registerLoansTools(server: McpServer, ctx: PgToolContext) {
             paymentFrequency: String(r.payment_frequency ?? "monthly"),
             extraPayment: Number(r.extra_payment ?? 0),
             residualValue: r.residual_value == null ? null : Number(r.residual_value),
+            ...loanScheduleExtras(r),
           });
         } catch (e) {
           if (e instanceof LoanValidationError) return integrityRow(e.message, null);
@@ -144,7 +171,8 @@ export function registerLoansTools(server: McpServer, ctx: PgToolContext) {
           if (remainingBalance <= residual + 0.01) {
             payoffDate = today;
             periodsRemaining = 0;
-          } else {
+          } else if (summary.scheduleMode !== "manual") {
+            // (a manual schedule keeps the user's own dates; no re-projection)
             try {
               const anchored = buildLoanSchedule({
                 principal: remainingBalance,
@@ -177,6 +205,15 @@ export function registerLoansTools(server: McpServer, ctx: PgToolContext) {
               : Math.round(principalPaid * 100) / 100,
           interestPaid: Math.round(interestPaid * 100) / 100,
           periodsRemaining,
+          scheduleMode: summary.scheduleMode,
+          interestMethod: summary.interestMethod,
+          // The comparable yearly rate on the balance owed (differs from
+          // annualRate for a flat or total-interest loan).
+          effectiveAnnualRate: summary.effectiveAnnualRate,
+          currency: loanCurrency,
+          reportingCurrency: reporting,
+          remainingBalanceReporting: toReporting(remainingBalance),
+          monthlyEquivalentPaymentReporting: toReporting(summary.monthlyEquivalentPayment),
         };
       });
       return text({ success: true, data: enriched });
@@ -194,12 +231,15 @@ export function registerLoansTools(server: McpServer, ctx: PgToolContext) {
     account_id?: number;
     payment_amount?: number;
     payment_frequency?: (typeof PAYMENT_FREQUENCIES)[number];
+    interest_method?: InterestMethod;
+    interest_amount?: number;
     extra_payment?: number;
     residual_value?: number;
     min_payment?: number;
+    currency?: string;
     note?: string;
   }): Promise<ToolResult> {
-      const { name, type, principal, annual_rate, term_months, start_date, account, account_id, payment_amount, payment_frequency, extra_payment, residual_value, min_payment, note } = args;
+      const { name, type, principal, annual_rate, term_months, start_date, account, account_id, payment_amount, payment_frequency, extra_payment, residual_value, min_payment, currency, note, interest_method, interest_amount } = args;
       // FINLYNQ-267: resolve the optional linked account via the shared envelope
       // — a mistyped/unmatched name is REFUSED (not silently unlinked) and a 2+
       // match returns an ambiguous list; `account_id` is the FK fast-path.
@@ -229,20 +269,38 @@ export function registerLoansTools(server: McpServer, ctx: PgToolContext) {
           paymentFrequency: payment_frequency ?? "monthly",
           extraPayment: extra_payment ?? 0,
           residualValue: residual_value ?? null,
+          interestMethod: interest_method,
+          interestAmount: interest_amount,
         });
       } catch (e) {
         if (e instanceof LoanValidationError) return err(e.message);
         throw e;
       }
+      // Currency resolution (feedback #7): explicit > linked account > display.
+      // This INSERT used to omit the column entirely, so every MCP-created loan
+      // silently took the table default — which was CAD.
+      let accountCurrency: string | null = null;
+      if (accountId != null) {
+        const acctRow = await q(db, sql`
+          SELECT currency FROM accounts WHERE id = ${accountId} AND user_id = ${userId}
+        `);
+        accountCurrency = (acctRow[0]?.currency as string | undefined) ?? null;
+      }
+      const loanCurrency = pickRecordCurrency({
+        explicit: currency,
+        accountCurrency,
+        displayCurrency: await resolveReportingCurrency(db, userId, null),
+      });
       const n = dek ? encryptName(dek, name) : { ct: null, lookup: null };
       // Stream D Phase 4 — plaintext name dropped.
       const result = await q(db, sql`
-        INSERT INTO loans (user_id, type, account_id, principal, annual_rate, term_months, start_date, payment_amount, payment_frequency, extra_payment, residual_value, note, name_ct, name_lookup)
-        VALUES (${userId}, ${type}, ${accountId}, ${principal}, ${annual_rate}, ${term_months ?? null}, ${start_date}, ${pmt}, ${payment_frequency ?? "monthly"}, ${extra_payment ?? 0}, ${residual_value ?? null}, ${encNote(note)}, ${n.ct}, ${n.lookup})
+        INSERT INTO loans (user_id, type, account_id, currency, principal, annual_rate, term_months, start_date, payment_amount, payment_frequency, extra_payment, residual_value, interest_method, interest_amount, note, name_ct, name_lookup)
+        VALUES (${userId}, ${type}, ${accountId}, ${loanCurrency}, ${principal}, ${annual_rate}, ${term_months ?? null}, ${start_date}, ${pmt}, ${payment_frequency ?? "monthly"}, ${extra_payment ?? 0}, ${residual_value ?? null}, ${interest_method ?? "rate"}, ${interest_method && interest_method !== "rate" ? interest_amount ?? null : null}, ${encNote(note)}, ${n.ct}, ${n.lookup})
         RETURNING id
       `);
       const termDesc = term_months != null ? `over ${term_months} months` : `at ${pmt}/${payment_frequency ?? "monthly"} (payment-driven)`;
-      return text({ success: true, data: { id: result[0]?.id, message: `Loan "${name}" created — $${principal} at ${annual_rate}% ${termDesc}` } });
+      // Report the currency rather than a bare `$` — the amount is not USD.
+      return text({ success: true, data: { id: result[0]?.id, currency: loanCurrency, message: `Loan "${name}" created — ${principal} ${loanCurrency} at ${annual_rate}% ${termDesc}` } });
   }
 
   // ── op: update — lifted VERBATIM from update_loan ──────────────────────────
@@ -256,16 +314,19 @@ export function registerLoansTools(server: McpServer, ctx: PgToolContext) {
     start_date?: string;
     payment_amount?: number;
     payment_frequency?: (typeof PAYMENT_FREQUENCIES)[number];
+    interest_method?: InterestMethod;
+    interest_amount?: number;
     extra_payment?: number;
     residual_value?: number;
     account?: string;
     account_id?: number;
+    currency?: string;
     note?: string;
   }): Promise<ToolResult> {
-      const { id, name, type, principal, annual_rate, term_months, start_date, payment_amount, payment_frequency, extra_payment, residual_value, account, account_id, note } = args;
+      const { id, name, type, principal, annual_rate, term_months, start_date, payment_amount, payment_frequency, extra_payment, residual_value, account, account_id, currency, note, interest_method, interest_amount } = args;
       const existing = await q(db, sql`
         SELECT id, principal, annual_rate, term_months, start_date, payment_amount,
-               payment_frequency, extra_payment, residual_value
+               payment_frequency, extra_payment, residual_value, manual_schedule, interest_overrides, interest_method, interest_amount
         FROM loans WHERE id = ${id} AND user_id = ${userId}
       `);
       if (!existing.length) return err(`Loan #${id} not found`);
@@ -281,6 +342,10 @@ export function registerLoansTools(server: McpServer, ctx: PgToolContext) {
         paymentFrequency: payment_frequency ?? String(cur.payment_frequency ?? "monthly"),
         extraPayment: extra_payment ?? Number(cur.extra_payment ?? 0),
         residualValue: residual_value ?? (cur.residual_value == null ? null : Number(cur.residual_value)),
+        ...loanScheduleExtras(cur),
+        // After the stored extras: this call may be changing the method.
+        ...(interest_method !== undefined ? { interestMethod: interest_method } : {}),
+        ...(interest_amount !== undefined ? { interestAmount: interest_amount } : {}),
       };
       if (parseYmdSafe(merged.startDate) !== null) {
         try {
@@ -332,7 +397,12 @@ export function registerLoansTools(server: McpServer, ctx: PgToolContext) {
       if (payment_frequency !== undefined) updates.push(sql`payment_frequency = ${payment_frequency}`);
       if (extra_payment !== undefined) updates.push(sql`extra_payment = ${extra_payment}`);
       if (residual_value !== undefined) updates.push(sql`residual_value = ${residual_value}`);
+      if (interest_method !== undefined) updates.push(sql`interest_method = ${interest_method}`);
+      if (interest_amount !== undefined) updates.push(sql`interest_amount = ${interest_amount}`);
       if (accountIdUpdate !== undefined) updates.push(sql`account_id = ${accountIdUpdate}`);
+      // Re-denominates the loan; it does NOT convert the stored amounts. This
+      // is the repair path for a loan created before the currency was settable.
+      if (currency !== undefined) updates.push(sql`currency = ${currency.toUpperCase()}`);
       if (note !== undefined) updates.push(sql`note = ${encNote(note)}`);
       if (!updates.length) return err("No fields to update");
 
@@ -361,11 +431,160 @@ export function registerLoansTools(server: McpServer, ctx: PgToolContext) {
       });
   }
 
-  // ── consolidated tool: manage_loans + hidden back-compat aliases ───────────
+  // ── post_interest: book one period's interest into the loan account ──────
+  // The payment itself stays a plain transfer (manage_transfers); this writes
+  // the SEPARATE interest expense on the loan's linked account. All rules live
+  // in postLoanInterest, shared with REST /api/loans/interest.
+  async function opPostInterest(args: {
+    loan_id: number;
+    period_date?: string;
+    amount?: number;
+    category_id?: number;
+    category?: string;
+    date?: string;
+  }): Promise<ToolResult> {
+    const { loan_id, period_date, amount, category_id, category, date } = args;
+    if (!dek) return err("Cannot post loan interest without an unlocked DEK (the entry's payee and note are encrypted).");
+
+    const rows = await q(db, sql`
+      SELECT id, principal, annual_rate, term_months, start_date, payment_amount,
+             payment_frequency, extra_payment, residual_value, manual_schedule, interest_overrides, interest_method, interest_amount, currency, interest_category_id
+      FROM loans WHERE id = ${loan_id} AND user_id = ${userId}
+    `);
+    if (!rows.length) return err(`Loan #${loan_id} not found`);
+    const loan = rows[0];
+
+    // Category: an explicit one wins, then the one saved on the loan, then the
+    // user's single "interest" expense category. Never guess between two and
+    // never auto-create one.
+    let categoryId: number;
+    if (category_id != null || category) {
+      const rawCats = await q(db, sql`SELECT id, name_ct FROM categories WHERE user_id = ${userId}`);
+      const out = resolveOrReport(
+        "category",
+        resolveEntity({ entity: "category", id: category_id, name: category, options: decryptNameish(rawCats, dek) }),
+      );
+      if ("report" in out) return out.report;
+      categoryId = out.id;
+    } else if (loan.interest_category_id != null) {
+      categoryId = Number(loan.interest_category_id);
+    } else {
+      const rawCats = await q(db, sql`SELECT id, name_ct, type FROM categories WHERE user_id = ${userId}`);
+      const candidates = decryptNameish(rawCats, dek).filter(
+        (c) => String(c.type) === "E" && /interest/i.test(String(c.name ?? "")),
+      );
+      if (candidates.length !== 1) {
+        return err(
+          candidates.length === 0
+            ? "This loan has no interest category yet and no expense category has 'interest' in its name. Pass category_id (see get_categories) or create one with manage_categories."
+            : `This loan has no interest category yet and several look like interest (${candidates.map((c) => `#${c.id} ${String(c.name)}`).join(", ")}). Pass category_id.`,
+        );
+      }
+      categoryId = Number(candidates[0].id);
+    }
+
+    if (parseYmdSafe(String(loan.start_date)) === null) {
+      return err(`Loan #${loan_id} has an invalid start_date; fix it with manage_loans(op:"update") first.`);
+    }
+    let schedule;
+    try {
+      schedule = buildLoanSchedule({
+        principal: Number(loan.principal),
+        annualRate: Number(loan.annual_rate),
+        termMonths: loan.term_months == null ? null : Number(loan.term_months),
+        startDate: String(loan.start_date),
+        paymentAmount: loan.payment_amount == null ? null : Number(loan.payment_amount),
+        paymentFrequency: String(loan.payment_frequency ?? "monthly"),
+        extraPayment: Number(loan.extra_payment ?? 0),
+        residualValue: loan.residual_value == null ? null : Number(loan.residual_value),
+        ...loanScheduleExtras(loan),
+      }).schedule;
+    } catch (e) {
+      if (e instanceof LoanValidationError) return err(e.message);
+      throw e;
+    }
+
+    // What the ledger already holds for this loan's interest, however it got
+    // there (typed in, recorded with manage_transactions, or posted here).
+    const state = await readLoanInterest(userId, loan_id, categoryId);
+    const { booked } = matchInterestToSchedule(schedule, state?.entries ?? []);
+    const due = dueUnpostedInterest(schedule, new Set(booked.keys()), todayISO());
+    const row = period_date ? schedule.find((r) => r.date === period_date) : due[0];
+    if (!row) {
+      return err(
+        period_date
+          ? `${period_date} is not a payment date on loan #${loan_id}'s schedule (see get_loan_amortization for the dates).`
+          : "Every payment that has come due already has interest booked on the loan account. Pass period_date to post a specific period.",
+      );
+    }
+
+    try {
+      const [created] = await postLoanInterest(userId, dek, {
+        loanId: loan_id,
+        categoryId,
+        entries: [{ periodDate: row.date, amount: amount ?? row.interest, date }],
+        source: "mcp_http",
+      });
+      const stillDue = due.filter((r) => r.date !== row.date).length;
+      return text({
+        success: true,
+        data: {
+          loanId: loan_id,
+          periodDate: created.periodDate,
+          transactionId: created.transactionId,
+          date: created.date,
+          amount: created.amount,
+          calculatedInterest: row.interest,
+          currency: String(loan.currency ?? ""),
+          categoryId,
+          duePeriodsStillUnposted: stillDue,
+          message: `Booked ${Math.abs(created.amount)} interest for the ${created.periodDate} payment on the loan account. The payment itself is a separate plain transfer.`,
+        },
+      });
+    } catch (e) {
+      // AppError (refusals) and OwnershipError both carry a caller-safe message.
+      if (e instanceof Error && (e.name === "AppError" || e.name === "OwnershipError")) {
+        return err(e.name === "OwnershipError" ? "Category not found" : e.message);
+      }
+      throw e;
+    }
+  }
+
+  // ── schedule ops: the loan's own schedule ────────────────────────────────
+  // set_schedule (complete rows that replace the calculation), set_interest
+  // (the interest of single calculated rows) and reset_schedule all go through
+  // saveLoanSchedule, shared with REST /api/loans/schedule: it validates by
+  // building the resulting schedule and stores nothing it cannot build.
+  async function opSchedule(loanId: number, change: ScheduleChange, done: string): Promise<ToolResult> {
+    try {
+      const state = await saveLoanSchedule(userId, loanId, change);
+      return text({
+        success: true,
+        data: {
+          loanId,
+          scheduleMode: state.mode,
+          rows: state.summary.schedule.length,
+          interestOverrides: Object.keys(state.interestOverrides).length,
+          firstPaymentDate: state.summary.schedule[0]?.date ?? null,
+          payoffDate: state.summary.payoffDate,
+          totalInterest: state.summary.totalInterest,
+          // What the rows leave unpaid: above 0 means the schedule stops short of payoff.
+          endingBalance: state.summary.schedule[state.summary.schedule.length - 1]?.balance ?? null,
+          message: done,
+        },
+      });
+    } catch (e) {
+      // AppError refusals carry a caller-safe message (bad row, unknown loan).
+      if (e instanceof Error && e.name === "AppError") return err(e.message);
+      throw e;
+    }
+  }
+
+  // ── consolidated tool: manage_loans ───────────
   registerManageTool(
     server,
     "manage_loans",
-    "Manage loans & debt: `op` selects add / update / delete / list. add: create a loan or lease (principal/rate + term_months OR payment_amount; residual_value for leases). update: change any loan field by id. delete: remove a loan by id. list: all loans with balance/rate/payment/payoff date/linked account. For amortization schedules or payoff strategies use get_loan_amortization / get_debt_payoff_plan.",
+    "Manage loans & debt; `op`: add, update, delete, list, post_interest, set_schedule, set_interest, reset_schedule. add: create a loan or lease (principal + term_months OR payment_amount; interest by annual_rate, or `interest_method` flat / total with `interest_amount`; residual_value for leases; `currency` defaults to the linked account's). update / delete: by id. list: every loan with balance/payment/payoff, in its own `currency` plus `*Reporting` companions for totals. post_interest: book one period's interest as an expense on the linked account (refused if unlinked or already booked); record the payment itself as a plain transfer (manage_transfers). set_schedule: your own rows replace the calculated ones (`merge` to change a few). set_interest: override the interest of single calculated rows. reset_schedule: back to calculated. See get_loan_amortization for the rows.",
     z.discriminatedUnion("op", [
       z.object({
         op: z.literal("add"),
@@ -381,7 +600,10 @@ export function registerLoansTools(server: McpServer, ctx: PgToolContext) {
         payment_frequency: z.enum(PAYMENT_FREQUENCIES).optional().describe("weekly | biweekly | semi_monthly | monthly | quarterly | annual (default monthly)"),
         extra_payment: z.number().nonnegative().optional().describe("Extra principal per payment (must be >= 0; default 0)"),
         residual_value: z.number().nonnegative().optional().describe("Lease residual/buyout — the schedule amortizes down to this instead of 0 (must be < principal)"),
+        interest_method: z.enum(INTEREST_METHODS).optional().describe("How interest is worked out. rate (default): annual_rate on the balance owed. flat: `interest_amount` with EVERY payment (how such loans are advertised). total: `interest_amount` is the interest over the whole loan, spread the standard way (level payment, more interest early)."),
+        interest_amount: z.number().nonnegative().optional().describe("For interest_method flat: interest per payment. For total: interest over the whole loan. Unused for rate."),
         min_payment: z.number().positive().optional().describe("Alias for payment_amount — minimum required payment (must be > 0)"),
+        currency: z.string().regex(/^[A-Za-z]{3,4}$/).optional().describe("ISO code the loan is denominated in, e.g. 'RUB'. Defaults to the linked account's currency, else the user's display currency — never a hardcoded default."),
         note: z.string().optional(),
       }),
       z.object({
@@ -397,8 +619,11 @@ export function registerLoansTools(server: McpServer, ctx: PgToolContext) {
         payment_frequency: z.enum(PAYMENT_FREQUENCIES).optional().describe("weekly | biweekly | semi_monthly | monthly | quarterly | annual"),
         extra_payment: z.number().nonnegative().optional().describe("Extra principal per payment (must be >= 0)"),
         residual_value: z.number().nonnegative().optional().describe("Lease residual/buyout — balance remaining at term end (must be < principal)"),
+        interest_method: z.enum(INTEREST_METHODS).optional().describe("How interest is worked out. rate (default): annual_rate on the balance owed. flat: `interest_amount` with EVERY payment (how such loans are advertised). total: `interest_amount` is the interest over the whole loan, spread the standard way (level payment, more interest early)."),
+        interest_amount: z.number().nonnegative().optional().describe("For interest_method flat: interest per payment. For total: interest over the whole loan. Unused for rate."),
         account: z.string().optional().describe("Linked account — name or alias (fuzzy matched — mistyped/unmatched is REFUSED; 2+ → ambiguous). Pass empty string to clear. PREFER `account_id`."),
         account_id: z.number().int().positive().optional().describe("Linked-account FK fast-path — wins over the fuzzy `account` name."),
+        currency: z.string().regex(/^[A-Za-z]{3,4}$/).optional().describe("ISO code the loan is denominated in. Changes the currency the stored amounts are interpreted in — it does NOT convert them."),
         note: z.string().optional(),
       }),
       z.object({
@@ -407,6 +632,47 @@ export function registerLoansTools(server: McpServer, ctx: PgToolContext) {
       }),
       z.object({
         op: z.literal("list").describe("List all loans with balance/payment/payoff."),
+      }),
+      z.object({
+        op: z.literal("post_interest"),
+        loan_id: z.number().int().positive().describe("Loan id (must be linked to an account)"),
+        period_date: ymdDate.optional().describe("Payment date on the loan's schedule whose interest to book (YYYY-MM-DD). Omit to take the oldest payment that has come due and has no interest on the loan account yet. Interest already recorded there under the interest category, by any tool or by hand, counts as booked."),
+        amount: z.number().positive().optional().describe("Interest to book, as a positive number in the loan account's currency. Omit to use the schedule's calculated interest for that period; pass it when the lender charged a different amount."),
+        category_id: z.number().int().positive().optional().describe("Expense category FK for the entry — wins over `category`."),
+        category: z.string().optional().describe("Expense category name (exact match; mistyped/ambiguous is REFUSED). When both are omitted, the loan's saved interest category is used, else the single expense category with 'interest' in its name; refused if there is none or more than one. The category used is saved on the loan."),
+        date: ymdDate.optional().describe("Transaction date (YYYY-MM-DD). Defaults to period_date."),
+      }),
+      z.object({
+        op: z.literal("set_schedule"),
+        loan_id: z.number().int().positive().describe("Loan id"),
+        rows: z
+          .array(
+            z.object({
+              date: ymdDate.describe("Payment date (YYYY-MM-DD)"),
+              payment: z.number().nonnegative().describe("Total paid on that date"),
+              interest: z.number().nonnegative().describe("Interest part of that payment; principal and balance are derived"),
+            }),
+          )
+          .min(1)
+          .describe("The loan's own schedule rows, one per payment. They REPLACE the calculated schedule unless `merge` is true."),
+        merge: z.boolean().optional().describe("true: lay these rows over the current schedule by date (change or add a few payments) instead of replacing every row. Default false."),
+      }),
+      z.object({
+        op: z.literal("set_interest"),
+        loan_id: z.number().int().positive().describe("Loan id (calculated schedule only; a manual schedule is changed with set_schedule)"),
+        overrides: z
+          .array(
+            z.object({
+              date: ymdDate.describe("A payment date on the loan's schedule (YYYY-MM-DD)"),
+              interest: z.number().nonnegative().nullable().describe("Interest actually charged for that payment; null removes the override"),
+            }),
+          )
+          .min(1)
+          .describe("Per-payment interest that replaces the calculated figure. The payment is unchanged, so principal and later balances follow."),
+      }),
+      z.object({
+        op: z.literal("reset_schedule"),
+        loan_id: z.number().int().positive().describe("Loan id — drops the manual schedule and every interest override; the schedule is calculated again."),
       }),
     ]),
     async (input) => {
@@ -419,68 +685,32 @@ export function registerLoansTools(server: McpServer, ctx: PgToolContext) {
           return opDelete(input);
         case "list":
           return opList();
+        case "post_interest":
+          return opPostInterest(input);
+        case "set_schedule":
+          return opSchedule(
+            input.loan_id,
+            { manualSchedule: input.rows, mergeRows: input.merge === true },
+            input.merge === true
+              ? `Merged ${input.rows.length} row(s) into the loan's schedule; it is now a manual schedule.`
+              : `Replaced the loan's schedule with ${input.rows.length} row(s).`,
+          );
+        case "set_interest":
+          return opSchedule(
+            input.loan_id,
+            { interestOverrides: Object.fromEntries(input.overrides.map((o) => [o.date, o.interest])) },
+            `Updated the interest of ${input.overrides.length} payment(s).`,
+          );
+        case "reset_schedule":
+          return opSchedule(
+            input.loan_id,
+            { manualSchedule: null, clearInterestOverrides: true },
+            "The schedule is calculated from the loan's terms again.",
+          );
       }
     },
   );
 
-  registerAlias(
-    server,
-    "list_loans",
-    "List all loans with balance, rate, payment, payoff date, and linked account",
-    {},
-    async () => opList(),
-  );
-  registerAlias(
-    server,
-    "add_loan",
-    "Create a new loan or lease. Term-driven (term_months → payment derived) or payment-driven (payment_amount → payoff date solved); at least one of the two is required. Leases set residual_value (balance remaining at term end).",
-    {
-      name: z.string().describe("Loan name"),
-      type: z.string().describe("Loan type (e.g. 'mortgage', 'lease', 'auto', 'student', 'personal')"),
-      principal: z.number().positive().describe("Original loan principal (must be > 0)"),
-      annual_rate: z.number().nonnegative().describe("Annual interest rate, e.g. 5.5 for 5.5% (must be >= 0; zero allowed for 0% promo)"),
-      term_months: z.number().int().positive().optional().describe("Loan term in months (optional when payment_amount is given — the term is solved from the payment)"),
-      start_date: ymdDate.describe("Loan start date (YYYY-MM-DD)"),
-      account: z.string().optional().describe("Linked account — name or alias (fuzzy matched — mistyped/unmatched is REFUSED, never silently unlinked). When linked, the account's ledger balance drives the outstanding balance. PREFER `account_id`."),
-      account_id: z.number().int().positive().optional().describe("Linked-account FK fast-path — wins over the fuzzy `account` name."),
-      payment_amount: z.number().positive().optional().describe("Payment per period (must be > 0). Must exceed the period interest or the call is refused."),
-      payment_frequency: z.enum(PAYMENT_FREQUENCIES).optional().describe("weekly | biweekly | semi_monthly | monthly | quarterly | annual (default monthly)"),
-      extra_payment: z.number().nonnegative().optional().describe("Extra principal per payment (must be >= 0; default 0)"),
-      residual_value: z.number().nonnegative().optional().describe("Lease residual/buyout — the schedule amortizes down to this instead of 0 (must be < principal)"),
-      min_payment: z.number().positive().optional().describe("Alias for payment_amount — minimum required payment (must be > 0)"),
-      note: z.string().optional(),
-    },
-    async (args) => opAdd(args),
-  );
-  registerAlias(
-    server,
-    "update_loan",
-    "Update any field of an existing loan by id",
-    {
-      id: z.number().describe("Loan id"),
-      name: z.string().optional(),
-      type: z.string().optional(),
-      principal: z.number().positive().optional().describe("Original loan principal (must be > 0)"),
-      annual_rate: z.number().nonnegative().optional().describe("Annual interest rate, e.g. 5.5 for 5.5% (must be >= 0)"),
-      term_months: z.number().int().positive().optional(),
-      start_date: ymdDate.optional(),
-      payment_amount: z.number().positive().optional().describe("Payment per period (must be > 0; must exceed the period interest)"),
-      payment_frequency: z.enum(PAYMENT_FREQUENCIES).optional().describe("weekly | biweekly | semi_monthly | monthly | quarterly | annual"),
-      extra_payment: z.number().nonnegative().optional().describe("Extra principal per payment (must be >= 0)"),
-      residual_value: z.number().nonnegative().optional().describe("Lease residual/buyout — balance remaining at term end (must be < principal)"),
-      account: z.string().optional().describe("Linked account — name or alias (fuzzy matched — mistyped/unmatched is REFUSED; 2+ → ambiguous). Pass empty string to clear. PREFER `account_id`."),
-      account_id: z.number().int().positive().optional().describe("Linked-account FK fast-path — wins over the fuzzy `account` name."),
-      note: z.string().optional(),
-    },
-    async (args) => opUpdate(args),
-  );
-  registerAlias(
-    server,
-    "delete_loan",
-    "Delete a loan by id",
-    { id: z.number().describe("Loan id to delete") },
-    async (args) => opDelete(args),
-  );
 
 
   // ── get_loan_amortization ─────────────────────────────────────────────────
@@ -497,7 +727,7 @@ export function registerLoansTools(server: McpServer, ctx: PgToolContext) {
       // Stream D Phase 4: l.name dropped — read l.name_ct only.
       const rows = await q(db, sql`
         SELECT id, name_ct, principal, annual_rate, term_months, start_date,
-               payment_amount, payment_frequency, extra_payment, residual_value, currency
+               payment_amount, payment_frequency, extra_payment, residual_value, manual_schedule, interest_overrides, interest_method, interest_amount, currency
         FROM loans WHERE id = ${loan_id} AND user_id = ${userId}
       `);
       if (!rows.length) return err(`Loan #${loan_id} not found`);
@@ -523,6 +753,7 @@ export function registerLoansTools(server: McpServer, ctx: PgToolContext) {
           paymentFrequency: String(loan.payment_frequency ?? "monthly"),
           extraPayment: Number(loan.extra_payment ?? 0),
           residualValue: loan.residual_value == null ? null : Number(loan.residual_value),
+          ...loanScheduleExtras(loan),
         });
       } catch (e) {
         if (e instanceof LoanValidationError) return err(e.message);
@@ -532,12 +763,25 @@ export function registerLoansTools(server: McpServer, ctx: PgToolContext) {
       const paid = summary.schedule.filter((r) => r.date <= cutoff);
       const principalPaid = paid.reduce((s, r) => s + r.principal, 0);
       const interestPaid = paid.reduce((s, r) => s + r.interest, 0);
+      // Booked-versus-calculated interest, judged on the most recent booked
+      // payments only. `window` says which, and must be relayed with the verdict.
+      const check = await assessLoanInterest(userId, loan_id);
+      const interestCheck =
+        check && check.status !== "insufficient"
+          ? { ...check, window: assessmentWindowNote(check) }
+          : null;
       return text({
         success: true,
         data: {
           loanId: loan_id,
           loanName: loan.name,
-          loanCurrency: loan.currency ?? "CAD",
+          scheduleMode: summary.scheduleMode,
+          interestMethod: summary.interestMethod,
+          effectiveAnnualRate: summary.effectiveAnnualRate,
+          interestCheck,
+          // FINLYNQ-183/284: never a CAD literal. A loan predating an explicit
+          // currency reads as the user's own reporting currency, not Canada's.
+          loanCurrency: String(loan.currency ?? reporting).toUpperCase(),
           reportingCurrency: reporting,
           asOfDate: cutoff,
           monthlyPayment: summary.monthlyPayment,
@@ -568,7 +812,7 @@ export function registerLoansTools(server: McpServer, ctx: PgToolContext) {
   // ── get_debt_payoff_plan ──────────────────────────────────────────────────
   server.tool(
     "get_debt_payoff_plan",
-    "Compare debt payoff strategies (avalanche vs snowball) across all user loans with an optional extra monthly payment. Loan balances stay in each loan's own currency; the response includes the resolved reportingCurrency for cross-currency context.",
+    "Compare debt payoff strategies (avalanche vs snowball) across all user loans with an optional extra monthly payment. Balances and minimum payments are converted to reportingCurrency before ranking and before the shared extra_payment budget is applied, so a mixed-currency book is compared like for like; `inputs.debts` echoes each loan's native currency and amount alongside the converted figures. extra_payment is interpreted in reportingCurrency.",
     {
       strategy: z.enum(["avalanche", "snowball", "both"]).optional().describe("'avalanche' (highest rate first), 'snowball' (smallest balance first), or 'both' (default)"),
       extra_payment: z.number().optional().describe("Extra monthly payment to apply on top of minimums (default 0)"),
@@ -579,17 +823,31 @@ export function registerLoansTools(server: McpServer, ctx: PgToolContext) {
       // Stream D Phase 4: l.name dropped — read l.name_ct only.
       const loansRaw = await q(db, sql`
         SELECT id, name_ct, principal, annual_rate, term_months, start_date,
-               payment_amount, payment_frequency, extra_payment, residual_value
+               payment_amount, payment_frequency, extra_payment, residual_value,
+               manual_schedule, interest_overrides, interest_method, interest_amount, currency
         FROM loans WHERE user_id = ${userId}
       `);
       if (!loansRaw.length) return text({ success: true, data: { message: "No loans found", strategies: {} } });
       const loans = decryptNameish(loansRaw, dek);
+      // FINLYNQ-123: this tool RANKS loans against each other (snowball orders
+      // by balance) and pools one `extra_payment` budget across all of them, so
+      // every balance and minimum must be in ONE currency first. Without this
+      // an ₽8.1M loan outranked every USD debt by ~80x and consumed the whole
+      // extra budget — the strategy itself came out wrong, not just its labels.
+      const rateMap = await getRateMap(reporting, userId);
       const today = new Date().toISOString().split("T")[0];
       // Issue #213 — split out legacy bad rows so one bad start_date no
       // longer poisons the whole strategy computation. The bad rows still
       // surface to the caller (`excluded`) so they can be fixed.
       const excluded: Array<{ loanId: number; error: string; value: unknown }> = [];
       const debts: Debt[] = [];
+      // Native-currency echo so the caller can see what each figure was before
+      // conversion — the converted `debts` array is what drives the strategy.
+      const debtsNative: Array<{
+        id: number; name: string; currency: string;
+        nativeBalance: number; nativeMinPayment: number;
+        balance: number; minPayment: number;
+      }> = [];
       for (const l of loans) {
         if (parseYmdSafe(String(l.start_date)) === null) {
           excluded.push({ loanId: Number(l.id), error: "invalid start_date", value: l.start_date });
@@ -606,6 +864,7 @@ export function registerLoansTools(server: McpServer, ctx: PgToolContext) {
             paymentFrequency: String(l.payment_frequency ?? "monthly"),
             extraPayment: Number(l.extra_payment ?? 0),
             residualValue: l.residual_value == null ? null : Number(l.residual_value),
+            ...loanScheduleExtras(l),
           });
         } catch (e) {
           if (e instanceof LoanValidationError) {
@@ -616,19 +875,39 @@ export function registerLoansTools(server: McpServer, ctx: PgToolContext) {
         }
         const paid = summary.schedule.filter((r) => r.date <= today);
         const principalPaid = paid.reduce((s, r) => s + r.principal, 0);
-        const balance = Math.max(Number(l.principal) - principalPaid, 0);
-        const minPayment = Number(l.payment_amount ?? summary.monthlyPayment);
+        const nativeBalance = Math.round(Math.max(Number(l.principal) - principalPaid, 0) * 100) / 100;
+        const nativeMinPayment = Number(l.payment_amount ?? summary.monthlyPayment);
+        const loanCurrency = String(l.currency ?? reporting).toUpperCase();
+        const balance = Math.round(convertWithRateMap(nativeBalance, loanCurrency, rateMap) * 100) / 100;
+        const minPayment = Math.round(convertWithRateMap(nativeMinPayment, loanCurrency, rateMap) * 100) / 100;
         debts.push({
           id: Number(l.id),
           name: String(l.name),
-          balance: Math.round(balance * 100) / 100,
+          // Rate is a percentage — comparable across currencies as-is, so the
+          // avalanche ordering was always sound; only snowball/pooling broke.
+          balance,
           rate: Number(l.annual_rate),
+          minPayment,
+        });
+        debtsNative.push({
+          id: Number(l.id),
+          name: String(l.name),
+          currency: loanCurrency,
+          nativeBalance,
+          nativeMinPayment,
+          balance,
           minPayment,
         });
       }
       const strat = strategy ?? "both";
       const extra = extra_payment ?? 0;
-      const result: Record<string, unknown> = { inputs: { extraPayment: extra, debts }, reportingCurrency: reporting };
+      const result: Record<string, unknown> = {
+        // `extraPayment` is the caller's pooled budget and is interpreted in
+        // the reporting currency, same as every converted balance below.
+        inputs: { extraPayment: extra, extraPaymentCurrency: reporting, debts: debtsNative },
+        reportingCurrency: reporting,
+        amountsConvertedTo: reporting,
+      };
       if (excluded.length) result.excluded = excluded;
       if (strat === "avalanche" || strat === "both") {
         result.avalanche = calculateDebtPayoff(debts, extra, "avalanche");

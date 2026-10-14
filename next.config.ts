@@ -81,6 +81,9 @@ const nextConfig: NextConfig = {
       // /import/classic was the temporary legacy-hub backup (Phase 3b → 6);
       // deleted after validation. Redirect so old bookmarks don't 404.
       { source: "/import/classic", destination: "/import", permanent: false },
+      // Subscriptions + Bill Calendar merged into one page (2026-10); the
+      // calendar is now a view of /subscriptions.
+      { source: "/calendar", destination: "/subscriptions?view=calendar", permanent: false },
     ];
   },
   async headers() {

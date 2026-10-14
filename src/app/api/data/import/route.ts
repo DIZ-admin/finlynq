@@ -6,6 +6,7 @@ import { encryptField, isEncrypted } from "@/lib/crypto/envelope";
 import { invalidateUser as invalidateUserTxCache } from "@/lib/mcp/user-tx-cache";
 import { safeErrorMessage } from "@/lib/validate";
 import { coerceSourceForRestore } from "@/lib/tx-source";
+import { normalizeCategoryType } from "@/lib/categories/category-type";
 
 type Row = Record<string, unknown>;
 
@@ -338,9 +339,19 @@ export async function POST(request: NextRequest) {
     // Insert categories, build old→new ID map
     const categoryIdMap = new Map<number, number>();
     if (d.categories?.length) {
+      // Same idea as accounts.mode above: a backup taken before
+      // categories_type_check existed can carry a word-form type ("expense",
+      // written by the old onboarding budgets step). Map it to its code, and
+      // fall back to expense for anything unrecognisable, so the insert
+      // doesn't trip the CHECK and abort the whole restore.
+      const strippedCats = strip(d.categories, userId).map((row) => {
+        const raw = (row as { type?: unknown }).type;
+        (row as { type: string }).type = normalizeCategoryType(raw) ?? "E";
+        return row;
+      });
       const inserted = await db
         .insert(schema.categories)
-        .values(strip(d.categories, userId) as (typeof schema.categories.$inferInsert)[])
+        .values(strippedCats as (typeof schema.categories.$inferInsert)[])
         .returning({ id: schema.categories.id });
       d.categories.forEach((old, i) => {
         if (inserted[i]) categoryIdMap.set(old.id as number, inserted[i].id);
@@ -890,9 +901,15 @@ export async function POST(request: NextRequest) {
         await db
           .insert(schema.settings)
           .values({ key: key as string, value: value as string, userId })
+          // `settings` has exactly ONE unique constraint: the composite PK
+          // `settings_pkey (key, user_id)`. A key-only target matches no
+          // constraint, so Postgres raises 42P10 on EVERY database — and this
+          // is the LAST step of an untransacted restore, so the whole request
+          // 500s with every other table already committed.
+          // `userId` is part of the conflict key, never something to overwrite.
           .onConflictDoUpdate({
-            target: schema.settings.key,
-            set: { value: value as string, userId },
+            target: [schema.settings.key, schema.settings.userId],
+            set: { value: value as string },
           })
           ;
       }

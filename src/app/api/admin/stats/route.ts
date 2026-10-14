@@ -7,7 +7,13 @@
 import { NextRequest, NextResponse } from "next/server";
 import { getDialect } from "@/db";
 import { requireAdmin } from "@/lib/auth/require-admin";
-import { getUsageStats, listUsers } from "@/lib/auth/queries";
+import {
+  getUsageStats,
+  listUsers,
+  getActiveUserCounts,
+  getPromptAckStats,
+} from "@/lib/auth/queries";
+import { PROMPTS } from "@/lib/prompts/registry";
 
 export async function GET(request: NextRequest) {
   if (getDialect() !== "postgres") {
@@ -21,6 +27,28 @@ export async function GET(request: NextRequest) {
   if (!auth.authenticated) return auth.response;
 
   const stats = await getUsageStats();
+
+  // Near-real-time active-user counts (last_active_at — captures web + MCP +
+  // API-key activity, unlike the login-based windows below).
+  const activeCounts = await getActiveUserCounts();
+
+  // FINLYNQ-301 — per-prompt completion (answered/deferred/dismissed). Merge the
+  // ack-table counts with the registered prompts so a live prompt with zero acks
+  // still shows a row (title + current version), keyed on (id, version).
+  const ackStats = await getPromptAckStats();
+  const promptAcks = PROMPTS.map((def) => {
+    const stat = ackStats.find(
+      (s) => s.promptId === def.id && s.version === def.version,
+    );
+    return {
+      promptId: def.id,
+      title: def.title,
+      version: def.version,
+      answered: stat?.answered ?? 0,
+      deferred: stat?.deferred ?? 0,
+      dismissed: stat?.dismissed ?? 0,
+    };
+  });
 
   // Compute registrations in last 7 and 30 days
   const allUsers = await listUsers({ limit: 10000 });
@@ -92,6 +120,10 @@ export async function GET(request: NextRequest) {
     activeUsersLast7Days: activeLast7,
     activeUsersLast30Days: activeLast30,
     loginsLast24Hours: loginsLast24h,
+    activeUsersLast15Min: activeCounts.activeLast15Min,
+    activeUsersLast60Min: activeCounts.activeLast60Min,
+    activeUsersLast24Hours: activeCounts.activeLast24Hours,
+    promptAcks,
     recentLogins,
   });
 }

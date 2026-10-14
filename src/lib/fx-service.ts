@@ -219,6 +219,32 @@ const METAL_YAHOO_TICKER: Record<string, string> = {
 // chart symbol: "<CCY>USD=X" for fiat (1 unit → USD) or a futures ticker like
 // "GC=F" for a metal (1 troy oz → USD). For a past date, picks the latest close
 // on/before the requested date.
+/**
+ * Latest positive close from a Yahoo chart payload, optionally capped at
+ * `cutoffMs` (inclusive). Full precision, unlike `meta.regularMarketPrice`
+ * which Yahoo rounds to 4dp — so for an ultra-low-value currency (VND ≈
+ * 0.000038 USD) the meta field arrives as a literal `0.0` while close[] still
+ * carries `3.79e-05`. Returns null when no usable close exists.
+ */
+function latestPositiveClose(
+  result: { timestamp?: unknown; indicators?: { quote?: Array<{ close?: unknown }> } },
+  cutoffMs?: number,
+): number | null {
+  const timestamps: unknown = result.timestamp;
+  const closes: unknown = result.indicators?.quote?.[0]?.close;
+  if (!Array.isArray(timestamps) || !Array.isArray(closes)) return null;
+  let best: { ts: number; close: number } | null = null;
+  for (let i = 0; i < timestamps.length; i++) {
+    const ts = timestamps[i];
+    const close = closes[i];
+    if (typeof ts !== "number" || typeof close !== "number" || close <= 0) continue;
+    const tsMs = ts * 1000;
+    if (cutoffMs != null && tsMs > cutoffMs) continue;
+    if (!best || tsMs > best.ts) best = { ts: tsMs, close };
+  }
+  return best ? best.close : null;
+}
+
 async function fetchYahooChartRateToUsd(symbol: string, date: string): Promise<number | null> {
   try {
     const today = todayISO();
@@ -243,7 +269,13 @@ async function fetchYahooChartRateToUsd(symbol: string, date: string): Promise<n
     }
     const res = await marketFetch(url, {
       headers: { "User-Agent": "Mozilla/5.0" },
-      next: { revalidate: 3600 },
+      // No `next: { revalidate }` — see the long note in price-service.ts's
+      // fetchQuoteLive. The argument is even stronger here: `findCached` is an
+      // exact (currency, date) lookup with NO staleness check, so today's rate
+      // is fetched ONCE and reused all day. Calls therefore arrived ~24h apart,
+      // far past any revalidate window — it never once saved a request, it only
+      // guaranteed that the rate we stored for today was actually yesterday's.
+      cache: "no-store",
       signal: AbortSignal.timeout(FX_FETCH_TIMEOUT_MS),
     });
     if (!res.ok) return null;
@@ -254,24 +286,16 @@ async function fetchYahooChartRateToUsd(symbol: string, date: string): Promise<n
       // Issue #206: meta.regularMarketPrice is TODAY's price even on a historical
       // chart payload; the actual historical close lives at indicators.quote[0].close[]
       // indexed by the timestamp[] array. Pick the latest close <= the requested date.
-      const timestamps: unknown = result.timestamp;
-      const closes: unknown = result.indicators?.quote?.[0]?.close;
-      if (!Array.isArray(timestamps) || !Array.isArray(closes)) return null;
-      const dateMs = new Date(`${date}T23:59:59Z`).getTime();
-      let best: { ts: number; close: number } | null = null;
-      for (let i = 0; i < timestamps.length; i++) {
-        const ts = timestamps[i];
-        const close = closes[i];
-        if (typeof ts !== "number" || typeof close !== "number" || close <= 0) continue;
-        const tsMs = ts * 1000;
-        if (tsMs > dateMs) continue;
-        if (!best || tsMs > best.ts) best = { ts: tsMs, close };
-      }
-      return best ? best.close : null;
+      return latestPositiveClose(result, new Date(`${date}T23:59:59Z`).getTime());
     }
-    // Latest branch — meta.regularMarketPrice is correct here.
+    // Latest branch — meta.regularMarketPrice is normally correct here, but Yahoo
+    // rounds it to 4dp, so any currency worth < 0.00005 USD (VND, LBP…) reports a
+    // literal 0.0 and would otherwise be treated as an outright fetch failure —
+    // negative-cached every 10 min, forever, since it can never succeed. Fall back
+    // to the full-precision close[] before giving up.
     const rate = result.meta?.regularMarketPrice;
-    return typeof rate === "number" && rate > 0 ? rate : null;
+    if (typeof rate === "number" && rate > 0) return rate;
+    return latestPositiveClose(result);
   } catch {
     return null;
   }
@@ -650,7 +674,30 @@ export async function getActiveCurrencies(): Promise<string[]> {
     .groupBy(schema.transactions.currency);
   const txnCurrencies = txnCurrencyRows.map((r) => r.currency);
 
-  return Array.from(new Set([...accountCurrencies, ...txnCurrencies]));
+  // Records that carry their OWN currency must be here too (2026-08-05).
+  // This set is what `getRateMap` iterates, and `convertWithRateMap` falls back
+  // to `rate ?? 1` for anything missing — so a currency absent from this list
+  // converts SILENTLY 1:1 rather than failing. A RUB loan for a user with no
+  // RUB account therefore totalled at ~80x its real value, which is the same
+  // rate=1 trap called out for retired currencies. loans/goals/subscriptions/
+  // budgets are all converted through this map (loans page, spotlight,
+  // dashboard), and none of them were represented.
+  const recordCurrencies: string[] = [];
+  for (const table of [schema.loans, schema.goals, schema.subscriptions, schema.budgets]) {
+    const rows = await db
+      .select({ currency: table.currency })
+      .from(table)
+      .groupBy(table.currency);
+    recordCurrencies.push(...rows.map((r) => r.currency));
+  }
+
+  return Array.from(
+    new Set(
+      [...accountCurrencies, ...txnCurrencies, ...recordCurrencies]
+        .filter((c): c is string => typeof c === "string" && c.trim() !== "")
+        .map((c) => c.trim().toUpperCase()),
+    ),
+  );
 }
 
 export async function getActiveCurrencyPairs(displayCurrency: string): Promise<Array<{ from: string; to: string }>> {

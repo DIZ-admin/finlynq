@@ -58,6 +58,7 @@ import { normalizeDate } from "@/lib/csv-parser";
 import { parseOfx } from "@/lib/ofx-parser";
 import {
   parseCsvWithFallback,
+  NEEDS_CURRENCY_MESSAGE,
   type ParseError,
 } from "@/lib/external-import/parsers/csv-pipeline";
 import type { DateFormatOverride } from "@/lib/csv-parser";
@@ -65,6 +66,8 @@ import { parseOfxToCanonical } from "@/lib/external-import/parsers/ofx";
 import { parseQfxToCanonical } from "@/lib/external-import/parsers/qfx";
 import type { RawTransaction } from "@/lib/import-pipeline";
 import { findUnreasonableAmountError } from "@/lib/import-pipeline";
+import { resolveIsinTickersInPlace } from "@/lib/securities/isin-resolve";
+import { resolveIsinForUser } from "@/lib/securities/isin-store";
 
 /** 60 days — matches the route + stage-email-import.ts. */
 const STAGE_TTL_MS = 60 * 24 * 60 * 60 * 1000;
@@ -187,6 +190,27 @@ export async function parseStatement(
           headers: result.headers,
           sampleRows: result.sampleRows,
           suggestedMapping: result.suggestedMapping,
+          fileName: file.name,
+        },
+      };
+    }
+    // GH #328 — the file names no currency and nothing was left to fall back
+    // on. Only reachable when the upload is NOT account-bound (`accountId`
+    // null ⇒ `boundAccountCurrency` null): both callers of `parseStatement`
+    // resolve `boundAccountCurrency` from the bound account, and the MCP
+    // `manage_statement_import(op:upload)` always requires an accountId. Kept
+    // as a defensive refusal rather than an `assert` so an unbound cross-account
+    // CSV gets a clean, actionable 422 instead of silently-CAD rows.
+    if (result.kind === "needs-currency") {
+      return {
+        status: 422,
+        body: {
+          type: "csv-needs-currency",
+          error: NEEDS_CURRENCY_MESSAGE,
+          headers: result.headers,
+          sampleRows: result.sampleRows,
+          suggestedMapping: result.suggestedMapping,
+          rowCount: result.rowCount,
           fileName: file.name,
         },
       };
@@ -425,6 +449,13 @@ export interface WriteStagedImportContext {
   userStatementBalance?: number | null;
   /** staged_imports.source — default "upload". Live connectors pass "connector". */
   source?: string;
+  /**
+   * FINLYNQ-271 — file-level sha256 (hex) of the raw uploaded bytes, stamped on
+   * staged_imports.content_hash for the `upload_statement` idempotency probe.
+   * The web upload route passes nothing (column stays NULL → byte-identical);
+   * only the MCP tool sets it. DISTINCT from the row-level `import_hash`.
+   */
+  contentHash?: string | null;
   /** Override staged_imports.fileFormat (default parseResult.format). Connectors
    *  pass a provider tag (e.g. "simplefin") so the pending list labels them. */
   fileFormatOverride?: string | null;
@@ -538,6 +569,13 @@ export async function writeStagedImport(
       dedupStatus: "new",
     });
   }
+
+  // GH #365 — a Ticker column holding ISINs (Zerodha and other brokers export
+  // by ISIN) is resolved to the Yahoo symbol the position trades under, so the
+  // rules and investment-op matching downstream see a priceable ticker. The
+  // import hash covers date/amount/payee only, so dedup is unaffected.
+  // The user's own stored ISINs first (resolveIsinForUser), then Yahoo.
+  await resolveIsinTickersInPlace(shaped, (isin) => resolveIsinForUser(userId, dek, isin));
 
   // ─── File → bank_transactions dedup (exact-only) ─────────────────────────
   const fitIds = shaped.filter((r) => r.fitId).map((r) => r.fitId!);
@@ -675,6 +713,13 @@ export async function writeStagedImport(
     stagedImportId: stagedImportIdLocal,
     userId,
     date: r.date,
+    // GH #328 — same resolution order as the CSV pipeline (row value → upload
+    // default knob → bound account). The trailing "CAD" is now UNREACHABLE and
+    // kept only as a type-level total: the CSV path always arrives with a
+    // non-null `r.currency` (the pipeline refuses with `needs-currency`
+    // otherwise), OFX/QFX carry CURDEF (and are refused without a bound
+    // account), and the SimpleFIN connector stamps the account's currency on
+    // every row. Do not restore it as a working fallback.
     currency: r.currency ?? knobs.defaultCurrency ?? boundAccountCurrency ?? "CAD",
     amount: r.amount,
     // User-tier encryption: DEK available, wrap directly under the user's DEK.
@@ -724,6 +769,8 @@ export async function writeStagedImport(
       statementPeriodStart,
       statementPeriodEnd,
       boundAccountId: accountId,
+      // FINLYNQ-271 — plaintext file-level hash (NULL for the web route).
+      contentHash: ctx.contentHash ?? null,
       fileFormat: ctx.fileFormatOverride ?? parseResult.format,
       // FINLYNQ-120 — filename lands at USER tier (v1:) with a session DEK.
       originalFilename: encryptStagingMeta(ctx.fileName, "user", dek),
@@ -812,6 +859,12 @@ export interface StageStatementInput {
   knobs?: Partial<ParseStatementKnobs>;
   /** Optional OFX/QFX payee source override (default 'name'). */
   payeeSource?: "name" | "memo";
+  /**
+   * FINLYNQ-271 — file-level sha256 (hex) of the raw bytes, persisted onto
+   * staged_imports.content_hash for the `upload_statement` idempotency probe.
+   * The MCP tool computes + passes it; the web route omits it (column NULL).
+   */
+  contentHash?: string | null;
 }
 
 /**
@@ -929,5 +982,6 @@ export async function stageStatementFile(
     knobs,
     boundAccountCurrency,
     userStatementBalance: input.userStatementBalance ?? null,
+    contentHash: input.contentHash ?? null,
   });
 }

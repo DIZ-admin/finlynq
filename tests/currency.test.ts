@@ -59,6 +59,17 @@ describe("formatCurrency", () => {
     expect(formatCurrency(1234.56, "USD", { decimals: 0 })).toBe("$1,235");
   });
 
+  it("defaults zero-decimal currencies to no fraction digits", () => {
+    expect(formatCurrency(9976241, "VND")).not.toContain(".00");
+    expect(formatCurrency(9976241, "VND")).toContain("9,976,241");
+    expect(formatCurrency(1500, "JPY")).not.toContain(".");
+    expect(formatCurrency(-374344573, "VND")).toContain("374,344,573");
+  });
+
+  it("still honors an explicit decimals option for zero-decimal currencies", () => {
+    expect(formatCurrency(1234.5, "VND", { decimals: 2 })).toContain("1,234.50");
+  });
+
   it("keeps native Intl symbols for non-dollar currencies", () => {
     expect(formatCurrency(10, "EUR")).toContain("€");
     expect(formatCurrency(10, "GBP")).toContain("£");

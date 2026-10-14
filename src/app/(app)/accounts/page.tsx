@@ -7,6 +7,7 @@ import { Badge } from "@/components/ui/badge";
 import { Button } from "@/components/ui/button";
 import { useDropdownOrder } from "@/components/dropdown-order-provider";
 import { formatCurrency } from "@/lib/currency";
+import { loanHref, useLinkedLoans } from "@/lib/hooks/useLinkedLoans";
 import { useDisplayCurrency } from "@/components/currency-provider";
 import { OnboardingTips } from "@/components/onboarding-tips";
 import { EmptyState } from "@/components/empty-state";
@@ -29,6 +30,7 @@ import {
   Plus,
   Archive,
   FolderCog,
+  Landmark,
 } from "lucide-react";
 
 type AccountBalance = {
@@ -135,6 +137,8 @@ export default function AccountsPage() {
 
   // Show-archived toggle (persists archived accounts in the list with a badge)
   const [showArchived, setShowArchived] = useState(false);
+  // Loans keyed by their linked account, for the per-row "Loan" link.
+  const loansByAccount = useLinkedLoans();
   // FINLYNQ-148: the Settings → Dropdown Ordering "account" list is the user's
   // configured account sort order. The /accounts list must honour it (it was
   // ignoring the setting and rendering in raw API order). Pinned accounts lead
@@ -161,11 +165,13 @@ export default function AccountsPage() {
 
   useEffect(() => { loadGroupOrder(); }, []);
 
-  function loadAccounts(includeArchived = showArchived) {
+  // Always fetch EVERY account, archived included — /api/dashboard returns them
+  // unconditionally now, and the totals below need them to match the dashboard
+  // hero and the net-worth chart. "Show archived" is a pure list filter.
+  function loadAccounts() {
     setLoading(true);
     setError(false);
     const params = new URLSearchParams();
-    if (includeArchived) params.set("includeArchived", "1");
     params.set("currency", displayCurrency);
     const url = `/api/dashboard?${params.toString()}`;
     fetch(url)
@@ -177,13 +183,18 @@ export default function AccountsPage() {
       .catch(() => { setError(true); setLoading(false); });
   }
 
-  useEffect(() => { loadAccounts(showArchived);   }, [showArchived, displayCurrency]);
+  useEffect(() => { loadAccounts();   }, [displayCurrency]);
 
-  const assets = accounts.filter((a) => a.accountType === "A");
-  const liabilities = accounts.filter((a) => a.accountType === "L");
-  // Totals always exclude archived, even when the toggle surfaces them in the list.
-  const activeAssets = assets.filter((a) => !a.archived);
-  const activeLiabilities = liabilities.filter((a) => !a.archived);
+  // The toggle hides archived rows from the LIST only.
+  const visible = showArchived ? accounts : accounts.filter((a) => !a.archived);
+  const assets = visible.filter((a) => a.accountType === "A");
+  const liabilities = visible.filter((a) => a.accountType === "L");
+  // Totals INCLUDE archived regardless of the toggle — an archived account's
+  // balance is still the user's money, and excluding it here made this page's
+  // Total Assets / Total Liabilities disagree with both the dashboard hero and
+  // the net-worth chart. Read off the unfiltered `accounts`, not `visible`.
+  const activeAssets = accounts.filter((a) => a.accountType === "A");
+  const activeLiabilities = accounts.filter((a) => a.accountType === "L");
 
   // FINLYNQ-179: the set of group names currently in use, for combobox
   // suggestions (any type) and the management dialog (scoped per type).
@@ -265,10 +276,35 @@ export default function AccountsPage() {
                       {a.archived && <Badge variant="secondary" className="text-[10px] shrink-0">Archived</Badge>}
                     </div>
                   </div>
-                  <span className={`font-mono text-sm font-semibold shrink-0 mr-2 ${a.balance >= 0 ? color : "text-rose-600"}`}>
-                    {formatCurrency(a.balance, a.currency)}
+                  {/* FINLYNQ-303 — both bases per row: the account's own
+                      currency is the primary figure, with the display-currency
+                      equivalent beneath it when they differ. The totals below
+                      remain reporting-only (a cross-currency sum has no native
+                      basis). */}
+                  <span className="shrink-0 mr-2 text-right">
+                    <span className={`font-mono text-sm font-semibold block ${a.balance >= 0 ? color : "text-rose-600"}`}>
+                      {formatCurrency(a.balance, a.currency)}
+                    </span>
+                    {a.convertedBalance != null &&
+                      a.currency.toUpperCase() !== displayCurrency.toUpperCase() && (
+                        <span className="font-mono text-[11px] text-muted-foreground block">
+                          {formatCurrency(a.convertedBalance, displayCurrency)}
+                        </span>
+                      )}
                   </span>
                 </Link>
+                {/* A sibling of the row link, not inside it: anchors cannot nest. */}
+                {(loansByAccount.get(a.accountId) ?? []).map((l) => (
+                  <Link
+                    key={l.id}
+                    href={loanHref(l.id)}
+                    title={`Open the loan "${l.name}" and its schedule`}
+                    aria-label={`Open the loan ${l.name}`}
+                    className="shrink-0 mr-2 inline-flex items-center gap-1 rounded-md px-2 py-1 text-xs text-muted-foreground hover:bg-muted hover:text-primary"
+                  >
+                    <Landmark className="h-3.5 w-3.5" /> Loan
+                  </Link>
+                ))}
               </div>
             ))}
           </CardContent>

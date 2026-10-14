@@ -7,7 +7,7 @@
  * substituted by the live holdings aggregator so the latest point matches the
  * dashboard hero net-worth number exactly.
  *
- * Mirrors the head of /api/dashboard (requireAuth → getDEK → getDisplayCurrency
+ * Mirrors the head of /api/dashboard (requireAuth → auth.context.dek → getDisplayCurrency
  * → getRateMap). The heavy lifting is the pure `buildNetWorthHistory` core.
  *
  * plan/net-worth-over-time.md Part A.
@@ -15,7 +15,6 @@
 
 import { NextRequest, NextResponse } from "next/server";
 import { requireAuth } from "@/lib/auth/require-auth";
-import { getDEK } from "@/lib/crypto/dek-cache";
 import {
   getRateMap,
   getDisplayCurrency,
@@ -35,6 +34,7 @@ import {
   buildNetWorthHistory,
   type NetWorthPeriod,
   type LiveAccountValue,
+  type CurrencyBasis,
 } from "@/lib/net-worth-history";
 import {
   rebuildPortfolioSnapshots,
@@ -226,6 +226,20 @@ function parsePeriod(raw: string | null): NetWorthPeriod {
   return raw === "6m" || raw === "1y" || raw === "all" ? raw : "6m";
 }
 
+/**
+ * FINLYNQ-303 — `?basis=native` renders the series in the ACCOUNT's own
+ * currency instead of the reporting currency.
+ *
+ * Rejected outright without an `accountId`: the whole-portfolio series spans
+ * accounts of differing currencies, so there is no single native currency to
+ * express it in, and silently honouring it would produce one label over a
+ * mixed-currency sum (the FINLYNQ-123 failure). Anything unrecognized falls
+ * back to `reporting`, so an old client is never broken by a typo'd param.
+ */
+function parseBasis(raw: string | null, accountId: number | null): CurrencyBasis {
+  return raw === "native" && accountId != null ? "native" : "reporting";
+}
+
 export function GET(request: NextRequest) {
   return withOp("GET /api/net-worth-history", () => handleGet(request));
 }
@@ -233,14 +247,14 @@ export function GET(request: NextRequest) {
 async function handleGet(request: NextRequest) {
   const auth = await requireAuth(request);
   if (!auth.authenticated) return auth.response;
-  const { userId, sessionId } = auth.context;
-  const dek = sessionId ? getDEK(sessionId, userId) : null;
+  const { userId, dek } = auth.context;
 
   const params = request.nextUrl.searchParams;
   const period = parsePeriod(params.get("period"));
   const accountId = params.get("accountId")
     ? parseInt(params.get("accountId")!, 10)
     : null;
+  const basis = parseBasis(params.get("basis"), accountId);
 
   try {
     const today = new Date().toISOString().slice(0, 10);
@@ -264,9 +278,14 @@ async function handleGet(request: NextRequest) {
       accountId ?? undefined,
     );
 
-    // Today's live override. Restrict to the SAME non-archived account sets the
-    // dashboard hero sums over, so the latest point matches.
-    const balances = await getAccountBalances(userId);
+    // Today's live override. Must cover the SAME account set the dashboard hero
+    // sums over, so the latest point matches — which now includes ARCHIVED
+    // accounts. Omitting them here did two things: today's point dropped the
+    // archived balance (a cliff at the right edge of the chart), and the
+    // `accountNameById` map below — built from these same rows — had no entry,
+    // so an archived account that DID reach the series (investment snapshots
+    // never filtered archived) rendered in the breakdown as "Account #609".
+    const balances = await getAccountBalances(userId, { includeArchived: true });
     const investmentAccountIds = new Set(
       balances.filter((b) => Boolean(b.isInvestment)).map((b) => b.accountId),
     );
@@ -301,22 +320,39 @@ async function handleGet(request: NextRequest) {
       liveInvestmentByAccount.set(accId, { value: v.value, currency: v.currency });
     }
 
-    const snapshots = snapshotRows.map((r) => ({
+    // FINLYNQ-303 — carry the native pair through. These mappings build fresh
+    // object literals, so any field not named here is silently dropped before
+    // the core ever sees it (which is exactly how the native basis appeared to
+    // "never activate" despite fully-backfilled rows).
+    const toSnapshot = (r: {
+      accountId: number | null;
+      snapDate: string;
+      marketValue: number;
+      currency: string;
+      nativeMarketValue: number | null;
+      nativeCurrency: string | null;
+    }) => ({
       accountId: r.accountId as number,
       snapDate: r.snapDate,
       marketValue: Number(r.marketValue),
       currency: r.currency,
-    }));
-    const cashSnapshots = cashSnapshotRows.map((r) => ({
-      accountId: r.accountId as number,
-      snapDate: r.snapDate,
-      marketValue: Number(r.marketValue),
-      currency: r.currency,
-    }));
+      nativeMarketValue:
+        r.nativeMarketValue == null ? null : Number(r.nativeMarketValue),
+      nativeCurrency: r.nativeCurrency,
+    });
+    const snapshots = snapshotRows.map(toSnapshot);
+    const cashSnapshots = cashSnapshotRows.map(toSnapshot);
 
-    const { series: rawSeries, hasInvestmentData, fxApproximation } = buildNetWorthHistory({
+    const {
+      series: rawSeries,
+      hasInvestmentData,
+      fxApproximation,
+      basisUsed,
+      seriesCurrency,
+    } = buildNetWorthHistory({
       period,
       displayCurrency,
+      basis,
       rateMap,
       cashSnapshots,
       liveCashByAccount,
@@ -404,9 +440,22 @@ async function handleGet(request: NextRequest) {
         // Per-account dirty markers (the impacted account + earliest date) drive
         // a scoped rebuild; their absence falls back to the full/windowed path.
         // An orphan reap (count 0 but stale rows) has no markers → fallback.
+        //
+        // A NULL watermark also forces the fallback, dirty rows or not: missing
+        // meta means never-built OR a full invalidation (a display-currency
+        // change deletes the watermark so history re-materializes in the new
+        // currency — markAllSnapshotsStale). The fast path rebuilds ONLY the
+        // dirty accounts and then stamps the watermark fresh, which would
+        // strand every other account's stored history (e.g. in the old
+        // currency) with no remaining staleness signal. Rows skipped here are
+        // not lost: the full rebuild covers their accounts, and any row a
+        // concurrent write creates survives for the next staleness trip.
         let cashDirty: CashDirtyRow[] = [];
         try {
-          cashDirty = hasCashOrphans ? [] : await listCashDirtyAccounts(userId);
+          cashDirty =
+            hasCashOrphans || cashMeta == null
+              ? []
+              : await listCashDirtyAccounts(userId);
         } catch {
           /* dirty lookup is best-effort — fall back to full rebuild */
         }
@@ -423,6 +472,13 @@ async function handleGet(request: NextRequest) {
       series,
       hasInvestmentData,
       fxApproximation,
+      // FINLYNQ-303 — `basisUsed` is what the series is ACTUALLY in (a native
+      // request downgrades when the rows predate the dual-basis rebuild), and
+      // `seriesCurrency` is what `series[].value` is denominated in. The client
+      // MUST label from these, not from what it asked for; `displayCurrency`
+      // stays in the payload for back-compat with callers that read it.
+      basisUsed,
+      seriesCurrency,
     });
   } catch (error: unknown) {
     await logApiError("GET", "/api/net-worth-history", error, userId);

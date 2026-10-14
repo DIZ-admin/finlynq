@@ -1,9 +1,12 @@
 /**
  * Cron job — roll portfolio snapshots forward for every enrolled user.
  *
- * Started by src/instrumentation.ts with a 24h setInterval. First run
- * fires 24h after server start; for the 21:00-UTC schedule called out
- * in the plan, follow up with a setTimeout-then-setInterval seed.
+ * NOT CURRENTLY SCHEDULED. It was only ever registered in a src hook that
+ * Next never loaded, so it has never run in any deployment; PR #346 left it
+ * unwired by owner decision (2026-09-13). Net-worth history stays current via
+ * the chart-load self-heal + manual rebuild. Scheduling it is its own change
+ * (register it in src/instrumentation-node.ts); for the 21:00-UTC schedule
+ * called out in the plan, seed with setTimeout-then-setInterval.
  *
  * Two passes:
  *   - INVESTMENT (DEK-bearing only): buildDailySnapshot no-ops without a DEK
@@ -20,7 +23,7 @@
  * Idempotent on the (user_id, snap_date, COALESCE(account_id, -1)) unique index.
  */
 
-import { and, eq } from "drizzle-orm";
+import { eq } from "drizzle-orm";
 import { db, schema } from "@/db";
 import { buildDailySnapshot } from "@/lib/portfolio/snapshots/builder";
 import { rebuildCashSnapshots } from "@/lib/portfolio/snapshots/cash-builder";
@@ -99,15 +102,13 @@ export async function runSnapshotsCron(
   }
 
   // ─── Cash pass (DEK-free — real work, broadened to ALL cash users) ───
+  // Archived accounts are NOT excluded: they still carry balances that belong
+  // in the history series, and a user whose only cash accounts are archived
+  // would otherwise never be picked up by the nightly roll-forward at all.
   const cashUsers = await db
     .selectDistinct({ userId: schema.accounts.userId })
     .from(schema.accounts)
-    .where(
-      and(
-        eq(schema.accounts.isInvestment, false),
-        eq(schema.accounts.archived, false),
-      ),
-    );
+    .where(eq(schema.accounts.isInvestment, false));
 
   const windowStart = subtractDaysUTC(date, CASH_CRON_WINDOW_DAYS);
   let cashUsersProcessed = 0;

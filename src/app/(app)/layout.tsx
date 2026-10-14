@@ -1,7 +1,7 @@
 import { Nav } from "@/components/nav";
 import { UnlockGate } from "@/components/unlock-gate";
-import { DonationBanner } from "@/components/donation-banner";
 import { AnnouncementBanner } from "@/components/announcement-banner";
+import { PromptGate } from "@/components/prompt-gate";
 import { CurrencyProvider } from "@/components/currency-provider";
 import { DropdownOrderProvider } from "@/components/dropdown-order-provider";
 import { FontProvider } from "@/components/font-provider";
@@ -14,8 +14,8 @@ export default function AppLayout({ children }: { children: React.ReactNode }) {
         <DropdownOrderProvider>
         <FontProvider>
         <div className="relative flex min-h-screen flex-col">
-          <DonationBanner />
           <AnnouncementBanner />
+          <PromptGate />
           <ReportingRecomputeIndicator />
           <div className="flex flex-1">
             <Nav />

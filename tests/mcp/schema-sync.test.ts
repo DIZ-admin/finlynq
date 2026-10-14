@@ -21,11 +21,11 @@ describe("FINLYNQ-132 schema and currency contract", () => {
     expect(execute).not.toHaveBeenCalled();
   });
 
-  it("falls back to CAD only when display currency is unavailable", async () => {
+  it("falls back to upstream's USD only when display currency is unavailable", async () => {
     const execute = vi.fn(async () => ({ rows: [] }));
     const currency = await resolveReportingCurrency({ execute }, "user-1", undefined);
 
-    expect(currency).toBe("CAD");
+    expect(currency).toBe("USD");
   });
 
   it("rejects a loan without term_months or payment_amount", () => {

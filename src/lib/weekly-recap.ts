@@ -5,6 +5,7 @@ import { eq, and, gte, lte, sql } from "drizzle-orm";
 import { tryDecryptField } from "@/lib/crypto/envelope";
 import { getDisplayCurrency, getRateMap, convertWithRateMap } from "@/lib/fx-service";
 import { convertReportingSlice } from "@/lib/fx/reporting-amount";
+import { advanceStaleSubscriptionDatesSafe } from "@/lib/subscriptions/advance-next-dates";
 
 const { categories, transactions, budgets } = schema;
 
@@ -270,7 +271,9 @@ export async function generateWeeklyRecap(userId: string, endDate?: string, dek?
     .sort((a, b) => b.amount - a.amount)
     .slice(0, 5);
 
-  // Upcoming bills (subscriptions in next 7 days from weekEnd)
+  // Upcoming bills (subscriptions in next 7 days from weekEnd). Stale
+  // next-payment dates are rolled forward first or they could never match.
+  await advanceStaleSubscriptionDatesSafe(db, userId);
   const weekAhead = new Date(parseDateOnly(weekEnd).getTime() + 7 * 86400000)
     .toISOString()
     .split("T")[0];

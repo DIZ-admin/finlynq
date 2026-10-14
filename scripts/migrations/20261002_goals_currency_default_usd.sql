@@ -1,0 +1,24 @@
+-- Goals: default `currency` to USD instead of CAD.
+--
+-- Same bug, same fix as 20260805_loans_currency_default_usd.sql:
+--
+--   * MCP `manage_goals(op:add)` omitted the column from its INSERT entirely,
+--     so every goal created through an AI assistant took this default — CAD —
+--     even for a USD user, and its progress was then measured in CAD.
+--   * REST `POST /api/goals` only set the column when the caller passed one,
+--     so the public API (mobile, API-key callers) fell through to it too.
+--   * `scripts/seed-demo.ts` never named it, so the public demo's goals were
+--     re-stamped CAD on every nightly reseed.
+--
+-- All three now resolve the currency explicitly (explicit > first linked
+-- account's currency > display currency) in the same commit; after this the
+-- default is only a backstop, and a CAD one contradicts the app-wide "default
+-- display currency = USD" convention (FINLYNQ-183).
+--
+-- EXISTING ROWS ARE DELIBERATELY NOT REWRITTEN. A goal already stamped 'CAD'
+-- may genuinely be a CAD goal; "the user chose CAD" and "the default filled
+-- in" are indistinguishable. The goals page now shows a goal's currency when
+-- it differs from the display currency, and both the edit dialog and MCP
+-- `manage_goals(op:update, currency)` can correct it.
+
+ALTER TABLE goals ALTER COLUMN currency SET DEFAULT 'USD';

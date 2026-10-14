@@ -1,6 +1,6 @@
 "use client";
 
-import { useState, useRef, useEffect, useCallback } from "react";
+import { useState, useRef, useEffect, useCallback, useMemo } from "react";
 import { useSearchParams, useRouter } from "next/navigation";
 import Link from "next/link";
 import { Card, CardContent } from "@/components/ui/card";
@@ -12,7 +12,10 @@ import { useDropdownOrder } from "@/components/dropdown-order-provider";
 import { Dialog, DialogContent, DialogHeader, DialogTitle } from "@/components/ui/dialog";
 import { OnboardingTips } from "@/components/onboarding-tips";
 import { Badge } from "@/components/ui/badge";
-import { Plus, ChevronLeft, ChevronRight, SlidersHorizontal, ChevronDown, Receipt, Search, X, AlertTriangle, ArrowRightLeft, Columns3, TrendingUp, Download } from "lucide-react";
+import { Plus, SlidersHorizontal, ChevronDown, Receipt, Search, X, AlertTriangle, ArrowRightLeft, Columns3, TrendingUp, Download, List, CalendarDays } from "lucide-react";
+import { Tabs, TabsList, TabsTrigger } from "@/components/ui/tabs";
+import { periodRange, shiftAnchor, type CalendarMode } from "@/lib/transactions/calendar";
+import { Pagination } from "@/components/ui/pagination";
 import { DropdownMenu, DropdownMenuTrigger, DropdownMenuContent, DropdownMenuGroup, DropdownMenuLabel, DropdownMenuCheckboxItem, DropdownMenuItem, DropdownMenuSeparator } from "@/components/ui/dropdown-menu";
 import { SplitDialog } from "./split-dialog";
 import { TransactionDialog, type TransactionDialogInitialState, type DialogLinkedSibling } from "@/components/transactions/transaction-dialog";
@@ -30,10 +33,11 @@ import type {
 import { useLookups, useTxColumnPrefs, useTxSortPref, useTxFilterPrefs } from "../_hooks/use-tx-prefs";
 import { useTransactions } from "../_hooks/use-transactions";
 import { TransactionTable } from "./transaction-table";
+import { TransactionsCalendar, describeCalendarSelection, refreshTransactionsCalendar } from "./transactions-calendar";
 import { buildTransactionQuery } from "@/lib/transactions/build-query";
 import { buildTxDrillUrl } from "@/lib/transactions/drill-url";
 import { exportCsv, type CsvColumn } from "@/lib/csv-export";
-import { todayISO } from "@/lib/utils/date";
+import { localDateISO, todayISO } from "@/lib/utils/date";
 import { LotReallocationNotice } from "@/components/portfolio/lot-reallocation-notice";
 import type { LotReallocationPreview } from "@/lib/portfolio/lots/types";
 
@@ -115,6 +119,53 @@ export function TransactionsWorkspace({
   // sort/filter hooks can reset it to 0 on change without a forward reference.
   const [page, setPage] = useState(0);
 
+  // List / Calendar view (in-app feedback 2026-10-07). `?view=calendar` opens
+  // straight into the calendar; toggling is local state so it never fights
+  // the URL⇄filter sync below. In calendar view the calendar OWNS the date
+  // range: the list shows the selected day, or the whole month when no day is
+  // selected, layered over every other filter via `listFilters` — `filters`
+  // itself (and so the URL-driven state) is left untouched.
+  const [view, setView] = useState<"list" | "calendar">(() =>
+    !locked && urlParams.get("view") === "calendar" ? "calendar" : "list",
+  );
+  // Week / month / year (in-app feedback asked for all three); `calAnchor` is
+  // any date inside the visible period, `calDay` the selected day if any.
+  const [calMode, setCalMode] = useState<CalendarMode>("month");
+  const [calAnchor, setCalAnchor] = useState(() => localDateISO());
+  const [calDay, setCalDay] = useState<string | null>(null);
+  const calRange = useMemo(
+    () => (calDay ? { start: calDay, end: calDay } : periodRange(calMode, calAnchor)),
+    [calDay, calMode, calAnchor],
+  );
+  const listFilters = useMemo(
+    () => (view === "calendar" ? { ...filters, startDate: calRange.start, endDate: calRange.end } : filters),
+    [view, filters, calRange],
+  );
+  const shiftCal = (delta: number) => {
+    setCalAnchor((a) => shiftAnchor(calMode, a, delta));
+    setCalDay(null);
+    setPage(0);
+  };
+  const calToday = () => {
+    const t = localDateISO();
+    setCalAnchor(t);
+    setCalDay(calMode === "year" ? null : t);
+    setPage(0);
+  };
+  const changeCalMode = (mode: CalendarMode) => {
+    // Keep the selected day (or the anchor) in view across the switch.
+    if (calDay) setCalAnchor(calDay);
+    if (mode === "year") setCalDay(null);
+    setCalMode(mode);
+    setPage(0);
+  };
+  const openCalMonth = (firstOfMonth: string) => {
+    setCalMode("month");
+    setCalAnchor(firstOfMonth);
+    setCalDay(null);
+    setPage(0);
+  };
+
   // FINLYNQ-130 — re-sync filters from the URL on every navigation (including
   // client-side drill-through while already mounted on /transactions). Resets
   // the page index and the controlled search input so a drill fully REPLACES
@@ -151,7 +202,7 @@ export function TransactionsWorkspace({
   // useTransactions (FINLYNQ-111 Phase 2). Same deps, fetch URL, {data,total}
   // unwrap, and driving effect; `page` is owned by the page-level state above.
   const { txns, total, loading, limit, loadTxns } = useTransactions(
-    filters,
+    listFilters,
     sortPref,
     colFilters,
     accounts,
@@ -163,6 +214,7 @@ export function TransactionsWorkspace({
   // every create / edit / delete / bulk action below.
   const afterMutate = useCallback(() => {
     loadTxns();
+    refreshTransactionsCalendar();
     onDataChange?.();
   }, [loadTxns, onDataChange]);
 
@@ -290,7 +342,7 @@ export function TransactionsWorkspace({
       // Same builder + filter/sort state the table uses; page 0 + high limit
       // pulls the entire filtered view in one shot (the route honors `limit`
       // directly when no post-decrypt filter is set, else caps at 1000).
-      const params = buildTransactionQuery(filters, sortPref, colFilters, accounts, {
+      const params = buildTransactionQuery(listFilters, sortPref, colFilters, accounts, {
         page: 0,
         limit: 100000,
       });
@@ -605,19 +657,9 @@ export function TransactionsWorkspace({
     (bulkAction === "update_note" && bulkNote === "" && bulkAction === "update_note") ||
     (bulkAction === "update_payee" && bulkPayee === "" && bulkAction === "update_payee");
 
-  const totalPages = Math.ceil(total / limit);
-
-  function getPageNumbers(): (number | "ellipsis")[] {
-    if (totalPages <= 7) return Array.from({ length: totalPages }, (_, i) => i);
-    const pages: (number | "ellipsis")[] = [0];
-    if (page > 2) pages.push("ellipsis");
-    for (let i = Math.max(1, page - 1); i <= Math.min(totalPages - 2, page + 1); i++) {
-      pages.push(i);
-    }
-    if (page < totalPages - 3) pages.push("ellipsis");
-    pages.push(totalPages - 1);
-    return pages;
-  }
+  // Pagination math + control now live in the shared <Pagination>
+  // (src/components/ui/pagination.tsx) — extracted from here verbatim so the
+  // admin users table could reuse it instead of forking a third copy.
 
   // Split allocated total for inline split editor
   return (
@@ -736,6 +778,20 @@ export function TransactionsWorkspace({
         onLinkedSiblingClick={(s) => openLinkedSibling(s as LinkedSibling)}
       />
 
+      {/* List / Calendar toggle (in-app feedback 2026-10-07). */}
+      <Tabs
+        value={view}
+        onValueChange={(v) => {
+          setView(v === "calendar" ? "calendar" : "list");
+          setPage(0);
+        }}
+      >
+        <TabsList>
+          <TabsTrigger value="list" className="px-3"><List className="h-4 w-4" /> List</TabsTrigger>
+          <TabsTrigger value="calendar" className="px-3"><CalendarDays className="h-4 w-4" /> Calendar</TabsTrigger>
+        </TabsList>
+      </Tabs>
+
       {/* Search + Filters */}
       <Card className="bg-muted/30 border-dashed">
         <CardContent className="pt-4 space-y-3">
@@ -755,9 +811,14 @@ export function TransactionsWorkspace({
           </div>
           <div className="flex flex-wrap gap-2 items-center">
             <SlidersHorizontal className="h-3.5 w-3.5 text-muted-foreground shrink-0" />
-            <Input type="date" className="w-36 h-8 text-xs" value={filters.startDate} onChange={(e) => { setFilters({ ...filters, startDate: e.target.value }); setPage(0); }} />
-            <span className="text-xs text-muted-foreground">to</span>
-            <Input type="date" className="w-36 h-8 text-xs" value={filters.endDate} onChange={(e) => { setFilters({ ...filters, endDate: e.target.value }); setPage(0); }} />
+            {/* In calendar view the calendar sets the dates (see listFilters). */}
+            {view === "list" && (
+              <>
+                <Input type="date" className="w-36 h-8 text-xs" value={filters.startDate} onChange={(e) => { setFilters({ ...filters, startDate: e.target.value }); setPage(0); }} />
+                <span className="text-xs text-muted-foreground">to</span>
+                <Input type="date" className="w-36 h-8 text-xs" value={filters.endDate} onChange={(e) => { setFilters({ ...filters, endDate: e.target.value }); setPage(0); }} />
+              </>
+            )}
             {/* Account picker is hidden on the account-scoped embed — the view
                 is already locked to a single account (keep the other filters). */}
             {!locked && (
@@ -766,8 +827,14 @@ export function TransactionsWorkspace({
                 onValueChange={(v) => { setFilters({ ...filters, accountId: v === "all" ? "" : v }); setPage(0); }}
                 items={[
                   { value: "all", label: "All accounts" } satisfies ComboboxItemShape,
+                  // Archived accounts ARE offered here — their transactions are
+                  // in the list, so you must be able to filter to them. Tagged
+                  // the same way the reports account filter tags them.
                   ...sortAccount(
-                    accounts.map((a): ComboboxItemShape => ({ value: String(a.id), label: formatAccountLabel(a) })),
+                    accounts.map((a): ComboboxItemShape => ({
+                      value: String(a.id),
+                      label: formatAccountLabel(a) + (a.archived ? " (archived)" : ""),
+                    })),
                     (a) => Number(a.value),
                     (a, z) => (a.label ?? "").localeCompare(z.label ?? ""),
                   ),
@@ -961,6 +1028,38 @@ export function TransactionsWorkspace({
         </CardContent>
       </Card>
 
+      {view === "calendar" && (
+        <>
+          <TransactionsCalendar
+            mode={calMode}
+            anchor={calAnchor}
+            selectedDay={calDay}
+            accountId={filters.accountId}
+            categoryId={filters.categoryId}
+            onModeChange={changeCalMode}
+            onSelectDay={(day) => {
+              setCalDay(day);
+              setPage(0);
+            }}
+            onShift={shiftCal}
+            onToday={calToday}
+            onOpenMonth={openCalMonth}
+          />
+          <div className="flex flex-wrap items-center gap-2 text-sm">
+            <span className="font-medium">{describeCalendarSelection(calMode, calAnchor, calDay)}</span>
+            {calDay != null && (
+              <button
+                type="button"
+                onClick={() => { setCalDay(null); setPage(0); }}
+                className="text-xs text-muted-foreground hover:text-foreground underline-offset-4 hover:underline"
+              >
+                Show the whole {calMode === "week" ? "week" : "month"}
+              </button>
+            )}
+          </div>
+        </>
+      )}
+
       {/* Bulk action bar */}
       {someSelected && (
         <div className="flex items-center gap-3 px-4 py-2.5 bg-primary/5 border border-primary/20 rounded-lg text-sm">
@@ -998,8 +1097,13 @@ export function TransactionsWorkspace({
               <Combobox
                 value={bulkAccountId}
                 onValueChange={(v) => setBulkAccountId(v)}
+                // Bulk "move to account" DESTINATION — archived accounts are
+                // excluded: this writes new rows into whatever you pick, and an
+                // archived account is one you've said you're done using.
                 items={sortAccount(
-                  accounts.map((a): ComboboxItemShape => ({ value: String(a.id), label: a.name })),
+                  accounts
+                    .filter((a) => a.archived !== true)
+                    .map((a): ComboboxItemShape => ({ value: String(a.id), label: a.name })),
                   (a) => Number(a.value),
                   (a, z) => (a.label ?? "").localeCompare(z.label ?? ""),
                 )}
@@ -1070,28 +1174,7 @@ export function TransactionsWorkspace({
       </Card>
 
       {/* Pagination */}
-      <div className="flex items-center justify-between">
-        <p className="text-sm text-muted-foreground">
-          Showing {total === 0 ? 0 : page * limit + 1}–{Math.min((page + 1) * limit, total)} of {total}
-        </p>
-        <div className="flex items-center gap-1">
-          <Button variant="outline" size="sm" disabled={page === 0} onClick={() => setPage(page - 1)}>
-            <ChevronLeft className="h-4 w-4" />
-          </Button>
-          {getPageNumbers().map((p, idx) =>
-            p === "ellipsis" ? (
-              <span key={`ellipsis-${idx}`} className="px-2 text-sm text-muted-foreground">...</span>
-            ) : (
-              <Button key={p} variant={page === p ? "default" : "outline"} size="sm" className="h-8 w-8 p-0 text-sm" onClick={() => setPage(p)}>
-                {p + 1}
-              </Button>
-            )
-          )}
-          <Button variant="outline" size="sm" disabled={page >= totalPages - 1} onClick={() => setPage(page + 1)}>
-            <ChevronRight className="h-4 w-4" />
-          </Button>
-        </div>
-      </div>
+      <Pagination page={page} limit={limit} total={total} onPageChange={setPage} />
 
       {/* Single delete confirmation dialog */}
       <Dialog open={deleteConfirmId !== null} onOpenChange={(open) => {

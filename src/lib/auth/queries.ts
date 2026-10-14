@@ -10,6 +10,8 @@ import { db } from "@/db";
 import type { DrizzleDb } from "@/db";
 import * as pgSchema from "@/db/schema-pg";
 import { eq, count, sql, inArray, and, isNull } from "drizzle-orm";
+import { normalizeDbRows } from "@/lib/db-utils";
+import type { TableColFilter } from "@/lib/table-filters";
 import crypto from "crypto";
 
 /** Returns the PostgreSQL schema tables */
@@ -391,6 +393,303 @@ export async function getUserCount() {
   return rows[0]?.total ?? 0;
 }
 
+// ─── Admin users table: server-side pagination + sort + filter ───────────────
+//
+// The admin users screen pages, sorts and filters SERVER-side. `listUsers`
+// above stays as-is for callers that just want a bounded dump (e.g. the stats
+// route); everything the admin table needs goes through `listUsersPage`, which
+// returns the page AND its matching total from ONE code path so the two can
+// never disagree. Paging with a filtered list but an unfiltered COUNT is
+// exactly the "50 of 53" class of bug this replaced.
+
+/**
+ * Active span, in whole days, as SQL — the elapsed time from signup to last
+ * recorded activity. Mirrors `spanDays` in `@/lib/auth/activity-span`; the two
+ * MUST agree or a server-side filter would contradict the number rendered in
+ * the row.
+ *
+ * Three load-bearing details:
+ *  - `created_at` is a **text** column (ISO strings) while `last_active_at` is
+ *    `timestamptz`, so the subtraction needs an explicit cast. Verified against
+ *    pf_dev: 0 of 27 rows fail the ISO shape, so the cast cannot throw.
+ *  - NULL `last_active_at` (never authenticated) COALESCEs to 0, so those users
+ *    always render and always match a bucket instead of vanishing.
+ *  - GREATEST(…, 0) clamps clock skew / backdated rows to 0 rather than
+ *    surfacing a negative span.
+ *
+ * References `users` as `u` — every query below aliases it that way.
+ *
+ * Built LAZILY (a function, not a module-level const). Calling `sql` at module
+ * scope makes importing this file — and anything that transitively imports it,
+ * e.g. require-admin.ts — fail outright under a test that mocks `drizzle-orm`
+ * without re-exporting `sql`.
+ */
+function activeSpanSql() {
+  return sql`COALESCE(GREATEST(0, FLOOR(EXTRACT(EPOCH FROM (u.last_active_at - u.created_at::timestamptz)) / 86400)), 0)::int`;
+}
+
+/**
+ * Whitelist of sortable columns. The ONLY way a sort key reaches the query: the
+ * client sends a key, it is checked against this list, and an unknown key is
+ * rejected by the route. No user-supplied string is ever interpolated into SQL.
+ *
+ * Kept as plain data (no `sql` calls) so `isUserSortKey` — which the route needs
+ * for validation — stays evaluable without a live drizzle module.
+ */
+const USER_SORT_KEY_LIST = [
+  "user",
+  "role",
+  "plan",
+  "verified",
+  "mfa",
+  "txns",
+  "lastActive",
+  "joined",
+  "span",
+] as const;
+
+export type UserSortKey = (typeof USER_SORT_KEY_LIST)[number];
+
+export const USER_SORT_KEYS: readonly UserSortKey[] = USER_SORT_KEY_LIST;
+
+export function isUserSortKey(value: unknown): value is UserSortKey {
+  return (
+    typeof value === "string" &&
+    (USER_SORT_KEY_LIST as readonly string[]).includes(value)
+  );
+}
+
+/**
+ * The SQL expression a sort key orders by. Exhaustive over `UserSortKey` — the
+ * switch has no default, so adding a key without an expression is a type error.
+ *
+ * `lastActive` coalesces NULL to the epoch so never-active users sort as the
+ * least-recently-active — matching `compareLastActive` in `@/lib/auth/dormancy`
+ * (Postgres would otherwise sort NULLs last on ASC, flipping them to the top).
+ */
+function userSortSql(key: UserSortKey) {
+  switch (key) {
+    case "user":
+      return sql`lower(COALESCE(NULLIF(u.display_name, ''), NULLIF(u.username, ''), NULLIF(u.email, ''), ''))`;
+    case "role":
+      return sql`u.role`;
+    case "plan":
+      return sql`u.plan`;
+    case "verified":
+      return sql`u.email_verified`;
+    case "mfa":
+      return sql`u.mfa_enabled`;
+    case "txns":
+      return sql`COALESCE(tx.total, 0)`;
+    case "lastActive":
+      return sql`COALESCE(u.last_active_at, 'epoch'::timestamptz)`;
+    case "joined":
+      return sql`u.created_at::timestamptz`;
+    case "span":
+      return activeSpanSql();
+  }
+}
+
+/** Default ordering when the caller names none: newest signups first. */
+const DEFAULT_USER_SORT: UserSortKey = "joined";
+
+/**
+ * Per-column filter → SQL predicate. Columns absent from this map are not
+ * filterable and are IGNORED rather than erroring, so a stale saved filter for
+ * a removed column degrades to "no filter" instead of a hard failure.
+ *
+ * Text search spans the three identity columns the User cell can render, so
+ * filtering "User" finds a row by display name, username OR email — matching
+ * what the cell actually shows.
+ */
+function userFilterSql(f: TableColFilter) {
+  switch (f.columnId) {
+    case "user": {
+      if (f.type !== "text") return null;
+      const needle = `%${f.value.trim().toLowerCase()}%`;
+      return sql`(lower(COALESCE(u.display_name, '')) LIKE ${needle} OR lower(COALESCE(u.username, '')) LIKE ${needle} OR lower(COALESCE(u.email, '')) LIKE ${needle})`;
+    }
+    case "role":
+      return f.type === "enum" ? sql`u.role IN ${f.values}` : null;
+    case "plan":
+      return f.type === "enum" ? sql`u.plan IN ${f.values}` : null;
+    case "verified":
+      return f.type === "enum"
+        ? sql`u.email_verified IN ${f.values.map((v) => (v === "1" ? 1 : 0))}`
+        : null;
+    case "mfa":
+      return f.type === "enum"
+        ? sql`u.mfa_enabled IN ${f.values.map((v) => (v === "1" ? 1 : 0))}`
+        : null;
+    case "txns":
+      return f.type === "numeric"
+        ? numericPredicate(sql`COALESCE(tx.total, 0)`, f)
+        : null;
+    case "span":
+      return f.type === "numeric" ? numericPredicate(activeSpanSql(), f) : null;
+    case "lastActive":
+      return f.type === "date" ? datePredicate(sql`u.last_active_at`, f) : null;
+    case "joined":
+      return f.type === "date"
+        ? datePredicate(sql`u.created_at::timestamptz`, f)
+        : null;
+    default:
+      return null;
+  }
+}
+
+function numericPredicate(
+  expr: ReturnType<typeof sql>,
+  f: Extract<TableColFilter, { type: "numeric" }>,
+) {
+  if (!Number.isFinite(f.value)) return null;
+  switch (f.op) {
+    case "eq":
+      return sql`${expr} = ${f.value}`;
+    case "gt":
+      return sql`${expr} > ${f.value}`;
+    case "lt":
+      return sql`${expr} < ${f.value}`;
+    case "between":
+      return f.value2 != null && Number.isFinite(f.value2)
+        ? sql`${expr} BETWEEN ${f.value} AND ${f.value2}`
+        : sql`${expr} >= ${f.value}`;
+  }
+}
+
+/**
+ * `to` is compared with `< to + 1 day` so an inclusive end date actually
+ * includes that whole day — a bare `<= '2026-07-31'` casts to midnight and
+ * silently excludes everything that happened during the day the user picked.
+ */
+function datePredicate(
+  expr: ReturnType<typeof sql>,
+  f: Extract<TableColFilter, { type: "date" }>,
+) {
+  const parts = [];
+  if (f.from) parts.push(sql`${expr} >= ${f.from}::timestamptz`);
+  if (f.to) parts.push(sql`${expr} < (${f.to}::timestamptz + interval '1 day')`);
+  if (parts.length === 0) return null;
+  return parts.length === 1
+    ? parts[0]
+    : sql`(${parts[0]} AND ${parts[1]})`;
+}
+
+export interface ListUsersPageOptions {
+  limit: number;
+  offset: number;
+  sort?: UserSortKey | null;
+  sortDir?: "asc" | "desc" | null;
+  /** Per-column filters (see @/lib/table-filters). Unknown columns ignored. */
+  filters?: TableColFilter[];
+}
+
+export interface AdminUserRow {
+  id: string;
+  username: string | null;
+  email: string | null;
+  displayName: string | null;
+  role: string;
+  emailVerified: number | boolean;
+  mfaEnabled: number | boolean;
+  onboardingComplete: number | boolean;
+  plan: string;
+  planExpiresAt: string | null;
+  loginCount: number;
+  lastLoginAt: string | null;
+  lastActiveAt: string | Date | null;
+  createdAt: string;
+  updatedAt: string;
+  transactionCount: number;
+  activeSpanDays: number;
+}
+
+/**
+ * One page of the admin users table, plus the total number of rows matching the
+ * SAME filter.
+ *
+ * The transaction count is a LEFT JOIN rather than the previous per-page GROUP
+ * BY joined in JS, because sorting by it has to happen in SQL — a JS join can
+ * only order the rows already fetched, which is the bug this whole change is
+ * about.
+ *
+ * Ordering always appends `u.id` as a tiebreaker. Without a deterministic total
+ * order, LIMIT/OFFSET over a column with duplicate values (role, plan, a span
+ * of 0 — the majority of rows) lets Postgres return a row on two different
+ * pages, or none at all.
+ */
+export async function listUsersPage(
+  options: ListUsersPageOptions,
+): Promise<{ rows: AdminUserRow[]; total: number }> {
+  const { limit, offset, sort, sortDir, filters = [] } = options;
+
+  // Filter fragment, built ONCE and reused by both the page query and the
+  // count query so they cannot drift apart.
+  const predicates = filters
+    .map((f) => userFilterSql(f))
+    .filter((p): p is NonNullable<typeof p> => p != null);
+  const whereSql =
+    predicates.length === 0
+      ? sql``
+      : sql`WHERE ${sql.join(predicates, sql` AND `)}`;
+
+  const sortKey: UserSortKey = isUserSortKey(sort) ? sort : DEFAULT_USER_SORT;
+  const dirSql = sortDir === "asc" ? sql`ASC` : sql`DESC`;
+
+  const pageResult = await db.execute(sql`
+    WITH tx AS (
+      SELECT user_id, COUNT(*)::int AS total
+      FROM transactions
+      GROUP BY user_id
+    )
+    SELECT
+      u.id,
+      u.username,
+      u.email,
+      u.display_name          AS "displayName",
+      u.role,
+      u.email_verified        AS "emailVerified",
+      u.mfa_enabled           AS "mfaEnabled",
+      u.onboarding_complete   AS "onboardingComplete",
+      u.plan,
+      u.plan_expires_at       AS "planExpiresAt",
+      u.login_count           AS "loginCount",
+      u.last_login_at         AS "lastLoginAt",
+      u.last_active_at        AS "lastActiveAt",
+      u.created_at            AS "createdAt",
+      u.updated_at            AS "updatedAt",
+      COALESCE(tx.total, 0)   AS "transactionCount",
+      ${activeSpanSql()}      AS "activeSpanDays"
+    FROM users u
+    LEFT JOIN tx ON tx.user_id = u.id
+    ${whereSql}
+    ORDER BY ${userSortSql(sortKey)} ${dirSql}, u.id ASC
+    LIMIT ${limit} OFFSET ${offset}
+  `);
+
+  // The count carries the SAME tx join as the page query — `txns` is a
+  // filterable column, so `tx.total` can appear in `whereSql` and a bare
+  // `FROM users u` would fail to resolve it. Joining unconditionally keeps one
+  // WHERE fragment valid in both statements, which is the property that stops
+  // the total from drifting away from the rows.
+  const countResult = await db.execute(sql`
+    WITH tx AS (
+      SELECT user_id, COUNT(*)::int AS total
+      FROM transactions
+      GROUP BY user_id
+    )
+    SELECT COUNT(*)::int AS total
+    FROM users u
+    LEFT JOIN tx ON tx.user_id = u.id
+    ${whereSql}
+  `);
+
+  const rows = normalizeDbRows<AdminUserRow>(pageResult);
+  const total = normalizeDbRows<{ total: number }>(countResult)[0]?.total ?? 0;
+
+  return { rows, total: Number(total) };
+}
+
 /**
  * Emails of every admin user (role='admin') that has a recovery email set.
  * Used to route maintainer notifications (e.g. new feedback) to the actual
@@ -422,11 +721,11 @@ export async function updateUserPlan(userId: string, plan: string, planExpiresAt
 }
 
 /**
- * Unlink a user's on-disk upload files (mcp_uploads + feedback attachments)
- * from disk. Runs BEFORE the wipe/delete transaction — unlink is not
- * transactional, and we'd rather leak a DB row than orphan a plaintext file on
- * disk if the transaction later fails. Swallows per-file errors (file may
- * already be gone) and a missing-table/column error on older deploys.
+ * Unlink a user's on-disk upload files (feedback attachments) from disk. Runs
+ * BEFORE the wipe/delete transaction — unlink is not transactional, and we'd
+ * rather leak a DB row than orphan a plaintext file on disk if the transaction
+ * later fails. Swallows per-file errors (file may already be gone) and a
+ * missing-table/column error on older deploys.
  */
 async function unlinkUserUploadFiles(userId: string) {
   const s = getSchema();
@@ -439,18 +738,6 @@ async function unlinkUserUploadFiles(userId: string) {
       // File may already be gone — swallow. The DB row delete cleans it up.
     }
   };
-
-  // mcp_uploads (encrypted import files).
-  try {
-    const uploadRows = await db
-      .select({ storagePath: s.mcpUploads.storagePath })
-      .from(s.mcpUploads)
-      .where(eq(s.mcpUploads.userId, userId));
-    for (const row of uploadRows) await unlinkPath(row.storagePath);
-  } catch {
-    // If the mcp_uploads table is missing on this environment (older deploys),
-    // the SELECT above throws — don't let that block the wipe/delete.
-  }
 
   // FINLYNQ-226 — feedback SEED attachment files (plaintext on disk, owner's).
   try {
@@ -492,6 +779,18 @@ async function unlinkUserUploadFiles(userId: string) {
  * user row) and `deleteUserAccount` (which then DROPS the user row). Keeping a
  * single deletion body is load-bearing: the two paths must never drift on which
  * tables they cover. Add a new per-user table here and BOTH paths pick it up.
+ *
+ * IMPORTANT — an `ON DELETE CASCADE` FK to `users` is NOT coverage. Only
+ * `deleteUserAccount` drops the user row; WIPE keeps it, so a table that relies
+ * on that cascade survives a wipe untouched. Cascading off a NOT NULL FK to a
+ * table this function deletes (accounts / transactions / portfolio_holdings /
+ * securities / holding_lots / backfill_runs / webhooks) DOES count. A NULLABLE
+ * cascade parent does not — `portfolio_snapshots.account_id IS NULL` rows are
+ * exactly how the whole-portfolio bars escaped.
+ *
+ * `tests/delete-all-user-data-coverage.test.ts` enforces this: every table in
+ * `schema-pg.ts` carrying a `user_id` column must be deleted here or listed in
+ * that test's documented exemptions.
  *
  * Each delete filters strictly by user_id — never by FK reach — so it can ONLY
  * remove rows owned by this user. If any other user's row holds an FK into one
@@ -551,14 +850,61 @@ async function deleteAllUserDataTx(tx: TxClient, userId: string) {
   // referenced and can be safely dropped via the user_id filter alone.
   await tx.delete(s.bankTransactions).where(eq(s.bankTransactions.userId, userId));
   await tx.delete(s.portfolioHoldings).where(eq(s.portfolioHoldings.userId, userId));
+  // Securities master (Tier 2) — MUST come after portfolioHoldings: the
+  // `portfolio_holdings.security_id` FK is ON DELETE SET NULL, so deleting
+  // securities first would pointlessly rewrite rows we're about to drop.
+  // `custom_security_prices.security_id` is NOT NULL ON DELETE CASCADE, so the
+  // user's manual price marks go with it — no separate delete needed.
+  //
+  // This carries the user's DEK-encrypted `symbol_ct`/`name_ct` +
+  // `symbol_lookup`/`name_lookup`, so leaving it behind meant encrypted
+  // security identities SURVIVED an account deletion. The table has NO FK to
+  // `users` at all — neither delete path reached it.
+  await tx.delete(s.securities).where(eq(s.securities.userId, userId));
   await tx.delete(s.categories).where(eq(s.categories.userId, userId));
+  // Staged import pipeline — MUST precede `accounts`. Both reference it with
+  // ON DELETE NO ACTION (`staged_imports.bound_account_id`,
+  // `staged_transactions.target_account_id`), so leaving them until later in
+  // the sweep made the `accounts` DELETE raise 23503 and abort the WHOLE
+  // transaction: any user who had ever uploaded a statement bound to an
+  // account could not delete their account or wipe their data at all.
+  // staged_transactions first — `staged_transactions.staged_import_id` is
+  // NOT NULL ON DELETE CASCADE off staged_imports, so the child goes first.
+  await tx.delete(s.stagedTransactions).where(eq(s.stagedTransactions.userId, userId));
+  await tx.delete(s.stagedImports).where(eq(s.stagedImports.userId, userId));
   await tx.delete(s.accounts).where(eq(s.accounts.userId, userId));
+
+  // ── Portfolio snapshot / lot bookkeeping ──────────────────────────────────
+  // None of these have an FK to `users`, so NEITHER path reached them.
+  // `portfolio_snapshots.account_id` cascades from accounts, but it is
+  // NULLABLE (account_id IS NULL = the whole-portfolio aggregate bar), so the
+  // aggregate rows survived even on delete-account. The rest are keyed on
+  // user_id alone with no FK anywhere.
+  //
+  // Not listed (covered transitively, all NOT NULL ON DELETE CASCADE):
+  //   holding_accounts / holding_lots  → portfolio_holdings
+  //   holding_lot_closures             → holding_lots
+  //   custom_security_prices           → securities
+  await tx.delete(s.portfolioSnapshots).where(eq(s.portfolioSnapshots.userId, userId));
+  await tx.delete(s.portfolioSnapshotDirty).where(eq(s.portfolioSnapshotDirty.userId, userId));
+  await tx
+    .delete(s.portfolioCashSnapshotDirty)
+    .where(eq(s.portfolioCashSnapshotDirty.userId, userId));
+  await tx
+    .delete(s.portfolioCashSnapshotMeta)
+    .where(eq(s.portfolioCashSnapshotMeta.userId, userId));
+  await tx.delete(s.portfolioLotsStatus).where(eq(s.portfolioLotsStatus.userId, userId));
+  await tx
+    .delete(s.portfolioLegacyRealizedGainSnapshot)
+    .where(eq(s.portfolioLegacyRealizedGainSnapshot.userId, userId));
+  await tx
+    .delete(s.reportingRecomputeStatus)
+    .where(eq(s.reportingRecomputeStatus.userId, userId));
 
   // Tables missed by the original implementation — Finding #5. Covers the
   // tokens that would survive a "wipe my account" click and still decrypt the
-  // user's session DEK after wipe, plus the staged-import plaintext buffer and
-  // mcp_uploads metadata rows whose on-disk files were unlinked above.
-  await tx.delete(s.mcpUploads).where(eq(s.mcpUploads.userId, userId));
+  // user's session DEK after wipe, plus the staged-import plaintext buffer.
+  // (The mcp_uploads delete was removed with the table — v4.1 retirement.)
   // FINLYNQ-226/228 — feedback rows are maintainer-owned support records and are
   // deliberately NOT deleted on wipe/delete (the maintainer keeps the bug
   // report). But the privacy-sensitive attachments are removed: the on-disk
@@ -608,8 +954,6 @@ async function deleteAllUserDataTx(tx: TxClient, userId: string) {
   // wipe keeps the user row so we delete explicitly here.
   await tx.delete(s.emailInbox).where(eq(s.emailInbox.userId, userId));
   await tx.delete(s.emailImportRules).where(eq(s.emailImportRules.userId, userId));
-  await tx.delete(s.stagedTransactions).where(eq(s.stagedTransactions.userId, userId));
-  await tx.delete(s.stagedImports).where(eq(s.stagedImports.userId, userId));
   await tx
     .delete(s.simplefinPendingTransactions)
     .where(eq(s.simplefinPendingTransactions.userId, userId));
@@ -623,9 +967,46 @@ async function deleteAllUserDataTx(tx: TxClient, userId: string) {
     await tx.delete(s.incomingEmails).where(eq(s.incomingEmails.toAddress, userImportEmail));
   }
 
+  // FINLYNQ-301 — per-user prompt completion acks (generic decision surface).
+  await tx.delete(s.userPromptAcks).where(eq(s.userPromptAcks.userId, userId));
+  // Per-user read/dismiss state for global admin announcements. Its only FK is
+  // to `announcements` (which are never deleted), so nothing cleaned it up.
+  await tx.delete(s.announcementReads).where(eq(s.announcementReads.userId, userId));
+
+  // ── users-CASCADE-only tables ─────────────────────────────────────────────
+  // These DO cascade off the `users` row, which covers `deleteUserAccount` —
+  // but WIPE keeps the user row, so without an explicit delete here a "wipe my
+  // account" left them fully intact. Same reasoning as the email group above.
+  await tx.delete(s.backfillProposals).where(eq(s.backfillProposals.userId, userId));
+  await tx.delete(s.backfillRuns).where(eq(s.backfillRuns.userId, userId));
+  // webhook_deliveries cascades off webhooks (NOT NULL) — no separate delete.
+  await tx.delete(s.webhooks).where(eq(s.webhooks.userId, userId));
+  // No FK to users at all; previously deleted only on the delete-account path,
+  // so a wipe left the keys behind. Belongs in the shared body like everything
+  // else — see the header note about the two paths never drifting.
+  await tx.delete(s.mcpIdempotencyKeys).where(eq(s.mcpIdempotencyKeys.userId, userId));
+
   // settings last — it holds the api_key/api_key_dek/email_webhook_* rows and
   // we also just read the import_email from here above.
   await tx.delete(s.settings).where(eq(s.settings.userId, userId));
+
+  // Send the user back through onboarding. Every caller of this body has just
+  // removed ALL of their data, so the account is indistinguishable from a fresh
+  // signup and should be treated as one — the wizard is where the display
+  // currency, starter accounts and budgets come from, and `settings` (including
+  // `display_currency`) was just dropped one line above, so without this the
+  // user lands on an empty dashboard with no way back to that setup flow.
+  //
+  // This also keeps the FINLYNQ-301 prompt gate coherent: `getPendingPrompts`
+  // returns nothing while `onboarding_complete = 0`, so a freshly-cleared user
+  // is asked by the wizard rather than by a decision prompt — exactly as a new
+  // signup is.
+  //
+  // No-op for `deleteUserAccount`, which drops the row immediately after.
+  await tx
+    .update(s.users)
+    .set({ onboardingComplete: 0 })
+    .where(eq(s.users.id, userId));
 }
 
 /**
@@ -693,14 +1074,46 @@ export async function wipeUserDataAndRewrap(
 }
 
 /**
+ * Clear every per-user data row but KEEP the account (and its DEK) — the
+ * "Clear All Data" danger-zone action, `DELETE /api/data`.
+ *
+ * Exists because that route used to carry its OWN hand-rolled delete list: 15
+ * tables against this function's ~50, outside a transaction, and with no
+ * `staged_imports` / `staged_transactions` delete even though it deleted
+ * `accounts` (which they reference NO ACTION). Consequences, all observed on
+ * dev 2026-07-27:
+ *   - `settings` survived, so a user's `display_currency` and custom
+ *     `active_currencies` came back after "delete everything".
+ *   - `onboarding_complete` stayed 1, so the wizard never replayed.
+ *   - The `accounts` DELETE 23503'd for any user with a bound staged import,
+ *     and because each delete auto-committed, it left a HALF-WIPED account
+ *     (the demo user lost transactions/categories/budgets/goals/holdings but
+ *     kept its 4 accounts).
+ * The UI promises "permanently delete all your data", so the fix is to route
+ * it through the same audited body as the other two paths rather than to keep
+ * a third list in sync.
+ *
+ * Differs from `wipeUserDataAndRewrap` only in NOT rotating the DEK — this
+ * path has no password to re-derive a KEK from. The data it protected is gone
+ * either way.
+ */
+export async function clearAllUserData(userId: string) {
+  await unlinkUserUploadFiles(userId);
+  await db.transaction(async (tx) => {
+    await deleteAllUserDataTx(tx, userId);
+  });
+}
+
+/**
  * Permanently DELETE a user account: every per-user data row PLUS the `users`
  * row itself. Used by POST /api/auth/delete-account.
  *
  * Unlike `wipeUserDataAndRewrap`, there is no DEK to rewrap afterward — the
- * identity is gone. The final `DELETE FROM users` cascades the ON DELETE
- * CASCADE children (webhooks, webhook_deliveries, transaction_flags, backfill
- * audit/runs). `mcp_idempotency_keys` has no FK to users, so it's deleted
- * explicitly here to avoid orphaning.
+ * identity is gone. `deleteAllUserDataTx` now covers every per-user table
+ * explicitly (including the ones that merely cascade off the `users` row, which
+ * the wipe path could not rely on), so the final `DELETE FROM users` should
+ * find nothing left to cascade. That is asserted by
+ * `tests/delete-all-user-data-coverage.test.ts`.
  *
  * Edge case — `admin_audit.admin_user_id` is NOT NULL with no cascade. A normal
  * `role='user'` account has zero rows there, so the delete is safe. If an admin
@@ -717,9 +1130,8 @@ export async function deleteUserAccount(userId: string) {
 
   await db.transaction(async (tx) => {
     await deleteAllUserDataTx(tx, userId);
-    // No FK to users — would orphan if we relied on the user-row cascade.
-    await tx.delete(s.mcpIdempotencyKeys).where(eq(s.mcpIdempotencyKeys.userId, userId));
-    // Final — drops the identity row and cascades its ON DELETE CASCADE children.
+    // Final — drops the identity row. Any ON DELETE CASCADE child is already
+    // gone (deleteAllUserDataTx deletes them explicitly so WIPE covers them too).
     await tx.delete(s.users).where(eq(s.users.id, userId));
   });
 }
@@ -733,5 +1145,83 @@ export async function getUsageStats() {
     totalUsers: userRows[0]?.total ?? 0,
     totalTransactions: txRows[0]?.total ?? 0,
     totalAccounts: acctRows[0]?.total ?? 0,
+  };
+}
+
+/** Per-(prompt, version) completion counts from `user_prompt_acks` (FINLYNQ-301). */
+export interface PromptAckStat {
+  promptId: string;
+  version: number;
+  answered: number;
+  deferred: number;
+  dismissed: number;
+}
+
+/**
+ * Group `user_prompt_acks` by (prompt_id, version) into answered/deferred/
+ * dismissed counts, for the /admin operator view — so per-prompt completion is
+ * visible without SQL. Rows exist only once a user has interacted with a prompt;
+ * the stats route merges in registered prompts that have zero acks so a live
+ * prompt still shows a row.
+ */
+export async function getPromptAckStats(): Promise<PromptAckStat[]> {
+  const s = getSchema();
+  const rows = await db
+    .select({
+      promptId: s.userPromptAcks.promptId,
+      version: s.userPromptAcks.version,
+      answered: count(sql`CASE WHEN ${s.userPromptAcks.status} = 'answered' THEN 1 END`),
+      deferred: count(sql`CASE WHEN ${s.userPromptAcks.status} = 'deferred' THEN 1 END`),
+      dismissed: count(sql`CASE WHEN ${s.userPromptAcks.status} = 'dismissed' THEN 1 END`),
+    })
+    .from(s.userPromptAcks)
+    .groupBy(s.userPromptAcks.promptId, s.userPromptAcks.version);
+  return rows.map((r) => ({
+    promptId: r.promptId,
+    version: Number(r.version),
+    answered: Number(r.answered),
+    deferred: Number(r.deferred),
+    dismissed: Number(r.dismissed),
+  }));
+}
+
+/** Rolling "active now" counts derived from `users.last_active_at`. */
+export interface ActiveUserCounts {
+  /** Users with an authenticated request in the last 15 minutes. */
+  activeLast15Min: number;
+  /** Users with an authenticated request in the last 60 minutes. */
+  activeLast60Min: number;
+  /** Users with an authenticated request in the last 24 hours. */
+  activeLast24Hours: number;
+}
+
+/**
+ * Near-real-time active-user counts across three rolling windows, from
+ * `users.last_active_at` — which is bumped on ANY authenticated access (web
+ * session, OAuth/MCP token, or `pf_` API key), throttled to one write per
+ * 15-min window (see `lib/auth/last-active.ts`). Unlike `last_login_at` this
+ * captures MCP-only and API-key-only users, so it reflects real activity — the
+ * signal an operator wants before restarting/deploying.
+ *
+ * One round-trip: three `COUNT(*) FILTER` aggregates over a single scan.
+ */
+export async function getActiveUserCounts(): Promise<ActiveUserCounts> {
+  // eslint-disable-next-line @typescript-eslint/no-explicit-any
+  const result = await (db as any).execute(sql`
+    SELECT
+      COUNT(*) FILTER (WHERE last_active_at > NOW() - interval '15 minutes') AS active_15m,
+      COUNT(*) FILTER (WHERE last_active_at > NOW() - interval '60 minutes') AS active_60m,
+      COUNT(*) FILTER (WHERE last_active_at > NOW() - interval '24 hours')   AS active_24h
+    FROM users
+  `);
+  const row = normalizeDbRows<{
+    active_15m: number | string;
+    active_60m: number | string;
+    active_24h: number | string;
+  }>(result)[0];
+  return {
+    activeLast15Min: Number(row?.active_15m ?? 0),
+    activeLast60Min: Number(row?.active_60m ?? 0),
+    activeLast24Hours: Number(row?.active_24h ?? 0),
   };
 }

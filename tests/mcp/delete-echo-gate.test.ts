@@ -41,7 +41,9 @@ function makeFixtureDb(matcher: (sqlText: string) => Record<string, unknown>[] |
   const queries: { text: string }[] = [];
   const db = {
     execute: async (q: unknown) => {
-      const text = serializeSqlTemplate(q);
+      // Collapse whitespace — the shared delete chokepoint writes multi-line
+      // `sql` templates, and these fixtures match on substrings.
+      const text = serializeSqlTemplate(q).replace(/\s+/g, " ").trim();
       queries.push({ text });
       const rows = matcher(text);
       return { rows: rows ?? [], rowCount: rows?.length ?? 0 };
@@ -50,14 +52,27 @@ function makeFixtureDb(matcher: (sqlText: string) => Record<string, unknown>[] |
   return { db, queries };
 }
 
+// v4.1 clean break: the per-verb delete aliases were removed; each op now lives
+// on a consolidated discriminated-union tool. Map the old alias name → the
+// union tool + the `op` discriminator to inject so each test's args stay identical.
+const ALIAS_TO_CONSOLIDATED: Record<string, { tool: string; op: string }> = {
+  delete_transaction: { tool: "manage_transactions", op: "delete" },
+  delete_split: { tool: "manage_splits", op: "delete" },
+};
+
 function getTool(name: string, db: { execute: (q: unknown) => Promise<unknown> }, dek: Buffer | null) {
   const server = new McpServer({ name: "delete-echo-test", version: "0.0.0" });
   registerPgTools(server, db, "test-user", dek);
   // eslint-disable-next-line @typescript-eslint/no-explicit-any
   const tools = (server as any)._registeredTools as Record<string, { handler: (a: unknown, e: unknown) => Promise<unknown> }>;
-  const tool = tools[name];
-  if (!tool) throw new Error(`${name} not registered`);
-  return tool;
+  const map = ALIAS_TO_CONSOLIDATED[name];
+  if (!map) throw new Error(`no consolidated mapping for ${name}`);
+  const tool = tools[map.tool];
+  if (!tool) throw new Error(`${map.tool} not registered`);
+  return {
+    handler: (args: unknown, extra: unknown) =>
+      tool.handler({ op: map.op, ...(args as Record<string, unknown>) }, extra),
+  };
 }
 
 function envelopeText(result: unknown): string {
@@ -83,7 +98,10 @@ describe("checkExpectedEcho (pure)", () => {
 describe("delete_transaction — echo gate (FINLYNQ-264 Phase 2)", () => {
   const dek = randomBytes(32);
   const fixture = (sqlText: string): Record<string, unknown>[] | undefined => {
-    if (/FROM transactions WHERE user_id/i.test(sqlText) && /AND id = /i.test(sqlText)) {
+    // The echo-gate lookup AND the shared chokepoint's owner-scope / sibling /
+    // dirty-date reads all select from `transactions` by id — one row answers
+    // them all (no link ids ⇒ the cascade expands to just this row).
+    if (/^SELECT .*FROM transactions WHERE user_id = \?/i.test(sqlText) && /AND id = /i.test(sqlText)) {
       return [{ id: 812, payee: encryptField(dek, "Rent"), amount: -1200, date: "2026-01-02" }];
     }
     return [];

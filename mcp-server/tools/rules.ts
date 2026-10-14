@@ -31,9 +31,18 @@ import {
   decryptRuleFields,
 } from "../../src/lib/rules/crypto";
 import {
+  ConditionGroup,
+  Action,
+  collectActionFKs,
+  validateInvestmentOpAction,
+  type ConditionGroup as ConditionGroupType,
+  type Action as ActionType,
+} from "../../src/lib/rules/schema";
+import { verifyOwnership, OwnershipError } from "../../src/lib/verify-ownership";
+import {
   invalidateUser as invalidateUserTxCache,
 } from "../../src/lib/mcp/user-tx-cache";
-import { registerManageTool, registerAlias } from "./_consolidate";
+import { registerManageTool } from "./_consolidate";
 
 type ToolResult = { content: Array<{ type: "text"; text: string }> };
 
@@ -447,6 +456,43 @@ export function registerRulesTools(server: McpServer, ctx: PgToolContext) {
         if (actions !== undefined) actionsObj = actions;
       }
 
+      // GH #341 follow-up — the union schema validates the v2 SHAPE, but not
+      // WHOSE ids are inside it. Mirror REST PUT /api/rules: re-validate a
+      // filled record_investment_op action, then cross-tenant FK guard every
+      // id referenced in actions[] (set_category.categoryId, set_account.
+      // accountId, set_portfolio_holding.holdingId, create_transfer.
+      // destAccountId, the record_investment_op FKs) and in account
+      // conditions. Without this a rule could be saved pointing at another
+      // user's row — an IDOR-shaped write once the rule later fires. Runs
+      // BEFORE encryptRuleFields (the guard reads plaintext ids). The legacy
+      // branch above needs no guard: its category resolves via a user-scoped
+      // query. ctx.db IS the `@/db` proxy on the HTTP surface, so the shared
+      // verifyOwnership hits the same database.
+      if (hasV2 && (actionsObj !== undefined || condsObj !== undefined)) {
+        const v2Actions = (actionsObj ?? []) as ActionType[];
+        for (const a of v2Actions) {
+          if (a.kind !== "record_investment_op") continue;
+          const code = validateInvestmentOpAction(a);
+          if (code) return err(`Investment-op action (${a.op}) is incomplete: ${code}`);
+        }
+        const fks = collectActionFKs(v2Actions);
+        if (condsObj !== undefined) {
+          for (const c of (condsObj as ConditionGroupType).all) {
+            if (c.field === "account") fks.accountIds.push(c.accountId);
+          }
+        }
+        try {
+          await verifyOwnership(userId, fks);
+        } catch (e) {
+          if (e instanceof OwnershipError) {
+            // Same anti-enumeration shape as REST's 404 — "not found", never
+            // "belongs to someone else".
+            return err(`${e.kind} id(s) not found: ${e.missingIds.join(", ")}`);
+          }
+          throw e;
+        }
+      }
+
       // Encrypt sensitive free-text (name + payee/note/tags values + rename/tags)
       // before persisting (2026-06-01). FK ids stay plaintext. Undefined slices
       // are no-ops inside encryptRuleFields. plan/encryption-plaintext-gaps.md
@@ -628,7 +674,7 @@ export function registerRulesTools(server: McpServer, ctx: PgToolContext) {
       return text({ success: true, data: { reordered: ordered_ids.length, order: ordered_ids } });
   }
 
-  // ── consolidated tool: manage_rules + hidden back-compat aliases ───────────
+  // ── consolidated tool: manage_rules ───────────
   registerManageTool(
     server,
     "manage_rules",
@@ -651,8 +697,13 @@ export function registerRulesTools(server: McpServer, ctx: PgToolContext) {
         assign_category: z.string().optional().describe("Legacy: category name (fuzzy matched)"),
         assign_tags: z.string().optional().describe("Legacy: tags assigned by the rule"),
         rename_to: z.string().optional().describe("Legacy: payee rename target"),
-        conditions: z.unknown().optional().describe("v2: full ConditionGroup JSON. Replaces conditions entirely."),
-        actions: z.unknown().optional().describe("v2: full Action[] JSON. Replaces actions entirely."),
+        // GH #341: these were `z.unknown()`, which emits a JSON-Schema node with
+        // NO `type` — strict clients (Home Assistant's voluptuous converter)
+        // reject the whole tools/list over it. Reuse the REAL rule schemas
+        // (same ones POST /api/rules validates with) so the full condition/
+        // action grammar is both advertised and validated.
+        conditions: ConditionGroup.optional().describe("v2: full ConditionGroup JSON ({all:[...]}). Replaces conditions entirely."),
+        actions: z.array(Action).min(1).max(10).optional().describe("v2: full Action[] JSON. Replaces actions entirely."),
         is_active: z.boolean().optional(),
         priority: z.number().optional(),
       }),
@@ -685,64 +736,6 @@ export function registerRulesTools(server: McpServer, ctx: PgToolContext) {
     },
   );
 
-  registerAlias(
-    server,
-    "create_rule",
-    "Create an auto-categorization rule for future imports. Legacy shorthand (match_payee + assign_category) is synthesized into a v2 rule (FINLYNQ-84).",
-    {
-      match_payee: z.string().describe("Payee pattern to match (substring, case-insensitive; legacy `%` wildcards are stripped)"),
-      assign_category: z.string().optional().describe("Category name to assign (fuzzy matched — mistyped/unmatched is REFUSED; 2+ → ambiguous). Pass this OR `category_id`."),
-      category_id: z.number().int().positive().optional().describe("Category FK fast-path — wins over the fuzzy `assign_category` name."),
-      rename_to: z.string().optional().describe("Optionally rename matched payee to this"),
-      assign_tags: z.string().optional().describe("Tags to assign (comma-separated)"),
-      priority: z.number().optional().describe("Rule priority (higher = checked first, default 0)"),
-    },
-    async (args) => opCreate(args),
-  );
-  registerAlias(
-    server,
-    "list_rules",
-    "List all auto-categorization rules. Returns JSONB conditions + actions (FINLYNQ-84 v2 shape) plus decrypted FK names for human-readable rendering.",
-    {},
-    async () => opList(),
-  );
-  registerAlias(
-    server,
-    "update_rule",
-    "Update an existing transaction rule. Accepts legacy shorthand (match_payee + assign_category) OR the v2 shape (conditions + actions, FINLYNQ-84).",
-    {
-      id: z.number().describe("Rule id"),
-      name: z.string().optional(),
-      match_payee: z.string().optional().describe("Legacy alias: sets a single payee/contains condition + set_category action"),
-      assign_category: z.string().optional().describe("Legacy: category name (fuzzy matched)"),
-      assign_tags: z.string().optional().describe("Legacy: tags assigned by the rule"),
-      rename_to: z.string().optional().describe("Legacy: payee rename target"),
-      conditions: z.unknown().optional().describe("v2: full ConditionGroup JSON. Replaces conditions entirely."),
-      actions: z.unknown().optional().describe("v2: full Action[] JSON. Replaces actions entirely."),
-      is_active: z.boolean().optional(),
-      priority: z.number().optional(),
-    },
-    async (args) => opUpdate(args),
-  );
-  registerAlias(
-    server,
-    "delete_rule",
-    "Delete a transaction rule by id or name (FINLYNQ-273 — `name` resolves via the shared envelope; `id` fast-path wins).",
-    {
-      id: z.number().int().positive().optional().describe("Rule FK fast-path — wins over `name`. Pass this OR `name`."),
-      name: z.string().optional().describe("Rule name (fuzzy matched — mistyped/unmatched is REFUSED; 2+ → ambiguous)."),
-    },
-    async (args) => opDelete(args),
-  );
-  registerAlias(
-    server,
-    "reorder_rules",
-    "Reorder rules by assigning new priorities. The first id in `ordered_ids` gets the highest priority.",
-    {
-      ordered_ids: z.array(z.number()).min(1).describe("Rule ids in desired execution order (first = highest priority)"),
-    },
-    async (args) => opReorder(args),
-  );
 
 
   // ── suggest_transaction_details ───────────────────────────────────────────

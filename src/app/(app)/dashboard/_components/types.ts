@@ -65,6 +65,20 @@ export type HealthData = {
   excludedComponents?: HealthExclusion[];
   reportingCurrency?: string;
   totals?: HealthTotals;
+  // FINLYNQ-291 — standalone headline percentages (see HealthPayload in
+  // src/lib/financial-health.ts). Optional here since older payloads omit them.
+  savingsRatePct?: number | null;
+  dti?: { pct: number | null; reliable: boolean };
+  /**
+   * How the money totals above were valued (2026-08-27). `"market"` means
+   * investment accounts were marked to market through the same shared overlay
+   * the dashboard tiles use, so `netWorthToday` ties to the Total Net Worth
+   * headline. `"ledger"` means no usable decryption key was available to price
+   * holdings, so investment accounts are net CONTRIBUTIONS — `netWorthNote`
+   * explains it. Optional: an older server omits both.
+   */
+  netWorthBasis?: "market" | "ledger";
+  netWorthNote?: string;
 };
 
 export type SpotlightItem = {
@@ -75,6 +89,13 @@ export type SpotlightItem = {
   description: string;
   actionUrl: string;
   amount?: number;
+  /**
+   * Currency of `amount` and of the figures inside `description` — always the
+   * user's display currency, converted server-side. Optional so a payload from
+   * an older server doesn't break the card; the render falls back to USD, the
+   * app-wide default (FINLYNQ-183), never CAD.
+   */
+  currency?: string;
 };
 
 export type WeeklyRecapData = {
@@ -111,7 +132,10 @@ export type InsightsData = {
 };
 
 export type RecurringData = {
-  recurring: { payee: string; avgAmount: number; frequency: string; nextDate: string }[];
+  // `avgAmount` is NATIVE (in `currency`); `monthlyRecurringTotal` is already
+  // converted to `displayCurrency` at the current rate (FINLYNQ-123).
+  recurring: { payee: string; avgAmount: number; currency: string; frequency: string; nextDate: string }[];
+  displayCurrency: string;
   monthlyRecurringTotal: number;
   count: number;
 };

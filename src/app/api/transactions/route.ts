@@ -1,8 +1,7 @@
 import { NextRequest, NextResponse } from "next/server";
-import { getTransactions, getTransactionCount, createTransaction, updateTransaction, deleteTransaction, getAccountById, type TxSortFilter } from "@/lib/queries";
+import { getTransactions, getTransactionCount, createTransaction, updateTransaction, getAccountById, type TxSortFilter } from "@/lib/queries";
 import { requireAuth } from "@/lib/auth/require-auth";
 import { requireEncryption } from "@/lib/auth/require-encryption";
-import { getDEK } from "@/lib/crypto/dek-cache";
 import { encryptTxWrite, decryptTxRows, filterDecryptedBySearch, nameLookup, decryptName } from "@/lib/crypto/encrypted-columns";
 import { decryptField } from "@/lib/crypto/envelope";
 import { invalidateUser as invalidateUserTxCache } from "@/lib/mcp/user-tx-cache";
@@ -21,16 +20,17 @@ import {
 import { canEditPortfolioRow } from "@/lib/portfolio/operations";
 import type { TxRowForLots } from "@/lib/portfolio/lots/types";
 import { db, schema } from "@/db";
-import { and, eq, inArray, or } from "drizzle-orm";
+import { and, eq, ne, or } from "drizzle-orm";
 import { markSnapshotsDirty } from "@/lib/portfolio/snapshots/dirty";
 import { markCashSnapshotsDirty } from "@/lib/portfolio/snapshots/cash-dirty";
 import { z } from "zod";
 import { validateBody, safeErrorMessage, logApiError } from "@/lib/validate";
 import { isSortableColumnId } from "@/lib/transactions/columns";
-import { expandLinkSiblings } from "@/lib/transactions/link-siblings";
+import { deleteTransactionsCascade } from "@/lib/transactions/delete-cascade";
 import { isTransactionSource, type TransactionSource } from "@/lib/tx-source";
 import { verifyOwnership, OwnershipError } from "@/lib/verify-ownership";
 import { securitiesReadEnabledForUser } from "@/lib/securities/flag";
+import { transferLegChanges } from "@/lib/transactions/transfer-leg-guard";
 
 const postSchema = z.object({
   date: z.string(),
@@ -91,10 +91,15 @@ export async function GET(request: NextRequest) {
   // `v1:...` ciphertext, which is ugly but recoverable (re-login
   // repopulates the DEK cache), whereas 423-ing the whole transactions
   // page blocks the user entirely.
+  //
+  // Take the DEK from `auth.context`, which every strategy populates: the
+  // session cache for cookie auth (account.ts), and the api_key_dek unwrap
+  // for Bearer `pf_...` callers (api-key.ts). Re-deriving it from `sessionId`
+  // here dropped the DEK for API-key and OAuth clients -- which have no
+  // session -- so every row came back as `v1:` ciphertext for them.
   const auth = await requireAuth(request);
   if (!auth.authenticated) return auth.response;
-  const { userId, sessionId } = auth.context;
-  const dek = sessionId ? getDEK(sessionId, userId) : null;
+  const { userId, dek } = auth.context;
 
   const params = request.nextUrl.searchParams;
   const search = params.get("search") ?? undefined;
@@ -453,7 +458,11 @@ async function resolveTxAmounts(
     date?: string;
   },
   userId: string,
-  isUpdate: boolean
+  isUpdate: boolean,
+  currentTx?: {
+    enteredCurrency?: string | null;
+    enteredAmount?: number | null;
+  }
 ): Promise<{
   ok: true;
   fields: {
@@ -540,8 +549,35 @@ async function resolveTxAmounts(
   // passed a currency that doesn't match the account, that's a cross-
   // currency entry without conversion (same as today's broken behavior); we
   // preserve it for back-compat but it will get flagged by tx_currency_audit.
+  //
+  // UPDATE (amount-only): when updating an existing cross-currency transaction
+  // with only amount (no enteredAmount), keep the existing entered_amount and
+  // recompute entered_fx_rate to stay consistent. Same-currency transactions
+  // get entered_amount = amount, entered_fx_rate = 1.
   if (data.amount != null) {
     const currency = (data.currency ?? accountCurrency).toUpperCase();
+
+    // For amount-only UPDATEs with cross-currency transactions: preserve entered_amount
+    if (isUpdate && currentTx?.enteredCurrency && currentTx.enteredAmount != null) {
+      const existingEnteredCurrency = currentTx.enteredCurrency.toUpperCase();
+      const existingEnteredAmount = currentTx.enteredAmount;
+
+      if (existingEnteredCurrency !== accountCurrency && existingEnteredAmount !== 0) {
+        // Cross-currency case: keep entered_amount, recompute entered_fx_rate
+        return {
+          ok: true,
+          fields: {
+            amount: data.amount,
+            currency,
+            enteredAmount: existingEnteredAmount,
+            enteredCurrency: existingEnteredCurrency,
+            enteredFxRate: data.amount / existingEnteredAmount,
+          },
+        };
+      }
+    }
+
+    // Same-currency case (or not an update): entered = amount with rate 1
     return {
       ok: true,
       fields: {
@@ -692,7 +728,75 @@ export async function PUT(request: NextRequest) {
       );
     }
 
-    const resolved = await resolveTxAmounts(data, auth.userId, true);
+    // Transfer-leg guard (2026-10-07). Rewriting one leg's amount / account /
+    // date / currency here leaves its partner leg as it was, so the pair stops
+    // agreeing. Those edits belong on PUT /api/transactions/transfer, which
+    // rewrites both legs together. Only applies while a partner leg actually
+    // exists (an orphaned leg has nothing to fall out of step with), and only
+    // to fields the patch CHANGES (see transferLegChanges).
+    const leg = await db
+      .select({
+        linkId: schema.transactions.linkId,
+        amount: schema.transactions.amount,
+        accountId: schema.transactions.accountId,
+        date: schema.transactions.date,
+        currency: schema.transactions.currency,
+        enteredAmount: schema.transactions.enteredAmount,
+        enteredCurrency: schema.transactions.enteredCurrency,
+      })
+      .from(schema.transactions)
+      .where(and(eq(schema.transactions.id, id), eq(schema.transactions.userId, auth.userId)))
+      .get();
+    if (leg?.linkId) {
+      const changed = transferLegChanges(leg, data);
+      if (changed.length > 0) {
+        const partner = await db
+          .select({ id: schema.transactions.id })
+          .from(schema.transactions)
+          .where(
+            and(
+              eq(schema.transactions.userId, auth.userId),
+              eq(schema.transactions.linkId, leg.linkId),
+              ne(schema.transactions.id, id),
+            ),
+          )
+          .get();
+        if (partner) {
+          return NextResponse.json(
+            {
+              error: `This is one side of a transfer, so its ${changed.join(", ")} can't be changed on its own. Edit it as a transfer so both accounts stay in step.`,
+              code: "transfer_leg_edit_refused",
+              fields: changed,
+              partnerTransactionId: partner.id,
+            },
+            { status: 409 },
+          );
+        }
+      }
+    }
+
+    // Fetch current transaction's entered_* fields for amount-only update handling.
+    // This is used by resolveTxAmounts to keep cross-currency transactions consistent
+    // when only the amount is being updated.
+    let currentTx: { enteredCurrency?: string | null; enteredAmount?: number | null } = {};
+    if (data.amount !== undefined && data.enteredAmount === undefined && data.enteredCurrency === undefined) {
+      const curr = await db
+        .select({
+          enteredCurrency: schema.transactions.enteredCurrency,
+          enteredAmount: schema.transactions.enteredAmount,
+        })
+        .from(schema.transactions)
+        .where(
+          and(
+            eq(schema.transactions.id, id),
+            eq(schema.transactions.userId, auth.userId),
+          ),
+        )
+        .get();
+      if (curr) currentTx = curr;
+    }
+
+    const resolved = await resolveTxAmounts(data, auth.userId, true, currentTx);
     if (!resolved.ok) return resolved.response;
     Object.assign(data, resolved.fields);
 
@@ -864,189 +968,41 @@ export async function DELETE(request: NextRequest) {
   // instead of the hard `portfolio_edit_blocked` 409.
   const confirmReallocation = params.get("confirmReallocation") === "1";
 
-  // Phase 2 portfolio-ops refactor (2026-05-25): paired rows from
-  // operations.ts share a `trade_link_id` (buy/sell cash leg pairs) or
-  // `link_id` (in-kind transfers, FX conversions). Deleting one leg without
-  // the sibling leaves an orphan that breaks account-level invariants
-  // (cash sleeve sum drifts, lot bookkeeping desyncs). Compute the full
-  // "delete set" up front — the target + every sibling sharing either
-  // link — then run the edit-guard + delete loop over the entire set.
-  // Sibling expansion is single-sourced in `expandLinkSiblings`
-  // (FINLYNQ-222) and shared with the bank-side delete cascade.
-  const target = await db
-    .select({ id: schema.transactions.id })
-    .from(schema.transactions)
-    .where(
-      and(
-        eq(schema.transactions.id, id),
-        eq(schema.transactions.userId, userId),
-      ),
-    )
-    .get();
-  if (!target) {
-    return NextResponse.json({ error: "Transaction not found" }, { status: 404 });
-  }
-  const allIds = await expandLinkSiblings(userId, [id]);
-
-  // Snapshot freshness — if any row in the delete set touches an investment
-  // holding, capture the earliest affected date BEFORE the rows are gone so we
-  // can mark snapshots dirty after the commit. Best-effort.
-  let snapshotDirtyFrom: string | null = null;
-  // Per-cash-account earliest deleted date → stamp the cash dirty marker so the
-  // chart-load self-heal rebuilds only the affected account(s) from that date.
-  const cashDirtyByAccount = new Map<number, string>();
+  // Thin wrapper (2026-07-30): expansion, edit-guard, lot reversal, the
+  // single-statement delete, the dirty markers and the tx-cache invalidation
+  // all live in `deleteTransactionsCascade` so the bulk / MCP / stdio delete
+  // paths get identical semantics. Only the HTTP shaping stays here.
   try {
-    const delRows = await db
-      .select({
-        date: schema.transactions.date,
-        accountId: schema.transactions.accountId,
-        portfolioHoldingId: schema.transactions.portfolioHoldingId,
-      })
-      .from(schema.transactions)
-      .where(and(eq(schema.transactions.userId, userId), inArray(schema.transactions.id, allIds)));
-    for (const r of delRows) {
-      if (r.portfolioHoldingId != null) {
-        if (snapshotDirtyFrom == null || r.date < snapshotDirtyFrom) snapshotDirtyFrom = r.date;
-      } else if (r.accountId != null) {
-        const cur = cashDirtyByAccount.get(r.accountId);
-        if (cur == null || r.date < cur) cashDirtyByAccount.set(r.accountId, r.date);
+    const outcome = await deleteTransactionsCascade(userId, [id], {
+      confirmReallocation,
+      requireAllSeeds: true,
+    });
+    if (!outcome.ok) {
+      if (outcome.reason === "not_found") {
+        return NextResponse.json({ error: "Transaction not found" }, { status: 404 });
       }
-    }
-  } catch {
-    /* best-effort — never block the delete */
-  }
-
-  // Portfolio edit-guard — applies to EVERY id in the delete set. The user
-  // can't delete a buy that has been sold (the sell's closures lock the buy
-  // in place); they have to delete the sell first. We check each row in the
-  // set and aggregate any blocking ids so the UI can surface a single
-  // actionable list.
-  const deleteIdSet = new Set<number>(allIds);
-  const blockingSet = new Set<number>();
-  for (const txId of allIds) {
-    const guard = await canEditPortfolioRow(userId, txId);
-    if (!guard.allowed && guard.blockingClosureTxIds) {
-      for (const b of guard.blockingClosureTxIds) {
-        // Exclude ids already in the delete set — the user is deleting
-        // them, so they're not "blocking" the operation.
-        if (!deleteIdSet.has(b)) blockingSet.add(b);
-      }
-    }
-  }
-  const blockingClosureTxIds = Array.from(blockingSet);
-  if (blockingClosureTxIds.length > 0 && !confirmReallocation) {
-    // FINLYNQ-176 — without the confirm flag, keep the 409 affordance so the
-    // client can fetch the reallocation preview before proceeding.
-    return NextResponse.json(
-      {
-        error:
-          `This transaction opens one or more lots that have been sold or transferred out. ` +
-          `Delete the ${blockingClosureTxIds.length} dependent transaction(s) first, then retry.`,
-        code: "portfolio_edit_blocked",
-        blockingClosureTxIds,
-      },
-      { status: 409 },
-    );
-  }
-
-  if (blockingClosureTxIds.length > 0) {
-    // FINLYNQ-176 reallocation path. Reverse the dependent closures' lot
-    // effects FIRST so they release the lots the deleted rows opened, then
-    // delete the tx rows, then re-close the dependents (FIFO + auto-short)
-    // against the remaining inventory. STRICT — any error throws → 500.
-    const { __setLotWriteHookStrictMode } = await import(
-      "@/lib/portfolio/lots/write-hooks"
-    );
-    __setLotWriteHookStrictMode(true);
-    try {
-      for (const depId of blockingClosureTxIds) {
-        await reverseLotsForDeleteHook(userId, depId);
-      }
-      for (const txId of allIds) {
-        await reverseLotsForDeleteHook(userId, txId);
-      }
-      for (const txId of allIds) {
-        await deleteTransaction(txId, userId);
-      }
-      // Re-close the (still-existing) dependent transactions against the
-      // post-delete inventory.
-      const ctx = await buildLotContext(userId, null);
-      const depRows = await db
-        .select({
-          id: schema.transactions.id,
-          userId: schema.transactions.userId,
-          date: schema.transactions.date,
-          amount: schema.transactions.amount,
-          currency: schema.transactions.currency,
-          enteredAmount: schema.transactions.enteredAmount,
-          enteredCurrency: schema.transactions.enteredCurrency,
-          quantity: schema.transactions.quantity,
-          accountId: schema.transactions.accountId,
-          categoryId: schema.transactions.categoryId,
-          portfolioHoldingId: schema.transactions.portfolioHoldingId,
-          tradeLinkId: schema.transactions.tradeLinkId,
-          source: schema.transactions.source,
-          kind: schema.transactions.kind,
-        })
-        .from(schema.transactions)
-        .where(and(eq(schema.transactions.userId, userId), inArray(schema.transactions.id, blockingClosureTxIds)));
-      depRows.sort((a, b) => a.date.localeCompare(b.date) || a.id - b.id);
-      for (const r of depRows) {
-        if (r.portfolioHoldingId == null || r.quantity == null) continue;
-        await applyLotEffectsForTx(
-          {
-            id: r.id,
-            userId: r.userId,
-            date: r.date,
-            amount: Number(r.amount ?? 0),
-            currency: r.currency ?? "USD",
-            enteredAmount: r.enteredAmount == null ? null : Number(r.enteredAmount),
-            enteredCurrency: r.enteredCurrency,
-            quantity: Number(r.quantity),
-            accountId: r.accountId,
-            categoryId: r.categoryId,
-            portfolioHoldingId: r.portfolioHoldingId,
-            tradeLinkId: r.tradeLinkId,
-            source: (r.source ?? "manual") as TransactionSource,
-            kind: r.kind,
-          },
-          ctx,
-        );
-      }
-    } finally {
-      __setLotWriteHookStrictMode(false);
-    }
-    invalidateUserTxCache(userId);
-    if (snapshotDirtyFrom) await markSnapshotsDirty(userId, snapshotDirtyFrom);
-    for (const [accId, date] of cashDirtyByAccount) {
-      await markCashSnapshotsDirty(userId, accId, date);
+      // FINLYNQ-176 — keep the 409 affordance so the client can fetch the
+      // reallocation preview before retrying with ?confirmReallocation=1.
+      return NextResponse.json(
+        {
+          error: outcome.message,
+          code: "portfolio_edit_blocked",
+          blockingClosureTxIds: outcome.blockingClosureTxIds,
+        },
+        { status: 409 },
+      );
     }
     return NextResponse.json({
       success: true,
-      deletedIds: allIds,
-      cascaded: allIds.length > 1,
-      reallocated: blockingClosureTxIds,
+      deletedIds: outcome.deletedIds,
+      cascaded: outcome.cascaded,
+      ...(outcome.reallocated.length > 0 ? { reallocated: outcome.reallocated } : {}),
     });
+  } catch (error: unknown) {
+    await logApiError("DELETE", "/api/transactions", error, userId);
+    return NextResponse.json(
+      { error: safeErrorMessage(error, "Failed to delete transaction") },
+      { status: 500 },
+    );
   }
-
-  // No dependent closures — the standard delete path.
-  // Reverse lots BEFORE deleting tx rows so reverseLotsForDeleteHook can
-  // see them. ON DELETE CASCADE on holding_lots.open_tx_id catches any
-  // strays as defense-in-depth.
-  for (const txId of allIds) {
-    await reverseLotsForDeleteHook(userId, txId);
-  }
-  for (const txId of allIds) {
-    await deleteTransaction(txId, userId);
-  }
-  invalidateUserTxCache(userId);
-  if (snapshotDirtyFrom) await markSnapshotsDirty(userId, snapshotDirtyFrom);
-  for (const [accId, date] of cashDirtyByAccount) {
-    await markCashSnapshotsDirty(userId, accId, date);
-  }
-  return NextResponse.json({
-    success: true,
-    deletedIds: allIds,
-    cascaded: allIds.length > 1,
-  });
 }

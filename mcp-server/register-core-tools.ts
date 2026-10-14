@@ -15,6 +15,7 @@ import { z } from "zod";
 import type { PgCompatDb } from "./pg-compat.js";
 import {
   buildLoanSchedule,
+  loanScheduleExtras,
   calculateDebtPayoff,
   LoanValidationError,
   type Debt,
@@ -24,6 +25,8 @@ import {
   validateCurrencyCode,
   validateFxDate,
   collapseLegSources,
+  getRateMap,
+  convertWithRateMap,
 } from "../src/lib/fx-service.js";
 import { SUPPORTED_CURRENCIES } from "../src/lib/fx/supported-currencies.js";
 import { resolveTxAmountsCore } from "../src/lib/currency-conversion.js";
@@ -36,6 +39,11 @@ import {
   verifyConfirmationToken,
 } from "../src/lib/mcp/confirmation-token.js";
 import { InvestmentHoldingRequiredError } from "../src/lib/investment-account.js";
+// GH #341: real rule schemas for update_rule's v2 fields — `z.unknown()` emits
+// an untyped JSON-Schema node that strict MCP clients reject.
+// collectActionFKs + validateInvestmentOpAction: the GH #341 follow-up FK
+// ownership guard (mirrors REST PUT /api/rules).
+import { ConditionGroup, Action, collectActionFKs, validateInvestmentOpAction } from "../src/lib/rules/schema.js";
 import { validateSignVsCategory } from "../src/lib/transactions/sign-category-invariant.js";
 import { ymdDate, ymPeriod, parseYmdSafe } from "./lib/date-validators.js";
 import fs from "fs/promises";
@@ -98,7 +106,7 @@ type SqliteRow = Record<string, unknown>;
  * Returns the user's display currency for a tool call:
  *   - explicit param wins (uppercased)
  *   - else settings.display_currency (uppercased)
- *   - else "CAD"
+ *   - else "USD"
  */
 async function resolveReportingCurrencyStdio(
   sqlite: PgCompatDb,
@@ -114,7 +122,9 @@ async function resolveReportingCurrencyStdio(
   } catch {
     // Best effort — fall through to default.
   }
-  return "CAD";
+  // FINLYNQ-284: USD terminal fallback, matching the HTTP resolver and the
+  // app-wide "default display currency = USD" convention (FINLYNQ-183).
+  return "USD";
 }
 
 /**
@@ -808,7 +818,7 @@ export function registerCoreTools(server: McpServer, sqlite: PgCompatDb, opts: C
       // Investment-account constraint: stdio MCP record_transaction has no
       // portfolio-holding parameter, so it can't satisfy the FK requirement.
       if (acct.is_investment) {
-        return sqliteErr(`Account #${account_id} is an investment account — record_transaction can't write to it (over any transport). Use the HTTP MCP at /mcp (portfolio_buy / portfolio_sell / portfolio_swap / portfolio_transfer / portfolio_deposit / portfolio_withdrawal / portfolio_income_expense / portfolio_fx_conversion) or the web app to record investment activity.`);
+        return sqliteErr(`Account #${account_id} is an investment account — record_transaction can't write to it (over any transport). Use the HTTP MCP at /mcp (portfolio_record_entry, entry_type: buy | sell | swap | transfer | deposit | withdrawal | income_expense | fx_conversion) or the web app to record investment activity.`);
       }
 
       let catId: number | null = null;
@@ -1080,16 +1090,51 @@ export function registerCoreTools(server: McpServer, sqlite: PgCompatDb, opts: C
   );
 
   // ── delete_transaction ─────────────────────────────────────────────────────
+  // Routed through the SHARED delete chokepoint (2026-07-30). This used to be
+  // a bare single-row DELETE: no link-sibling cascade (so deleting one leg of
+  // a transfer left the other behind as phantom money), no lot reversal (so
+  // closures pointed at a deleted open), no snapshot-dirty markers. stdio has
+  // no DEK and no confirmation-token machinery — that stays as documented —
+  // but the ledger-integrity steps are transport-independent and now apply.
+  //
+  // The chokepoint is `@/db`-backed, not pg-compat; the stdio entry
+  // (mcp-server/index.ts) registers that adapter at startup.
   server.tool(
     "delete_transaction",
-    "Permanently delete a transaction by ID",
-    { id: z.number().describe("Transaction ID to delete") },
-    async ({ id }) => {
+    "Permanently delete a transaction by ID. If the row is one leg of a transfer / trade / swap, ALL linked legs are deleted together (deleting just one would leave phantom money in the other account) — pass confirm_cascade to acknowledge.",
+    {
+      id: z.number().describe("Transaction ID to delete"),
+      confirm_cascade: z.boolean().optional().describe("Acknowledge that every linked sibling leg will be deleted too. Without it, a linked row is refused and the refusal names each sibling id."),
+    },
+    async ({ id, confirm_cascade }) => {
       const t = await sqlite.prepare(`SELECT id, payee, amount, date FROM transactions WHERE id = ? AND user_id = ?`).get(id, userId) as { id: number; payee: string; amount: number; date: string } | undefined;
       if (!t) return sqliteErr(`Transaction #${id} not found or not owned by user`);
-      await sqlite.prepare(`DELETE FROM transactions WHERE id = ? AND user_id = ?`).run(id, userId);
-      invalidateUserTxCache(userId);
-      return txt({ success: true, data: { message: `Deleted transaction #${id}: "${t.payee}" ${t.amount} on ${t.date}` } });
+      try {
+        const { planTransactionDelete, deleteTransactionsCascade } = await import(
+          "../src/lib/transactions/delete-cascade.js"
+        );
+        const plan = await planTransactionDelete(userId, [id]);
+        if (plan.siblingIds.length > 0 && !confirm_cascade) {
+          return sqliteErr(
+            `Transaction #${id} is one leg of a linked pair. Deleting it also deletes ` +
+            `${plan.siblingIds.length} sibling row(s): #${plan.siblingIds.join(", #")} ` +
+            `(total ${plan.ids.length} rows). Re-run with confirm_cascade: true to proceed.`,
+          );
+        }
+        const outcome = await deleteTransactionsCascade(userId, [id], { plan });
+        if (!outcome.ok) return sqliteErr(outcome.message);
+        const extra = outcome.deletedIds.length > 1
+          ? ` (cascaded to ${outcome.deletedIds.length} linked rows: #${outcome.deletedIds.join(", #")})`
+          : "";
+        return txt({ success: true, data: { message: `Deleted transaction #${id}: "${t.payee}" ${t.amount} on ${t.date}${extra}`, deletedIds: outcome.deletedIds, cascaded: outcome.cascaded } });
+      } catch (e) {
+        // Fail LOUD rather than falling back to the unsafe bare DELETE — an
+        // orphaned transfer leg is worse than a refused delete.
+        return sqliteErr(
+          `Delete refused: the ledger-integrity path is unavailable (${e instanceof Error ? e.message : String(e)}). ` +
+          `Delete this transaction from the web app or HTTP MCP instead.`,
+        );
+      }
     }
   );
 
@@ -1357,7 +1402,7 @@ export function registerCoreTools(server: McpServer, sqlite: PgCompatDb, opts: C
       name: z.string().describe("Account name (must be unique)"),
       type: z.enum(["A", "L"]).describe("'A'=asset, 'L'=liability"),
       group: z.string().optional().describe("Account group"),
-      currency: supportedCurrencyEnum.optional().describe("Currency (default CAD)"),
+      currency: supportedCurrencyEnum.optional().describe("Currency (defaults to your display currency)"),
       note: z.string().optional(),
       alias: z.string().max(64).optional().describe("Optional short alias used to match the account when receipts or imports reference it by a non-canonical name (e.g. last 4 digits of a card, or a receipt label)."),
     },
@@ -1811,7 +1856,7 @@ export function registerCoreTools(server: McpServer, sqlite: PgCompatDb, opts: C
           get_investment_insights: "get_investment_insights(mode?, targets?, benchmark?) — mode: 'patterns' (default), 'rebalancing' (needs targets), 'benchmark'",
           get_net_worth: "get_net_worth(currency?, months?) — Omit months for current totals; set months>0 for a trend.",
           record_transfer: "record_transfer(from_account_id, to_account_id, amount, ...) — Atomic transfer pair. Stdio requires numeric ids; HTTP MCP also accepts fromAccount/toAccount (strict fuzzy fail-loud ambiguity per issue #234). In-kind: holding+quantity.",
-          portfolio_buy: "portfolio_buy / portfolio_sell / portfolio_swap / portfolio_transfer / portfolio_deposit / portfolio_withdrawal / portfolio_income_expense / portfolio_fx_conversion — HTTP MCP only (need an unlocked DEK; unavailable on stdio). Canonical investment writes; record_transaction rejects investment accounts.",
+          portfolio_buy: "portfolio_buy is a hidden HTTP-only alias for portfolio_record_entry (entry_type: buy). portfolio_record_entry (entry_type: buy | sell | swap | transfer | deposit | withdrawal | income_expense | fx_conversion) is the canonical investment write — HTTP MCP only (need an unlocked DEK; unavailable on stdio). record_transaction rejects investment accounts.",
           preview_bulk_update: "preview_bulk_update(filter, changes) — stdio-accepted `changes` keys: category_id, category (name → id), account_id, date, note, payee, is_business, tags. Unknown keys fail strictly. Returns affectedCount, sampleBefore/After, unappliedChanges[{field, requestedValue, reason}], confirmationToken. sampleAfter.category re-hydrates to the resolved name when `category` resolves. (HTTP transport adds quantity, portfolioHoldingId, portfolioHolding.)",
           execute_bulk_update: "execute_bulk_update(filter, changes, confirmation_token) — re-runs name→id resolution and aborts when the resolved set is empty. Returns {updated, unappliedChanges[{field, requestedValue, reason}]}. Stdio: category-by-name only (HTTP supports quantity/holding writes too).",
         };
@@ -1825,14 +1870,14 @@ export function registerCoreTools(server: McpServer, sqlite: PgCompatDb, opts: C
         write_tools: ["record_transaction", "bulk_record_transactions", "update_transaction", "delete_transaction", "set_budget", "delete_budget", "add_account", "update_account", "delete_account", "add_goal", "update_goal", "delete_goal", "create_category", "delete_category", "create_rule", "add_snapshot", "apply_rules_to_uncategorized"],
         portfolio_tools: ["get_portfolio_analysis", "get_portfolio_performance", "analyze_holding", "trace_holding_quantity", "get_investment_insights"],
         transfer_tools: ["record_transfer"],
-        tip: "Finlynq records bookkeeping entries in your own database; it never connects to a brokerage or bank or moves real money. Use tool_name='record_transaction' for usage details. Investment accounts CANNOT use record_transaction / bulk_record_transactions / record_transfer for trades — use the HTTP-MCP portfolio_* tools (portfolio_buy / portfolio_sell / portfolio_swap / portfolio_transfer / portfolio_deposit / portfolio_withdrawal / portfolio_income_expense / portfolio_fx_conversion), which are unavailable on stdio (no DEK). record_transfer remains the path for plain cash transfers between non-investment accounts.",
+        tip: "Finlynq records bookkeeping entries in your own database; it never connects to a brokerage or bank or moves real money. Use tool_name='record_transaction' for usage details. Investment accounts CANNOT use record_transaction / bulk_record_transactions / record_transfer for trades — use the HTTP-MCP portfolio_record_entry (entry_type: buy | sell | swap | transfer | deposit | withdrawal | income_expense | fx_conversion), which is unavailable on stdio (no DEK). record_transfer remains the path for plain cash transfers between non-investment accounts.",
       });
 
       if (t === "schema") return dataResponse({
         key_tables: {
           transactions: "id, date, account_id, category_id, currency, amount, payee, note, tags",
           accounts: "id, type(A/L), group, name, currency, note",
-          categories: "id, type(E/I/T), group, name, note",
+          categories: "id, type(E/I/R), group, name, note",
           budgets: "id, category_id, month(YYYY-MM), amount",
           goals: "id, name, type, target_amount, deadline, status, account_id",
           transaction_rules: "id, name, conditions (JSONB ConditionGroup, AND-only), actions (JSONB Action[]), priority, is_active, created_at, updated_at (FINLYNQ-84)",
@@ -1965,7 +2010,7 @@ export function registerCoreTools(server: McpServer, sqlite: PgCompatDb, opts: C
     async ({ loan_id, as_of_date, reportingCurrency }) => {
       const reporting = await resolveReportingCurrencyStdio(sqlite, userId, reportingCurrency);
       const loan = await sqlite.prepare(
-        `SELECT id, principal, annual_rate, term_months, start_date, payment_amount, payment_frequency, extra_payment, residual_value, currency FROM loans WHERE id = ? AND user_id = ?`
+        `SELECT id, principal, annual_rate, term_months, start_date, payment_amount, payment_frequency, extra_payment, residual_value, manual_schedule, interest_overrides, interest_method, interest_amount, currency FROM loans WHERE id = ? AND user_id = ?`
       ).get(loan_id, userId) as SqliteRow | undefined;
       if (!loan) return sqliteErr(`Loan #${loan_id} not found`);
       // Issue #213 — guard against legacy bad start_date so this tool no
@@ -1990,6 +2035,7 @@ export function registerCoreTools(server: McpServer, sqlite: PgCompatDb, opts: C
           paymentFrequency: String(loan.payment_frequency ?? "monthly"),
           extraPayment: Number(loan.extra_payment ?? 0),
           residualValue: loan.residual_value == null ? null : Number(loan.residual_value),
+          ...loanScheduleExtras(loan),
         });
       } catch (e) {
         if (e instanceof LoanValidationError) return sqliteErr(e.message);
@@ -2004,7 +2050,9 @@ export function registerCoreTools(server: McpServer, sqlite: PgCompatDb, opts: C
         data: {
           loanId: loan_id,
           // Stream D Phase 4: loanName omitted on stdio (cannot decrypt name_ct).
-          loanCurrency: loan.currency ?? "CAD",
+          // FINLYNQ-183/284: never a CAD literal — a loan with no explicit
+          // currency reads as the user's own reporting currency.
+          loanCurrency: String(loan.currency ?? reporting).toUpperCase(),
           reportingCurrency: reporting,
           asOfDate: cutoff,
           monthlyPayment: summary.monthlyPayment,
@@ -2033,7 +2081,7 @@ export function registerCoreTools(server: McpServer, sqlite: PgCompatDb, opts: C
   // ── get_debt_payoff_plan ──────────────────────────────────────────────────
   server.tool(
     "get_debt_payoff_plan",
-    "Compare avalanche vs snowball payoff across all user loans. Loan balances stay in each loan's own currency; reportingCurrency is surfaced as metadata.",
+    "Compare avalanche vs snowball payoff across all user loans. Balances and minimum payments are converted to reportingCurrency before ranking and before the shared extra_payment budget is applied; `inputs.debts` echoes each loan's native currency and amount. extra_payment is interpreted in reportingCurrency.",
     {
       strategy: z.enum(["avalanche", "snowball", "both"]).optional(),
       extra_payment: z.number().optional(),
@@ -2042,14 +2090,24 @@ export function registerCoreTools(server: McpServer, sqlite: PgCompatDb, opts: C
     async ({ strategy, extra_payment, reportingCurrency }) => {
       const reporting = await resolveReportingCurrencyStdio(sqlite, userId, reportingCurrency);
       const loans = await sqlite.prepare(
-        `SELECT id, principal, annual_rate, term_months, start_date, payment_amount, payment_frequency, extra_payment, residual_value FROM loans WHERE user_id = ?`
+        `SELECT id, principal, annual_rate, term_months, start_date, payment_amount, payment_frequency, extra_payment, residual_value, manual_schedule, interest_overrides, interest_method, interest_amount, currency FROM loans WHERE user_id = ?`
       ).all(userId) as SqliteRow[];
       if (!loans.length) return txt({ success: true, data: { message: "No loans found", strategies: {} } });
+      // FINLYNQ-123: snowball ranks by balance and the extra_payment budget is
+      // pooled across every debt, so all balances must share one currency
+      // first. Mirrors the HTTP tool in mcp-server/tools/loans.ts.
+      const rateMap = await getRateMap(reporting, userId);
       const today = new Date().toISOString().split("T")[0];
       // Issue #213 — split out legacy bad rows so one bad start_date no
       // longer poisons the whole strategy computation.
       const excluded: Array<{ loanId: number; error: string; value: unknown }> = [];
       const debts: Debt[] = [];
+      // Native-currency echo alongside the converted figures the strategy uses.
+      const debtsNative: Array<{
+        id: number; currency: string;
+        nativeBalance: number; nativeMinPayment: number;
+        balance: number; minPayment: number;
+      }> = [];
       for (const l of loans) {
         if (parseYmdSafe(String(l.start_date)) === null) {
           excluded.push({ loanId: Number(l.id), error: "invalid start_date", value: l.start_date });
@@ -2066,6 +2124,7 @@ export function registerCoreTools(server: McpServer, sqlite: PgCompatDb, opts: C
             paymentFrequency: String(l.payment_frequency ?? "monthly"),
             extraPayment: Number(l.extra_payment ?? 0),
             residualValue: l.residual_value == null ? null : Number(l.residual_value),
+            ...loanScheduleExtras(l),
           });
         } catch (e) {
           if (e instanceof LoanValidationError) {
@@ -2076,20 +2135,35 @@ export function registerCoreTools(server: McpServer, sqlite: PgCompatDb, opts: C
         }
         const paid = summary.schedule.filter((r) => r.date <= today);
         const principalPaid = paid.reduce((s, r) => s + r.principal, 0);
-        const balance = Math.max(Number(l.principal) - principalPaid, 0);
-        const minPayment = Number(l.payment_amount ?? summary.monthlyPayment);
+        const nativeBalance = Math.round(Math.max(Number(l.principal) - principalPaid, 0) * 100) / 100;
+        const nativeMinPayment = Number(l.payment_amount ?? summary.monthlyPayment);
+        const loanCurrency = String(l.currency ?? reporting).toUpperCase();
+        const balance = Math.round(convertWithRateMap(nativeBalance, loanCurrency, rateMap) * 100) / 100;
+        const minPayment = Math.round(convertWithRateMap(nativeMinPayment, loanCurrency, rateMap) * 100) / 100;
         debts.push({
           id: Number(l.id),
           // Stream D Phase 4: stdio cannot decrypt loan name — surface id only.
           name: `Loan #${Number(l.id)}`,
-          balance: Math.round(balance * 100) / 100,
+          balance,
           rate: Number(l.annual_rate),
+          minPayment,
+        });
+        debtsNative.push({
+          id: Number(l.id),
+          currency: loanCurrency,
+          nativeBalance,
+          nativeMinPayment,
+          balance,
           minPayment,
         });
       }
       const strat = strategy ?? "both";
       const extra = extra_payment ?? 0;
-      const result: Record<string, unknown> = { inputs: { extraPayment: extra, debts }, reportingCurrency: reporting };
+      const result: Record<string, unknown> = {
+        inputs: { extraPayment: extra, extraPaymentCurrency: reporting, debts: debtsNative },
+        reportingCurrency: reporting,
+        amountsConvertedTo: reporting,
+      };
       if (excluded.length) result.excluded = excluded;
       if (strat === "avalanche" || strat === "both") result.avalanche = calculateDebtPayoff(debts, extra, "avalanche");
       if (strat === "snowball" || strat === "both") result.snowball = calculateDebtPayoff(debts, extra, "snowball");
@@ -2362,8 +2436,8 @@ export function registerCoreTools(server: McpServer, sqlite: PgCompatDb, opts: C
       assign_category_id: z.number().int().nullable().optional().describe("Legacy: category FK for set_category action"),
       assign_tags: z.string().optional(),
       rename_to: z.string().optional(),
-      conditions: z.unknown().optional().describe("v2: ConditionGroup JSON. Replaces conditions entirely."),
-      actions: z.unknown().optional().describe("v2: Action[] JSON. Replaces actions entirely."),
+      conditions: ConditionGroup.optional().describe("v2: ConditionGroup JSON ({all:[...]}). Replaces conditions entirely."),
+      actions: z.array(Action).min(1).max(10).optional().describe("v2: Action[] JSON. Replaces actions entirely."),
       is_active: z.boolean().optional(),
       priority: z.number().optional(),
     },
@@ -2405,6 +2479,44 @@ export function registerCoreTools(server: McpServer, sqlite: PgCompatDb, opts: C
       } else if (hasV2) {
         if (conditions !== undefined) condsJson = JSON.stringify(conditions);
         if (actions !== undefined) actionsJson = JSON.stringify(actions);
+      }
+
+      // GH #341 follow-up — the v2 shape is schema-validated but the ids
+      // inside it are not. Mirror REST PUT /api/rules (and the HTTP
+      // manage_rules op:update): re-validate record_investment_op, then
+      // cross-tenant FK ownership pre-check over every id in actions[] +
+      // account conditions. Goes through the pg-compat shim (NOT the @/db
+      // verifyOwnership) so it still guards when the shared-adapter
+      // bootstrap failed.
+      if (hasV2) {
+        for (const a of actions ?? []) {
+          if (a.kind !== "record_investment_op") continue;
+          const code = validateInvestmentOpAction(a);
+          if (code) return sqliteErr(`Investment-op action (${a.op}) is incomplete: ${code}`);
+        }
+        const fks = collectActionFKs(actions ?? []);
+        if (conditions !== undefined) {
+          for (const c of conditions.all) {
+            if (c.field === "account") fks.accountIds.push(c.accountId);
+          }
+        }
+        const notOwned = async (table: string, label: string, ids: number[]) => {
+          const uniq = [...new Set(ids)];
+          if (uniq.length === 0) return null;
+          const placeholders = uniq.map(() => "?").join(",");
+          const owned = await sqlite.prepare(
+            `SELECT id FROM ${table} WHERE user_id = ? AND id IN (${placeholders})`
+          ).all(userId, ...uniq) as SqliteRow[];
+          const ownedSet = new Set(owned.map((r) => Number(r.id)));
+          const missing = uniq.filter((n) => !ownedSet.has(n));
+          // Anti-enumeration: "not found", never "belongs to someone else".
+          return missing.length ? sqliteErr(`${label} id(s) not found: ${missing.join(", ")}`) : null;
+        };
+        const refusal =
+          (await notOwned("categories", "category", fks.categoryIds))
+          ?? (await notOwned("accounts", "account", fks.accountIds))
+          ?? (await notOwned("portfolio_holdings", "holding", fks.holdingIds));
+        if (refusal) return refusal;
       }
 
       const updates: string[] = [];
@@ -3296,83 +3408,35 @@ export function registerCoreTools(server: McpServer, sqlite: PgCompatDb, opts: C
       "This tool requires the HTTP MCP transport because staging operations need to read or write encrypted data under your DEK. Connect via the HTTP MCP at /mcp instead, or use the web UI at /import/pending.",
     );
 
+  // reconcile-consolidation §6a — the staged-import + bank-reconcile cohort is
+  // folded into 3 HTTP-only discriminated-union tools. stdio can't run them
+  // (staging/reconcile need the user's DEK), so it registers refusal STUBS under
+  // the NEW names (the retired per-verb names — update_staged_transaction,
+  // approve_staged_rows, … — no longer exist on ANY transport). Each stub takes
+  // a loose `op` field for parity with the HTTP schema and refuses cleanly.
   server.tool(
-    "list_staged_imports",
-    "List the user's staged imports (HTTP MCP only — stdio refuses; staging needs the DEK).",
+    "manage_statement_import",
+    "Manage the staged-import lifecycle: upload/list/get/list_rows/update_row/link_transfer_pair/approve/send_to_bank_ledger/apply_rules/reject (HTTP MCP only — stdio refuses; staging needs the DEK).",
     {
-      status: z.enum(["pending", "imported", "rejected"]).optional(),
-      limit: z.number().int().positive().optional(),
+      op: z.string().describe("The staged-import operation (HTTP MCP only)."),
     },
     async () => stagingHttpOnlyError(),
   );
 
   server.tool(
-    "get_staged_import",
-    "Fetch full detail for one staged import (HTTP MCP only — stdio refuses; staging needs the DEK).",
-    { stagedImportId: z.string() },
-    async () => stagingHttpOnlyError(),
-  );
-
-  server.tool(
-    "list_staged_transactions",
-    "Flat list of staged transaction rows (HTTP MCP only — stdio refuses; staging needs the DEK).",
+    "reconcile",
+    "Reconcile a bank statement against the ledger for one account: suggest/accept/unlink/materialize/apply_rules (HTTP MCP only — stdio refuses; reconcile needs the DEK).",
     {
-      stagedImportId: z.string().optional(),
-      dedupStatus: z.enum(["new", "existing", "probable_duplicate"]).optional(),
-      rowStatus: z.enum(["pending", "approved", "rejected"]).optional(),
-      txType: z.enum(["E", "I", "R"]).optional(),
-      limit: z.number().int().positive().optional(),
+      op: z.string().describe("The reconcile operation (HTTP MCP only)."),
     },
     async () => stagingHttpOnlyError(),
   );
 
   server.tool(
-    "update_staged_transaction",
-    "Edit a single staged transaction row (HTTP MCP only — stdio refuses; staging needs the DEK).",
+    "manage_bank_ledger",
+    "Maintain bank-ledger rows and balance anchors: list_anchors/upsert_anchor/find_duplicates/delete_row (HTTP MCP only — stdio refuses; the reconcile cohort needs the DEK).",
     {
-      stagedTransactionId: z.string(),
-      txType: z.enum(["E", "I", "R"]).optional(),
-      payee: z.string().optional(),
-      category: z.string().optional(),
-      note: z.string().optional(),
-      tags: z.string().optional(),
-      quantity: z.number().nullable().optional(),
-      portfolioHoldingId: z.number().int().nullable().optional(),
-      enteredAmount: z.number().nullable().optional(),
-      enteredCurrency: z.string().nullable().optional(),
-      peerStagedId: z.string().nullable().optional(),
-      targetAccountId: z.number().int().nullable().optional(),
-      forceCommit: z.boolean().optional(),
-    },
-    async () => stagingHttpOnlyError(),
-  );
-
-  server.tool(
-    "link_staged_transfer_pair",
-    "Sugar over update_staged_transaction (HTTP MCP only — stdio refuses; staging needs the DEK).",
-    { rowAId: z.string(), rowBId: z.string() },
-    async () => stagingHttpOnlyError(),
-  );
-
-  server.tool(
-    "approve_staged_rows",
-    "Materialize staged rows into the live transactions table (HTTP MCP only — stdio refuses; staging needs the DEK).",
-    {
-      stagedImportId: z.string(),
-      rowIds: z.array(z.string()).optional(),
-      forceImportIndices: z.array(z.number().int()).optional(),
-      idempotencyKey: z.string().uuid().optional(),
-      confirmation_token: z.string().optional(),
-    },
-    async () => stagingHttpOnlyError(),
-  );
-
-  server.tool(
-    "reject_staged_import",
-    "Reject (hard-delete) a staged import (HTTP MCP only — stdio refuses; staging needs the DEK).",
-    {
-      stagedImportId: z.string(),
-      confirmation_token: z.string().optional(),
+      op: z.string().describe("The bank-ledger operation (HTTP MCP only)."),
     },
     async () => stagingHttpOnlyError(),
   );

@@ -8,6 +8,7 @@ import { Card, CardContent } from "@/components/ui/card";
 import { Table, TableBody, TableCell, TableHead, TableHeader, TableRow } from "@/components/ui/table";
 import { Badge } from "@/components/ui/badge";
 import { formatCurrency } from "@/lib/currency";
+import { loanHref, useLinkedLoans } from "@/lib/hooks/useLinkedLoans";
 import {
   ArrowLeft,
   Wallet,
@@ -22,6 +23,7 @@ import {
   Receipt,
   TrendingUp,
   ChevronDown,
+  Landmark,
 } from "lucide-react";
 import { Dialog, DialogContent, DialogHeader, DialogTitle } from "@/components/ui/dialog";
 import { AccountDialog } from "../_components/account-dialog";
@@ -37,6 +39,7 @@ import { Button } from "@/components/ui/button";
 import { Label } from "@/components/ui/label";
 import { Combobox, type ComboboxItemShape } from "@/components/ui/combobox";
 import { ConfirmDialog } from "@/components/ui/confirm-dialog";
+import { ErrorState } from "@/components/error-state";
 import { useActiveCurrencies } from "@/lib/hooks/useActiveCurrencies";
 import { ModePicker } from "@/components/inbox/mode-picker";
 import { ImportPrefsPicker } from "@/components/inbox/import-prefs-picker";
@@ -103,7 +106,12 @@ export default function AccountDetailPage() {
   const { id } = useParams();
   const router = useRouter();
   const [account, setAccount] = useState<Account | null>(null);
+  // Loans that track this account, so the account can link straight to them.
+  const linkedLoans = useLinkedLoans().get(Number(id)) ?? [];
   const [accounts, setAccounts] = useState<Account[]>([]);
+  /** The account lookup finished and produced nothing (missing id, not yours,
+   *  or the request failed) — as opposed to "still in flight". */
+  const [loadFailed, setLoadFailed] = useState(false);
   // Transaction COUNT for the stat card. The list itself is rendered by the
   // embedded <TransactionsWorkspace> below (its own SWR fetch); this page only
   // needs the total for the header tile.
@@ -272,8 +280,11 @@ export default function AccountDetailPage() {
 
   // Re-fetch this account fresh (decrypted name/alias) after a save — avoids
   // depending on the PUT response shape and keeps `accounts` in sync.
+  // `includeArchived=1` is load-bearing here as well as on the initial load:
+  // archiving from this page's own Edit dialog re-runs this, and without it the
+  // account the user just archived would vanish from under them.
   function reloadAccount() {
-    fetch("/api/accounts")
+    fetch("/api/accounts?includeArchived=1")
       .then((r) => r.json())
       .then((accts: Account[]) => {
         if (!Array.isArray(accts)) return;
@@ -303,13 +314,27 @@ export default function AccountDetailPage() {
   }
 
   useEffect(() => {
-    fetch("/api/accounts")
+    // `includeArchived=1`: GET /api/accounts hides archived accounts by default
+    // (it is the lists/pickers source), but THIS page is the detail view — and
+    // the only place the Unarchive button lives. Without the flag an archived
+    // account was never found, `account` stayed null, and the render guard
+    // below sat on its loading skeleton forever: the account became both
+    // unviewable and permanently un-unarchivable from the web UI.
+    setLoadFailed(false);
+    fetch("/api/accounts?includeArchived=1")
       .then((r) => r.json())
       .then((accts: Account[]) => {
         setAccounts(Array.isArray(accts) ? accts : []);
-        const found = accts.find((a: Account) => a.id === Number(id));
+        const found = Array.isArray(accts)
+          ? accts.find((a: Account) => a.id === Number(id))
+          : undefined;
         setAccount(found ?? null);
-      });
+        // Distinguish "still loading" from "no such account". Both used to
+        // render the same endless skeleton, so a bad/foreign id looked
+        // identical to a slow network.
+        if (!found) setLoadFailed(true);
+      })
+      .catch(() => setLoadFailed(true));
 
     // Fetch the computed balance from the dashboard API. For investment
     // accounts, balance = market value of holdings; cashFlowBasis is the
@@ -340,6 +365,18 @@ export default function AccountDetailPage() {
     else if (hash === "#import-prefs") openEdit("import");
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [account]);
+
+  if (!account && loadFailed) return (
+    <div className="space-y-6">
+      <Link href="/accounts" className="inline-flex items-center gap-1.5 text-sm text-muted-foreground hover:text-foreground transition-colors">
+        <ArrowLeft className="h-4 w-4" /> Back to Accounts
+      </Link>
+      <ErrorState
+        title="Account not found"
+        message="This account doesn't exist, or it isn't one of yours."
+      />
+    </div>
+  );
 
   if (!account) return (
     <div className="space-y-6">
@@ -376,13 +413,14 @@ export default function AccountDetailPage() {
     (o) => o.op === "deposit" || o.op === "withdrawal",
   );
 
-  const dialogAccount: DialogAccount = {
-    id: account.id,
-    name: account.name,
-    currency: account.currency,
-    type: account.type,
-    isInvestment: account.isInvestment,
-  };
+  // EVERY account goes to the dialog, with this one pre-selected. It used to
+  // get this account alone, which left the Transfer tab with no destination to
+  // offer ("No matches"): a transfer needs a second account. The viewed account
+  // is passed as not archived so it stays selectable on its own page, as it
+  // always was; the dialog hides other archived accounts when creating.
+  const dialogAccounts: DialogAccount[] = accounts.map((a) =>
+    a.id === account.id ? { ...a, archived: false } : a,
+  );
 
   return (
     <div className="space-y-6">
@@ -404,6 +442,12 @@ export default function AccountDetailPage() {
               </Badge>
               {isInvestment && (
                 <Badge variant="secondary" className="text-[10px]">Investment</Badge>
+              )}
+              {account.archived === true && (
+                <Badge variant="secondary" className="text-[10px]">Archived</Badge>
+              )}
+              {linkedLoans.length > 0 && (
+                <Badge variant="secondary" className="text-[10px]">Loan</Badge>
               )}
             </div>
           </div>
@@ -444,6 +488,18 @@ export default function AccountDetailPage() {
               </DropdownMenuGroup>
             </DropdownMenuContent>
           </DropdownMenu>
+          {linkedLoans.map((l) => (
+            <Button
+              key={l.id}
+              variant="outline"
+              size="sm"
+              render={<Link href={loanHref(l.id)} />}
+              title={`Open the loan "${l.name}" and its schedule`}
+            >
+              <Landmark className="h-3.5 w-3.5 mr-1.5" />
+              {linkedLoans.length === 1 ? "View loan" : l.name}
+            </Button>
+          ))}
           <Button variant="outline" size="sm" onClick={() => openEdit("details")}>
             <Pencil className="h-3.5 w-3.5 mr-1.5" /> Edit
           </Button>
@@ -507,7 +563,11 @@ export default function AccountDetailPage() {
       {/* Balance Over Time — accurate daily series (cash live from
           transactions, investments from stored snapshots).
           plan/net-worth-over-time.md Part A. */}
-      <NetWorthHistoryChart accountId={account.id} title="Balance Over Time" />
+      <NetWorthHistoryChart
+        accountId={account.id}
+        title="Balance Over Time"
+        accountCurrency={account.currency}
+      />
 
       {/* Reconciliation mode, Import preferences, and Cash sleeves moved into
           the Edit dialog (FINLYNQ-227) — they declutter the main page and are
@@ -534,12 +594,14 @@ export default function AccountDetailPage() {
       <TransactionDialog
         open={txDialogOpen}
         onOpenChange={setTxDialogOpen}
-        accounts={[dialogAccount]}
+        accounts={dialogAccounts}
         categories={dialogCategories}
         holdings={dialogHoldings}
         initialState={{
           kind: "transaction-prefill",
           values: { accountId: String(account.id), currency: account.currency },
+          // Transfer tab: money leaves this account unless the user says otherwise.
+          transferSeed: { fromAccountId: String(account.id) },
         }}
         onSaved={() => {
           setTxDialogOpen(false);
