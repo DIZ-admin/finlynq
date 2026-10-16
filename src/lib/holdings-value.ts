@@ -20,6 +20,7 @@ import { isMetalCurrency, isCryptoSymbol, isCurrencyCodeSymbol } from "@/lib/fx/
 import { decryptNamedRows } from "@/lib/crypto/encrypted-columns";
 import { cashLegSkipSql } from "@/lib/portfolio/aggregation-predicates";
 import { todayISO } from "@/lib/utils/date";
+import { loadLotCostByHolding } from "@/lib/portfolio/lots/cost-basis";
 import { effectivePriceAtDate, loadCustomPriceMap } from "@/lib/securities/custom-prices";
 
 export type AccountHoldingsValue = {
@@ -47,6 +48,33 @@ export type HoldingValue = {
   currency: string;     // account currency
 };
 
+/**
+ * Float dust threshold for "this position no longer exists". Matches the
+ * epsilon the lot engine already uses (`lots/replan.ts`, `lots/write-hooks.ts`)
+ * so a sold-out position with IEEE-754 residue is treated identically here.
+ */
+export const QTY_EPSILON = 1e-9;
+
+/**
+ * Is this net quantity a real position worth valuing?
+ *
+ * ONLY ~zero is excluded. A NEGATIVE net quantity is a genuine position — an
+ * overdrawn cash sleeve, or a short — and must be valued at its (negative)
+ * market value, not dropped.
+ *
+ * Review 2026-07-30 finding #2: the guard here used to be `qty <= 0`, which
+ * silently deleted every net-negative position from this aggregator while
+ * `/api/portfolio/overview` kept them (its own guards are `quantity !== 0`).
+ * Because this function feeds account balances, net-worth snapshots, goals
+ * progress and the MCP balance tools, a cash sleeve netting −1000 reported as
+ * 0 in all of those and −1000 on the portfolio page — a cross-aggregator
+ * disagreement that always erred toward INFLATING net worth (invariant tc-1b
+ * requires the −1000).
+ */
+export function isMaterialQty(qty: number): boolean {
+  return Number.isFinite(qty) && Math.abs(qty) >= QTY_EPSILON;
+}
+
 export type HoldingsValueOpts = {
   /**
    * Compute the snapshot as of this date (ISO YYYY-MM-DD). Transactions
@@ -69,6 +97,19 @@ async function valueHoldingsAtDate(
 ): Promise<HoldingValue[]> {
   const asOfDate = opts?.asOfDate ?? todayISO();
   const isToday = asOfDate >= todayISO();
+  // The user's cost-basis method. With advanced lot allocation on, each
+  // position's cost basis is the cost of the lots still held. Loaded for a
+  // CURRENT valuation only: historical callers (net-worth snapshots) read
+  // `.value`, and reloading every lot per date would cost a great deal for a
+  // figure they never use. Holding id -> cost in the holding's currency.
+  const lotCostBasisByHolding = new Map<number, number>();
+  if (isToday) {
+    // Null on the simple method; cash sleeves are already left out.
+    const lotCost = await loadLotCostByHolding(userId, dek ?? null);
+    for (const [holdingId, lot] of lotCost ?? []) {
+      if (lot.qty > 1e-9) lotCostBasisByHolding.set(holdingId, lot.costBasis);
+    }
+  }
   // Stream D Phase 4 — plaintext name/symbol dropped; ciphertext only.
   const rawHoldings = await db
     .select({
@@ -294,7 +335,7 @@ async function valueHoldingsAtDate(
   for (const h of holdings) {
     if (h.accountId == null) continue;
     const qty = qtyByHoldingId.get(h.id) ?? 0;
-    if (qty <= 0) continue;
+    if (!isMaterialQty(qty)) continue;
 
     const accountCurrency = h.accountCurrency ?? h.currency;
     let price: number | null = null;
@@ -382,8 +423,16 @@ async function valueHoldingsAtDate(
       totalBuyAmountInHoldingCcy += b.buyAmountInEntered * fxToHoldingCcy;
     }
     const avgCostInHoldingCcy = totalBuyQty > 0 ? totalBuyAmountInHoldingCcy / totalBuyQty : null;
+    // Advanced lot allocation: the cost of the lots still held replaces the
+    // average of every purchase. Same rule as /api/portfolio/overview (a long
+    // position with lots; cash sleeves stay on the ledger path), so the
+    // Portfolio page, account balances and the MCP tools report one figure.
+    const lotCostBasis = h.isCash === true ? undefined : lotCostBasisByHolding.get(h.id);
     let costBasisInAccountCcy: number;
-    if (avgCostInHoldingCcy != null) {
+    if (lotCostBasis != null) {
+      const fxHoldingToAccount = await getFx(h.currency, accountCurrency);
+      costBasisInAccountCcy = lotCostBasis * fxHoldingToAccount;
+    } else if (avgCostInHoldingCcy != null) {
       const costBasisInHoldingCcy = qty * avgCostInHoldingCcy;
       const fxHoldingToAccount = await getFx(h.currency, accountCurrency);
       costBasisInAccountCcy = costBasisInHoldingCcy * fxHoldingToAccount;

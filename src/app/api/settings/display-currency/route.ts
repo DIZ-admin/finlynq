@@ -3,11 +3,14 @@ import { z } from "zod";
 import { requireAuth } from "@/lib/auth/require-auth";
 import { db, schema } from "@/db";
 import { eq, and } from "drizzle-orm";
-import { isSupportedCurrency } from "@/lib/fx/supported-currencies";
+import { isReportableCurrency } from "@/lib/fx/supported-currencies";
 import { validateBody, safeErrorMessage, logApiError } from "@/lib/validate";
-import { recomputeReportingAmounts } from "@/lib/fx/reporting-amount";
+import {
+  setDisplayCurrency,
+  DEFAULT_DISPLAY_CURRENCY,
+} from "@/lib/settings/display-currency";
 
-const DEFAULT_CURRENCY = "CAD";
+const DEFAULT_CURRENCY = DEFAULT_DISPLAY_CURRENCY;
 
 export async function GET(request: NextRequest) {
   const auth = await requireAuth(request);
@@ -49,10 +52,18 @@ export async function PUT(request: NextRequest) {
   if (parsed.error) return parsed.error;
   const { displayCurrency } = parsed.data;
 
-  if (!isSupportedCurrency(displayCurrency)) {
+  // Validates against the REPORTABLE set, not `isSupportedCurrency`. The latter
+  // also answers "is this ticker cash rather than a stock", and several
+  // reportable codes are live equity/ETF tickers (AED = Aegon, SAR = Saratoga),
+  // so the two lists must stay separate — see supported-currencies.ts. A code
+  // outside the reportable set has no live quote, and FX resolution ends in a
+  // `rate = 1` fallback rather than an error, so accepting it would silently
+  // report every total at 1:1. The custom-rate path is the escape hatch, and
+  // `useDisplayCurrencyOptions` surfaces those currencies in the picker.
+  if (!isReportableCurrency(displayCurrency)) {
     return NextResponse.json(
       {
-        error: `Currency ${displayCurrency} is not in the supported list. Add a custom rate via Settings → Custom exchange rates first.`,
+        error: `Currency ${displayCurrency} has no live exchange rate. Add a custom rate via Settings → Custom exchange rates first.`,
         code: "currency-unsupported",
       },
       { status: 400 }
@@ -60,43 +71,15 @@ export async function PUT(request: NextRequest) {
   }
 
   try {
-    // Read the prior value so we only recompute reporting amounts on a real
-    // change (currency rework Phase 3).
-    const prior = await db
-      .select({ value: schema.settings.value })
-      .from(schema.settings)
-      .where(
-        and(
-          eq(schema.settings.key, "display_currency"),
-          eq(schema.settings.userId, auth.context.userId)
-        )
-      )
-      .limit(1);
-    const changed = (prior[0]?.value ?? DEFAULT_CURRENCY).toUpperCase() !== displayCurrency;
-
-    await db
-      .insert(schema.settings)
-      .values({
-        key: "display_currency",
-        userId: auth.context.userId,
-        value: displayCurrency,
-      })
-      .onConflictDoUpdate({
-        target: [schema.settings.key, schema.settings.userId],
-        set: { value: displayCurrency },
-      });
-
-    // Currency rework Phase 3 — re-derive every transaction's stored reporting
-    // amount into the new currency at historical rates. Fire-and-forget: the
-    // persistent Node server keeps running it; `reporting_recompute_status`
-    // tracks progress for the Settings toast; reports stay correct meanwhile
-    // via the on-the-fly fallback. Guarded against concurrent runs.
-    if (changed) {
-      void recomputeReportingAmounts(auth.context.userId, displayCurrency).catch((err) => {
-
-        console.error("[display-currency] reporting recompute failed:", err);
-      });
-    }
+    // FINLYNQ-301 — one shared writer for both this route and the display-
+    // currency decision prompt: upsert on (key, userId) + recompute reporting
+    // amounts only on a real change. Behaviour is identical to the prior inline
+    // block (the recompute is still fire-and-forget inside the helper).
+    const { changed } = await setDisplayCurrency(
+      db,
+      auth.context.userId,
+      displayCurrency
+    );
 
     return NextResponse.json({ displayCurrency, recomputing: changed });
   } catch (error: unknown) {

@@ -26,7 +26,9 @@ export function SpendingCategoryChart({ data, currency = "CAD" }: { data: Spendi
       <Card className="card-hover">
         <CardHeader className="pb-1 px-5 pt-5">
           <CardTitle className="text-sm font-semibold">Spending by Category</CardTitle>
-          <p className="text-[11px] text-muted-foreground">Current month breakdown</p>
+          {/* /api/dashboard defaults to a trailing 12-month window (plus the current
+              month), not the current month alone. */}
+          <p className="text-[11px] text-muted-foreground">Last 12 months breakdown</p>
         </CardHeader>
         <CardContent className="px-5 pb-5">
           <div className="flex items-center gap-5">

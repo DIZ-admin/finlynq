@@ -8,13 +8,14 @@ import {
 } from "@/lib/queries";
 import { getRateMap, convertWithRateMap, getDisplayCurrency } from "@/lib/fx-service";
 import { selfHealReportingAmounts, convertReportingSlice } from "@/lib/fx/reporting-amount";
-import { getHoldingsValueByAccount } from "@/lib/holdings-value";
+import { getHoldingsValueByAccount, verifyHoldingDecryptHealth } from "@/lib/holdings-value";
+import { applyInvestmentMarketOverlay } from "@/lib/accounts/investment-balance-overlay";
 import { requireAuth } from "@/lib/auth/require-auth";
-import { getDEK } from "@/lib/crypto/dek-cache";
 import { logApiError } from "@/lib/validate";
 import { decryptNamedRows, decryptName } from "@/lib/crypto/encrypted-columns";
 import { safeName } from "@/lib/safe-name";
 import { rankBreakdown, type BreakdownMember } from "@/lib/chart-breakdown";
+import { buildSpendingByCategory } from "@/lib/dashboard/spending-by-category";
 import { withOp } from "@/lib/diagnostics/op-context";
 
 export function GET(request: NextRequest) {
@@ -23,15 +24,20 @@ export function GET(request: NextRequest) {
 
 async function handleGet(request: NextRequest) {
   // Dashboard must stay accessible even when the session has no cached DEK
-  // (e.g. first request after a server restart). `getDEK` returns null in
+  // (e.g. first request after a server restart). `auth.context.dek` is null in
   // that case; downstream decryption falls through to plaintext/legacy rows.
   const auth = await requireAuth(request);
   if (!auth.authenticated) return auth.response;
-  const { userId, sessionId } = auth.context;
-  const dek = sessionId ? getDEK(sessionId, userId) : null;
+  const { userId, dek } = auth.context;
   const params = request.nextUrl.searchParams;
   const displayCurrency = await getDisplayCurrency(userId, params.get("currency"));
-  const includeArchived = params.get("includeArchived") === "1";
+  // `includeArchived` is accepted for backward compatibility but no longer
+  // gates anything: archived accounts ALWAYS come back now. `archived` is a
+  // list/picker visibility flag, not a claim the money stopped existing, and
+  // this endpoint is the hero net-worth source — omitting them understated it
+  // by the whole archived balance and made the hero disagree with the
+  // net-worth chart. Every row carries `archived`, so a list consumer that
+  // wants to hide them (the /accounts "Show archived" toggle) filters clientside.
 
   // Currency rework Phase 3 — the dashboard is the post-login landing page, so
   // proactively backfill any transaction whose stored reporting_amount is
@@ -51,7 +57,7 @@ async function handleGet(request: NextRequest) {
 
     const rateMap = await getRateMap(displayCurrency, userId);
 
-    const rawBalances = await getAccountBalances(userId, { includeArchived });
+    const rawBalances = await getAccountBalances(userId, { includeArchived: true });
     // Stream D: decrypt accountName + alias before display / currency conversion.
     const balances = decryptNamedRows(rawBalances, dek, {
       accountNameCt: "accountName",
@@ -77,14 +83,34 @@ async function handleGet(request: NextRequest) {
     //
     // cashFlowBasis is the transaction sum exposed separately so the account
     // detail page can display "Cash flow" alongside Market value.
-    const holdingsByAccount = await getHoldingsValueByAccount(userId, dek);
-    const convertedBalances = balances.map((b: any) => {
-      const holdings = holdingsByAccount.get(b.accountId);
+    //
+    // The branch itself is the shared `applyInvestmentMarketOverlay` (2026-08-27)
+    // — the ONE net-worth valuation decision, also behind the Reports balance
+    // sheet, the reconcile summary, the built-in chat, the financial-health
+    // score, and the MCP balance tools. It adds two guards this route did not
+    // have: it never prices with a null DEK (holdings symbols would decrypt to
+    // null and be valued at qty×1), and `verifyHoldingDecryptHealth` catches a
+    // present-but-stale DEK (FINLYNQ-281) and falls back to ledger rather than
+    // rendering garbage. `fetchHoldings` is memoized so the map is available
+    // for the per-row `holdingsValue`/`holdingsCostBasis` fields without a
+    // second pricing pass — and stays UNFETCHED in the null-DEK branch, which
+    // is exactly the case that used to produce qty×1 numbers here.
+    let holdingsByAccount: Awaited<ReturnType<typeof getHoldingsValueByAccount>> | null = null;
+    const overlay = await applyInvestmentMarketOverlay(
+      balances.map((b: any) => ({
+        id: b.accountId,
+        currency: b.currency,
+        isInvestment: Boolean(b.isInvestment),
+        ledgerBalance: Number(b.balance),
+      })),
+      dek,
+      async () => (holdingsByAccount ??= await getHoldingsValueByAccount(userId, dek)),
+      () => verifyHoldingDecryptHealth(userId, dek),
+    );
+    const convertedBalances = balances.map((b: any, i: number) => {
+      const holdings = holdingsByAccount?.get(b.accountId);
       const cashFlowBasis = b.balance;
-      const isInvestment = Boolean(b.isInvestment);
-      const totalBalance = isInvestment
-        ? (holdings?.value ?? 0)
-        : cashFlowBasis;
+      const totalBalance = overlay.rows[i]?.balance ?? cashFlowBasis;
       return {
         ...b,
         balance: totalBalance,
@@ -167,26 +193,20 @@ async function handleGet(request: NextRequest) {
     );
 
     const spendSlices = await getSpendingByCategoryWithReporting(userId, startDate, endDate);
-    const spendMap = new Map<string | number, {
-      categoryId: number | null;
-      categoryNameCt: string | null;
-      categoryGroup: string | null;
-      categoryType: string | null;
-      total: number;
-    }>();
-    for (const r of spendSlices) {
-      const key = r.categoryId ?? `null:${r.categoryGroup}`;
-      const cur = spendMap.get(key) ?? {
+    // Convert each slice to display currency, then group + decrypt the category
+    // NAME (the card reads a plaintext `categoryName`; shipping only the
+    // encrypted `categoryNameCt` made every slice fall back to "Uncategorized").
+    // A cold DEK degrades to "Category #<id>", never a false "Uncategorized".
+    const spendingByCategory = buildSpendingByCategory(
+      spendSlices.map((r) => ({
         categoryId: r.categoryId,
         categoryNameCt: r.categoryNameCt,
         categoryGroup: r.categoryGroup,
         categoryType: r.categoryType,
-        total: 0,
-      };
-      cur.total += convertGroup(r);
-      spendMap.set(key, cur);
-    }
-    const spendingByCategory = Array.from(spendMap.values())
+        total: convertGroup(r),
+      })),
+      (nameCt) => decryptName(nameCt, dek, null),
+    )
       .map((r) => ({ ...r, total: Math.round(r.total * 100) / 100 }))
       .sort((a, b) => a.total - b.total);
 

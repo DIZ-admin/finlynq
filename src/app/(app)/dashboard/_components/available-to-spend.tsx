@@ -14,9 +14,12 @@ type Props = {
   income: number;
   expenses: number;
   currency?: string;
+  /** Label of the month the figures cover (the dashboard's reference month,
+   * usually the last complete month — not necessarily the current one). */
+  monthLabel?: string;
 };
 
-export function AvailableToSpend({ income, expenses, currency = "CAD" }: Props) {
+export function AvailableToSpend({ income, expenses, currency = "CAD", monthLabel }: Props) {
   const available = income - expenses;
   const pctSpent = income > 0 ? (expenses / income) * 100 : 0;
 
@@ -31,7 +34,7 @@ export function AvailableToSpend({ income, expenses, currency = "CAD" }: Props) 
             </div>
             <div>
               <p className="text-xs font-medium text-muted-foreground tracking-wide uppercase">Available to Spend</p>
-              <p className="text-[11px] text-muted-foreground">This month remaining</p>
+              <p className="text-[11px] text-muted-foreground">{monthLabel ? `${monthLabel} remaining` : "This month remaining"}</p>
             </div>
           </div>
 

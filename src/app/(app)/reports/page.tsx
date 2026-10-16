@@ -19,6 +19,15 @@ import { exportCsv } from "@/lib/csv-export";
 import { buildTxDrillUrl } from "@/lib/transactions/drill-url";
 import { CHART_COLORS } from "@/lib/chart-colors";
 import { todayISO } from "@/lib/utils/date";
+import { AccountFilter } from "./_components/account-filter";
+import { serializeAccountIds } from "@/lib/reports/account-filter";
+import {
+  ALL_TIME_START,
+  MULTI_YEAR_PRESETS,
+  REPORT_PERIODS,
+  REPORT_PERIOD_LABELS,
+  type ReportPeriod as Period,
+} from "@/lib/reports/period";
 import { PageSkeleton } from "@/components/page-skeleton";
 import { SankeyChart } from "@/components/sankey-chart";
 import {
@@ -36,8 +45,7 @@ import {
   ChevronRight,
   ChevronDown,
   Calendar,
-  Layers,
-} from "lucide-react";
+  Layers, Wallet, ChartColumn } from "lucide-react";
 import {
   BarChart,
   Bar,
@@ -53,7 +61,6 @@ import {
 
 // ── Types ──
 
-type Period = "daily" | "weekly" | "monthly" | "quarterly";
 type GroupByOption = "category" | "group";
 
 type TimeseriesPoint = {
@@ -194,6 +201,11 @@ export function getPresetRange(preset: string, now: Date = new Date()): { start:
         end: localDateStr(endD.getFullYear(), endD.getMonth() + 1, endD.getDate()),
       };
     }
+    case "last-5-years":
+      // Five calendar years including the current one, through today.
+      return { start: `${y - 4}-01-01`, end };
+    case "all-time":
+      return { start: ALL_TIME_START, end };
     default: {
       // Fallback: current year-to-date (same as "ytd") — safe, no partial months.
       return { start: `${y}-01-01`, end };
@@ -214,6 +226,8 @@ export default function ReportsPage() {
   const [period, setPeriod] = useState<Period>("monthly");
   const [groupBy, setGroupBy] = useState<GroupByOption>("category");
   const [datePreset, setDatePreset] = useState<string>("ytd");
+  // Account scoping — empty = every account (see lib/reports/account-filter.ts).
+  const [accountIds, setAccountIds] = useState<number[]>([]);
 
   // Data states
   const [trendsData, setTrendsData] = useState<TrendsData | null>(null);
@@ -230,6 +244,13 @@ export default function ReportsPage() {
   const [expandedIncomeGroups, setExpandedIncomeGroups] = useState<Set<string>>(new Set());
   const [expandedExpenseGroups, setExpandedExpenseGroups] = useState<Set<string>>(new Set());
 
+  // One serialization for all four endpoints. Omitted entirely when empty,
+  // so an unfiltered report sends no param at all rather than `accountIds=`.
+  const acctParam = useMemo(() => {
+    const v = serializeAccountIds(accountIds);
+    return v ? `&accountIds=${encodeURIComponent(v)}` : "";
+  }, [accountIds]);
+
   const devMode = useDevMode();
 
   // Active tab
@@ -241,13 +262,16 @@ export default function ReportsPage() {
     const { start, end } = getPresetRange(preset);
     setStartDate(start);
     setEndDate(end);
+    // A multi-year range broken down monthly is 60+ columns; default it to
+    // yearly. The Period select stays free to change afterwards.
+    if (MULTI_YEAR_PRESETS.includes(preset)) setPeriod("yearly");
   }, []);
 
   // Fetch trends data
   useEffect(() => {
     let cancelled = false;
     const biz = isBusiness ? "&business=true" : "";
-    fetch(`/api/reports/trends?startDate=${startDate}&endDate=${endDate}&period=${period}&groupBy=${groupBy}${biz}&currency=${encodeURIComponent(displayCurrency)}`)
+    fetch(`/api/reports/trends?startDate=${startDate}&endDate=${endDate}&period=${period}&groupBy=${groupBy}${biz}${acctParam}&currency=${encodeURIComponent(displayCurrency)}`)
       .then((r) => (r.ok ? r.json() : null))
       .then((d) => {
         if (!cancelled) setTrendsData(d && typeof d === "object" ? (d as TrendsData) : null);
@@ -261,12 +285,12 @@ export default function ReportsPage() {
     return () => {
       cancelled = true;
     };
-  }, [startDate, endDate, period, groupBy, isBusiness, displayCurrency]);
+  }, [startDate, endDate, period, groupBy, isBusiness, displayCurrency, acctParam]);
 
   // Fetch balance sheet
   useEffect(() => {
     let cancelled = false;
-    fetch(`/api/reports?type=balance-sheet&endDate=${endDate}&currency=${encodeURIComponent(displayCurrency)}`)
+    fetch(`/api/reports?type=balance-sheet&endDate=${endDate}${acctParam}&currency=${encodeURIComponent(displayCurrency)}`)
       .then((r) => (r.ok ? r.json() : null))
       .then((d) => {
         if (!cancelled) setBalanceSheet(d && typeof d === "object" ? (d as BalanceSheet) : null);
@@ -277,23 +301,23 @@ export default function ReportsPage() {
     return () => {
       cancelled = true;
     };
-  }, [endDate, displayCurrency]);
+  }, [endDate, displayCurrency, acctParam]);
 
   // Fetch unrealized P&L (computed inside the income-statement endpoint).
   // Same period as the rest of the income tab.
   useEffect(() => {
     const biz = isBusiness ? "&business=true" : "";
-    fetch(`/api/reports?type=income-statement&startDate=${startDate}&endDate=${endDate}${biz}&currency=${encodeURIComponent(displayCurrency)}`)
+    fetch(`/api/reports?type=income-statement&startDate=${startDate}&endDate=${endDate}${biz}${acctParam}&currency=${encodeURIComponent(displayCurrency)}`)
       .then((r) => r.json())
       .then((d) => setUnrealizedData(d?.unrealized ?? null))
       .catch(() => setUnrealizedData(null));
-  }, [startDate, endDate, isBusiness, displayCurrency]);
+  }, [startDate, endDate, isBusiness, displayCurrency, acctParam]);
 
   // Fetch YoY (dev mode only)
   useEffect(() => {
     if (!devMode) return;
     let cancelled = false;
-    fetch(`/api/reports/yoy?year1=${yoyYear1}&year2=${yoyYear2}&currency=${encodeURIComponent(displayCurrency)}`)
+    fetch(`/api/reports/yoy?year1=${yoyYear1}&year2=${yoyYear2}${acctParam}&currency=${encodeURIComponent(displayCurrency)}`)
       .then((r) => (r.ok ? r.json() : null))
       .then((d) => {
         if (!cancelled) setYoyData(d && typeof d === "object" ? (d as YoYData) : null);
@@ -304,7 +328,7 @@ export default function ReportsPage() {
     return () => {
       cancelled = true;
     };
-  }, [yoyYear1, yoyYear2, devMode, displayCurrency]);
+  }, [yoyYear1, yoyYear2, devMode, displayCurrency, acctParam]);
 
   // Sankey data
   const sankeyIncome = useMemo(() => {
@@ -379,12 +403,7 @@ export default function ReportsPage() {
     );
   }
 
-  const periodLabels: Record<Period, string> = {
-    daily: "Daily",
-    weekly: "Weekly",
-    monthly: "Monthly",
-    quarterly: "Quarterly",
-  };
+  const periodLabels = REPORT_PERIOD_LABELS;
 
   // Hold the first paint until trends resolves so the charts never flash blank
   // axes against null data.
@@ -421,6 +440,8 @@ export default function ReportsPage() {
                   <SelectItem value="last-quarter">Last Quarter</SelectItem>
                   <SelectItem value="last-year">Last Year</SelectItem>
                   <SelectItem value="last-12">Last 12 Months</SelectItem>
+                  <SelectItem value="last-5-years">Last 5 Years</SelectItem>
+                  <SelectItem value="all-time">All Time</SelectItem>
                   <SelectItem value="custom">Custom</SelectItem>
                 </SelectContent>
               </Select>
@@ -465,10 +486,9 @@ export default function ReportsPage() {
                   <SelectValue />
                 </SelectTrigger>
                 <SelectContent>
-                  <SelectItem value="daily">Daily</SelectItem>
-                  <SelectItem value="weekly">Weekly</SelectItem>
-                  <SelectItem value="monthly">Monthly</SelectItem>
-                  <SelectItem value="quarterly">Quarterly</SelectItem>
+                  {REPORT_PERIODS.map((p) => (
+                    <SelectItem key={p} value={p}>{REPORT_PERIOD_LABELS[p]}</SelectItem>
+                  ))}
                 </SelectContent>
               </Select>
             </div>
@@ -488,6 +508,17 @@ export default function ReportsPage() {
                   <SelectItem value="group">Category Group</SelectItem>
                 </SelectContent>
               </Select>
+            </div>
+
+            <Separator orientation="vertical" className="h-8 mx-1" />
+
+            {/* Account scoping — applies to every report on this page. */}
+            <div>
+              <Label className="text-xs text-muted-foreground mb-1 block">
+                <Wallet className="inline h-3 w-3 mr-1" />
+                Accounts
+              </Label>
+              <AccountFilter selected={accountIds} onChange={setAccountIds} />
             </div>
 
             <Separator orientation="vertical" className="h-8 mx-1" />
@@ -1270,6 +1301,20 @@ export default function ReportsPage() {
 const MAX_PERIOD_COLUMNS = 30;
 
 /** Muted "--" cell for zero/missing period values (avoids $0.00 noise across 30 cols). */
+/** Small chart icon next to a category name → the category view (/categories/[id]). */
+function CategoryInsightsLink({ categoryId, name }: { categoryId: number; name: string }) {
+  return (
+    <Link
+      href={`/categories/${categoryId}`}
+      className="text-muted-foreground/60 hover:text-primary"
+      title={`${name}: trends, average, top payees`}
+      aria-label={`Open ${name} category view`}
+    >
+      <ChartColumn className="h-3.5 w-3.5" />
+    </Link>
+  );
+}
+
 function PeriodCell({ value, currency, colorClass }: { value: number | undefined; currency: string; colorClass: string }) {
   if (value == null || value === 0) {
     return <TableCell className="text-right text-xs text-muted-foreground/50 font-mono">--</TableCell>;
@@ -1460,13 +1505,16 @@ function GroupRow({
                 <TableCell></TableCell>
                 <TableCell className="text-sm pl-6 text-muted-foreground">
                   {item.categoryId != null ? (
-                    <Link
-                      href={buildTxDrillUrl({ categoryId: String(item.categoryId), startDate, endDate })}
-                      className="hover:underline hover:text-foreground"
-                      title={`View ${item.name} transactions for this period`}
-                    >
-                      {item.name}
-                    </Link>
+                    <span className="inline-flex items-center gap-1.5">
+                      <Link
+                        href={buildTxDrillUrl({ categoryId: String(item.categoryId), startDate, endDate })}
+                        className="hover:underline hover:text-foreground"
+                        title={`View ${item.name} transactions for this period`}
+                      >
+                        {item.name}
+                      </Link>
+                      <CategoryInsightsLink categoryId={item.categoryId} name={item.name} />
+                    </span>
                   ) : (
                     item.name
                   )}
@@ -1531,13 +1579,16 @@ function FlatTable({
                 <TableRow key={i} className="hover:bg-muted/30">
                   <TableCell className="text-sm">
                     {item.categoryId != null ? (
-                      <Link
-                        href={buildTxDrillUrl({ categoryId: String(item.categoryId), startDate, endDate })}
-                        className="hover:underline"
-                        title={`View ${item.name} transactions for this period`}
-                      >
-                        {item.name}
-                      </Link>
+                      <span className="inline-flex items-center gap-1.5">
+                        <Link
+                          href={buildTxDrillUrl({ categoryId: String(item.categoryId), startDate, endDate })}
+                          className="hover:underline"
+                          title={`View ${item.name} transactions for this period`}
+                        >
+                          {item.name}
+                        </Link>
+                        <CategoryInsightsLink categoryId={item.categoryId} name={item.name} />
+                      </span>
                     ) : (
                       item.name
                     )}

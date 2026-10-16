@@ -7,18 +7,23 @@ import {
   calculateDebtPayoff,
   LoanValidationError,
   PAYMENT_FREQUENCIES,
+  INTEREST_METHODS,
+  loanScheduleExtras,
 } from "@/lib/loan-calculator";
 import { requireAuth } from "@/lib/auth/require-auth";
-import { requireDevMode } from "@/lib/require-dev-mode";
+import { requireEncryption } from "@/lib/auth/require-encryption";
 import { z } from "zod";
 import { validateBody, safeErrorMessage, logApiError } from "@/lib/validate";
 import { buildNameFields, decryptNamedRows, encryptOptional, decryptOptional } from "@/lib/crypto/encrypted-columns";
 import { verifyOwnership, OwnershipError } from "@/lib/verify-ownership";
 import { todayISO } from "@/lib/utils/date";
+import { getDisplayCurrency, getRateMap, convertWithRateMap } from "@/lib/fx-service";
+import { pickRecordCurrency } from "@/lib/fx/record-currency";
 // Issue #213 — shared YYYY-MM-DD validator (regex + leap-year/Feb-30 round-trip).
 import { ymdDate, parseYmdSafe } from "../../../../mcp-server/lib/date-validators";
 
 const paymentFrequencyEnum = z.enum(PAYMENT_FREQUENCIES);
+const interestMethodEnum = z.enum(INTEREST_METHODS);
 
 const createLoanSchema = z.object({
   name: z.string(),
@@ -34,6 +39,9 @@ const createLoanSchema = z.object({
   paymentFrequency: paymentFrequencyEnum.optional(),
   extraPayment: z.number().nonnegative().optional(),
   residualValue: z.number().nonnegative().nullable().optional(),
+  // rate (default) | flat (interestAmount each payment) | total (interestAmount over the loan)
+  interestMethod: interestMethodEnum.optional(),
+  interestAmount: z.number().nonnegative().nullable().optional(),
   note: z.string().optional(),
 }).refine((d) => d.termMonths != null || d.paymentAmount != null, {
   message: "Either termMonths or paymentAmount is required",
@@ -53,6 +61,9 @@ const updateLoanSchema = z.object({
   paymentFrequency: paymentFrequencyEnum.optional(),
   extraPayment: z.number().nonnegative().optional(),
   residualValue: z.number().nonnegative().nullable().optional(),
+  // rate (default) | flat (interestAmount each payment) | total (interestAmount over the loan)
+  interestMethod: interestMethodEnum.optional(),
+  interestAmount: z.number().nonnegative().nullable().optional(),
   note: z.string().optional(),
 });
 
@@ -80,7 +91,6 @@ async function getLinkedAccountBalances(userId: string, accountIds: number[]) {
 
 export async function GET(request: NextRequest) {
   const auth = await requireAuth(request); if (!auth.authenticated) return auth.response;
-  const devGuard = await requireDevMode(request); if (devGuard) return devGuard;
   const { userId } = auth.context;
   // Stream D Phase 4 — plaintext name/accountName dropped.
   const rawLoans = await db
@@ -100,6 +110,10 @@ export async function GET(request: NextRequest) {
       extraPayment: schema.loans.extraPayment,
       residualValue: schema.loans.residualValue,
       note: schema.loans.note,
+      manualSchedule: schema.loans.manualSchedule,
+      interestOverrides: schema.loans.interestOverrides,
+      interestMethod: schema.loans.interestMethod,
+      interestAmount: schema.loans.interestAmount,
     })
     .from(schema.loans)
     .leftJoin(schema.accounts, eq(schema.loans.accountId, schema.accounts.id))
@@ -119,8 +133,29 @@ export async function GET(request: NextRequest) {
   const acctBalances = await getLinkedAccountBalances(userId, linkedIds);
   const today = todayISO();
 
+  // FINLYNQ-123 dual basis: every amount below stays in the LOAN's own
+  // currency (that's what the schedule was computed in), and each row also
+  // carries a current-rate conversion into the display currency so the page
+  // can total across a mixed-currency book. Summing the native figures under
+  // one label — which is what the page used to do — reports an ₽8.1M mortgage
+  // as $8.1M.
+  const displayCurrency = await getDisplayCurrency(
+    userId,
+    request.nextUrl.searchParams.get("currency"),
+  );
+  const rateMap = await getRateMap(displayCurrency, userId);
+  const toDisplay = (amount: number | null, from: string | null) =>
+    amount == null ? null : convertWithRateMap(amount, from ?? displayCurrency, rateMap);
+
   // Add amortization summary for each loan
-  const withSummary = loans.map((loan) => {
+  const withSummary = loans.map((rawLoan) => {
+    // The stored schedule rows feed the calculator but are NOT part of the
+    // list response (a 30-year manual schedule is 360 rows per loan); the
+    // schedule panel fetches them from /api/loans/schedule.
+    const { manualSchedule: _manual, interestOverrides: _overrides, ...loan } = rawLoan;
+    void _manual;
+    void _overrides;
+    const extras = loanScheduleExtras(rawLoan);
     const integrityRow = (error: string, value: unknown) => ({
       ...loan,
       monthlyPayment: null,
@@ -131,6 +166,9 @@ export async function GET(request: NextRequest) {
       interestPaid: null,
       periodsRemaining: null,
       balanceSource: null,
+      displayCurrency,
+      remainingBalanceDisplay: null,
+      monthlyEquivalentPaymentDisplay: null,
       dataIntegrity: { error, value },
     });
     // Issue #213 — guard against legacy bad start_date so the whole list
@@ -150,6 +188,7 @@ export async function GET(request: NextRequest) {
         paymentFrequency: loan.paymentFrequency,
         extraPayment: loan.extraPayment ?? 0,
         residualValue: loan.residualValue,
+        ...extras,
       });
     } catch (e) {
       // A legacy row whose payment no longer amortizes shouldn't poison the list.
@@ -177,6 +216,9 @@ export async function GET(request: NextRequest) {
       if (remainingBalance <= residual + 0.01) {
         payoffDate = today;
         periodsRemaining = 0;
+      } else if (summary.scheduleMode === "manual") {
+        // The user supplied the dates themselves; re-projecting from today's
+        // balance with a calculated payment would overwrite them.
       } else {
         try {
           const anchored = buildLoanSchedule({
@@ -211,6 +253,17 @@ export async function GET(request: NextRequest) {
           : Math.round(principalPaid * 100) / 100,
       interestPaid: Math.round(interestPaid * 100) / 100,
       periodsRemaining,
+      scheduleMode: summary.scheduleMode,
+      effectiveAnnualRate: summary.effectiveAnnualRate,
+      interestOverrideCount: Object.keys(extras.interestOverrides ?? {}).length,
+      // Additive reporting-currency companions — the native fields above are
+      // untouched, so nothing that already read this response changes.
+      displayCurrency,
+      remainingBalanceDisplay: toDisplay(remainingBalance, loan.currency),
+      monthlyEquivalentPaymentDisplay: toDisplay(
+        summary.monthlyEquivalentPayment,
+        loan.currency,
+      ),
     };
   });
 
@@ -218,15 +271,40 @@ export async function GET(request: NextRequest) {
 }
 
 export async function POST(request: NextRequest) {
-  const auth = await requireAuth(request); if (!auth.authenticated) return auth.response;
-  const devGuard = await requireDevMode(request); if (devGuard) return devGuard;
+  // requireEncryption, not requireAuth: buildNameFields(null) returns {} and
+  // encryptOptional(null, note) stores the note as PLAINTEXT — a DEK-less
+  // write persisted a permanently nameless row (review 2026-07-30 #7).
+  const auth = await requireEncryption(request); if (!auth.ok) return auth.response;
+  const { userId, dek } = auth;
   try {
     const body = await request.json();
 
     if (body.action === "amortization") {
       // FINLYNQ-136: honors paymentAmount (payment-driven) + residualValue
       // (lease) and returns the per-calendar-month interest accrual.
+      // With `loanId`, the loan's own manual schedule / interest overrides are
+      // applied, so the panel shows what every other surface computes.
+      let extras = {};
+      const loanId = Number(body.loanId);
+      if (Number.isInteger(loanId) && loanId > 0) {
+        const stored = await db
+          .select({
+            manualSchedule: schema.loans.manualSchedule,
+            interestOverrides: schema.loans.interestOverrides,
+            interestMethod: schema.loans.interestMethod,
+            interestAmount: schema.loans.interestAmount,
+          })
+          .from(schema.loans)
+          .where(and(eq(schema.loans.id, loanId), eq(schema.loans.userId, userId)))
+          .get();
+        if (stored) extras = loanScheduleExtras(stored);
+      }
       const result = buildLoanSchedule({
+        ...extras,
+        // A caller trying out a method before saving states it explicitly.
+        ...(body.interestMethod
+          ? { interestMethod: body.interestMethod, interestAmount: body.interestAmount }
+          : {}),
         principal: body.principal,
         annualRate: body.annualRate,
         termMonths: body.termMonths,
@@ -260,7 +338,7 @@ export async function POST(request: NextRequest) {
     // Cross-tenant FK guard (H-1) — verify the optional accountId belongs
     // to the caller before INSERT. `null`/undefined skipped by the helper.
     if (d.accountId != null) {
-      await verifyOwnership(auth.context.userId, { accountIds: [d.accountId] });
+      await verifyOwnership(userId, { accountIds: [d.accountId] });
     }
     // FINLYNQ-136: reject non-amortizing inputs (payment below first period's
     // interest, residual >= principal) at create time with a clear 400.
@@ -273,14 +351,33 @@ export async function POST(request: NextRequest) {
       paymentFrequency: d.paymentFrequency ?? "monthly",
       extraPayment: d.extraPayment ?? 0,
       residualValue: d.residualValue,
+      interestMethod: d.interestMethod,
+      interestAmount: d.interestAmount,
     });
-    const enc = buildNameFields(auth.context.dek, { name: d.name });
+    // Currency resolution (feedback #7): explicit > linked account > display.
+    // Falling through to the column default is what let MCP-created loans land
+    // as CAD; the web form always sends one, but the REST API is public.
+    let accountCurrency: string | null = null;
+    if (d.accountId != null) {
+      const acct = await db
+        .select({ currency: schema.accounts.currency })
+        .from(schema.accounts)
+        .where(and(eq(schema.accounts.id, d.accountId), eq(schema.accounts.userId, userId)))
+        .get();
+      accountCurrency = acct?.currency ?? null;
+    }
+    const currency = pickRecordCurrency({
+      explicit: d.currency,
+      accountCurrency,
+      displayCurrency: await getDisplayCurrency(userId),
+    });
+    const enc = buildNameFields(dek, { name: d.name });
     // Stream D Phase 4 — plaintext name dropped.
     const loan = await db.insert(schema.loans).values({
-      userId: auth.context.userId,
+      userId,
       type: d.type,
       accountId: d.accountId || null,
-      ...(d.currency ? { currency: d.currency.toUpperCase() } : {}),
+      currency,
       principal: d.principal,
       annualRate: d.annualRate,
       termMonths: d.termMonths ?? null,
@@ -289,7 +386,9 @@ export async function POST(request: NextRequest) {
       paymentFrequency: d.paymentFrequency ?? "monthly",
       extraPayment: d.extraPayment ?? 0,
       residualValue: d.residualValue ?? null,
-      note: encryptOptional(auth.context.dek, d.note) ?? "",
+      interestMethod: d.interestMethod ?? "rate",
+      interestAmount: d.interestMethod && d.interestMethod !== "rate" ? d.interestAmount ?? null : null,
+      note: encryptOptional(dek, d.note) ?? "",
       ...enc,
     }).returning().get();
 
@@ -301,14 +400,16 @@ export async function POST(request: NextRequest) {
     if (error instanceof LoanValidationError) {
       return NextResponse.json({ error: error.message }, { status: 400 });
     }
-    await logApiError("POST", "/api/loans", error, auth.context.userId);
+    await logApiError("POST", "/api/loans", error, userId);
     return NextResponse.json({ error: safeErrorMessage(error, "Failed") }, { status: 500 });
   }
 }
 
 export async function PUT(request: NextRequest) {
-  const auth = await requireAuth(request); if (!auth.authenticated) return auth.response;
-  const devGuard = await requireDevMode(request); if (devGuard) return devGuard;
+  // requireEncryption — with a null DEK the rename silently no-ops and the note
+  // lands in plaintext (review 2026-07-30 #7).
+  const auth = await requireEncryption(request); if (!auth.ok) return auth.response;
+  const { userId, dek } = auth;
   try {
     const body = await request.json();
     const parsed = validateBody(body, updateLoanSchema);
@@ -317,14 +418,14 @@ export async function PUT(request: NextRequest) {
     // Cross-tenant FK guard (H-1) — `accountId` may be re-pointed to another
     // user's account on update. `null` is an explicit unlink; skip it.
     if (data.accountId != null && data.accountId > 0) {
-      await verifyOwnership(auth.context.userId, { accountIds: [data.accountId] });
+      await verifyOwnership(userId, { accountIds: [data.accountId] });
     }
     // FINLYNQ-136: validate the MERGED row still amortizes (e.g. lowering the
     // payment below the period interest, or raising residual past principal).
     const existing = await db
       .select()
       .from(schema.loans)
-      .where(and(eq(schema.loans.id, id), eq(schema.loans.userId, auth.context.userId)))
+      .where(and(eq(schema.loans.id, id), eq(schema.loans.userId, userId)))
       .all();
     if (!existing.length) return NextResponse.json({ error: "Not found" }, { status: 404 });
     const merged = { ...existing[0], ...data };
@@ -338,19 +439,23 @@ export async function PUT(request: NextRequest) {
         paymentFrequency: merged.paymentFrequency,
         extraPayment: merged.extraPayment ?? 0,
         residualValue: merged.residualValue,
+        ...loanScheduleExtras(existing[0]),
+        // After the stored extras: this request may be changing the method.
+        interestMethod: merged.interestMethod,
+        interestAmount: merged.interestAmount,
       });
     }
     const toEncrypt: Record<string, string | null | undefined> = {};
     if (name !== undefined) toEncrypt.name = name;
-    const enc = buildNameFields(auth.context.dek, toEncrypt);
+    const enc = buildNameFields(dek, toEncrypt);
     if (data.currency) data.currency = data.currency.toUpperCase();
     const updatePayload: Record<string, unknown> = { ...data, ...enc };
     // Encrypt the free-text note when present (2026-06-01 plaintext-gap closure).
     if (data.note !== undefined) {
-      updatePayload.note = encryptOptional(auth.context.dek, data.note);
+      updatePayload.note = encryptOptional(dek, data.note);
     }
     // eslint-disable-next-line @typescript-eslint/no-explicit-any
-    const loan = await db.update(schema.loans).set(updatePayload as any).where(and(eq(schema.loans.id, id), eq(schema.loans.userId, auth.context.userId))).returning().get();
+    const loan = await db.update(schema.loans).set(updatePayload as any).where(and(eq(schema.loans.id, id), eq(schema.loans.userId, userId))).returning().get();
     return NextResponse.json(loan);
   } catch (error: unknown) {
     if (error instanceof OwnershipError) {
@@ -359,14 +464,13 @@ export async function PUT(request: NextRequest) {
     if (error instanceof LoanValidationError) {
       return NextResponse.json({ error: error.message }, { status: 400 });
     }
-    await logApiError("PUT", "/api/loans", error, auth.context.userId);
+    await logApiError("PUT", "/api/loans", error, userId);
     return NextResponse.json({ error: safeErrorMessage(error, "Failed") }, { status: 500 });
   }
 }
 
 export async function DELETE(request: NextRequest) {
   const auth = await requireAuth(request); if (!auth.authenticated) return auth.response;
-  const devGuard = await requireDevMode(request); if (devGuard) return devGuard;
   const id = parseInt(request.nextUrl.searchParams.get("id") ?? "0");
   if (!id) return NextResponse.json({ error: "Missing id" }, { status: 400 });
   await db.delete(schema.loans).where(and(eq(schema.loans.id, id), eq(schema.loans.userId, auth.context.userId)));

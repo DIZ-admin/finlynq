@@ -802,7 +802,13 @@ export default function BudgetsPage() {
                   >
                     <div className="flex flex-wrap items-center justify-between gap-y-1 mb-1.5">
                       <div className="flex items-center gap-2 min-w-0">
-                        <span className="text-sm font-medium truncate">{b.categoryName}</span>
+                        <Link
+                          href={`/categories/${b.categoryId}`}
+                          className="text-sm font-medium truncate hover:underline"
+                          title={b.categoryName ? `${b.categoryName}: trends, average, top payees` : "Category view"}
+                        >
+                          {b.categoryName}
+                        </Link>
                         <span className={`shrink-0 text-xs font-medium tabular-nums px-1.5 py-0.5 rounded-full ${
                           over
                             ? "bg-rose-100 text-rose-700 dark:bg-rose-950/50 dark:text-rose-300"

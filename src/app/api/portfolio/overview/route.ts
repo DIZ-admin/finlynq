@@ -7,7 +7,6 @@ import { getCryptoPrices, symbolToCoinGeckoId } from "@/lib/crypto-service";
 import { getLatestFxRate, convertCurrency, getDisplayCurrency, getRate } from "@/lib/fx-service";
 import { isMetalCurrency, isCryptoSymbol, isCurrencyCodeSymbol } from "@/lib/fx/supported-currencies";
 import { requireAuth } from "@/lib/auth/require-auth";
-import { getDEK } from "@/lib/crypto/dek-cache";
 import { decryptNamedRows } from "@/lib/crypto/encrypted-columns";
 import { clusterFromAssetType } from "@/lib/securities/canonical";
 import { securitiesReadEnabledForUser } from "@/lib/securities/flag";
@@ -17,6 +16,7 @@ import { aggregateMovers } from "@/lib/portfolio/top-movers";
 import { effectivePriceAtDate, loadCustomPriceMap } from "@/lib/securities/custom-prices";
 import { todayISO } from "@/lib/utils/date";
 import { isLotsEnabledForUser, loadMetricsForUser } from "@/lib/portfolio/lots/read";
+import { lotCostInCurrency } from "@/lib/portfolio/cost-metrics";
 import { listRealizedGainClosures, augmentWithBaseCurrency } from "@/lib/portfolio/realized-gains";
 import { round2 } from "@/lib/utils/number";
 import { withOp } from "@/lib/diagnostics/op-context";
@@ -28,8 +28,7 @@ export function GET(request: NextRequest) {
 async function handleGet(request: NextRequest) {
   const auth = await requireAuth(request);
   if (!auth.authenticated) return auth.response;
-  const { userId, sessionId } = auth.context;
-  const dek = sessionId ? getDEK(sessionId, userId) : null;
+  const { userId, dek } = auth.context;
   const displayCurrency = await getDisplayCurrency(userId, request.nextUrl.searchParams.get("currency"));
   const todayDate = todayISO();
 
@@ -468,14 +467,30 @@ async function handleGet(request: NextRequest) {
   // Pre-compute the quote currency for each holding â€” the currency that
   // marketValue (price Ã— quantity) will be in once we enrich. Cost basis
   // MUST be normalized to this currency so unrealizedGain = marketValue âˆ’
-  // costBasis is dimensionally consistent. Crypto's quote is "CAD" (the
-  // crypto-service quirk); cash uses the symbol; stocks use Yahoo's q.currency.
+  // costBasis is dimensionally consistent. Crypto uses the crypto price's own
+  // currency; cash uses the symbol; stocks use Yahoo's q.currency.
+  //
+  // Shared crypto-price lookup so this pre-pass and the enrichment loop below
+  // can never disagree about a holding's quote currency. They DID disagree
+  // (review 2026-07-30 finding #1): this pass hardcoded "CAD" while enrichment
+  // set `cp.currency || "USD"`, so a USD-priced crypto position had its cost
+  // basis normalized into CAD and then subtracted from a USD market value —
+  // inflating unrealized G/L by the whole CAD/USD spread on EVERY crypto
+  // holding. crypto-service caches `vs_currency=usd`, so the truth is USD.
+  const cryptoPriceForSymbol = (symbol: string | null | undefined) =>
+    symbol ? cryptoPriceMap.get(String(symbol).toUpperCase().split("-")[0]) : undefined;
   const quoteCurrencyById = new Map<number, string>();
   for (const h of holdings) {
     const isCryptoH = h.isCrypto === 1 || (h.symbol ? isCryptoSymbol(h.symbol) : false);
     const symbolIsCurrencyH = symbolIsCash(h.symbol);
     let qc = h.currency;
-    if (isCryptoH) qc = "CAD";
+    if (isCryptoH) {
+      // Mirror the enrichment branch EXACTLY: a resolved price contributes
+      // `cp.currency || "USD"`; with no price the row keeps h.currency, which
+      // is what `fxRates.get(quoteCurrency ?? h.currency)` falls back to there.
+      const cp = cryptoPriceForSymbol(h.symbol);
+      if (cp) qc = cp.currency || "USD";
+    }
     else if (symbolIsCurrencyH && h.symbol) {
       const symU = h.symbol.toUpperCase();
       // Metals (XAU/XAG/XPT/XPD) are tradeable units priced in the holding's
@@ -493,8 +508,8 @@ async function handleGet(request: NextRequest) {
   }
 
   // Backfill fxRates with any quote currencies not already covered (crypto
-  // returns "CAD" even when h.currency is USD; Yahoo may return a quote
-  // currency that doesn't match the holding's row currency).
+  // quotes come back USD-based even when h.currency is something else; Yahoo
+  // may return a quote currency that doesn't match the holding's row currency).
   for (const qc of new Set(quoteCurrencyById.values())) {
     if (qc && !fxRates.has(qc)) {
       fxRates.set(qc, await getRate(qc, displayCurrency, todayDate, userId));
@@ -624,24 +639,39 @@ async function handleGet(request: NextRequest) {
       prices: new Map(),
       reportingCurrency: displayCurrency,
     });
+    const rowCurrencyById = new Map(holdings.map((h) => [h.id, h.currency]));
     for (const lm of lotMetrics) {
       const m = metricsByHoldingId.get(lm.holdingId);
       if (!m) continue;
+      // Lot figures come back in the position row's own currency, while every
+      // other figure in `m` is in the QUOTE currency (quoteCurrencyById) that
+      // the market value is priced in. Carry them across at today's rate, the
+      // same hop aggInHoldingCurrency gives the simple figures. Without it a
+      // Toronto-listed fund on a USD row had a USD cost subtracted from a CAD
+      // market value, so its holding-currency cost, unrealized gain and % were
+      // wrong whenever lot allocation was on (the display-currency figures use
+      // costBasisReporting and were never affected).
+      const rowCcy = rowCurrencyById.get(lm.holdingId);
+      const toQuote = rowCcy ? await getCrossRate(rowCcy, quoteCurrencyById.get(lm.holdingId) ?? rowCcy) : 1;
+      const lot = lotCostInCurrency(
+        { qty: lm.qty, costBasis: lm.costBasis, realizedGain: lm.realizedGainAllTime },
+        toQuote,
+      );
       if (cashHoldingIdSet.has(lm.holdingId)) {
         // Reconciled iff the lot signed net qty matches the ledger balance.
         const ledgerQty = m.qty;
         const reconciled = Math.abs(lm.qty - ledgerQty) <= Math.max(0.01, Math.abs(ledgerQty) * 1e-4);
         if (reconciled && Math.abs(ledgerQty) > 1e-9) {
-          m.totalCostBasis = lm.costBasis;
-          m.avgCostPerShare = lm.costBasis / ledgerQty;
+          m.totalCostBasis = lot.costBasis;
+          m.avgCostPerShare = lot.costBasis / ledgerQty;
           reportingCostBasisByHolding.set(lm.holdingId, lm.costBasisReporting);
         }
         // else: leave m as-is → the fiat-cash peg (FINLYNQ-277) applies.
         continue;
       }
-      m.totalCostBasis = lm.qty > 1e-9 ? lm.costBasis : null;
-      m.avgCostPerShare = lm.qty > 1e-9 ? lm.costBasis / lm.qty : null;
-      m.realizedGain = lm.realizedGainAllTime;
+      m.totalCostBasis = lm.qty > 1e-9 ? lot.costBasis : null;
+      m.avgCostPerShare = lm.qty > 1e-9 ? lot.costBasis / lm.qty : null;
+      m.realizedGain = lot.realizedGain;
       if (lm.qty > 1e-9) reportingCostBasisByHolding.set(lm.holdingId, lm.costBasisReporting);
     }
     const rgBase = await augmentWithBaseCurrency(
@@ -713,8 +743,9 @@ async function handleGet(request: NextRequest) {
       price = effectivePriceAtDate(points, todayDate) ?? 0;
       quoteCurrency = h.currency;
     } else if (isCrypto && h.symbol) {
-      const base = String(h.symbol).toUpperCase().split("-")[0];
-      const cp = cryptoPriceMap.get(base);
+      // Same lookup the quoteCurrencyById pre-pass uses (shared helper) so the
+      // cost-basis target currency and the market-value currency stay identical.
+      const cp = cryptoPriceForSymbol(h.symbol);
       if (cp) {
         price = cp.price;
         change = cp.change24h;

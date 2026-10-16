@@ -1,14 +1,14 @@
 import { NextRequest, NextResponse } from "next/server";
 import { db, schema } from "@/db";
-import { sql, and, gte, lte, eq } from "drizzle-orm";
+import { sql, and, gte, lte, eq, inArray } from "drizzle-orm";
 import { requireAuth } from "@/lib/auth/require-auth";
-import { getDEK } from "@/lib/crypto/dek-cache";
 import { decryptName } from "@/lib/crypto/encrypted-columns";
 import { getDisplayCurrency, getRateMap, convertWithRateMap } from "@/lib/fx-service";
 import { selfHealReportingAmounts } from "@/lib/fx/reporting-amount";
 import { todayISO } from "@/lib/utils/date";
+import { parseAccountIdsParam, ACCOUNT_IDS_PARAM } from "@/lib/reports/account-filter";
+import { isReportPeriod, type ReportPeriod as Period } from "@/lib/reports/period";
 
-type Period = "daily" | "weekly" | "monthly" | "quarterly";
 type GroupBy = "category" | "group";
 
 function periodExpr(period: Period) {
@@ -22,6 +22,8 @@ function periodExpr(period: Period) {
       return sql<string>`SUBSTR(${schema.transactions.date}, 1, 7)`;
     case "quarterly":
       return sql<string>`SUBSTR(${schema.transactions.date}, 1, 4) || '-Q' || ((CAST(SUBSTR(${schema.transactions.date}, 6, 2) AS INTEGER) - 1) / 3 + 1)`;
+    case "yearly":
+      return sql<string>`SUBSTR(${schema.transactions.date}, 1, 4)`;
   }
 }
 
@@ -36,25 +38,35 @@ function formatPeriodLabel(key: string, period: Period): string {
     const d = new Date(parseInt(y), parseInt(m) - 1);
     return d.toLocaleDateString("en-CA", { year: "numeric", month: "short" });
   }
-  // quarterly
+  // quarterly ("2026-Q1") and yearly ("2026") keys are already readable
   return key;
 }
 
 export async function GET(request: NextRequest) {
   const auth = await requireAuth(request);
   if (!auth.authenticated) return auth.response;
-  const { userId, sessionId } = auth.context;
+  const { userId, dek } = auth.context;
   // DEK is needed to resolve `categories.name_ct` for Phase-3 NULL'd users.
   // Soft-fail (null DEK) keeps legacy plaintext readable; encrypted-only
   // rows surface as "" and roll up under the existing "Uncategorized" bucket.
-  const dek = sessionId ? getDEK(sessionId, userId) : null;
 
   const params = request.nextUrl.searchParams;
   const startDate = params.get("startDate") ?? `${new Date().getFullYear()}-01-01`;
   const endDate = params.get("endDate") ?? todayISO();
-  const period = (params.get("period") ?? "monthly") as Period;
+  // An unknown period used to fall through `periodExpr` as undefined and
+  // fail inside the query; refuse it instead of guessing a granularity.
+  const periodParam = params.get("period") ?? "monthly";
+  if (!isReportPeriod(periodParam)) {
+    return NextResponse.json(
+      { error: "period must be one of daily, weekly, monthly, quarterly, yearly" },
+      { status: 400 },
+    );
+  }
+  const period: Period = periodParam;
   const groupBy = (params.get("groupBy") ?? "category") as GroupBy;
   const isBusiness = params.get("business") === "true";
+  // Reports-page account scoping. `null` = every account (see account-filter.ts).
+  const accountIds = parseAccountIdsParam(params.get(ACCOUNT_IDS_PARAM));
 
   // Currency rework Phase 3 — convert to the display currency. Prefer the
   // STORED per-row historical reporting_amount; fall back to on-the-fly
@@ -93,6 +105,7 @@ export async function GET(request: NextRequest) {
     sql`${schema.categories.type} IN ('I', 'E')`,
   ];
   if (isBusiness) conditions.push(eq(schema.transactions.isBusiness, 1));
+  if (accountIds) conditions.push(inArray(schema.transactions.accountId, accountIds));
 
   const timeseriesRows = await db
     .select({

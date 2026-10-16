@@ -15,6 +15,9 @@
 import { NextRequest, NextResponse } from "next/server";
 import { requireAuth } from "@/lib/auth/require-auth";
 import { fetchQuote } from "@/lib/price-service";
+import { looksLikeYahooTicker } from "@/lib/securities/yahoo-symbol";
+import { isIsin } from "@/lib/securities/isin";
+import { resolveIsinForUser } from "@/lib/securities/isin-store";
 import { symbolToCoinGeckoId } from "@/lib/crypto-service";
 import {
   isSupportedCurrency,
@@ -39,10 +42,15 @@ export type SymbolInfo = {
   price?: number;
   /** Where the info came from */
   source: "yahoo" | "coingecko" | "currency-list" | "active-currencies" | "none";
+  /** Set when the input was an ISIN: the ISIN typed. `symbol` is then the
+   *  Yahoo symbol it resolved to, which the form should store instead. */
+  resolvedFromIsin?: string;
+  /** Security name Yahoo returned for a resolved ISIN. */
+  name?: string | null;
 };
 
 /**
- * Stock-style (Yahoo) symbols look like AAPL, VCN.TO, BRK-B, MSFT.
+ * Stock-style (Yahoo) symbols look like AAPL, VCN.TO, BRK-B, 7203.T, 0700.HK.
  * Currency codes are 3-4 capital letters. We use ordering to disambiguate
  * — a ticker that's also a currency code (rare; e.g. "BTC", "ETH") is
  * treated as crypto first since the holding is typically a coin position
@@ -58,6 +66,39 @@ export async function GET(request: NextRequest) {
     return NextResponse.json({ error: "Missing symbol" }, { status: 400 });
   }
   const symbol = raw.toUpperCase();
+
+  // 0. An ISIN (GH #365) — resolve it to the Yahoo symbol and describe THAT.
+  //    Checked first: a valid ISIN is never a ticker, coin or currency code.
+  if (isIsin(symbol)) {
+    // The user's own securities first (an ISIN they've used before), then Yahoo.
+    const match = await resolveIsinForUser(auth.context.userId, auth.context.dek, symbol);
+    if (!match) {
+      return NextResponse.json<SymbolInfo>({
+        symbol,
+        kind: "unknown",
+        currency: null,
+        label: `${symbol} looks like an ISIN, but Yahoo Finance has no listing for it — enter the ticker instead`,
+        isCrypto: false,
+        source: "none",
+      });
+    }
+    const resolved = match.symbol.toUpperCase();
+    const quote = await fetchQuote(resolved);
+    return NextResponse.json<SymbolInfo>({
+      symbol: resolved,
+      kind: match.quoteType === "ETF" ? "etf" : "stock",
+      currency: quote?.currency || null,
+      label:
+        `ISIN ${symbol} → ${resolved}` +
+        (match.source === "stored" ? " (from your securities)" : "") +
+        (quote?.currency ? ` — priced in ${quote.currency}` : ""),
+      isCrypto: false,
+      ...(quote && quote.price > 0 ? { price: quote.price } : {}),
+      source: "yahoo",
+      resolvedFromIsin: symbol,
+      name: match.name ?? null,
+    });
+  }
 
   // 1. Crypto via CoinGecko? (BTC, ETH, SOL, ...)
   const cgId = symbolToCoinGeckoId(symbol);
@@ -100,7 +141,7 @@ export async function GET(request: NextRequest) {
   }
 
   // 3. Stock/ETF via Yahoo?
-  if (/^[A-Z][A-Z0-9.\-]{0,14}$/.test(symbol)) {
+  if (looksLikeYahooTicker(symbol)) {
     const quote = await fetchQuote(symbol);
     if (quote && quote.price > 0) {
       return NextResponse.json<SymbolInfo>({

@@ -20,6 +20,7 @@ import { db, schema } from "@/db";
 import { and, eq, gte, inArray, lte } from "drizzle-orm";
 import { todayISO } from "@/lib/utils/date";
 import { marketFetch } from "@/lib/market-fetch";
+import { toYahooSymbol } from "@/lib/securities/yahoo-symbol";
 
 // FINLYNQ-201: the ETF-vs-stock classification no longer relies on a hardcoded
 // ETF registry. The badge is driven by Yahoo's `quoteType`/`instrumentType`
@@ -282,10 +283,23 @@ async function writePriceCache(
 export async function fetchQuoteLive(symbol: string): Promise<QuoteResult | null> {
   try {
     const res = await marketFetch(
-      `${YAHOO_BASE}/chart/${encodeURIComponent(symbol)}?interval=1d&range=1d`,
+      `${YAHOO_BASE}/chart/${encodeURIComponent(toYahooSymbol(symbol))}?interval=1d&range=1d`,
       {
-        headers: { "User-Agent": "Mozilla/5.0" },
-        next: { revalidate: 300 },
+        // DO NOT put `next: { revalidate: N }` back on a LIVE quote fetch.
+        // Next's fetch data cache is stale-while-revalidate: past the window it
+        // hands the CALLER the previous body and refreshes the entry in the
+        // background — so every price we stored was one fetch-generation old.
+        // Measured on prod 2026-07-29: the price_cache row was written at
+        // 15:33:48.880 while Yahoo's response arrived at 15:33:48.953 (73ms
+        // LATER); the DB got 121.37 (yesterday's close) and the correct 160.545
+        // went to the on-disk cache for the next caller. Every stock/ETF on prod
+        // was holding yesterday's close as today's price — invisible on a 2%
+        // mover, a 25% valuation error on HURN's +32% earnings day.
+        // It also saved nothing: our own price_cache TTL (30 min) is LONGER than
+        // any revalidate window we'd set, so every call already arrives expired
+        // and goes to the network regardless. Call volume is unchanged by this;
+        // the only difference is whether the caller gets the current answer.
+        cache: "no-store",
         signal: AbortSignal.timeout(QUOTE_FETCH_TIMEOUT_MS),
       }
     );
@@ -510,7 +524,7 @@ export async function fetchYahooDailyCloses(
     const period1 = Math.floor(Date.parse(`${fromDate}T00:00:00Z`) / 1000);
     const period2 = Math.floor(Date.now() / 1000);
     if (!Number.isFinite(period1) || period1 >= period2) return [];
-    const url = `${YAHOO_BASE}/chart/${encodeURIComponent(symbol)}?period1=${period1}&period2=${period2}&interval=1d`;
+    const url = `${YAHOO_BASE}/chart/${encodeURIComponent(toYahooSymbol(symbol))}?period1=${period1}&period2=${period2}&interval=1d`;
     const res = await marketFetch(url, {
       headers: { "User-Agent": "Mozilla/5.0" },
       next: { revalidate: 86400 },
@@ -580,7 +594,7 @@ export async function fetchQuoteAtDate(symbol: string, date: string): Promise<Qu
     );
     const period1 = Math.floor(windowStart.getTime() / 1000);
     const period2 = Math.floor(windowEndMs / 1000);
-    const url = `${YAHOO_BASE}/chart/${encodeURIComponent(symbol)}?period1=${period1}&period2=${period2}&interval=1d`;
+    const url = `${YAHOO_BASE}/chart/${encodeURIComponent(toYahooSymbol(symbol))}?period1=${period1}&period2=${period2}&interval=1d`;
     const res = await marketFetch(url, {
       headers: { "User-Agent": "Mozilla/5.0" },
       next: { revalidate: 86400 },

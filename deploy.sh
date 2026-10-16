@@ -211,7 +211,31 @@ if ! command -v psql >/dev/null 2>&1; then
   exit 1
 fi
 MIGRATIONS_DIR="$APP_DIR/scripts/migrations"
+BASELINE_FILE="$APP_DIR/scripts/baseline/0001_schema_baseline.sql"
 psql "$DB_URL" -v ON_ERROR_STOP=1 -q -c "CREATE TABLE IF NOT EXISTS schema_migrations (version TEXT PRIMARY KEY, applied_at TIMESTAMPTZ NOT NULL DEFAULT NOW());"
+
+# Baseline step (GH #312). Replaying scripts/migrations/ against an EMPTY database
+# does not work — measured 2026-07-24: 38 of 70 files fail and only 43 of 70
+# tables get created, because much of the schema was historically created by
+# untracked `scripts/migrate-*.sql` run by hand. So on an empty database we apply
+# the full schema baseline first; it records the migrations it subsumes, and the
+# loop below then skips them.
+#
+# INERT ON PROD AND DEV BY CONSTRUCTION: the guard fires only when `public` holds
+# no ordinary tables besides `schema_migrations`, which can never be true of an
+# environment that has ever served a request. Mirrors scripts/run-migrations.mjs.
+EXISTING_TABLES=$(psql "$DB_URL" -tA -c "SELECT count(*) FROM pg_class c JOIN pg_namespace n ON n.oid = c.relnamespace WHERE n.nspname = 'public' AND c.relkind = 'r' AND c.relname <> 'schema_migrations';")
+if [ "$EXISTING_TABLES" = "0" ]; then
+  if [ ! -f "$BASELINE_FILE" ]; then
+    echo "==> ERROR: empty database but no baseline at $BASELINE_FILE."
+    echo "==>        The migration chain alone cannot build the schema from zero."
+    exit 1
+  fi
+  echo "==> Empty database detected — applying schema baseline..."
+  psql "$DB_URL" -v ON_ERROR_STOP=1 --single-transaction -q -f "$BASELINE_FILE"
+  echo "==> Baseline applied ($(psql "$DB_URL" -tA -c "SELECT count(*) FROM schema_migrations;") migration(s) recorded as subsumed)."
+fi
+
 APPLIED_COUNT=0
 if [ -d "$MIGRATIONS_DIR" ]; then
   shopt -s nullglob
@@ -326,14 +350,27 @@ if ! systemctl is-active --quiet "$SERVICE_NAME"; then
 fi
 echo "==> $SERVICE_NAME is running"
 
-# 8. Health check — confirm the app is serving requests
-echo "==> Running health check..."
-sleep 2
+# 8. Smoke check — BLOCKING. Confirms the app is genuinely serving requests.
+#
+# This used to be a single `curl ... || echo "app may still be warming up"`,
+# which could not fail: the warn branch swallowed the error and the deploy
+# printed "completed successfully" over a dead app. It only checked healthz,
+# so it also could not have caught a deploy that answered API routes while
+# 500-ing on every page. Now delegated to scripts/smoke-check.sh (shared with
+# the "Verify deployment" step in deploy-{prod,dev}.yml) and allowed to fail
+# the deploy, which is what surfaces the breakage — on prod that non-zero exit
+# is what opens the "🚨 Production deploy failed" issue.
+echo "==> Running smoke check..."
 APP_PORT=$(sudo systemctl show "$SERVICE_NAME" -p Environment --value 2>/dev/null | tr ' ' '\n' | grep '^PORT=' | cut -d= -f2 || echo "3000")
-HEALTH_URL="http://localhost:${APP_PORT}/api/healthz"
-if curl -fs --max-time 10 "$HEALTH_URL" -o /dev/null; then
-  echo "==> Health check passed ($HEALTH_URL)"
-else
-  echo "==> Warning: health check at $HEALTH_URL did not respond (app may still be warming up)"
+
+# set -e is already on, so a non-zero exit here aborts the deploy script. Print
+# the tail of the service journal first — by the time anyone reads the CI log
+# the interesting startup errors are the ones from the last few seconds.
+if ! bash "$APP_DIR/scripts/smoke-check.sh" "http://localhost:${APP_PORT}" 90; then
+  echo ""
+  echo "==> Last 50 log lines from $SERVICE_NAME:"
+  sudo journalctl -u "$SERVICE_NAME" -n 50 --no-pager || true
+  exit 1
 fi
+
 echo "==> Deploy completed successfully at $(date)"

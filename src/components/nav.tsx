@@ -18,7 +18,7 @@ import {
   Upload,
   Settings,
   CreditCard,
-  CalendarDays,
+  ChartPie,
   FlameKindling,
   GitBranch,
   MessageSquare,
@@ -65,8 +65,9 @@ const navGroups: { label: string; items: NavItem[] }[] = [
       { href: "/transactions", label: "Transactions", icon: ArrowLeftRight, color: ACTIVE_ACCENT, mode: "prod" },
       { href: "/budgets", label: "Budgets", icon: PiggyBank, color: ACTIVE_ACCENT, mode: "prod" },
       { href: "/goals", label: "Goals", icon: Target, color: ACTIVE_ACCENT, mode: "prod" },
-      { href: "/subscriptions", label: "Subscriptions", icon: CreditCard, color: ACTIVE_ACCENT, mode: "dev" },
-      { href: "/calendar", label: "Calendar", icon: CalendarDays, color: ACTIVE_ACCENT, mode: "dev" },
+      // Subscriptions + Bill Calendar merged (2026-10): the calendar is a view
+      // of this page (/calendar redirects to ?view=calendar). Out of dev mode.
+      { href: "/subscriptions", label: "Subscriptions", icon: CreditCard, color: ACTIVE_ACCENT, mode: "prod" },
     ],
   },
   {
@@ -74,13 +75,14 @@ const navGroups: { label: string; items: NavItem[] }[] = [
     items: [
       { href: "/accounts", label: "Accounts", icon: Wallet, color: ACTIVE_ACCENT, mode: "prod" },
       { href: "/portfolio", label: "Portfolio", icon: TrendingUp, color: ACTIVE_ACCENT, mode: "prod" },
-      { href: "/loans", label: "Loans & Debt", icon: Landmark, color: ACTIVE_ACCENT, mode: "dev" },
+      { href: "/loans", label: "Loans & Debt", icon: Landmark, color: ACTIVE_ACCENT, mode: "prod" },
     ],
   },
   {
     label: "Analysis",
     items: [
       { href: "/reports", label: "Reports", icon: FileText, color: ACTIVE_ACCENT, mode: "prod" },
+      { href: "/categories", label: "Categories", icon: ChartPie, color: ACTIVE_ACCENT, mode: "prod" },
       { href: "/tax", label: "Tax", icon: Calculator, color: ACTIVE_ACCENT, mode: "dev" },
     ],
   },

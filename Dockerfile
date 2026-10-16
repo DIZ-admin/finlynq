@@ -1,7 +1,7 @@
 # ── Stage 1: Build the application ───────────────────────────────────────────
-# TODO(security): pin node:22-alpine to a digest (e.g. node:22-alpine@sha256:...)
-# so a tag rebase can't silently swap the base image we publish from.
-FROM node:22-alpine AS builder
+# Pin the multi-platform base manifest so the release build cannot silently
+# consume a rebased tag between verification and publication.
+FROM node:22-alpine@sha256:0a7108bf6c7bf5de370ffb1a3ed6be93d405b43ff159f681a8d18c0e2bc2e402 AS builder
 RUN apk add --no-cache libc6-compat python3 make g++
 WORKDIR /app
 
@@ -22,8 +22,7 @@ ENV NEXT_TELEMETRY_DISABLED=1
 RUN npm run build
 
 # ── Stage 2: Production image ─────────────────────────────────────────────────
-# TODO(security): pin node:22-alpine to a digest — see build stage.
-FROM node:22-alpine AS runner
+FROM node:22-alpine@sha256:0a7108bf6c7bf5de370ffb1a3ed6be93d405b43ff159f681a8d18c0e2bc2e402 AS runner
 RUN apk add --no-cache curl netcat-openbsd
 WORKDIR /app
 
@@ -41,8 +40,14 @@ COPY --from=builder /app/.next/standalone ./
 COPY --from=builder /app/.next/static ./.next/static
 COPY --from=builder /app/public ./public
 
-# Copy PostgreSQL migration files
-COPY --from=builder /app/drizzle-pg ./drizzle-pg
+# Copy the schema baseline + migration chain and the runner that applies them.
+# `drizzle-pg/` is deliberately NOT copied any more: it only ever created 21 of
+# the ~68 tables the app needs, which is why the published image could never
+# reach a registerable instance (GH #312). It survives in the repo for local
+# `npm run db:generate` workflows and is no longer a deployment path.
+COPY --from=builder /app/scripts/baseline ./scripts/baseline
+COPY --from=builder /app/scripts/migrations ./scripts/migrations
+COPY --from=builder /app/scripts/run-migrations.mjs ./scripts/run-migrations.mjs
 
 # Copy and prepare the entrypoint script
 COPY scripts/entrypoint.sh /entrypoint.sh

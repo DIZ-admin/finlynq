@@ -4,6 +4,7 @@ import { generateImportHash, checkDuplicates } from "./import-hash";
 import type { RawTransaction } from "./import-pipeline";
 import { buildNameFields, decryptName, nameLookup } from "./crypto/encrypted-columns";
 import { resolveOrCreateSecurity } from "./securities/resolve";
+import { normalizeCategoryType } from "./categories/category-type";
 // `parseAmount` moved to the dependency-free `./parse-amount` module
 // (2026-06-04) so client components can import it without pulling this file's
 // server-only `@/db` dependency into the browser bundle. Imported here for
@@ -251,17 +252,41 @@ export function extractCSVHeaders(csvText: string): string[] {
   return parseCSVRow(lines[0]);
 }
 
+/**
+ * Shared return shape of the two CSV row readers.
+ *
+ * `currencyFallbackUsed` (GH #328) is the per-parse provenance signal: true iff
+ * at least one PARSED row got its `currency` from the `defaultCurrency`
+ * argument (or the "CAD" last-resort) rather than from the file itself — i.e.
+ * the file has no Currency column, or the mapped cell was empty on that row.
+ *
+ * It exists so the CSV pipeline can tell "this row genuinely says CAD" apart
+ * from "we stamped CAD because we had nothing", which a post-hoc scan for the
+ * literal string cannot do. Additive: every other caller destructures
+ * `{ rows, errors }` and is byte-identical.
+ */
+export interface CsvParseResult {
+  rows: RawTransaction[];
+  errors: Array<{ row: number; message: string }>;
+  currencyFallbackUsed: boolean;
+}
+
 export function csvToRawTransactions(
   csvText: string,
   dateFormatOverride?: DateFormatOverride | null,
   defaultCurrency?: string | null,
-): { rows: RawTransaction[]; errors: Array<{ row: number; message: string }> } {
+): CsvParseResult {
   const parsed = parseCSV(csvText);
   const rows: RawTransaction[] = [];
   const errors: Array<{ row: number; message: string }> = [];
+  let currencyFallbackUsed = false;
 
   if (parsed.length === 0) {
-    return { rows: [], errors: [{ row: 0, message: "File is empty or contains only headers" }] };
+    return {
+      rows: [],
+      errors: [{ row: 0, message: "File is empty or contains only headers" }],
+      currencyFallbackUsed: false,
+    };
   }
 
   for (let i = 0; i < parsed.length; i++) {
@@ -281,6 +306,11 @@ export function csvToRawTransactions(
       continue;
     }
 
+    // GH #328 — did THIS row's currency come from the file, or from the
+    // fallback? `||` (not `??`) so an empty cell counts as "not from the file".
+    const fileCurrency = row["Currency"] || "";
+    if (!fileCurrency) currencyFallbackUsed = true;
+
     rows.push({
       date,
       account: row["Account"] ?? "",
@@ -288,9 +318,11 @@ export function csvToRawTransactions(
       payee: row["Payee"] ?? "",
       category: row["Categorization"] ?? "",
       // FINLYNQ — honor a template/upload default currency when the file has no
-      // Currency column (or an empty cell). `||` (not `??`) so empty strings fall
-      // through. CAD stays the last-resort so no-default imports are unchanged.
-      currency: row["Currency"] || defaultCurrency || "CAD",
+      // Currency column (or an empty cell). CAD stays the last-resort so
+      // non-pipeline callers (email import, importTransactions) are unchanged;
+      // the CSV pipeline never reaches it (it fails loud on
+      // `currencyFallbackUsed` with no fallback — GH #328).
+      currency: fileCurrency || defaultCurrency || "CAD",
       note: row["Note"] ?? "",
       tags: row["Tags"] ?? "",
       quantity: row["Quantity"] ? parseFloat(row["Quantity"]) || undefined : undefined,
@@ -298,7 +330,7 @@ export function csvToRawTransactions(
     });
   }
 
-  return { rows, errors };
+  return { rows, errors, currencyFallbackUsed };
 }
 
 /**
@@ -311,13 +343,18 @@ export function csvToRawTransactionsWithMapping(
   mapping: Record<string, string>,
   dateFormatOverride?: DateFormatOverride | null,
   defaultCurrency?: string | null,
-): { rows: RawTransaction[]; errors: Array<{ row: number; message: string }> } {
+): CsvParseResult {
   const parsed = parseCSV(csvText);
   const rows: RawTransaction[] = [];
   const errors: Array<{ row: number; message: string }> = [];
+  let currencyFallbackUsed = false;
 
   if (parsed.length === 0) {
-    return { rows: [], errors: [{ row: 0, message: "File is empty or contains only headers" }] };
+    return {
+      rows: [],
+      errors: [{ row: 0, message: "File is empty or contains only headers" }],
+      currencyFallbackUsed: false,
+    };
   }
 
   // Invert: field → header  (mapping already is { field: header })
@@ -325,7 +362,11 @@ export function csvToRawTransactionsWithMapping(
   const amountCol = mapping["amount"];
 
   if (!dateCol || !amountCol) {
-    return { rows: [], errors: [{ row: 0, message: "Column mapping must include date and amount" }] };
+    return {
+      rows: [],
+      errors: [{ row: 0, message: "Column mapping must include date and amount" }],
+      currencyFallbackUsed: false,
+    };
   }
 
   // Optional sign-flip parser knob (ColumnMapping.flipSign). The mapping is
@@ -354,6 +395,14 @@ export function csvToRawTransactionsWithMapping(
     // Guard -0 so a zero amount stays +0 after the flip.
     const amount = flipSign && parsedAmount !== 0 ? -parsedAmount : parsedAmount;
 
+    // GH #328 — same per-row provenance signal as the canonical reader: an
+    // unmapped Currency column OR an empty mapped cell means this row's
+    // currency did NOT come from the file.
+    const fileCurrency = mapping["currency"]
+      ? (row[mapping["currency"]] || "")
+      : "";
+    if (!fileCurrency) currencyFallbackUsed = true;
+
     rows.push({
       date,
       account: mapping["account"] ? (row[mapping["account"]] ?? "") : "",
@@ -361,11 +410,9 @@ export function csvToRawTransactionsWithMapping(
       payee: mapping["payee"] ? (row[mapping["payee"]] ?? "") : "",
       category: mapping["category"] ? (row[mapping["category"]] ?? "") : undefined,
       // FINLYNQ — fall back to the template/upload default currency when no
-      // Currency column is mapped, or the mapped cell is empty. `||` so empty
-      // cells fall through; CAD stays the last-resort.
-      currency: mapping["currency"]
-        ? (row[mapping["currency"]] || defaultCurrency || "CAD")
-        : (defaultCurrency || "CAD"),
+      // Currency column is mapped, or the mapped cell is empty. CAD stays the
+      // last-resort for non-pipeline callers only (GH #328 — see above).
+      currency: fileCurrency || defaultCurrency || "CAD",
       note: mapping["note"] ? (row[mapping["note"]] ?? "") : undefined,
       tags: mapping["tags"] ? (row[mapping["tags"]] ?? "") : undefined,
       quantity: mapping["quantity"] ? (parseFloat(row[mapping["quantity"]] ?? "") || undefined) : undefined,
@@ -376,7 +423,7 @@ export function csvToRawTransactionsWithMapping(
     });
   }
 
-  return { rows, errors };
+  return { rows, errors, currencyFallbackUsed };
 }
 
 /**
@@ -500,11 +547,18 @@ export async function importCategories(csvText: string, userId: string, dek: Buf
             .get()
         : null;
       if (!existing) {
+        // A blank Type column means expense; anything else must be a
+        // recognisable type, or the row would be stored where no report sees it.
+        const type = row["Type"] ? normalizeCategoryType(row["Type"]) : "E";
+        if (!type) {
+          errors.push(`"${row["Category"]}": unknown Type "${row["Type"]}" (use E, I or R)`);
+          continue;
+        }
         const enc = buildNameFields(dek, { name: row["Category"] });
         await db.insert(schema.categories)
           .values({
             userId,
-            type: row["Type"] || "E",
+            type,
             group: row["Group"] ?? "",
             note: row["Note"] ?? "",
             ...enc,

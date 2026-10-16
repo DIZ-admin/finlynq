@@ -54,25 +54,25 @@ PUT /api/settings/display-currency
 There is currently **no MCP operation** that changes this setting. Configure it
 through the web/API endpoint, then MCP reporting tools read it automatically.
 An explicit `reportingCurrency` argument still overrides the saved setting for
-one call. When the setting is absent or unreadable, the documented final
-fallback is `CAD`.
+one call. When the setting is absent or unreadable, the v3.5.0 final fallback
+is `USD`. This differs from the earlier fork's `CAD` fallback: set the intended
+Household display currency explicitly before deployment.
 
 ## Subscriptions
 
 `manage_subscriptions(op: "add")` accepts an optional `currency`.
 
 - Explicit `currency` always wins.
-- When omitted, the subscription inherits `settings.display_currency`.
-- It does not inherit an account currency; a subscription may have no linked
-  account and the display setting is deterministic for both cases.
-- If `display_currency` is configured as `CHF`, an omitted currency is stored as
-  `CHF`; it is not silently stored as `CAD`.
-- If no display currency is configured, the final fallback is `CAD`.
+- When omitted and linked to an account, it inherits the account currency.
+- Without a linked account it inherits `settings.display_currency`.
+- If `display_currency` is configured as `CHF`, an omitted currency with no
+  linked account is stored as `CHF`; it is not silently stored as `CAD`.
+- If no display currency is configured, the final fallback is `USD`.
 - Bulk subscription creation follows the same rule and resolves the default
   once for the operation.
 
 Budget and report totals use the resolved reporting currency: explicit
-`reportingCurrency`, otherwise `settings.display_currency`, otherwise `CAD`.
+`reportingCurrency`, otherwise `settings.display_currency`, otherwise `USD`.
 
 ## Safety
 

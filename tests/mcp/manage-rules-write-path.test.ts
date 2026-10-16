@@ -93,13 +93,14 @@ describe("manage_rules v2 write path (FINLYNQ-129)", () => {
   });
 });
 
-describe("transaction-rules v2 migration safety (FINLYNQ-129)", () => {
-  it("refuses legacy rows instead of truncating them", () => {
+describe("historical transaction-rules v2 migration fixture (FINLYNQ-129)", () => {
+  it("preserves the fork's old fail-closed guard without pretending the v3.5.0 runner executes it", () => {
     const migration = readFileSync(
-      resolve(__dirname, "../../scripts/migrate-finlynq-84-rules-v2.sql"),
+      resolve(__dirname, "../legacy-rules-v2-manual.sql"),
       "utf8",
     );
 
+    expect(migration).toMatch(/HISTORICAL FIXTURE ONLY/);
     expect(migration).toMatch(/legacy_rows/);
     expect(migration).toMatch(/RAISE EXCEPTION/);
     expect(migration).toMatch(/ADD COLUMN IF NOT EXISTS conditions jsonb/i);

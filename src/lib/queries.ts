@@ -731,7 +731,11 @@ export async function upsertBudget(userId: string, data: { categoryId: number; m
     if (data.currency) update.currency = data.currency;
     return db.update(budgets).set(update).where(eq(budgets.id, existing.id)).returning().get();
   }
-  return db.insert(budgets).values({ ...data, userId, currency: data.currency ?? "CAD" }).returning().get();
+  // A new record's currency is never a hardcoded default (feedback #7): an
+  // omitted currency means the user's display currency — the one every budget
+  // screen shows amounts in. The old "CAD" made a USD user's 500 read as $365.
+  const currency = data.currency?.trim().toUpperCase() || (await getDisplayCurrency(userId));
+  return db.insert(budgets).values({ ...data, userId, currency }).returning().get();
 }
 
 export async function deleteBudget(id: number, userId: string) {
@@ -1051,14 +1055,24 @@ export async function getNetWorthOverTime(userId: string) {
  * single account). Investment accounts are excluded so their buy/sell legs
  * (which net to ~0) never get summed as a "balance" — their value comes from
  * snapshots instead. Returns deltas over ALL history (the cumulative on any
- * grid day needs every delta before the window). Archived accounts are
- * excluded to mirror the dashboard hero's account set.
+ * grid day needs every delta before the window).
+ *
+ * ARCHIVED ACCOUNTS ARE INCLUDED. `archived` is a list/picker visibility flag,
+ * not a statement that the money never existed — see the "archived accounts
+ * stay in the money math" invariant. Filtering them here rewrote the PAST:
+ * archiving an account today erased its contribution from every historical
+ * point, so a chart drawn six months ago silently changed. Measured on dev
+ * (2026-09-12): archiving a $2,157.52 savings account moved the 6-months-ago
+ * net-worth point from -11,177.42 to -12,217.15. Keep in lockstep with
+ * {@link getCashDailyDeltasByAccount}, {@link getCashSnapshotsInRange} and
+ * {@link getCashTxFingerprint} — the fingerprint decides when a rebuild runs,
+ * and a rebuild REAPS every snapshot the builder didn't rewrite, so a filter
+ * here plus no filter there permanently deletes stored history.
  */
 export async function getCashDailyDeltas(userId: string, accountId?: number) {
   const conditions = [
     eq(transactions.userId, userId),
     eq(accounts.isInvestment, false),
-    eq(accounts.archived, false),
   ];
   if (accountId != null) conditions.push(eq(transactions.accountId, accountId));
   return db
@@ -1114,6 +1128,11 @@ export async function getInvestmentSnapshotsInRange(
       snapDate: schema.portfolioSnapshots.snapDate,
       marketValue: schema.portfolioSnapshots.marketValue,
       currency: schema.portfolioSnapshots.currency,
+      // FINLYNQ-303 — the same balance in the ACCOUNT currency. NULL on rows
+      // written before the dual-basis rebuild; the caller falls back to the
+      // reporting basis rather than rendering zeros.
+      nativeMarketValue: schema.portfolioSnapshots.nativeMarketValue,
+      nativeCurrency: schema.portfolioSnapshots.nativeCurrency,
     })
     .from(schema.portfolioSnapshots)
     .innerJoin(accounts, eq(schema.portfolioSnapshots.accountId, accounts.id))
@@ -1123,17 +1142,20 @@ export async function getInvestmentSnapshotsInRange(
 }
 
 /**
- * Per-ACCOUNT per-day cash delta (is_investment=false, archived=false). Mirror
- * of {@link getCashDailyDeltas} grouped by account_id so the cash-snapshot
- * builder can keep a separate running cumulative per account (each account has
- * exactly one currency, carried on the row). plan/net-worth-cash-snapshots.md
- * Phase 2.
+ * Per-ACCOUNT per-day cash delta (is_investment=false; archived INCLUDED —
+ * see {@link getCashDailyDeltas}). Mirror of {@link getCashDailyDeltas}
+ * grouped by account_id so the cash-snapshot builder can keep a separate
+ * running cumulative per account (each account has exactly one currency,
+ * carried on the row). plan/net-worth-cash-snapshots.md Phase 2.
+ *
+ * This one is the BUILDER's input, so its account set is also the
+ * `keepAccountIds` the reaper spares. Excluding archived accounts here is what
+ * made `deleteOrphanCashSnapshots` delete their stored history outright.
  */
 export async function getCashDailyDeltasByAccount(userId: string, accountId?: number) {
   const conditions = [
     eq(transactions.userId, userId),
     eq(accounts.isInvestment, false),
-    eq(accounts.archived, false),
   ];
   if (accountId != null) conditions.push(eq(transactions.accountId, accountId));
   return db
@@ -1153,10 +1175,13 @@ export async function getCashDailyDeltasByAccount(userId: string, accountId?: nu
 
 /**
  * Stored CASH snapshots in [from, to] — the cash-side mirror of
- * {@link getInvestmentSnapshotsInRange}. Filters `is_investment=false`,
- * `archived=false`, and `source='cash'` (defense-in-depth: source + the
- * is_investment partition keep this disjoint from the investment reader, which
- * filters `is_investment=true`). NEVER returns the whole-portfolio NULL
+ * {@link getInvestmentSnapshotsInRange}. Filters `is_investment=false` and
+ * `source='cash'` (defense-in-depth: source + the is_investment partition keep
+ * this disjoint from the investment reader, which filters `is_investment=true`).
+ * Archived accounts are INCLUDED — see {@link getCashDailyDeltas}; the
+ * investment reader never filtered them, so this was also the only reason an
+ * archived CASH account vanished from the chart while an archived BROKERAGE
+ * account did not. NEVER returns the whole-portfolio NULL
  * aggregate (the cash builder never writes one, and the inner join on a NULL
  * account_id wouldn't match anyway — the explicit isNotNull is belt-and-braces).
  * plan/net-worth-cash-snapshots.md Phase 2.
@@ -1172,7 +1197,6 @@ export async function getCashSnapshotsInRange(
     gte(schema.portfolioSnapshots.snapDate, from),
     lte(schema.portfolioSnapshots.snapDate, to),
     eq(accounts.isInvestment, false),
-    eq(accounts.archived, false),
     eq(schema.portfolioSnapshots.source, "cash"),
   ];
   if (accountId != null) {
@@ -1186,6 +1210,10 @@ export async function getCashSnapshotsInRange(
       snapDate: schema.portfolioSnapshots.snapDate,
       marketValue: schema.portfolioSnapshots.marketValue,
       currency: schema.portfolioSnapshots.currency,
+      // FINLYNQ-303 — the same balance in the ACCOUNT currency (see the
+      // investment reader above for the NULL-fallback contract).
+      nativeMarketValue: schema.portfolioSnapshots.nativeMarketValue,
+      nativeCurrency: schema.portfolioSnapshots.nativeCurrency,
     })
     .from(schema.portfolioSnapshots)
     .innerJoin(accounts, eq(schema.portfolioSnapshots.accountId, accounts.id))
@@ -1195,13 +1223,18 @@ export async function getCashSnapshotsInRange(
 }
 
 /**
- * Cheap staleness fingerprint over the user's CASH (is_investment=false,
- * archived=false) transactions: the newest create/update instant plus the row
- * count. `count` is load-bearing — a DELETE leaves max-updated untouched, so
- * only the count drop reveals it. Mirrors the exact filter the cash builder
- * reads through so archiving an account (which removes its txns from the set)
- * flips the count and triggers a rebuild that drops its snapshots.
- * plan/net-worth-cash-snapshots.md Phase 2.
+ * Cheap staleness fingerprint over the user's CASH (is_investment=false)
+ * transactions: the newest create/update instant plus the row count. `count`
+ * is load-bearing — a DELETE leaves max-updated untouched, so only the count
+ * drop reveals it. plan/net-worth-cash-snapshots.md Phase 2.
+ *
+ * MUST mirror the exact filter {@link getCashDailyDeltasByAccount} reads
+ * through. It previously also filtered `archived=false`, and the pairing was
+ * deliberate: archiving an account dropped its txns from the set, flipped the
+ * count, and triggered a rebuild whose `keepAccountIds` no longer named that
+ * account — so `deleteOrphanCashSnapshots` erased its stored history. Archived
+ * accounts now stay in both, so the count no longer moves on archive and the
+ * reaper no longer has a reason to fire.
  */
 export async function getCashTxFingerprint(
   userId: string,
@@ -1219,7 +1252,6 @@ export async function getCashTxFingerprint(
       and(
         eq(transactions.userId, userId),
         eq(accounts.isInvestment, false),
-        eq(accounts.archived, false),
       ),
     )
     .all();

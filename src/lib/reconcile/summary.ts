@@ -11,9 +11,14 @@
  *                        bank_transaction_id lineage FK is set (i.e. a bank
  *                        row was materialized into the ledger). This is the
  *                        last reconcile/materialize event.
- *   - pendingCount     = bank_transactions for the account with NO referencing
- *                        ledger transaction yet (unreconciled rows). Cheap
- *                        NOT EXISTS anti-join.
+ *   - pendingCount     = bank_transactions for the account with NO row in
+ *                        `transaction_bank_links` (unreconciled rows). Cheap
+ *                        NOT EXISTS anti-join, shared with the dashboard
+ *                        Action Center via `unrecordedBankRowSql()`. It keys on
+ *                        the LINK TABLE, not the `bank_transaction_id` FK used
+ *                        by lastReconciledAt above — that FK is set only for a
+ *                        `primary` link, so counting on it reported already-
+ *                        reconciled `extra`-linked rows as pending (GH #332).
  *
  * Names are resolved by the API boundary (decrypt + safeAccountName), NOT
  * here — this core stays DEK-free.
@@ -27,6 +32,7 @@ import {
   type BalanceSummaryAccount,
 } from "./balance-summary";
 import { getHoldingsValueByAccount } from "@/lib/holdings-value";
+import { unrecordedBankRowSql } from "./unrecorded-rows";
 
 export interface ReconcileSummaryRow {
   accountId: number;
@@ -85,8 +91,9 @@ export async function getReconcileSummary(
     )
     .groupBy(schema.transactions.accountId);
 
-  // Pending (unreconciled) bank rows per account — no ledger transaction
-  // references the bank row yet.
+  // Pending (unreconciled) bank rows per account — nothing in
+  // `transaction_bank_links` references the bank row yet. Matches the
+  // reconcile UI's `bank_only` badge exactly; see unrecorded-rows.ts.
   const pendingRows = await db
     .select({
       accountId: schema.bankTransactions.accountId,
@@ -96,7 +103,7 @@ export async function getReconcileSummary(
     .where(
       and(
         eq(schema.bankTransactions.userId, userId),
-        sql`NOT EXISTS (SELECT 1 FROM transactions t WHERE t.bank_transaction_id = ${schema.bankTransactions.id})`,
+        unrecordedBankRowSql(),
       ),
     )
     .groupBy(schema.bankTransactions.accountId);

@@ -16,7 +16,7 @@ import { z } from "zod";
 import { requireAuth } from "@/lib/auth/require-auth";
 import { db, schema } from "@/db";
 import { and, eq } from "drizzle-orm";
-import { isSupportedCurrency } from "@/lib/fx/supported-currencies";
+import { DEFAULT_DISPLAY_CURRENCY } from "@/lib/settings/display-currency";
 import { logApiError, safeErrorMessage, validateBody } from "@/lib/validate";
 
 const KEY = "active_currencies";
@@ -51,7 +51,10 @@ async function readDisplay(userId: string): Promise<string> {
       )
     )
     .limit(1);
-  return row[0]?.value ?? "CAD";
+  // FINLYNQ-183: the app-wide default is USD, never CAD. This fallback is what
+  // a user with no `display_currency` row derives their whole active set from,
+  // so a stale CAD here seeded every currency dropdown with the wrong code.
+  return row[0]?.value ?? DEFAULT_DISPLAY_CURRENCY;
 }
 
 async function deriveFromData(userId: string): Promise<string[]> {
@@ -68,6 +71,20 @@ async function deriveFromData(userId: string): Promise<string[]> {
   const set = new Set<string>();
   for (const r of accountRows) if (r.currency) set.add(r.currency.toUpperCase());
   for (const r of txRows) if (r.currency) set.add(r.currency.toUpperCase());
+  // Records that carry their OWN currency count as "in use" too (2026-08-05).
+  // Accounts and transactions alone missed money the user genuinely holds in a
+  // currency: a RUB loan (or goal/subscription/budget) for someone with no RUB
+  // account left RUB out of every dropdown, so they could not create another
+  // one from the web — the form's `ensure` only force-includes the value a
+  // record ALREADY has. Same omission as `getActiveCurrencies` in fx-service.
+  for (const table of [schema.loans, schema.goals, schema.subscriptions, schema.budgets]) {
+    const rows = await db
+      .select({ currency: table.currency })
+      .from(table)
+      .where(eq(table.userId, userId))
+      .groupBy(table.currency);
+    for (const r of rows) if (r.currency) set.add(r.currency.toUpperCase());
+  }
   return Array.from(set);
 }
 

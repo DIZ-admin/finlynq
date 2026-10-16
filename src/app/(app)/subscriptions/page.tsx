@@ -1,162 +1,169 @@
 "use client";
 
-import { DevModeGuard } from "@/components/dev-mode-guard";
+/**
+ * Subscriptions — ONE page for recurring payments (2026-10).
+ *
+ * Merges the old dev-mode-only Subscriptions list and Bill Calendar pages:
+ *   - List view: tracked subscriptions grouped by status, plus recurring
+ *     payments detected in the user's transactions that aren't tracked yet
+ *     (one-click "Track").
+ *   - Calendar view: every projected payment for a month — tracked
+ *     subscriptions, untracked detected bills and expected income.
+ * Both views read the same pure builders (lib/subscriptions/calendar-events.ts)
+ * and schedule math (lib/subscriptions/schedule.ts), so a total in one view
+ * can't disagree with the other. `/calendar` redirects to `?view=calendar`.
+ */
 
-import { useEffect, useState, useCallback } from "react";
+import { Suspense, useCallback, useEffect, useMemo, useState } from "react";
+import { useRouter, useSearchParams } from "next/navigation";
 import { Card, CardContent } from "@/components/ui/card";
 import { Button } from "@/components/ui/button";
-import { Input } from "@/components/ui/input";
-import { Label } from "@/components/ui/label";
-import {
-  Select,
-  SelectContent,
-  SelectItem,
-  SelectTrigger,
-  SelectValue,
-} from "@/components/ui/select";
-import { Combobox, type ComboboxItemShape } from "@/components/ui/combobox";
-import { useDropdownOrder } from "@/components/dropdown-order-provider";
-import {
-  Dialog,
-  DialogContent,
-  DialogHeader,
-  DialogTitle,
-  DialogTrigger,
-} from "@/components/ui/dialog";
 import { Badge } from "@/components/ui/badge";
-import { formatCurrency, formatDate } from "@/lib/currency";
+import { Tabs, TabsList, TabsTrigger } from "@/components/ui/tabs";
+import { Select, SelectContent, SelectItem, SelectTrigger, SelectValue } from "@/components/ui/select";
 import {
-  Plus,
-  Trash2,
-  CreditCard,
-  Pause,
-  Play,
-  XCircle,
-  Zap,
-  ArrowUpDown,
-  DollarSign,
-  CalendarDays,
-  RotateCcw,
-  Bell,
-  BellOff,
-} from "lucide-react";
+  DropdownMenu,
+  DropdownMenuContent,
+  DropdownMenuItem,
+  DropdownMenuSeparator,
+  DropdownMenuTrigger,
+} from "@/components/ui/dropdown-menu";
 import { ConfirmDialog } from "@/components/ui/confirm-dialog";
 import { ErrorState } from "@/components/error-state";
 import { PageSkeleton } from "@/components/page-skeleton";
+import { useDisplayCurrency } from "@/components/currency-provider";
+import { formatCurrency, formatDate } from "@/lib/currency";
 import { parseSaveError } from "@/lib/save-error";
+import { localDateISO } from "@/lib/utils/date";
+import {
+  FREQUENCY_LABELS,
+  FREQUENCY_SUFFIX,
+  addDays,
+  daysBetween,
+  frequencyOrMonthly,
+  monthlyEquivalent,
+  rollForwardNextDate,
+} from "@/lib/subscriptions/schedule";
+import {
+  detectedSuggestions,
+  effectiveNextDate,
+  subDisplayAmount,
+  subscriptionTotals,
+  type RecurringRow,
+} from "@/lib/subscriptions/calendar-events";
+import { SubscriptionDialog, EMPTY_DRAFT, type SubscriptionDraft } from "./_components/subscription-dialog";
+import { SubscriptionsCalendar } from "./_components/subscriptions-calendar";
+import type { Subscription } from "./_components/types";
+import {
+  Bell,
+  BellOff,
+  CalendarClock,
+  CalendarDays,
+  CreditCard,
+  List,
+  MoreHorizontal,
+  Pause,
+  Pencil,
+  Play,
+  Plus,
+  RotateCcw,
+  Sparkles,
+  Trash2,
+  Wallet,
+  XCircle,
+} from "lucide-react";
 
-type Subscription = {
-  id: number;
-  name: string;
-  amount: number;
-  currency: string;
-  frequency: string;
-  categoryId: number | null;
-  categoryName: string | null;
-  accountId: number | null;
-  accountName: string | null;
-  nextDate: string | null;
-  status: string;
-  cancelReminderDate: string | null;
-  notes: string | null;
-};
+type Option = { id: number; name: string | null };
+type SortField = "nextDate" | "name" | "cost";
+type View = "list" | "calendar";
 
-type DetectedSub = {
-  name: string;
-  amount: number;
-  frequency: string;
-  nextDate: string;
-  accountId: number;
-  categoryId: number | null;
-  count: number;
-  lastDate: string;
-};
+const SUGGESTIONS_PREVIEW = 3;
+const DUE_SOON_DAYS = 30;
 
-type Category = { id: number; name: string };
-type Account = { id: number; name: string };
-
-type SortField = "name" | "amount" | "nextDate";
-
-const frequencyLabels: Record<string, string> = {
-  weekly: "Weekly",
-  monthly: "Monthly",
-  quarterly: "Quarterly",
-  annual: "Annual",
-};
-
-const statusConfig: Record<
-  string,
-  { label: string; badgeClass: string; borderClass: string }
-> = {
-  active: {
-    label: "Active",
-    badgeClass: "bg-emerald-100 text-emerald-700 border-emerald-200 dark:bg-emerald-950/50 dark:text-emerald-300 dark:border-emerald-900/60",
-    borderClass: "border-l-emerald-500",
-  },
+const STATUS_BADGE: Record<string, { label: string; className: string }> = {
   paused: {
     label: "Paused",
-    badgeClass: "bg-amber-100 text-amber-700 border-amber-200 dark:bg-amber-950/50 dark:text-amber-300 dark:border-amber-900/60",
-    borderClass: "border-l-amber-500",
+    className: "bg-amber-100 text-amber-700 border-amber-200 dark:bg-amber-950/50 dark:text-amber-300 dark:border-amber-900/60",
   },
   cancelled: {
     label: "Cancelled",
-    badgeClass: "bg-rose-100 text-rose-700 border-rose-200 dark:bg-rose-950/50 dark:text-rose-300 dark:border-rose-900/60",
-    borderClass: "border-l-rose-500",
+    className: "bg-rose-100 text-rose-700 border-rose-200 dark:bg-rose-950/50 dark:text-rose-300 dark:border-rose-900/60",
   },
 };
 
-function toMonthlyAmount(amount: number, frequency: string): number {
-  switch (frequency) {
-    case "weekly":
-      return amount * 4.33;
-    case "quarterly":
-      return amount / 3;
-    case "annual":
-      return amount / 12;
-    default:
-      return amount;
-  }
+/** "today" / "tomorrow" / "in 5 days" for near dates, else null. */
+function relativeDue(date: string, today: string): string | null {
+  const d = daysBetween(today, date);
+  if (d === 0) return "today";
+  if (d === 1) return "tomorrow";
+  if (d > 1 && d <= 14) return `in ${d} days`;
+  return null;
+}
+
+export default function SubscriptionsPage() {
+  return (
+    <Suspense fallback={<PageSkeleton variant="list" rows={5} />}>
+      <SubscriptionsPageContent />
+    </Suspense>
+  );
 }
 
 function SubscriptionsPageContent() {
+  const router = useRouter();
+  const searchParams = useSearchParams();
+  const view: View = searchParams.get("view") === "calendar" ? "calendar" : "list";
+  const { displayCurrency: ctxCurrency } = useDisplayCurrency();
+
   const [subs, setSubs] = useState<Subscription[]>([]);
-  const [categories, setCategories] = useState<Category[]>([]);
-  const [accounts, setAccounts] = useState<Account[]>([]);
+  const [recurring, setRecurring] = useState<RecurringRow[]>([]);
+  const [categories, setCategories] = useState<Option[]>([]);
+  const [accounts, setAccounts] = useState<Option[]>([]);
   const [loading, setLoading] = useState(true);
   const [loadError, setLoadError] = useState(false);
+
   const [dialogOpen, setDialogOpen] = useState(false);
-  const [detectDialogOpen, setDetectDialogOpen] = useState(false);
-  const [detected, setDetected] = useState<DetectedSub[]>([]);
-  const [detecting, setDetecting] = useState(false);
-  const [editSub, setEditSub] = useState<Subscription | null>(null);
-  const [sortField, setSortField] = useState<SortField>("name");
-  const [formError, setFormError] = useState("");
-  const [submitting, setSubmitting] = useState(false);
+  const [editing, setEditing] = useState<Subscription | null>(null);
+  const [initialDraft, setInitialDraft] = useState<SubscriptionDraft>(EMPTY_DRAFT);
+
+  const [sortField, setSortField] = useState<SortField>("nextDate");
+  const [showAllSuggestions, setShowAllSuggestions] = useState(false);
+  const [busyKey, setBusyKey] = useState<string | null>(null);
+  const [actionError, setActionError] = useState("");
   const [deleteId, setDeleteId] = useState<number | null>(null);
   const [deleting, setDeleting] = useState(false);
-  const [form, setForm] = useState({
-    name: "",
-    amount: "",
-    currency: "CAD",
-    frequency: "monthly",
-    categoryId: "",
-    accountId: "",
-    nextDate: "",
-    notes: "",
-    cancelReminderDate: "",
-  });
 
-  const load = useCallback(() => {
+  const today = localDateISO();
+
+  const loadSubs = useCallback(async () => {
     setLoadError(false);
-    fetch("/api/subscriptions")
-      .then((r) => (r.ok ? r.json() : Promise.reject(new Error("Failed to load subscriptions"))))
-      .then((data) => setSubs(Array.isArray(data) ? data : []))
-      .catch(() => setLoadError(true))
-      .finally(() => setLoading(false));
+    try {
+      const res = await fetch("/api/subscriptions");
+      if (!res.ok) throw new Error("load failed");
+      const data = await res.json();
+      setSubs(Array.isArray(data) ? data : []);
+    } catch {
+      setLoadError(true);
+    } finally {
+      setLoading(false);
+    }
+  }, []);
+
+  // Detection is a nice-to-have on top of the tracked list: a failure here
+  // just means no suggestions / no projected income, never a page error.
+  const loadRecurring = useCallback(async () => {
+    try {
+      const res = await fetch("/api/recurring");
+      if (!res.ok) return;
+      const data = await res.json();
+      setRecurring(Array.isArray(data?.recurring) ? data.recurring : []);
+    } catch {
+      /* non-fatal */
+    }
   }, []);
 
   useEffect(() => {
-    load();
+    loadSubs();
+    loadRecurring();
     fetch("/api/categories")
       .then((r) => (r.ok ? r.json() : []))
       .then((data) => setCategories(Array.isArray(data) ? data : []))
@@ -165,679 +172,354 @@ function SubscriptionsPageContent() {
       .then((r) => (r.ok ? r.json() : []))
       .then((data) => setAccounts(Array.isArray(data) ? data : []))
       .catch(() => {});
-  }, [load]);
+  }, [loadSubs, loadRecurring]);
 
-  const sortAccount = useDropdownOrder("account");
-  const sortCategory = useDropdownOrder("category");
-  const sortCurrency = useDropdownOrder("currency");
-
-  function resetForm() {
-    setForm({
-      name: "",
-      amount: "",
-      currency: "CAD",
-      frequency: "monthly",
-      categoryId: "",
-      accountId: "",
-      nextDate: "",
-      notes: "",
-      cancelReminderDate: "",
-    });
-    setEditSub(null);
-    setFormError("");
+  function setView(next: View) {
+    router.replace(next === "calendar" ? "/subscriptions?view=calendar" : "/subscriptions", { scroll: false });
   }
 
-  function openEdit(sub: Subscription) {
-    setEditSub(sub);
-    setForm({
-      name: sub.name,
-      amount: String(sub.amount),
-      currency: sub.currency,
-      frequency: sub.frequency,
-      categoryId: sub.categoryId ? String(sub.categoryId) : "",
-      accountId: sub.accountId ? String(sub.accountId) : "",
-      nextDate: sub.nextDate ?? "",
-      notes: sub.notes ?? "",
-      cancelReminderDate: sub.cancelReminderDate ?? "",
+  // Totals are in the currency the server converted into (FINLYNQ-123).
+  const displayCurrency = subs.find((s) => s.displayCurrency)?.displayCurrency ?? ctxCurrency;
+  const totals = useMemo(
+    () => subscriptionTotals(subs, today, addDays(today, DUE_SOON_DAYS)),
+    [subs, today],
+  );
+  const suggestions = useMemo(() => detectedSuggestions(recurring, subs), [recurring, subs]);
+
+  const sorted = useMemo(() => {
+    const monthlyCost = (s: Subscription) => monthlyEquivalent(Math.abs(subDisplayAmount(s)), s.frequency);
+    return [...subs].sort((a, b) => {
+      if (sortField === "cost") return monthlyCost(b) - monthlyCost(a);
+      if (sortField === "nextDate") {
+        const an = effectiveNextDate(a, today) ?? "9999-12-31";
+        const bn = effectiveNextDate(b, today) ?? "9999-12-31";
+        if (an !== bn) return an.localeCompare(bn);
+      }
+      return (a.name ?? "").localeCompare(b.name ?? "");
     });
+  }, [subs, sortField, today]);
+
+  const groups: { key: string; title: string; icon: React.ReactNode; rows: Subscription[] }[] = [
+    { key: "active", title: "Active", icon: <Play className="h-4 w-4 text-emerald-500" />, rows: sorted.filter((s) => s.status === "active") },
+    { key: "paused", title: "Paused", icon: <Pause className="h-4 w-4 text-amber-500" />, rows: sorted.filter((s) => s.status === "paused") },
+    { key: "cancelled", title: "Cancelled", icon: <XCircle className="h-4 w-4 text-rose-500" />, rows: sorted.filter((s) => s.status === "cancelled") },
+  ];
+
+  // ── dialog openers ─────────────────────────────────────────────────────────
+  function openAdd() {
+    setEditing(null);
+    setInitialDraft(EMPTY_DRAFT);
     setDialogOpen(true);
   }
 
-  async function handleSubmit(e: React.FormEvent) {
-    e.preventDefault();
-    const payload = {
-      name: form.name,
-      amount: parseFloat(form.amount),
-      currency: form.currency,
-      frequency: form.frequency,
-      categoryId: form.categoryId ? parseInt(form.categoryId) : null,
-      accountId: form.accountId ? parseInt(form.accountId) : null,
-      nextDate: form.nextDate || null,
-      notes: form.notes || null,
-      cancelReminderDate: form.cancelReminderDate || null,
+  function openEdit(sub: Subscription) {
+    setEditing(sub);
+    setDialogOpen(true);
+  }
+
+  function openEditById(id: number) {
+    const sub = subs.find((s) => s.id === id);
+    if (sub) openEdit(sub);
+  }
+
+  function draftFromDetected(r: RecurringRow): SubscriptionDraft {
+    const frequency = frequencyOrMonthly(r.frequency);
+    return {
+      ...EMPTY_DRAFT,
+      name: r.payee,
+      amount: String(Math.abs(r.avgAmount)),
+      currency: r.currency,
+      frequency,
+      nextDate: rollForwardNextDate(r.nextDate, frequency, today) ?? "",
+      accountId: r.accountId ? String(r.accountId) : "",
+      categoryId: r.categoryId ? String(r.categoryId) : "",
     };
+  }
 
-    setSubmitting(true);
+  function reviewDetected(r: RecurringRow) {
+    setEditing(null);
+    setInitialDraft(draftFromDetected(r));
+    setDialogOpen(true);
+  }
+
+  // ── mutations (each: in-flight guard, try/catch, res.ok) ───────────────────
+  async function mutate(key: string, run: () => Promise<Response>, fallback: string): Promise<boolean> {
+    if (busyKey) return false;
+    setBusyKey(key);
+    setActionError("");
     try {
-      const res = editSub
-        ? await fetch("/api/subscriptions", {
-            method: "PUT",
-            headers: { "Content-Type": "application/json" },
-            body: JSON.stringify({ id: editSub.id, ...payload }),
-          })
-        : await fetch("/api/subscriptions", {
-            method: "POST",
-            headers: { "Content-Type": "application/json" },
-            body: JSON.stringify(payload),
-          });
-
+      const res = await run();
       if (!res.ok) {
-        // Keep the dialog open with the user's input; surface the reason.
-        setFormError(await parseSaveError(res, "Failed to save subscription"));
-        return;
+        setActionError(await parseSaveError(res, fallback));
+        return false;
       }
-
-      setDialogOpen(false);
-      resetForm();
-      load();
+      await loadSubs();
+      return true;
     } catch {
-      setFormError("Network error. Please try again.");
+      setActionError("Network error. Please try again.");
+      return false;
     } finally {
-      setSubmitting(false);
+      setBusyKey(null);
     }
   }
 
-  async function handleStatusChange(sub: Subscription, newStatus: string) {
-    await fetch("/api/subscriptions", {
-      method: "PUT",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ id: sub.id, status: newStatus }),
-    });
-    load();
+  const putSub = (body: Record<string, unknown>) =>
+    fetch("/api/subscriptions", { method: "PUT", headers: { "Content-Type": "application/json" }, body: JSON.stringify(body) });
+
+  function trackDetected(r: RecurringRow) {
+    const d = draftFromDetected(r);
+    return mutate(
+      `track:${r.payee}|${r.currency}`,
+      () =>
+        fetch("/api/subscriptions", {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({
+            name: d.name,
+            amount: Math.abs(r.avgAmount),
+            // Carry the detected native currency (feedback #7).
+            currency: r.currency,
+            frequency: d.frequency,
+            nextDate: d.nextDate || null,
+            accountId: r.accountId || null,
+            categoryId: r.categoryId || null,
+          }),
+        }),
+      `Couldn't add ${r.payee}`,
+    );
+  }
+
+  function changeStatus(sub: Subscription, status: string) {
+    return mutate(`status:${sub.id}`, () => putSub({ id: sub.id, status }), "Couldn't update the subscription");
+  }
+
+  function toggleReminder(sub: Subscription) {
+    let cancelReminderDate: string | null = null;
+    if (!sub.cancelReminderDate) {
+      // Default: a week before the next payment (or a week from today).
+      const next = effectiveNextDate(sub, today);
+      const candidate = next ? addDays(next, -7) : addDays(today, 7);
+      cancelReminderDate = candidate < today ? today : candidate;
+    }
+    return mutate(`reminder:${sub.id}`, () => putSub({ id: sub.id, cancelReminderDate }), "Couldn't update the reminder");
   }
 
   async function handleDelete() {
     if (deleteId == null) return;
     setDeleting(true);
-    try {
-      await fetch(`/api/subscriptions?id=${deleteId}`, { method: "DELETE" });
-      setDeleteId(null);
-      load();
-    } finally {
-      setDeleting(false);
-    }
+    const ok = await mutate(`delete:${deleteId}`, () => fetch(`/api/subscriptions?id=${deleteId}`, { method: "DELETE" }), "Couldn't delete the subscription");
+    setDeleting(false);
+    if (ok) setDeleteId(null);
   }
 
   const deletingSub = subs.find((s) => s.id === deleteId) ?? null;
 
-  async function handleDetect() {
-    setDetecting(true);
-    try {
-      const res = await fetch("/api/subscriptions", {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ action: "detect" }),
-      });
-      const data = await res.json();
-      setDetected(data.suggestions ?? []);
-      setDetectDialogOpen(true);
-    } finally {
-      setDetecting(false);
-    }
-  }
-
-  async function addDetected(d: DetectedSub) {
-    await fetch("/api/subscriptions", {
-      method: "POST",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({
-        name: d.name,
-        amount: d.amount,
-        frequency: d.frequency,
-        nextDate: d.nextDate,
-        accountId: d.accountId || null,
-        categoryId: d.categoryId || null,
-      }),
-    });
-    setDetected((prev) => prev.filter((x) => x.name !== d.name));
-    load();
-  }
-
-  async function toggleCancelReminder(sub: Subscription) {
-    if (sub.cancelReminderDate) {
-      // Remove reminder
-      await fetch("/api/subscriptions", {
-        method: "PUT",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ id: sub.id, cancelReminderDate: null }),
-      });
-    } else {
-      // Set reminder to 7 days before next date, or 7 days from now
-      const baseDate = sub.nextDate
-        ? new Date(sub.nextDate + "T00:00:00")
-        : new Date();
-      baseDate.setDate(baseDate.getDate() - 7);
-      const reminderDate = baseDate.toISOString().split("T")[0];
-      await fetch("/api/subscriptions", {
-        method: "PUT",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ id: sub.id, cancelReminderDate: reminderDate }),
-      });
-    }
-    load();
-  }
-
-  // Compute summaries
-  const activeSubs = subs.filter((s) => s.status === "active");
-  const pausedSubs = subs.filter((s) => s.status === "paused");
-  const cancelledSubs = subs.filter((s) => s.status === "cancelled");
-
-  const totalMonthly = activeSubs.reduce(
-    (sum, s) => sum + toMonthlyAmount(s.amount, s.frequency),
-    0
-  );
-  const totalAnnual = totalMonthly * 12;
-
-  // Sorting
-  function sortSubs(list: Subscription[]): Subscription[] {
-    return [...list].sort((a, b) => {
-      switch (sortField) {
-        case "amount":
-          return b.amount - a.amount;
-        case "nextDate":
-          return (a.nextDate ?? "").localeCompare(b.nextDate ?? "");
-        default:
-          return (a.name ?? "").localeCompare(b.name ?? "");
-      }
-    });
-  }
-
-  function renderSubList(
-    list: Subscription[],
-    title: string,
-    icon: React.ReactNode
-  ) {
-    if (list.length === 0) return null;
-    const sorted = sortSubs(list);
+  if (loading) return <PageSkeleton variant="list" rows={5} />;
+  if (loadError) {
     return (
-      <div className="space-y-3">
-        <h2 className="text-lg font-semibold text-muted-foreground flex items-center gap-2">
-          {icon}
-          {title} ({list.length})
-        </h2>
-        {sorted.map((sub) => {
-          const config = statusConfig[sub.status] ?? statusConfig.active;
-          return (
-            <Card
-              key={sub.id}
-              className={`border-l-4 ${config.borderClass} cursor-pointer hover:bg-muted/30 transition-colors`}
-              onClick={() => openEdit(sub)}
-            >
-              <CardContent className="py-4">
-                <div className="flex items-center justify-between">
-                  <div className="flex items-center gap-3 min-w-0">
-                    <CreditCard className="h-5 w-5 text-muted-foreground shrink-0" />
-                    <div className="min-w-0">
-                      <h3 className="font-semibold truncate">{sub.name}</h3>
-                      <div className="flex flex-wrap gap-1.5 mt-1">
-                        <Badge className={config.badgeClass}>
-                          {config.label}
-                        </Badge>
-                        <Badge variant="outline">
-                          {frequencyLabels[sub.frequency] ?? sub.frequency}
-                        </Badge>
-                        {sub.categoryName && (
-                          <Badge variant="secondary">{sub.categoryName}</Badge>
-                        )}
-                        {sub.nextDate && (
-                          <Badge
-                            variant="outline"
-                            className="gap-1 text-xs"
-                          >
-                            <CalendarDays className="h-3 w-3" />
-                            {formatDate(sub.nextDate)}
-                          </Badge>
-                        )}
-                        {sub.cancelReminderDate && (
-                          <Badge className="bg-orange-100 text-orange-700 border-orange-200 dark:bg-orange-950/50 dark:text-orange-300 dark:border-orange-900/60 gap-1">
-                            <Bell className="h-3 w-3" />
-                            Remind {formatDate(sub.cancelReminderDate)}
-                          </Badge>
-                        )}
-                      </div>
-                    </div>
-                  </div>
-                  <div className="flex items-center gap-2 shrink-0 ml-4">
-                    <div className="text-right mr-2">
-                      <p className="font-bold text-lg">
-                        {formatCurrency(sub.amount, sub.currency)}
-                      </p>
-                      <p className="text-xs text-muted-foreground">
-                        /{sub.frequency}
-                      </p>
-                    </div>
-                    {/* Status toggle buttons */}
-                    {sub.status === "active" && (
-                      <>
-                        <Button
-                          variant="ghost"
-                          size="icon"
-                          className="h-8 w-8"
-                          title="Pause"
-                          aria-label={`Pause subscription ${sub.name}`}
-                          onClick={(e) => {
-                            e.stopPropagation();
-                            handleStatusChange(sub, "paused");
-                          }}
-                        >
-                          <Pause className="h-4 w-4" />
-                        </Button>
-                        <Button
-                          variant="ghost"
-                          size="icon"
-                          className="h-8 w-8"
-                          title={
-                            sub.cancelReminderDate
-                              ? "Remove cancel reminder"
-                              : "Set cancel reminder"
-                          }
-                          aria-label={
-                            sub.cancelReminderDate
-                              ? `Remove cancel reminder for ${sub.name}`
-                              : `Set cancel reminder for ${sub.name}`
-                          }
-                          onClick={(e) => {
-                            e.stopPropagation();
-                            toggleCancelReminder(sub);
-                          }}
-                        >
-                          {sub.cancelReminderDate ? (
-                            <BellOff className="h-4 w-4 text-orange-500" />
-                          ) : (
-                            <Bell className="h-4 w-4" />
-                          )}
-                        </Button>
-                        <Button
-                          variant="ghost"
-                          size="icon"
-                          className="h-8 w-8 text-rose-500"
-                          title="Cancel"
-                          aria-label={`Cancel subscription ${sub.name}`}
-                          onClick={(e) => {
-                            e.stopPropagation();
-                            handleStatusChange(sub, "cancelled");
-                          }}
-                        >
-                          <XCircle className="h-4 w-4" />
-                        </Button>
-                      </>
-                    )}
-                    {sub.status === "paused" && (
-                      <Button
-                        variant="ghost"
-                        size="icon"
-                        className="h-8 w-8"
-                        title="Resume"
-                        aria-label={`Resume subscription ${sub.name}`}
-                        onClick={(e) => {
-                          e.stopPropagation();
-                          handleStatusChange(sub, "active");
-                        }}
-                      >
-                        <Play className="h-4 w-4" />
-                      </Button>
-                    )}
-                    {sub.status === "cancelled" && (
-                      <Button
-                        variant="ghost"
-                        size="icon"
-                        className="h-8 w-8"
-                        title="Reactivate"
-                        aria-label={`Reactivate subscription ${sub.name}`}
-                        onClick={(e) => {
-                          e.stopPropagation();
-                          handleStatusChange(sub, "active");
-                        }}
-                      >
-                        <RotateCcw className="h-4 w-4" />
-                      </Button>
-                    )}
-                    <Button
-                      variant="ghost"
-                      size="icon"
-                      className="h-8 w-8 text-destructive"
-                      title="Delete"
-                      aria-label={`Delete subscription ${sub.name}`}
-                      onClick={(e) => {
-                        e.stopPropagation();
-                        setDeleteId(sub.id);
-                      }}
-                    >
-                      <Trash2 className="h-4 w-4" />
-                    </Button>
-                  </div>
-                </div>
-              </CardContent>
-            </Card>
-          );
-        })}
-      </div>
+      <ErrorState
+        title="Couldn't load subscriptions"
+        message="We couldn't load your subscriptions. Please try again."
+        onRetry={() => { setLoading(true); loadSubs(); loadRecurring(); }}
+      />
     );
   }
 
-  if (loading) return <PageSkeleton variant="list" rows={5} />;
-  if (loadError) return <ErrorState title="Couldn't load subscriptions" message="We couldn't load your subscriptions. Please try again." onRetry={() => { setLoading(true); load(); }} />;
+  const visibleSuggestions = showAllSuggestions ? suggestions : suggestions.slice(0, SUGGESTIONS_PREVIEW);
 
   return (
     <div className="space-y-6">
       {/* Header */}
-      <div className="flex items-center justify-between">
+      <div className="flex flex-wrap items-start justify-between gap-3">
         <div>
           <h1 className="text-2xl font-bold">Subscriptions</h1>
           <p className="text-sm text-muted-foreground mt-1">
-            Track recurring subscriptions and set cancel reminders
+            Recurring bills and subscriptions: what they cost and when they&apos;re due.
           </p>
         </div>
-        <div className="flex gap-2">
-          <Button variant="outline" onClick={handleDetect} disabled={detecting}>
-            <Zap className="h-4 w-4 mr-1" />
-            {detecting ? "Detecting..." : "Auto-detect"}
-          </Button>
-          <Dialog
-            open={dialogOpen}
-            onOpenChange={(open) => {
-              setDialogOpen(open);
-              if (!open) resetForm();
-            }}
-          >
-            <DialogTrigger render={<Button />}>
-              <Plus className="h-4 w-4 mr-1" /> Add Subscription
-            </DialogTrigger>
-            <DialogContent>
-              <DialogHeader>
-                <DialogTitle>
-                  {editSub ? "Edit Subscription" : "New Subscription"}
-                </DialogTitle>
-              </DialogHeader>
-              <form onSubmit={handleSubmit} className="space-y-3">
-                <div>
-                  <Label>Name</Label>
-                  <Input
-                    value={form.name}
-                    onChange={(e) =>
-                      setForm({ ...form, name: e.target.value })
-                    }
-                    placeholder="e.g. Netflix, Spotify"
-                    required
-                  />
-                </div>
-                <div className="grid grid-cols-2 gap-3">
-                  <div>
-                    <Label>Amount</Label>
-                    <Input
-                      type="number"
-                      step="0.01"
-                      value={form.amount}
-                      onChange={(e) =>
-                        setForm({ ...form, amount: e.target.value })
-                      }
-                      required
-                    />
-                  </div>
-                  <div>
-                    <Label>Frequency</Label>
-                    <Select
-                      value={form.frequency}
-                      onValueChange={(v) =>
-                        setForm({ ...form, frequency: v ?? "monthly" })
-                      }
-                    >
-                      <SelectTrigger>
-                        <SelectValue />
-                      </SelectTrigger>
-                      <SelectContent>
-                        <SelectItem value="weekly">Weekly</SelectItem>
-                        <SelectItem value="monthly">Monthly</SelectItem>
-                        <SelectItem value="quarterly">Quarterly</SelectItem>
-                        <SelectItem value="annual">Annual</SelectItem>
-                      </SelectContent>
-                    </Select>
-                  </div>
-                </div>
-                <div className="grid grid-cols-2 gap-3">
-                  <div>
-                    <Label>Currency</Label>
-                    <Combobox
-                      value={form.currency}
-                      onValueChange={(v) => setForm({ ...form, currency: v || "CAD" })}
-                      items={sortCurrency(
-                        ["CAD", "USD", "EUR", "GBP"].map((c): ComboboxItemShape => ({ value: c, label: c })),
-                        (c) => c.value,
-                        (a, z) => a.label.localeCompare(z.label),
-                      )}
-                      placeholder="CAD"
-                      searchPlaceholder="Search…"
-                      emptyMessage="No matches"
-                      className="w-full"
-                    />
-                  </div>
-                  <div>
-                    <Label>Next Date</Label>
-                    <Input
-                      type="date"
-                      value={form.nextDate}
-                      onChange={(e) =>
-                        setForm({ ...form, nextDate: e.target.value })
-                      }
-                    />
-                  </div>
-                </div>
-                <div className="grid grid-cols-2 gap-3">
-                  <div>
-                    <Label>Category</Label>
-                    <Combobox
-                      value={form.categoryId}
-                      onValueChange={(v) => setForm({ ...form, categoryId: v })}
-                      items={sortCategory(
-                        categories.map((c): ComboboxItemShape => ({ value: String(c.id), label: c.name })),
-                        (c) => Number(c.value),
-                        (a, z) => (a.label ?? "").localeCompare(z.label ?? ""),
-                      )}
-                      placeholder="None"
-                      searchPlaceholder="Search categories…"
-                      emptyMessage="No matches"
-                      className="w-full"
-                    />
-                  </div>
-                  <div>
-                    <Label>Account</Label>
-                    <Combobox
-                      value={form.accountId}
-                      onValueChange={(v) => setForm({ ...form, accountId: v })}
-                      items={sortAccount(
-                        accounts.map((a): ComboboxItemShape => ({ value: String(a.id), label: a.name })),
-                        (a) => Number(a.value),
-                        (a, z) => (a.label ?? "").localeCompare(z.label ?? ""),
-                      )}
-                      placeholder="None"
-                      searchPlaceholder="Search accounts…"
-                      emptyMessage="No matches"
-                      className="w-full"
-                    />
-                  </div>
-                </div>
-                <div>
-                  <Label>Cancel Reminder Date</Label>
-                  <Input
-                    type="date"
-                    value={form.cancelReminderDate}
-                    onChange={(e) =>
-                      setForm({ ...form, cancelReminderDate: e.target.value })
-                    }
-                  />
-                </div>
-                <div>
-                  <Label>Notes</Label>
-                  <Input
-                    value={form.notes}
-                    onChange={(e) =>
-                      setForm({ ...form, notes: e.target.value })
-                    }
-                  />
-                </div>
-                {formError && (
-                  <p className="text-sm text-destructive">{formError}</p>
-                )}
-                <Button type="submit" className="w-full" disabled={submitting}>
-                  {submitting ? "Saving…" : editSub ? "Save Changes" : "Add Subscription"}
-                </Button>
-              </form>
-            </DialogContent>
-          </Dialog>
-        </div>
+        <Button onClick={openAdd}>
+          <Plus className="h-4 w-4 mr-1" /> Add subscription
+        </Button>
       </div>
 
-      {/* Summary Cards */}
-      <div className="grid grid-cols-1 md:grid-cols-3 gap-4">
-        <Card>
-          <CardContent className="flex items-center gap-4 pt-6">
-            <div className="flex h-10 w-10 items-center justify-center rounded-xl bg-indigo-100 dark:bg-indigo-950/40">
-              <DollarSign className="h-5 w-5 text-indigo-600 dark:text-indigo-400" />
-            </div>
-            <div>
-              <p className="text-sm text-muted-foreground">Monthly Cost</p>
-              <p className="text-2xl font-bold">
-                {formatCurrency(totalMonthly, "CAD")}
-              </p>
-            </div>
-          </CardContent>
-        </Card>
-        <Card>
-          <CardContent className="flex items-center gap-4 pt-6">
-            <div className="flex h-10 w-10 items-center justify-center rounded-xl bg-rose-100 dark:bg-rose-950/40">
-              <CalendarDays className="h-5 w-5 text-rose-600 dark:text-rose-400" />
-            </div>
-            <div>
-              <p className="text-sm text-muted-foreground">Annual Cost</p>
-              <p className="text-2xl font-bold text-rose-600">
-                {formatCurrency(totalAnnual, "CAD")}
-              </p>
-            </div>
-          </CardContent>
-        </Card>
-        <Card>
-          <CardContent className="flex items-center gap-4 pt-6">
-            <div className="flex h-10 w-10 items-center justify-center rounded-xl bg-emerald-100 dark:bg-emerald-950/40">
-              <CreditCard className="h-5 w-5 text-emerald-600 dark:text-emerald-400" />
-            </div>
-            <div>
-              <p className="text-sm text-muted-foreground">Active</p>
-              <p className="text-2xl font-bold">
-                {activeSubs.length}{" "}
-                <span className="text-base font-normal text-muted-foreground">
-                  / {subs.length}
-                </span>
-              </p>
-            </div>
-          </CardContent>
-        </Card>
+      {/* Summary */}
+      <div className="grid grid-cols-2 lg:grid-cols-4 gap-3">
+        <StatCard
+          icon={<Wallet className="h-4 w-4 text-indigo-600 dark:text-indigo-400" />}
+          label="Per month"
+          value={formatCurrency(totals.monthly, displayCurrency)}
+        />
+        <StatCard
+          icon={<CalendarDays className="h-4 w-4 text-rose-600 dark:text-rose-400" />}
+          label="Per year"
+          value={formatCurrency(totals.annual, displayCurrency)}
+        />
+        <StatCard
+          icon={<CalendarClock className="h-4 w-4 text-amber-600 dark:text-amber-400" />}
+          label={`Due in next ${DUE_SOON_DAYS} days`}
+          value={formatCurrency(totals.dueSoonAmount, displayCurrency)}
+          sub={`${totals.dueSoonCount} payment${totals.dueSoonCount === 1 ? "" : "s"}`}
+        />
+        <StatCard
+          icon={<CreditCard className="h-4 w-4 text-emerald-600 dark:text-emerald-400" />}
+          label="Active"
+          value={String(totals.activeCount)}
+          sub={`of ${subs.length} tracked`}
+        />
       </div>
 
-      {/* Sort controls */}
-      {subs.length > 0 && (
-        <div className="flex items-center gap-2">
-          <ArrowUpDown className="h-4 w-4 text-muted-foreground" />
-          <span className="text-sm text-muted-foreground">Sort by:</span>
-          {(["name", "amount", "nextDate"] as SortField[]).map((field) => (
-            <Button
-              key={field}
-              variant={sortField === field ? "default" : "outline"}
-              size="sm"
-              onClick={() => setSortField(field)}
-            >
-              {field === "nextDate" ? "Next Date" : field.charAt(0).toUpperCase() + field.slice(1)}
-            </Button>
-          ))}
-        </div>
+      {actionError && (
+        <p role="alert" className="rounded-lg border border-destructive/30 bg-destructive/5 px-3 py-2 text-sm text-destructive">
+          {actionError}
+        </p>
       )}
 
-      {/* Empty state */}
-      {subs.length === 0 && (
-        <Card>
-          <CardContent className="py-12 flex flex-col items-center text-center">
-            <div className="flex h-14 w-14 items-center justify-center rounded-2xl bg-muted mb-4">
-              <CreditCard className="h-7 w-7 text-muted-foreground" />
-            </div>
-            <h3 className="text-lg font-semibold mb-1">
-              No subscriptions yet
-            </h3>
-            <p className="text-sm text-muted-foreground max-w-sm">
-              Add your recurring subscriptions manually or use auto-detect to
-              find them from your transaction history.
-            </p>
-          </CardContent>
-        </Card>
-      )}
+      {/* View switch + sort */}
+      <div className="flex flex-wrap items-center justify-between gap-3">
+        <Tabs value={view} onValueChange={(v) => setView((v as View) ?? "list")}>
+          <TabsList>
+            <TabsTrigger value="list" className="px-3"><List className="h-4 w-4" /> List</TabsTrigger>
+            <TabsTrigger value="calendar" className="px-3"><CalendarDays className="h-4 w-4" /> Calendar</TabsTrigger>
+          </TabsList>
+        </Tabs>
+        {view === "list" && subs.length > 1 && (
+          <div className="flex items-center gap-2">
+            <span className="text-sm text-muted-foreground">Sort by</span>
+            <Select value={sortField} onValueChange={(v) => setSortField((v as SortField) ?? "nextDate")}>
+              <SelectTrigger className="w-40">
+                <SelectValue>{(v: unknown) => (v === "name" ? "Name" : v === "cost" ? "Monthly cost" : "Next payment")}</SelectValue>
+              </SelectTrigger>
+              <SelectContent>
+                <SelectItem value="nextDate">Next payment</SelectItem>
+                <SelectItem value="cost">Monthly cost</SelectItem>
+                <SelectItem value="name">Name</SelectItem>
+              </SelectContent>
+            </Select>
+          </div>
+        )}
+      </div>
 
-      {/* Subscription lists grouped by status */}
-      {renderSubList(
-        activeSubs,
-        "Active",
-        <Play className="h-5 w-5 text-emerald-500" />
-      )}
-      {renderSubList(
-        pausedSubs,
-        "Paused",
-        <Pause className="h-5 w-5 text-amber-500" />
-      )}
-      {renderSubList(
-        cancelledSubs,
-        "Cancelled",
-        <XCircle className="h-5 w-5 text-rose-500" />
-      )}
-
-      {/* Auto-detect results dialog */}
-      <Dialog open={detectDialogOpen} onOpenChange={setDetectDialogOpen}>
-        <DialogContent>
-          <DialogHeader>
-            <DialogTitle>Detected Subscriptions</DialogTitle>
-          </DialogHeader>
-          {detected.length === 0 ? (
-            <p className="text-sm text-muted-foreground py-4 text-center">
-              No recurring subscriptions detected from your transactions.
-            </p>
-          ) : (
-            <div className="space-y-3 max-h-96 overflow-y-auto">
-              {detected.map((d) => (
-                <div
-                  key={d.name}
-                  className="flex items-center justify-between p-3 rounded-lg border"
-                >
+      {view === "calendar" ? (
+        <SubscriptionsCalendar
+          subs={subs}
+          recurring={recurring}
+          displayCurrency={displayCurrency}
+          onEdit={openEditById}
+          onTrack={trackDetected}
+        />
+      ) : (
+        <div className="space-y-6">
+          {/* Detected from transactions */}
+          {suggestions.length > 0 && (
+            <Card className="border-primary/30 bg-primary/[0.03]">
+              <CardContent className="pt-5 space-y-3">
+                <div className="flex items-start gap-3">
+                  <div className="flex h-9 w-9 shrink-0 items-center justify-center rounded-xl bg-primary/15">
+                    <Sparkles className="h-4 w-4 text-primary" />
+                  </div>
                   <div>
-                    <p className="font-medium">{d.name}</p>
+                    <h2 className="font-semibold">Found in your transactions</h2>
                     <p className="text-sm text-muted-foreground">
-                      {formatCurrency(d.amount, "CAD")} /{d.frequency} --{" "}
-                      {d.count} occurrences
-                    </p>
-                    <p className="text-xs text-muted-foreground">
-                      Next: {formatDate(d.nextDate)}
+                      {suggestions.length === 1
+                        ? "1 payment repeats on a schedule but isn't tracked yet."
+                        : `${suggestions.length} payments repeat on a schedule but aren't tracked yet.`}
                     </p>
                   </div>
-                  <Button size="sm" onClick={() => addDetected(d)}>
-                    <Plus className="h-4 w-4 mr-1" /> Add
-                  </Button>
                 </div>
-              ))}
-            </div>
+                <div className="divide-y rounded-lg border bg-background">
+                  {visibleSuggestions.map((r) => {
+                    const key = `track:${r.payee}|${r.currency}`;
+                    const freq = frequencyOrMonthly(r.frequency);
+                    return (
+                      <div key={`${r.payee}|${r.currency}`} className="flex flex-wrap items-center justify-between gap-2 px-3 py-2.5">
+                        <div className="min-w-0">
+                          <p className="font-medium truncate">{r.payee}</p>
+                          <p className="text-xs text-muted-foreground">
+                            {formatCurrency(Math.abs(r.avgAmount), r.currency)} / {FREQUENCY_SUFFIX[freq]} · seen {r.count}× · last {formatDate(r.lastDate)}
+                          </p>
+                        </div>
+                        <div className="flex items-center gap-1.5">
+                          <Button variant="ghost" size="sm" onClick={() => reviewDetected(r)}>Review</Button>
+                          <Button size="sm" onClick={() => trackDetected(r)} disabled={busyKey !== null}>
+                            <Plus className="h-3.5 w-3.5 mr-1" />
+                            {busyKey === key ? "Adding…" : "Track"}
+                          </Button>
+                        </div>
+                      </div>
+                    );
+                  })}
+                </div>
+                {suggestions.length > SUGGESTIONS_PREVIEW && (
+                  <Button variant="link" size="sm" className="px-0" onClick={() => setShowAllSuggestions((v) => !v)}>
+                    {showAllSuggestions ? "Show fewer" : `Show all ${suggestions.length}`}
+                  </Button>
+                )}
+              </CardContent>
+            </Card>
           )}
-        </DialogContent>
-      </Dialog>
+
+          {/* Empty state */}
+          {subs.length === 0 && (
+            <Card>
+              <CardContent className="py-12 flex flex-col items-center text-center">
+                <div className="flex h-14 w-14 items-center justify-center rounded-2xl bg-muted mb-4">
+                  <CreditCard className="h-7 w-7 text-muted-foreground" />
+                </div>
+                <h3 className="text-lg font-semibold mb-1">No subscriptions tracked yet</h3>
+                <p className="text-sm text-muted-foreground max-w-sm mb-4">
+                  Add streaming services, insurance, memberships and other repeating bills (weekly to annual)
+                  to see what they cost you and when each one is due.
+                </p>
+                <Button onClick={openAdd}>
+                  <Plus className="h-4 w-4 mr-1" /> Add subscription
+                </Button>
+              </CardContent>
+            </Card>
+          )}
+
+          {groups.map((g) =>
+            g.rows.length === 0 ? null : (
+              <section key={g.key} className="space-y-2">
+                <h2 className="text-sm font-semibold text-muted-foreground flex items-center gap-2 uppercase tracking-wide">
+                  {g.icon}
+                  {g.title} ({g.rows.length})
+                </h2>
+                <div className="space-y-2">
+                  {g.rows.map((sub) => (
+                    <SubscriptionRowCard
+                      key={sub.id}
+                      sub={sub}
+                      today={today}
+                      displayCurrency={displayCurrency}
+                      busy={busyKey !== null}
+                      onEdit={() => openEdit(sub)}
+                      onStatus={(s) => changeStatus(sub, s)}
+                      onToggleReminder={() => toggleReminder(sub)}
+                      onDelete={() => setDeleteId(sub.id)}
+                    />
+                  ))}
+                </div>
+              </section>
+            ),
+          )}
+        </div>
+      )}
+
+      <SubscriptionDialog
+        open={dialogOpen}
+        onOpenChange={setDialogOpen}
+        editing={editing}
+        initial={initialDraft}
+        categories={categories}
+        accounts={accounts}
+        onSaved={() => { loadSubs(); }}
+      />
 
       <ConfirmDialog
         open={deleteId !== null}
-        onOpenChange={(open) => { if (!open) setDeleteId(null); }}
+        onOpenChange={(open) => { if (!open && !deleting) setDeleteId(null); }}
         title="Delete subscription"
-        description={<>Are you sure you want to delete <strong>{deletingSub?.name ?? "this subscription"}</strong>? This cannot be undone.</>}
+        description={<>Delete <strong>{deletingSub?.name ?? "this subscription"}</strong>? Your transactions are not affected. This cannot be undone.</>}
         confirmLabel="Delete subscription"
         busy={deleting}
         onConfirm={handleDelete}
@@ -846,4 +528,121 @@ function SubscriptionsPageContent() {
   );
 }
 
-export default function SubscriptionsPage() { return <DevModeGuard><SubscriptionsPageContent /></DevModeGuard>; }
+function StatCard({ icon, label, value, sub }: { icon: React.ReactNode; label: string; value: string; sub?: string }) {
+  return (
+    <Card>
+      <CardContent className="pt-4 pb-4">
+        <div className="flex items-center gap-2 text-xs text-muted-foreground">
+          {icon}
+          <span className="truncate">{label}</span>
+        </div>
+        <p className="text-xl sm:text-2xl font-bold mt-1 tabular-nums truncate">{value}</p>
+        {sub && <p className="text-xs text-muted-foreground mt-0.5">{sub}</p>}
+      </CardContent>
+    </Card>
+  );
+}
+
+function SubscriptionRowCard({
+  sub,
+  today,
+  displayCurrency,
+  busy,
+  onEdit,
+  onStatus,
+  onToggleReminder,
+  onDelete,
+}: {
+  sub: Subscription;
+  today: string;
+  displayCurrency: string;
+  busy: boolean;
+  onEdit: () => void;
+  onStatus: (status: string) => void;
+  onToggleReminder: () => void;
+  onDelete: () => void;
+}) {
+  const freq = frequencyOrMonthly(sub.frequency);
+  const next = effectiveNextDate(sub, today);
+  const rel = next && sub.status === "active" ? relativeDue(next, today) : null;
+  const monthly = monthlyEquivalent(Math.abs(subDisplayAmount(sub)), freq);
+  const showMonthly = freq !== "monthly" || sub.currency !== displayCurrency;
+  const statusBadge = STATUS_BADGE[sub.status];
+  const initial = (sub.name ?? "?").trim().charAt(0).toUpperCase() || "?";
+
+  const meta = [
+    FREQUENCY_LABELS[freq],
+    sub.status === "active" ? (next ? `next ${formatDate(next)}${rel ? ` (${rel})` : ""}` : "no date set") : null,
+    sub.categoryName,
+  ].filter(Boolean).join(" · ");
+
+  return (
+    <Card
+      className={`cursor-pointer transition-colors hover:bg-muted/30 ${sub.status !== "active" ? "opacity-75" : ""}`}
+      onClick={onEdit}
+    >
+      <CardContent className="py-3 flex items-center gap-3">
+        <div className="flex h-10 w-10 shrink-0 items-center justify-center rounded-full bg-muted font-semibold text-muted-foreground">
+          {initial}
+        </div>
+        <div className="min-w-0 flex-1">
+          <div className="flex items-center gap-2 min-w-0">
+            <h3 className="font-semibold truncate">{sub.name ?? "Subscription"}</h3>
+            {statusBadge && <Badge className={statusBadge.className}>{statusBadge.label}</Badge>}
+            {rel === "today" || rel === "tomorrow" ? (
+              <Badge className="bg-amber-100 text-amber-800 border-amber-200 dark:bg-amber-950/50 dark:text-amber-300 dark:border-amber-900/60">
+                Due {rel}
+              </Badge>
+            ) : null}
+          </div>
+          <p className="text-xs text-muted-foreground mt-0.5 truncate">{meta}</p>
+          {sub.cancelReminderDate && (
+            <p className="text-xs text-orange-600 dark:text-orange-400 mt-0.5 flex items-center gap-1">
+              <Bell className="h-3 w-3" /> Cancel reminder {formatDate(sub.cancelReminderDate)}
+            </p>
+          )}
+        </div>
+        <div className="text-right shrink-0">
+          <p className="font-semibold tabular-nums">
+            {formatCurrency(sub.amount, sub.currency)}
+            <span className="text-xs font-normal text-muted-foreground"> / {FREQUENCY_SUFFIX[freq]}</span>
+          </p>
+          {showMonthly && (
+            <p className="text-xs text-muted-foreground tabular-nums">≈ {formatCurrency(monthly, displayCurrency)} / mo</p>
+          )}
+        </div>
+        <div onClick={(e) => e.stopPropagation()}>
+          <DropdownMenu>
+            <DropdownMenuTrigger
+              render={
+                <Button variant="ghost" size="icon" className="h-8 w-8" aria-label={`Actions for ${sub.name ?? "subscription"}`} disabled={busy}>
+                  <MoreHorizontal className="h-4 w-4" />
+                </Button>
+              }
+            />
+            <DropdownMenuContent align="end" className="min-w-48">
+              <DropdownMenuItem onClick={onEdit}><Pencil /> Edit</DropdownMenuItem>
+              {sub.status === "active" && (
+                <>
+                  <DropdownMenuItem onClick={onToggleReminder}>
+                    {sub.cancelReminderDate ? <><BellOff /> Remove cancel reminder</> : <><Bell /> Remind me to cancel</>}
+                  </DropdownMenuItem>
+                  <DropdownMenuItem onClick={() => onStatus("paused")}><Pause /> Pause</DropdownMenuItem>
+                  <DropdownMenuItem onClick={() => onStatus("cancelled")}><XCircle /> Mark cancelled</DropdownMenuItem>
+                </>
+              )}
+              {sub.status === "paused" && (
+                <DropdownMenuItem onClick={() => onStatus("active")}><Play /> Resume</DropdownMenuItem>
+              )}
+              {sub.status === "cancelled" && (
+                <DropdownMenuItem onClick={() => onStatus("active")}><RotateCcw /> Reactivate</DropdownMenuItem>
+              )}
+              <DropdownMenuSeparator />
+              <DropdownMenuItem variant="destructive" onClick={onDelete}><Trash2 /> Delete</DropdownMenuItem>
+            </DropdownMenuContent>
+          </DropdownMenu>
+        </div>
+      </CardContent>
+    </Card>
+  );
+}

@@ -31,6 +31,8 @@ import { getLatestFxRate } from "@/lib/fx-service";
 
 export type GoalProgressInput = {
   id: number;
+  /** Goal type; `debt_payoff` measures paid-down debt instead of saved balance. */
+  type?: string | null;
   currency: string | null;
   targetAmount: number;
   deadline: string | null;
@@ -62,7 +64,10 @@ export async function computeGoalProgress(
     new Set(goals.flatMap((g) => g.accountIds)),
   );
 
-  const accountMeta: Map<number, { currency: string; isInvestment: boolean }> =
+  const accountMeta: Map<
+    number,
+    { currency: string; isInvestment: boolean; isLiability: boolean }
+  > =
     allAccountIds.length > 0
       ? new Map(
           (
@@ -71,6 +76,7 @@ export async function computeGoalProgress(
                 id: schema.accounts.id,
                 currency: schema.accounts.currency,
                 isInvestment: schema.accounts.isInvestment,
+                type: schema.accounts.type,
               })
               .from(schema.accounts)
               .where(
@@ -79,7 +85,14 @@ export async function computeGoalProgress(
                   inArray(schema.accounts.id, allAccountIds),
                 ),
               )
-          ).map((a) => [a.id, { currency: a.currency, isInvestment: !!a.isInvestment }]),
+          ).map((a) => [
+            a.id,
+            {
+              currency: a.currency,
+              isInvestment: !!a.isInvestment,
+              isLiability: a.type === "L",
+            },
+          ]),
         )
       : new Map();
 
@@ -123,16 +136,32 @@ export async function computeGoalProgress(
   };
 
   for (const g of goals) {
-    const goalCurrency = (g.currency ?? "CAD").toUpperCase();
+    // `goals.currency` is NOT NULL, so this fallback only covers a caller that
+    // omits it. USD, never CAD (FINLYNQ-183 — the app-wide default).
+    const goalCurrency = (g.currency ?? "USD").toUpperCase();
     let currentAmount = 0;
+    let linksLiability = false;
     for (const accountId of g.accountIds) {
       const meta = accountMeta.get(accountId);
       if (!meta) continue; // account got deleted under us; skip silently
+      if (meta.isLiability) linksLiability = true;
       const valueInAccountCcy = meta.isInvestment
         ? holdingsByAccount.get(accountId)?.value ?? 0
         : cashByAccount.get(accountId) ?? 0;
       const fx = await getFx(meta.currency, goalCurrency);
       currentAmount += valueInAccountCcy * fx;
+    }
+
+    // debt_payoff goals linked to a liability account measure the debt itself:
+    // the summed balance is negative (what is still owed), and progress is the
+    // part of the target already paid off, so a freshly-linked loan reads 0%
+    // rather than -100%. Gated on an actual liability link — a debt goal with
+    // no accounts (manual tracking) or one saving toward the payoff in an
+    // asset account keeps the ordinary saved-balance rule; inverting those
+    // read "nothing owed" and reported them 100% complete on day one.
+    if (g.type === "debt_payoff" && linksLiability) {
+      const owed = Math.max(-currentAmount, 0);
+      currentAmount = Math.max(g.targetAmount - owed, 0);
     }
 
     const progress =

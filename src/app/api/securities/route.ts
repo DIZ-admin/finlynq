@@ -31,6 +31,7 @@ import { apiHandler } from "@/lib/api-handler";
 import { buildNameFields, decryptName, decryptNamedRows } from "@/lib/crypto/encrypted-columns";
 import { resolveOrCreateSecurity, gcOrphanSecurity } from "@/lib/securities/resolve";
 import { loadCustomPriceMap } from "@/lib/securities/custom-prices";
+import { findNeverPricedSecurityIds } from "@/lib/securities/price-coverage";
 
 interface SecurityAccountLink {
   accountId: number;
@@ -59,6 +60,8 @@ export const GET = apiHandler(
         image: schema.securities.image,
         symbolCt: schema.securities.symbolCt,
         nameCt: schema.securities.nameCt,
+        isinCt: schema.securities.isinCt,
+        createdAt: schema.securities.createdAt,
       })
       .from(schema.securities)
       .where(eq(schema.securities.userId, userId));
@@ -70,7 +73,8 @@ export const GET = apiHandler(
     const securities = decryptNamedRows(secRows, dek, {
       symbolCt: "symbol",
       nameCt: "name",
-    }) as Array<(typeof secRows)[number] & { symbol: string | null; name: string | null }>;
+      isinCt: "isin",
+    }) as Array<(typeof secRows)[number] & { symbol: string | null; name: string | null; isin: string | null }>;
 
     // Positions per security, with account name + qty (cached) for context.
     const posRows = await db
@@ -106,6 +110,24 @@ export const GET = apiHandler(
       linksBySecurity.set(p.securityId, arr);
     }
 
+    // Which held, auto-priced tickers have NEVER produced a price_cache row —
+    // i.e. our providers can't price them (a mistyped or user-invented symbol
+    // like `AMZN401K`). Drives the `unpriced` ticker advisory on the Securities
+    // tab. Best-effort + conservative: on any probe failure this is empty, so a
+    // healthy ticker is never flagged. Requires the DEK to have decrypted the
+    // symbols — a locked session yields null symbols → no candidates → no flags.
+    const neverPriced = await findNeverPricedSecurityIds(
+      securities.map((s) => ({
+        id: s.id,
+        symbol: s.symbol,
+        isCash: s.isCash,
+        isCrypto: s.isCrypto === 1,
+        priceSource: s.priceSource,
+        heldIn: (linksBySecurity.get(s.id) ?? []).length,
+        createdAt: s.createdAt,
+      })),
+    );
+
     const data = securities
       .map((s) => {
         const marks = customPriceMap.get(s.id) ?? [];
@@ -114,12 +136,16 @@ export const GET = apiHandler(
           id: s.id,
           symbol: s.symbol,
           name: s.name,
+          // GH #365 — the ISIN this security was entered/imported by, if any.
+          isin: s.isin ?? null,
           assetType: s.assetType,
           currency: s.currency,
           isCash: s.isCash,
           isCrypto: s.isCrypto === 1,
           priceSource: (s.priceSource as "auto" | "manual") ?? "auto",
           latestPrice: last ? { date: last.date, price: last.price } : null,
+          // True ⇒ no provider has ever priced this ticker (see price-coverage.ts).
+          neverPriced: neverPriced.has(s.id),
           image: s.image,
           accounts: (linksBySecurity.get(s.id) ?? []).sort(
             (a, b) => (a.accountName ?? "").localeCompare(b.accountName ?? ""),
