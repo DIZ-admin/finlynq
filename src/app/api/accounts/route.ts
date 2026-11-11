@@ -1,5 +1,5 @@
 import { NextRequest, NextResponse } from "next/server";
-import { getAccounts, getAccountById, createAccount, updateAccount, deleteAccount } from "@/lib/queries";
+import { getAccounts, createAccount, updateAccount, deleteAccount } from "@/lib/queries";
 import { requireAuth } from "@/lib/auth/require-auth";
 import { requireEncryption } from "@/lib/auth/require-encryption";
 import { z } from "zod";
@@ -7,7 +7,7 @@ import { validateBody, safeErrorMessage, logApiError } from "@/lib/validate";
 import { buildNameFields, decryptNamedRows } from "@/lib/crypto/encrypted-columns";
 import { backfillInvestmentAccount } from "@/lib/investment-account";
 import { isPgErrorCode } from "@/lib/db-utils";
-import { db } from "@/db";
+import { db, withDbTransaction } from "@/db";
 import {
   getAccountDeleteBlockers,
   accountDeleteBlockedMessage,
@@ -68,18 +68,13 @@ export async function POST(request: NextRequest) {
     const enc = buildNameFields(dek, { name, alias: normalizedAlias });
     // Stream D Phase 4 — plaintext `name`/`alias` columns dropped. Only the
     // `*_ct`/`*_lookup` siblings get persisted via `enc`.
-    const account = await createAccount(userId, { ...rest, ...enc });
-    // When the user creates an account already flagged investment, ensure
-    // the per-account Cash holding exists so the constraint is satisfiable
-    // out of the gate. No transactions to reassign on a fresh account.
-    if (rest.isInvestment === true && account?.id != null) {
-      try {
-        await backfillInvestmentAccount(userId, account.id, dek);
-      } catch (e) {
-        // Backfill failure shouldn't undo the account creation — log only.
-        await logApiError("POST-backfill", "/api/accounts", e, userId);
+    const account = await withDbTransaction(async () => {
+      const created = await createAccount(userId, { ...rest, ...enc });
+      if (rest.isInvestment === true && created?.id != null) {
+        await backfillInvestmentAccount(userId, created.id, dek);
       }
-    }
+      return created;
+    });
     return NextResponse.json(account, { status: 201 });
   } catch (error: unknown) {
     await logApiError("POST", "/api/accounts", error, userId);
@@ -104,33 +99,16 @@ export async function PUT(request: NextRequest) {
     if (name !== undefined) toEncrypt.name = name;
     if (normalizedAlias !== undefined) toEncrypt.alias = normalizedAlias;
     const enc = buildNameFields(dek, toEncrypt);
-    const normalized = data;
-    // Detect false → true flip on isInvestment so we can run the backfill
-    // (Cash holding + null-FK reassignment) in the same request.
-    let needsInvestmentBackfill = false;
-    if (normalized.isInvestment === true) {
-      const before = await getAccountById(id, userId);
-      if (before && before.isInvestment === false) needsInvestmentBackfill = true;
-    }
-    const account = await updateAccount(id, userId, { ...normalized, ...enc });
-    if (!account) return NextResponse.json({ error: "Account not found" }, { status: 404 });
-    if (needsInvestmentBackfill) {
-      try {
+    const account = await withDbTransaction(async () => {
+      const updated = await updateAccount(id, userId, { ...data, ...enc });
+      // An explicit opt-in also repairs accounts left incomplete by older builds.
+      // Backfill only assigns transactions with no holding, so retries are safe.
+      if (updated && data.isInvestment === true) {
         await backfillInvestmentAccount(userId, id, dek);
-      } catch (e) {
-        // Surface the backfill failure rather than leaving the user with a
-        // freshly-flagged account whose existing rows still violate the
-        // constraint. The flag flip already committed; the error tells
-        // them to retry or investigate.
-        await logApiError("PUT-backfill", "/api/accounts", e, userId);
-        return NextResponse.json(
-          {
-            error: "Account flagged as investment, but the cash-holding backfill failed. Existing transactions in this account may not yet satisfy the constraint — retry the toggle or contact support.",
-          },
-          { status: 500 },
-        );
       }
-    }
+      return updated;
+    });
+    if (!account) return NextResponse.json({ error: "Account not found" }, { status: 404 });
     return NextResponse.json(account);
   } catch (error: unknown) {
     await logApiError("PUT", "/api/accounts", error, userId);

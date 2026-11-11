@@ -41,7 +41,7 @@
     "jose": "^6.2.2",
     "jszip": "^3.10.1",
     "lucide-react": "^0.577.0",
-    "next": "16.4.0",
+    "next": "16.4.6",
     "next-themes": "^0.4.6",
     "nodemailer": "^10.1.1",
     "otpauth": "^9.5.0",
@@ -84,7 +84,10 @@
     "hono": "^4.12.34",
     "tmp": "^0.2.7",
     "postcss": "^8.5.25",
-    "sharp": "^0.35.5"
+    "sharp": "^0.35.5",
+    "exceljs": {
+      "uuid": "11.1.1"
+    }
   },
   "description": "Open-source personal finance app with native MCP server",
   "homepage": "https://finlynq.com",

@@ -6,12 +6,31 @@ vi.mock("@/lib/auth/require-auth", () => ({
 
 const mockGetAccounts = vi.fn();
 const mockCreateAccount = vi.fn();
+const mockUpdateAccount = vi.fn();
+const mockBackfill = vi.fn();
+let investment = false;
 vi.mock("@/lib/queries", () => ({
   getAccounts: (...args: unknown[]) => mockGetAccounts(...args),
   createAccount: (...args: unknown[]) => mockCreateAccount(...args),
+  updateAccount: (...args: unknown[]) => mockUpdateAccount(...args),
+}));
+vi.mock("@/lib/investment-account", () => ({
+  backfillInvestmentAccount: (...args: unknown[]) => mockBackfill(...args),
+}));
+vi.mock("@/db", async (original) => ({
+  ...await original<typeof import("@/db")>(),
+  withDbTransaction: async <T>(run: () => Promise<T>): Promise<T> => {
+    const before = investment;
+    try {
+      return await run();
+    } catch (error) {
+      investment = before;
+      throw error;
+    }
+  },
 }));
 
-import { GET, POST } from "@/app/api/accounts/route";
+import { GET, POST, PUT } from "@/app/api/accounts/route";
 import { requireAuth } from "@/lib/auth/require-auth";
 import { createMockRequest, parseResponse } from "../helpers/api-test-utils";
 import { NextResponse } from "next/server";
@@ -19,6 +38,8 @@ import { NextResponse } from "next/server";
 describe("API /api/accounts", () => {
   beforeEach(() => {
     vi.clearAllMocks();
+    mockBackfill.mockReset();
+    investment = false;
   });
 
   describe("GET", () => {
@@ -133,5 +154,24 @@ describe("API /api/accounts", () => {
       expect(status).toBe(201);
       expect((data as { note: string }).note).toBe("Shared");
     });
+  });
+
+  it("rolls back a failed investment conversion and retries the backfill", async () => {
+    mockUpdateAccount.mockImplementation((_id, _user, values) => {
+      investment = values.isInvestment;
+      return { id: 7, isInvestment: investment };
+    });
+    mockBackfill.mockRejectedValueOnce(new Error("synthetic backfill failure"));
+    const request = () => createMockRequest("http://localhost:3000/api/accounts", {
+      method: "PUT", body: { id: 7, isInvestment: true },
+    });
+    expect((await PUT(request())).status).toBe(500);
+    expect(investment).toBe(false);
+    expect((await PUT(request())).status).toBe(200);
+    expect(investment).toBe(true);
+    expect(mockBackfill).toHaveBeenCalledTimes(2);
+    // The same operation must also repair rows left by a previous release.
+    expect((await PUT(request())).status).toBe(200);
+    expect(mockBackfill).toHaveBeenCalledTimes(3);
   });
 });
